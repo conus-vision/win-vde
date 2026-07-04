@@ -5,6 +5,7 @@
 #include <cstdio>
 #include "str_util.hpp"
 #include "layout.hpp"
+#include "lifecycle.hpp"
 
 static int g_fail = 0, g_total = 0;
 #define CHECK(c) do{ g_total++; if(!(c)){ g_fail++; printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #c);} }while(0)
@@ -96,6 +97,32 @@ static void test_grace_untouched_when_app_not_observed(){
     CHECK(out.size()==1); CHECK(out[0].missingRuns==2);
 }
 
+static void test_lc_startup_present_restores(){
+    LcState s; CHECK(LcOnStartup(s, true) == LcAction::StartupRestore);
+    CHECK(s.prevPresent && s.restoredThisAppearance);
+}
+static void test_lc_startup_absent_none(){
+    LcState s; CHECK(LcOnStartup(s, false) == LcAction::None); CHECK(!s.prevPresent);
+}
+static void test_lc_launch_then_settle_restores_once(){
+    LcState s; LcOnStartup(s, false);
+    CHECK(LcOnTick(s, true, 4) == LcAction::None);      // appearance tick 1
+    CHECK(LcOnTick(s, true, 4) == LcAction::None);      // 2
+    CHECK(LcOnTick(s, true, 4) == LcAction::None);      // 3
+    CHECK(LcOnTick(s, true, 4) == LcAction::DoRestore); // 4 ⇒ settle reached
+    CHECK(LcOnTick(s, true, 4) == LcAction::AutoSave);  // then periodic autosave
+}
+static void test_lc_absent_does_not_wipe_and_rearm(){
+    LcState s; LcOnStartup(s, true);
+    CHECK(LcOnTick(s, false, 4) == LcAction::None);     // present->absent: no wipe
+    CHECK(!s.restoredThisAppearance);                  // re-armed
+    CHECK(LcOnTick(s, true, 4) == LcAction::None);      // reappearance restarts settle
+}
+static void test_lc_exit(){
+    LcState s; CHECK(LcOnExit(s, true) == LcAction::FinalSave);
+    CHECK(LcOnExit(s, false) == LcAction::None);
+}
+
 int main(){
     test_etld1();
     test_b64();
@@ -107,6 +134,11 @@ int main(){
     test_grace_seen_resets_unseen_increments();
     test_grace_drops_at_threshold();
     test_grace_untouched_when_app_not_observed();
+    test_lc_startup_present_restores();
+    test_lc_startup_absent_none();
+    test_lc_launch_then_settle_restores_once();
+    test_lc_absent_does_not_wipe_and_rearm();
+    test_lc_exit();
     printf("%d/%d passed\n", g_total - g_fail, g_total);
     return g_fail ? 1 : 0;
 }
