@@ -6,6 +6,7 @@
 #include "str_util.hpp"
 #include "layout.hpp"
 #include "lifecycle.hpp"
+#include "session.hpp"
 
 static int g_fail = 0, g_total = 0;
 #define CHECK(c) do{ g_total++; if(!(c)){ g_fail++; printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #c);} }while(0)
@@ -123,9 +124,45 @@ static void test_lc_exit(){
     CHECK(LcOnExit(s, false) == LcAction::None);
 }
 
+// --- minimal SNSS encoder mirroring the REAL format ---
+// cmds 0/2/7/8 = raw fixed structs of two int32 (no pickle header); cmd 6 = base::Pickle
+// (4-byte-aligned fields; url = UTF-8 WriteString, title = UTF-16 WriteString16).
+static void wInt(std::string& p,int v){ for(int i=0;i<4;i++)p.push_back((char)((v>>(8*i))&0xFF)); }   // raw int32
+static void pkInt(std::string& p,int v){ while(p.size()%4)p.push_back(0); wInt(p,v); }                 // aligned
+static void pkStr(std::string& p,const std::string& s){ pkInt(p,(int)s.size()); p+=s; while(p.size()%4)p.push_back(0); }
+static void pkStr16(std::string& p,const std::string& s){ pkInt(p,(int)s.size()); for(char ch:s){ p.push_back(ch); p.push_back(0);} while(p.size()%4)p.push_back(0); }
+static void snssFrame(std::string& f,unsigned char id,const std::string& content){
+    unsigned sz=(unsigned)(content.size()+1);
+    f.push_back((char)(sz&0xFF)); f.push_back((char)((sz>>8)&0xFF)); f.push_back((char)id); f+=content;
+}
+static void snssRaw(std::string& f,unsigned char id,int a,int b){ std::string c; wInt(c,a); wInt(c,b); snssFrame(f,id,c); }
+static void snssPickle(std::string& f,unsigned char id,const std::string& payload){ std::string pk; wInt(pk,(int)payload.size()); pk+=payload; snssFrame(f,id,pk); }
+static std::string makeSnss(){
+    std::string f="SNSS"; wInt(f,3);
+    snssRaw(f,0,10,1); snssRaw(f,0,10,2); snssRaw(f,0,11,3);   // SetTabWindow [win,tab]
+    snssRaw(f,2,1,0); snssRaw(f,2,2,1); snssRaw(f,2,3,0);      // SetTabIndexInWindow [tab,idx]
+    snssRaw(f,8,10,1); snssRaw(f,8,11,0);                      // SetSelectedTabInIndex [win,idx]
+    auto nav=[&](int tab,int idx,const std::string& url,const std::string& title){ std::string p; pkInt(p,tab); pkInt(p,idx); pkStr(p,url); pkStr16(p,title); snssPickle(f,6,p); };
+    nav(1,0,"https://github.com/x","GitHub"); nav(2,0,"https://docs.python.org/3","Python"); nav(3,0,"https://example.com/","Example");
+    snssRaw(f,7,1,0); snssRaw(f,7,2,0); snssRaw(f,7,3,0);      // SetSelectedNavigationIndex [tab,idx]
+    return f;
+}
+static void test_snss_parse(){
+    auto w = ParseChromiumSNSS(makeSnss());
+    CHECK(w.size()==2);
+    int wi10=-1,wi11=-1; for(int i=0;i<(int)w.size();++i){ if(w[i].counts.count("github.com"))wi10=i; if(w[i].counts.count("example.com"))wi11=i; }
+    CHECK(wi10>=0 && wi11>=0);
+    CHECK(w[wi10].tabCount==2); CHECK(w[wi10].counts["github.com"]==1); CHECK(w[wi10].counts["python.org"]==1);
+    CHECK(w[wi10].activeTitle=="Python"); CHECK(w[wi10].activeDomain=="python.org");
+    CHECK(w[wi11].tabCount==1); CHECK(w[wi11].activeTitle=="Example");
+}
+static void test_snss_garbage(){ auto w=ParseChromiumSNSS("not an snss file...."); CHECK(w.empty()); }
+
 int main(){
     test_etld1();
     test_b64();
+    test_snss_parse();
+    test_snss_garbage();
     test_layout_roundtrip_v3();
     test_layout_parse_v2();
     test_merge_upsert_and_keep();

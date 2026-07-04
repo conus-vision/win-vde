@@ -45,6 +45,7 @@
 #include "str_util.hpp"   // W2U8/U82W, GUID helpers, b64, GetWindowsBuild, hostOf, etld1
 #include "layout.hpp"     // DeskRec, CountsToStr, StrToCounts (+ v3 layout logic)
 #include "lifecycle.hpp"  // LcState/LcAction, LcOnStartup/LcOnTick/LcOnExit
+#include "session.hpp"    // WinFp, Chromium SNSS reader (ReadChromiumWindows)
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
@@ -230,14 +231,14 @@ struct JParser {
         ok=false; return false; }
 };
 // hostOf / etld1 → moved to str_util.hpp
-struct SSWindow { std::string activeTitle, activeDomain; std::map<std::string,int> counts; int tabCount=0; };
-static std::vector<SSWindow> extractWindows(const JValue& root){
-    std::vector<SSWindow> out;
+// struct WinFp → unified as WinFp in session.hpp
+static std::vector<WinFp> extractWindows(const JValue& root){
+    std::vector<WinFp> out;
     const JValue* wins=root.find("windows"); if(!wins||wins->t!=JValue::ARR)return out;
     for(const auto& w: wins->arr){
         const JValue* tabs=w.find("tabs"); if(!tabs||tabs->t!=JValue::ARR)continue;
         int selected=1; if(const JValue* s=w.find("selected"))selected=s->asInt(1);
-        SSWindow sw; sw.tabCount=(int)tabs->arr.size();
+        WinFp sw; sw.tabCount=(int)tabs->arr.size();
         for(size_t ti=0; ti<tabs->arr.size(); ++ti){
             const JValue& tab=tabs->arr[ti];
             const JValue* entries=tab.find("entries"); if(!entries||entries->t!=JValue::ARR||entries->arr.empty())continue;
@@ -335,14 +336,7 @@ static BOOL CALLBACK EnumFF(HWND hwnd, LPARAM lp){
 static std::vector<LiveWin> EnumFirefoxWindows(){ std::vector<LiveWin> v; EnumWindows(EnumFF,(LPARAM)&v); if(g_vdmDoc)for(auto&w:v)g_vdmDoc->GetWindowDesktopId(w.hwnd,&w.desktop); return v; }
 
 // ============================ sessionstore IO =================================
-static bool ReadFileBytes(const std::wstring& path, std::string& out){
-    HANDLE f=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
-    if(f==INVALID_HANDLE_VALUE)return false;
-    char buf[65536]; DWORD rd=0; out.clear();
-    while(ReadFile(f,buf,sizeof(buf),&rd,nullptr)&&rd)out.append(buf,rd);
-    CloseHandle(f); return true;
-}
-static bool FileExists(const std::wstring& p){ DWORD a=GetFileAttributesW(p.c_str()); return a!=INVALID_FILE_ATTRIBUTES&&!(a&FILE_ATTRIBUTE_DIRECTORY); }
+// ReadFileBytes / FileExists → moved to str_util.hpp
 static std::wstring FirefoxProfileDirUncached();
 static std::wstring FirefoxProfileDir(){ static std::wstring c; if(c.empty()) c=FirefoxProfileDirUncached(); return c; }
 static std::wstring FirefoxProfileDirUncached(){
@@ -364,7 +358,7 @@ static std::wstring FirefoxProfileDirUncached(){
     for(auto& sec:sections) if(sec.first.rfind("Profile",0)==0){ auto pth=sec.second.find("Path"); if(pth!=sec.second.end()&&pth->second.find(".default-release")!=std::string::npos){ bool rel=sec.second.count("IsRelative")?sec.second["IsRelative"]=="1":true; return resolve(pth->second,rel); } }
     return L"";
 }
-static std::vector<SSWindow> ReadSessionstore(std::wstring* usedPathOut=nullptr){
+static std::vector<WinFp> ReadSessionstore(std::wstring* usedPathOut=nullptr){
     std::wstring prof=FirefoxProfileDir(); if(prof.empty())return {};
     const wchar_t* cand[]={L"\\sessionstore-backups\\recovery.jsonlz4",L"\\sessionstore-backups\\recovery.baklz4",L"\\sessionstore.jsonlz4",L"\\sessionstore-backups\\previous.jsonlz4"};
     for(auto c:cand){ std::wstring path=prof+c; if(!FileExists(path))continue; std::string bytes; if(!ReadFileBytes(path,bytes))continue;
@@ -382,7 +376,7 @@ struct Fp {
 };
 static std::vector<Fp> BuildLiveFingerprints(int* boundCount=nullptr){
     std::vector<LiveWin> live=EnumFirefoxWindows();
-    std::vector<SSWindow> ss=ReadSessionstore();
+    std::vector<WinFp> ss=ReadSessionstore();
     std::vector<bool> used(ss.size(),false); int bound=0; std::vector<Fp> out;
     for(auto& w:live){
         std::string sTitle=W2U8(StripFirefoxSuffix(w.rawTitle));

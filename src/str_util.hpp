@@ -70,3 +70,12 @@ inline std::string etld1(const std::string& host){
     if(last.size()==2&&two.count(penult)) return parts[parts.size()-3]+"."+penult+"."+last;
     return penult+"."+last;
 }
+
+inline bool ReadFileBytes(const std::wstring& path, std::string& out){
+    HANDLE f=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(f==INVALID_HANDLE_VALUE)return false;
+    char buf[65536]; DWORD rd=0; out.clear();
+    while(ReadFile(f,buf,sizeof(buf),&rd,nullptr)&&rd)out.append(buf,rd);
+    CloseHandle(f); return true;
+}
+inline bool FileExists(const std::wstring& p){ DWORD a=GetFileAttributesW(p.c_str()); return a!=INVALID_FILE_ATTRIBUTES&&!(a&FILE_ATTRIBUTE_DIRECTORY); }
