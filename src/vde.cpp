@@ -372,62 +372,80 @@ static double Score(const Fp& s, const Fp& l){
 }
 
 // ============================ snapshot storage ================================
-static std::wstring SnapshotPath(){
+static std::wstring DataDir(){
     wchar_t base[MAX_PATH]={0}; GetEnvironmentVariableW(L"LOCALAPPDATA",base,MAX_PATH);
-    std::wstring dir=std::wstring(base)+L"\\VirtualDesktopsExtention"; CreateDirectoryW(dir.c_str(),nullptr);
-    return dir+L"\\layout.txt";
+    std::wstring dir=std::wstring(base)+L"\\VirtualDesktopsExtention"; CreateDirectoryW(dir.c_str(),nullptr); return dir;
 }
-// CountsToStr / StrToCounts / DeskRec → moved to layout.hpp
-static bool WriteSnapshot(const std::vector<DeskRec>& desks, const std::vector<Fp>& wins){
-    HANDLE f=CreateFileW(SnapshotPath().c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
-    if(f==INVALID_HANDLE_VALUE)return false;
-    std::string out="# VDE snapshot v2\n";
-    for(auto& d:desks){ char l[128]; sprintf_s(l,"D\t%d\t",d.index); out+=l; out+=W2U8(GuidToString(d.guid)); out+="\t"; out+=b64enc(W2U8(d.name)); out+="\n"; }
-    for(auto& w:wins){ char l[128]; sprintf_s(l,"W\t%d\t",w.deskIndex); out+=l; out+=W2U8(GuidToString(w.desktop)); out+="\t"; out+=b64enc(w.activeTitle); out+="\t"; out+=w.activeDomain; out+="\t"; out+=std::to_string(w.tabCount); out+="\t"; out+=CountsToStr(w.counts); out+="\n"; }
-    DWORD wr=0; BOOL ok=WriteFile(f,out.data(),(DWORD)out.size(),&wr,nullptr); CloseHandle(f); return ok&&wr==out.size();
+static std::wstring LayoutPath(bool manual){ return DataDir()+(manual?L"\\layout-manual.txt":L"\\layout-auto.txt"); }
+static void MigrateLegacyLayout(){
+    std::wstring legacy=DataDir()+L"\\layout.txt", autoP=LayoutPath(false);
+    if(FileExists(legacy) && !FileExists(autoP)) MoveFileW(legacy.c_str(), autoP.c_str());
 }
-static bool ReadSnapshot(std::vector<DeskRec>& desks, std::vector<Fp>& wins){
-    std::string data; if(!ReadFileBytes(SnapshotPath(),data))return false; size_t pos=0;
-    while(pos<data.size()){ size_t nl=data.find('\n',pos); std::string line=data.substr(pos,(nl==std::string::npos?data.size():nl)-pos); pos=(nl==std::string::npos?data.size():nl+1);
-        if(!line.empty()&&line.back()=='\r')line.pop_back(); if(line.empty()||line[0]=='#')continue;
-        std::vector<std::string> col; size_t p=0; while(true){ size_t t=line.find('\t',p); col.push_back(line.substr(p,(t==std::string::npos?line.size():t)-p)); if(t==std::string::npos)break; p=t+1; }
-        if(col.size()<4)continue;
-        if(col[0]=="D"){ DeskRec d; d.index=atoi(col[1].c_str()); StringToGuid(U82W(col[2]),d.guid); d.name=U82W(b64dec(col[3])); desks.push_back(d); }
-        else if(col[0]=="W"){ Fp w; w.deskIndex=atoi(col[1].c_str()); StringToGuid(U82W(col[2]),w.desktop); w.activeTitle=b64dec(col[3]);
-            if(col.size()>=7){ w.activeDomain=col[4]; w.tabCount=atoi(col[5].c_str()); w.counts=StrToCounts(col[6]); } wins.push_back(w); }
+static bool WriteTextFile(const std::wstring& path, const std::string& text){
+    HANDLE f=CreateFileW(path.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(f==INVALID_HANDLE_VALUE)return false; DWORD wr=0; BOOL ok=WriteFile(f,text.data(),(DWORD)text.size(),&wr,nullptr); CloseHandle(f); return ok&&wr==text.size();
+}
+static std::vector<DeskRec> CurrentDesktops(){
+    std::vector<DeskRec> desks; UINT count=0; if(g_vdmi) g_vdmi->GetCount(&count);
+    for(UINT i=0;i<count;++i){ IVirtualDesktop* d=GetDesktopByIndex(i); if(!d)continue; GUID g={0};d->GetID(&g);
+        DeskRec dr; dr.index=(int)i; dr.guid=g; dr.name=DesktopNameFromRegistry(g); desks.push_back(dr); d->Release(); }
+    return desks;
+}
+// Currently-open windows (Phase 1: Firefox) as LayoutWin with desktop assigned.
+// Accumulates each window's FingerprintKey into `seen` and app into `apps` (for grace bookkeeping).
+static std::vector<LayoutWin> CollectPresentWindows(std::set<std::string>* seen, std::set<std::string>* apps){
+    std::vector<LayoutWin> out; auto fps=BuildLiveFingerprints();
+    for(auto& f:fps){ if(GuidIsZero(f.desktop))continue;
+        LayoutWin w; w.app="firefox"; w.deskIndex=GetDesktopIndexByGuid(f.desktop);
+        w.desktop=f.desktop; w.activeTitle=f.activeTitle; w.activeDomain=f.activeDomain; w.tabCount=f.tabCount; w.counts=f.counts; w.missingRuns=0;
+        out.push_back(w);
+        if(seen) seen->insert(FingerprintKey(w.app,w.counts,w.activeTitle));
+        if(apps) apps->insert(w.app);
     }
-    return true;
+    return out;
 }
 
 // ============================ save / restore cores ============================
 // Возвращают краткую сводку (UTF-8) для трей-балуна; CLI печатает её и детали.
-static std::string RunSave(){
-    auto fps=BuildLiveFingerprints();
-    if(fps.empty())return "No Firefox windows found. Nothing to save.";
-    std::vector<DeskRec> desks; UINT count=0; g_vdmi->GetCount(&count);
-    for(UINT i=0;i<count;++i){ IVirtualDesktop* d=GetDesktopByIndex(i); if(!d)continue; GUID g={0};d->GetID(&g); DeskRec dr; dr.index=(int)i;dr.guid=g;dr.name=DesktopNameFromRegistry(g); desks.push_back(dr); d->Release(); }
-    std::vector<Fp> recs; int withDom=0;
-    for(auto& f:fps){ if(GuidIsZero(f.desktop))continue; Fp r=f; r.deskIndex=GetDesktopIndexByGuid(f.desktop); if(r.hasDomains())withDom++; recs.push_back(r); }
-    if(!WriteSnapshot(desks,recs))return "Failed to write snapshot.";
-    char b[160]; sprintf_s(b,"Saved %d window(s) (%d with domain data) across %u desktop(s).",(int)recs.size(),withDom,count);
-    return b;
+static Fp SavedToFp(const LayoutWin& w){
+    Fp f; f.desktop=w.desktop; f.deskIndex=w.deskIndex; f.activeTitle=w.activeTitle;
+    f.activeDomain=w.activeDomain; f.counts=w.counts; f.tabCount=w.tabCount; return f;
 }
-static std::string RunRestore(std::vector<std::string>* linesOut=nullptr){
-    std::vector<DeskRec> savedDesks; std::vector<Fp> saved;
-    if(!ReadSnapshot(savedDesks,saved)||saved.empty())return "No usable snapshot. Run 'save' first.";
+// Manual save: full snapshot of currently-open windows → layout-manual.txt (no grace).
+static std::string RunSaveManual(){
+    auto present=CollectPresentWindows(nullptr,nullptr);
+    if(present.empty()) return "No browser windows found. Nothing to save.";
+    if(!WriteTextFile(LayoutPath(true), SerializeLayout(CurrentDesktops(), present))) return "Failed to write manual layout.";
+    char b[160]; sprintf_s(b,"Saved layout: %d window(s).",(int)present.size()); return b;
+}
+// Auto save: merge present windows into layout-auto.txt. Never touches the file when
+// no windows are open (anti-wipe). Absent windows are kept (grace, aged only on exit).
+static std::string RunSaveAuto(std::set<std::string>* seen, std::set<std::string>* apps){
+    auto present=CollectPresentWindows(seen,apps);
+    if(present.empty()) return "";
+    std::vector<DeskRec> ed; std::vector<LayoutWin> existing; { std::string t; if(ReadFileBytes(LayoutPath(false),t)) ParseLayout(t,ed,existing); }
+    auto merged=MergeAutoLayout(existing, present);
+    WriteTextFile(LayoutPath(false), SerializeLayout(CurrentDesktops(), merged));
+    return "auto-saved";
+}
+static std::string RunRestore(bool manual, std::vector<std::string>* linesOut=nullptr){
+    std::vector<DeskRec> savedDesks; std::vector<LayoutWin> saved;
+    { std::string t; if(!ReadFileBytes(LayoutPath(manual),t) || !ParseLayout(t,savedDesks,saved) || saved.empty())
+        return manual?"No saved layout. Use 'Save windows layout' first.":"No auto layout yet."; }
     auto live=BuildLiveFingerprints();
-    if(live.empty())return "No Firefox windows to restore.";
+    if(live.empty())return "No browser windows to restore.";
     UINT count=0; g_vdmi->GetCount(&count);
     const double T_FLOOR=0.35,T_ACCEPT=0.55;
     struct Pair{ double sc; int si,li; }; std::vector<Pair> pairs;
-    for(int i=0;i<(int)saved.size();++i)for(int j=0;j<(int)live.size();++j){ double sc=Score(saved[i],live[j]); if(sc>=T_FLOOR)pairs.push_back({sc,i,j}); }
+    for(int i=0;i<(int)saved.size();++i){ if(saved[i].app!="firefox")continue; Fp S=SavedToFp(saved[i]);   // Phase 1: live windows are Firefox
+        for(int j=0;j<(int)live.size();++j){ double sc=Score(S,live[j]); if(sc>=T_FLOOR)pairs.push_back({sc,i,j}); } }
     std::sort(pairs.begin(),pairs.end(),[](const Pair&a,const Pair&b){return a.sc>b.sc;});
     std::vector<int> usedS(saved.size(),0),usedL(live.size(),0),assignL2S(live.size(),-1); int matched=0;
     for(auto& p:pairs) if(!usedS[p.si]&&!usedL[p.li]&&p.sc>=T_ACCEPT){ usedS[p.si]=usedL[p.li]=1; assignL2S[p.li]=p.si; matched++; }
     int moved=0,failed=0;
     for(int li=0;li<(int)live.size();++li){ Fp& L=live[li];
         if(assignL2S[li]<0){ if(linesOut)linesOut->push_back("[no match] "+L.activeTitle); continue; }
-        const Fp& S=saved[assignL2S[li]];
+        const LayoutWin& S=saved[assignL2S[li]];
         IVirtualDesktop* dest=nullptr; GUID destGuid={0};
         if(GetDesktopIndexByGuid(S.desktop)>=0){ dest=GetDesktopByGuid(S.desktop); destGuid=S.desktop; }
         else if(S.deskIndex>=0&&(UINT)S.deskIndex<count){ dest=GetDesktopByIndex((UINT)S.deskIndex); if(dest)dest->GetID(&destGuid); }
@@ -460,9 +478,13 @@ static int CliRun(const std::wstring& cmd){
         }
         return 0;
     }
-    if(cmd==L"save"){ std::string s=RunSave(); printf("%s\n",s.c_str()); printf("Snapshot: %s\n",W2U8(SnapshotPath()).c_str()); return 0; }
-    if(cmd==L"restore"){ std::vector<std::string> lines; std::string s=RunRestore(&lines); for(auto& l:lines)printf("  %s\n",l.c_str()); printf("\n%s\n",s.c_str()); return 0; }
-    printf("Usage: vde <save|restore|status|list>\n");
+    if(cmd==L"save"){ std::string s=RunSaveManual(); printf("%s\n",s.c_str()); printf("Manual layout: %s\n",W2U8(LayoutPath(true)).c_str()); return 0; }
+    if(cmd==L"restore"){ std::vector<std::string> lines; std::string s=RunRestore(true,&lines); for(auto& l:lines)printf("  %s\n",l.c_str()); printf("\n%s\n",s.c_str()); return 0; }
+    if(cmd==L"restore-auto"){ std::vector<std::string> lines; std::string s=RunRestore(false,&lines); for(auto& l:lines)printf("  %s\n",l.c_str()); printf("\n%s\n",s.c_str()); return 0; }
+    printf("Usage: vde <save|restore|restore-auto|status|list>\n");
+    printf("  save          save current window layout to layout-manual.txt\n");
+    printf("  restore       restore from layout-manual.txt\n");
+    printf("  restore-auto  restore from the last auto-saved layout\n");
     printf("  (no args) -> run resident in tray; Ctrl+Alt+D opens the desktop picker\n");
     return 2;
 }
@@ -780,7 +802,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                     unsigned long long sig=LayoutSignature(); // 2) изменилась ли раскладка окно->десктоп
                     if(sig!=g_lastLayoutSig){                 //    тяжёлый разбор+запись только тогда
                         g_lastLayoutSig=sig;
-                        RunSave();
+                        RunSaveAuto(nullptr,nullptr);
                     }
                 }
             }
@@ -800,8 +822,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             SetForegroundWindow(hwnd);
             int cmd=TrackPopupMenu(m,TPM_RETURNCMD|TPM_RIGHTBUTTON,pt.x,pt.y,0,hwnd,nullptr); DestroyMenu(m);
             if(cmd==200)ShowPicker();
-            else if(cmd==201)Balloon(U82W(RunSave()));
-            else if(cmd==202)Balloon(U82W(RunRestore()));
+            else if(cmd==201)Balloon(U82W(RunSaveManual()));
+            else if(cmd==202)Balloon(U82W(RunRestore(true)));
             else if(cmd==203)OpenSettings();
             else if(cmd==209)DestroyWindow(hwnd);
         } else if(LOWORD(lp)==WM_LBUTTONDBLCLK) ShowPicker();
@@ -847,9 +869,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int){
     int argc=0; LPWSTR* argv=CommandLineToArgvW(GetCommandLineW(),&argc);
     std::wstring cmd = (argc>=2)?argv[1]:L"";
     if(argv)LocalFree(argv);
-    bool cli = (cmd==L"save"||cmd==L"restore"||cmd==L"status"||cmd==L"list"||cmd==L"-h"||cmd==L"--help"||cmd==L"/?");
+    bool cli = (cmd==L"save"||cmd==L"restore"||cmd==L"restore-auto"||cmd==L"status"||cmd==L"list"||cmd==L"-h"||cmd==L"--help"||cmd==L"/?");
 
     if(FAILED(CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED))) return 1;
+
+    MigrateLegacyLayout();   // rename legacy layout.txt -> layout-auto.txt (once)
 
     int rc;
     if(cli){
