@@ -1,0 +1,10 @@
+// vde.rc — ресурсы для Virtual Desktops Extention for Windows 11
+// ID 101 должен совпадать с IDI_APPICON в vde.cpp.
+// vde.ico должен лежать рядом с этим файлом во время компиляции rc.exe.
+// Это единственная иконка в exe, поэтому Проводник возьмёт её как значок файла.
+
+101 ICON "vde.ico"
+
+// Application manifest: Common Controls v6 (themes, SysLink, TaskDialog).
+// 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, 24 = RT_MANIFEST.
+1 24 "vde.exe.manifest"
