@@ -62,6 +62,7 @@ static const wchar_t* APP_SHORT = L"Virtual Desktops Extention"; // <=63 chars f
 static UINT g_hotMods = MOD_CONTROL | MOD_ALT;  // Ctrl+Alt+D по умолчанию
 static UINT g_hotVk   = 'D';
 static bool g_autoFix = true;                   // монитор: авто-сохранение и авто-восстановление раскладки
+static bool g_degraded = false;                 // недокументированный COM не работает (обновление Windows) -> урезанный режим
 static const bool SWITCH_AFTER_MOVE = false;    // переключаться на десктоп после переноса окна
 
 #define IDI_APPICON 101    // должен совпадать с ID в vde.rc
@@ -264,6 +265,19 @@ static bool InitServices(){
     return true;
 }
 static void ReleaseServices(){ if(g_vdmDoc)g_vdmDoc->Release(); if(g_avc)g_avc->Release(); if(g_vdmi)g_vdmi->Release(); if(g_shell)g_shell->Release(); }
+// After a Windows update the undocumented vtable/IIDs can shift: QueryService may
+// still succeed but calls return garbage. Verify a couple of calls make sense.
+static bool SanityCheckServices(){
+    if(!g_vdmi) return false;
+    UINT n=0; if(FAILED(g_vdmi->GetCount(&n))) return false;
+    if(n<1 || n>64) return false;
+    IVirtualDesktop* d=nullptr; if(FAILED(g_vdmi->GetCurrentDesktop(&d))||!d) return false;
+    GUID g={0}; bool ok=SUCCEEDED(d->GetID(&g)) && !GuidIsZero(g); d->Release(); return ok;
+}
+static DWORD ReadLastGoodBuild(){ HKEY hk; DWORD v=0,cb=sizeof(v);
+    if(RegOpenKeyExW(HKEY_CURRENT_USER,L"Software\\VirtualDesktopsExtention",0,KEY_READ,&hk)==ERROR_SUCCESS){ RegQueryValueExW(hk,L"LastGoodBuild",0,0,(LPBYTE)&v,&cb); RegCloseKey(hk); } return v; }
+static void WriteLastGoodBuild(DWORD b){ HKEY hk;
+    if(RegCreateKeyExW(HKEY_CURRENT_USER,L"Software\\VirtualDesktopsExtention",0,nullptr,0,KEY_WRITE,nullptr,&hk,nullptr)==ERROR_SUCCESS){ RegSetValueExW(hk,L"LastGoodBuild",0,REG_DWORD,(LPBYTE)&b,sizeof(b)); RegCloseKey(hk); } }
 static IVirtualDesktop* GetDesktopByIndex(UINT index){ IObjectArray* a=nullptr; if(FAILED(g_vdmi->GetDesktops(&a))||!a)return nullptr; IVirtualDesktop* d=nullptr; a->GetAt(index,kIID_IVirtualDesktop,(void**)&d); a->Release(); return d; }
 static IVirtualDesktop* GetDesktopByGuid(const GUID& t){ IObjectArray* a=nullptr; if(FAILED(g_vdmi->GetDesktops(&a))||!a)return nullptr; UINT n=0;a->GetCount(&n); IVirtualDesktop* r=nullptr;
     for(UINT i=0;i<n;++i){ IVirtualDesktop* d=nullptr; if(SUCCEEDED(a->GetAt(i,kIID_IVirtualDesktop,(void**)&d))&&d){ GUID g={0};d->GetID(&g); if(IsEqualGUID(g,t)){r=d;break;} d->Release(); } } a->Release(); return r; }
@@ -427,6 +441,7 @@ static Fp SavedToFp(const LayoutWin& w){
 }
 // Manual save: full snapshot of currently-open windows → layout-manual.txt (no grace).
 static std::string RunSaveManual(){
+    if(g_degraded) return "Virtual-desktop features are unavailable on this Windows build.";
     auto present=CollectPresentWindows(nullptr,nullptr);
     if(present.empty()) return "No browser windows found. Nothing to save.";
     if(!WriteTextFile(LayoutPath(true), SerializeLayout(CurrentDesktops(), present))) return "Failed to write manual layout.";
@@ -435,6 +450,7 @@ static std::string RunSaveManual(){
 // Auto save: merge present windows into layout-auto.txt. Never touches the file when
 // no windows are open (anti-wipe). Absent windows are kept (grace, aged only on exit).
 static std::string RunSaveAuto(std::set<std::string>* seen, std::set<std::string>* apps){
+    if(g_degraded) return "";
     auto present=CollectPresentWindows(seen,apps);
     if(present.empty()) return "";
     std::vector<DeskRec> ed; std::vector<LayoutWin> existing; { std::string t; if(ReadFileBytes(LayoutPath(false),t)) ParseLayout(t,ed,existing); }
@@ -443,6 +459,7 @@ static std::string RunSaveAuto(std::set<std::string>* seen, std::set<std::string
     return "auto-saved";
 }
 static std::string RunRestore(bool manual, std::vector<std::string>* linesOut=nullptr){
+    if(g_degraded) return "Virtual-desktop features are unavailable on this Windows build.";
     std::vector<DeskRec> savedDesks; std::vector<LayoutWin> saved;
     { std::string t; if(!ReadFileBytes(LayoutPath(manual),t) || !ParseLayout(t,savedDesks,saved) || saved.empty())
         return manual?"No saved layout. Use 'Save windows layout' first.":"No auto layout yet."; }
@@ -592,6 +609,7 @@ static void Paint(HDC hdcReal, RECT client){
 static void HidePicker(){ ShowWindow(g_main,SW_HIDE); }
 static void Commit(int idx){ if(idx<0||idx>=(int)g_tiles.size())return; HidePicker(); if(g_target&&IsWindow(g_target)){ IVirtualDesktop* d=GetDesktopByIndex((UINT)g_tiles[idx].index); if(d){ GUID g={0};d->GetID(&g); MoveWindowToDesktop(g_target,d,g); if(SWITCH_AFTER_MOVE)g_vdmi->SwitchDesktop(d); d->Release(); } } }
 static void ShowPicker(){
+    if(g_degraded) return;   // desktop COM unavailable; startup dialog + tray tip already explain
     g_target=GetForegroundWindow(); if(g_target==g_main)g_target=nullptr;
     if(g_target&&IsWindow(g_target)){ int len=GetWindowTextLengthW(g_target); std::wstring t(len+1,0); GetWindowTextW(g_target,&t[0],len+1); t.resize(wcslen(t.c_str())); g_targetTitle=t; } else g_targetTitle.clear();
     BuildModel(); SIZE sz=DesiredClientSize();
@@ -622,7 +640,7 @@ static HICON LoadAppIcon(int cx,int cy){
 static void TrayAdd(HWND hwnd){
     g_nid.cbSize=sizeof(g_nid); g_nid.hWnd=hwnd; g_nid.uID=1; g_nid.uFlags=NIF_ICON|NIF_MESSAGE|NIF_TIP; g_nid.uCallbackMessage=WM_TRAY;
     g_nid.hIcon=LoadAppIcon(GetSystemMetrics(SM_CXSMICON),GetSystemMetrics(SM_CYSMICON));
-    wcsncpy_s(g_nid.szTip,APP_NAME,_TRUNCATE);
+    wcsncpy_s(g_nid.szTip, g_degraded ? L"Virtual Desktops Extension (compatibility issue - see About)" : APP_NAME, _TRUNCATE);
     Shell_NotifyIconW(NIM_ADD,&g_nid);
 }
 static void TrayRemove(){ Shell_NotifyIconW(NIM_DELETE,&g_nid); }
@@ -685,7 +703,7 @@ static bool ApplyHotkey(){
     return RegisterHotKey(g_main,1,g_hotMods|MOD_NOREPEAT,g_hotVk)!=0;
 }
 static void ApplyAutoFix(){   // enable/disable the lifecycle monitor timer
-    if(g_autoFix){ g_lastLayoutSig=0; SetTimer(g_main,TIMER_MONITOR,MONITOR_INTERVAL_MS,nullptr); }
+    if(g_autoFix && !g_degraded){ g_lastLayoutSig=0; SetTimer(g_main,TIMER_MONITOR,MONITOR_INTERVAL_MS,nullptr); }
     else KillTimer(g_main,TIMER_MONITOR);
 }
 
@@ -842,6 +860,57 @@ static void OpenAbout(){
     if(g_about){ ShowWindow(g_about,SW_SHOW); SetForegroundWindow(g_about); }
 }
 
+// --------------------------- compatibility-issue window ----------------------
+static HWND g_compat=nullptr;
+static bool g_compatBuildChanged=false;
+static LRESULT CALLBACK CompatProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
+    switch(msg){
+    case WM_CREATE:{
+        int y=S(14);
+        const wchar_t* head = g_compatBuildChanged
+            ? L"A recent Windows update changed the undocumented virtual-desktop interfaces this tool relies on."
+            : L"The undocumented virtual-desktop interfaces this tool relies on are not available on this Windows build.";
+        CreateWindowW(L"STATIC",head,WS_CHILD|WS_VISIBLE,S(16),y,S(424),S(34),hwnd,nullptr,g_inst,nullptr); y+=S(40);
+        CreateWindowW(L"STATIC",L"Moving other apps' windows between virtual desktops has no public Windows API, so win-vde uses undocumented system interfaces. This is expected \x2014 it is not a fault in your system.",WS_CHILD|WS_VISIBLE,S(16),y,S(424),S(50),hwnd,nullptr,g_inst,nullptr); y+=S(54);
+        std::wstring bld=std::wstring(L"Your Windows build: ")+std::to_wstring(GetWindowsBuild())+L".";
+        CreateWindowW(L"STATIC",bld.c_str(),WS_CHILD|WS_VISIBLE,S(16),y,S(424),S(20),hwnd,nullptr,g_inst,nullptr); y+=S(24);
+        CreateWindowW(L"STATIC",L"Please email the build number so a fix can be posted, or watch the project page:",WS_CHILD|WS_VISIBLE,S(16),y,S(424),S(20),hwnd,nullptr,g_inst,nullptr); y+=S(24);
+        CreateWindowW(L"SysLink",L"<a href=\"mailto:info@conus.vision\">info@conus.vision</a>",WS_CHILD|WS_VISIBLE|WS_TABSTOP,S(16),y,S(424),S(20),hwnd,(HMENU)IDC_LINK_MAIL,g_inst,nullptr); y+=S(22);
+        CreateWindowW(L"SysLink",L"<a href=\"https://github.com/conus-vision/win-vde\">github.com/conus-vision/win-vde</a>",WS_CHILD|WS_VISIBLE|WS_TABSTOP,S(16),y,S(424),S(20),hwnd,(HMENU)IDC_LINK_REPO,g_inst,nullptr); y+=S(30);
+        CreateWindowW(L"BUTTON",L"Copy details",WS_CHILD|WS_VISIBLE|WS_TABSTOP,S(258),y,S(104),S(28),hwnd,(HMENU)IDC_ABOUT_COPY,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Close",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON|WS_TABSTOP,S(372),y,S(70),S(28),hwnd,(HMENU)IDOK,g_inst,nullptr);
+        SetChildFont(hwnd);
+        return 0;
+    }
+    case WM_NOTIFY:{ NMHDR* n=(NMHDR*)lp; if(n->code==NM_CLICK||n->code==NM_RETURN){
+        if(n->idFrom==IDC_LINK_MAIL) ShellExecuteW(hwnd,L"open",L"mailto:info@conus.vision",nullptr,nullptr,SW_SHOW);
+        else if(n->idFrom==IDC_LINK_REPO) ShellExecuteW(hwnd,L"open",L"https://github.com/conus-vision/win-vde",nullptr,nullptr,SW_SHOW);
+    } return 0; }
+    case WM_COMMAND:
+        if(LOWORD(wp)==IDC_ABOUT_COPY){ AboutCopy(hwnd); return 0; }
+        if(LOWORD(wp)==IDOK){ DestroyWindow(hwnd); return 0; }
+        return 0;
+    case WM_CTLCOLORSTATIC:{ HDC dc=(HDC)wp; SetBkMode(dc,TRANSPARENT); return (LRESULT)GetSysColorBrush(COLOR_BTNFACE); }
+    case WM_CLOSE: DestroyWindow(hwnd); return 0;
+    case WM_DESTROY: g_compat=nullptr; return 0;
+    }
+    return DefWindowProcW(hwnd,msg,wp,lp);
+}
+static void ShowCompatIssue(bool buildChanged){
+    g_compatBuildChanged=buildChanged;
+    static bool reg=false;
+    if(!reg){ WNDCLASSW wc={0}; wc.lpfnWndProc=CompatProc; wc.hInstance=g_inst; wc.lpszClassName=L"VdeCompat";
+        wc.hCursor=LoadCursorW(nullptr,IDC_ARROW); wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
+        wc.hIcon=LoadAppIcon(GetSystemMetrics(SM_CXICON),GetSystemMetrics(SM_CYICON));
+        RegisterClassW(&wc); reg=true; }
+    int W=S(472),H=S(300);
+    RECT wr={0,0,W,H}; AdjustWindowRect(&wr,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,FALSE);
+    int ww=wr.right-wr.left, wh=wr.bottom-wr.top;
+    int sx=(GetSystemMetrics(SM_CXSCREEN)-ww)/2, sy=(GetSystemMetrics(SM_CYSCREEN)-wh)/2;
+    g_compat=CreateWindowExW(WS_EX_TOPMOST,L"VdeCompat",L"Virtual Desktops Extension \x2014 compatibility issue",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,sx,sy,ww,wh,nullptr,nullptr,g_inst,nullptr);
+    if(g_compat){ ShowWindow(g_compat,SW_SHOW); SetForegroundWindow(g_compat); }
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     switch(msg){
     case WM_HOTKEY: ShowPicker(); return 0;
@@ -869,7 +938,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             if(g_autoFix && FirefoxPresent()){ Balloon(U82W(RunRestore(false))); g_lastLayoutSig=LayoutSignature(); }
             return 0;
         }
-        if(wp==TIMER_MONITOR && g_autoFix){
+        if(wp==TIMER_MONITOR && g_autoFix && !g_degraded){
             bool present = FirefoxPresent();
             LcAction a = LcOnTick(g_lc, present, LAUNCH_SETTLE_TICKS);
             if(a==LcAction::DoRestore){                        // app appeared & stabilized ⇒ restore
@@ -907,7 +976,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         } else if(LOWORD(lp)==WM_LBUTTONDBLCLK) ShowPicker();
         return 0;
     case WM_DESTROY:
-        if(g_autoFix && LcOnExit(g_lc, FirefoxPresent())==LcAction::FinalSave){   // save only if windows are open (R2)
+        if(g_autoFix && !g_degraded && LcOnExit(g_lc, FirefoxPresent())==LcAction::FinalSave){   // save only if windows are open (R2)
             RunSaveAuto(&g_seenKeys,&g_observedApps);
             std::vector<DeskRec> dd; std::vector<LayoutWin> recs; std::string t;   // age grace counters by one run
             if(ReadFileBytes(LayoutPath(false),t) && ParseLayout(t,dd,recs)){
@@ -941,14 +1010,16 @@ static int RunGui(HINSTANCE hInst){
                                L"Another app may be using it. Change it in Settings,\n"
                                L"or open the picker via double-click on the tray icon.",APP_NAME,MB_ICONWARNING);
     ApplyAutoFix();   // start the lifecycle monitor timer if enabled
-    { bool present=FirefoxPresent(); LcAction a=LcOnStartup(g_lc,present);   // R1: restore now if windows already open
+    if(!g_degraded){ bool present=FirefoxPresent(); LcAction a=LcOnStartup(g_lc,present);   // R1: restore now if windows already open
       if(g_autoFix && a==LcAction::StartupRestore) SetTimer(g_main,TIMER_STARTUP,STARTUP_SETTLE_MS,nullptr); }
-    Balloon(g_autoFix ? L"Running. Auto-restore of your window layout is on."
-                      : L"Running. Press your hotkey to move the active window to a desktop.");
+    Balloon(g_degraded ? L"Running in limited mode (compatibility issue). See About for details."
+                       : (g_autoFix ? L"Running. Auto-restore of your window layout is on."
+                                    : L"Running. Press your hotkey to move the active window to a desktop."));
     MSG msg;
     while(GetMessageW(&msg,nullptr,0,0)){
         if(g_settings && IsDialogMessageW(g_settings,&msg)) continue;
         if(g_about && IsDialogMessageW(g_about,&msg)) continue;
+        if(g_compat && IsDialogMessageW(g_compat,&msg)) continue;
         TranslateMessage(&msg); DispatchMessageW(&msg);
     }
     if(g_uiFont)DeleteObject(g_uiFont);
@@ -970,11 +1041,18 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int){
     if(cli){
         if(AttachConsole(ATTACH_PARENT_PROCESS)){ FILE* f; freopen_s(&f,"CONOUT$","w",stdout); freopen_s(&f,"CONOUT$","w",stderr); }
         SetConsoleOutputCP(CP_UTF8);
-        if(!InitServices()){ printf("Failed to init virtual-desktop services (IID layout may not match this build).\n"); rc=3; }
-        else rc=CliRun(cmd);
+        if(!InitServices() || !SanityCheckServices()){ printf("Virtual-desktop services unavailable: a Windows update may have changed the undocumented interfaces. Please report your build (%lu) to info@conus.vision or https://github.com/conus-vision/win-vde\n",(unsigned long)GetWindowsBuild()); rc=3; }
+        else { WriteLastGoodBuild(GetWindowsBuild()); rc=CliRun(cmd); }
     } else {
-        if(!InitServices()){ MessageBoxW(nullptr,L"Could not start virtual-desktop services.\nThe interface IID layout may not match this Windows build.",APP_NAME,MB_ICONERROR); rc=2; }
-        else rc=RunGui(hInst);
+        g_inst=hInst; InitMetrics();
+        bool good = InitServices() && SanityCheckServices();
+        if(good){ WriteLastGoodBuild(GetWindowsBuild()); rc=RunGui(hInst); }
+        else {                                              // R12: don't die silently — explain + degraded tray
+            g_degraded=true;
+            DWORD last=ReadLastGoodBuild();
+            ShowCompatIssue(last!=0 && last!=GetWindowsBuild());
+            rc=RunGui(hInst);
+        }
     }
     ReleaseServices(); CoUninitialize();
     return rc;
