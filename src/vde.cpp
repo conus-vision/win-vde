@@ -73,6 +73,7 @@ static const bool SWITCH_AFTER_MOVE = false;    // переключаться н
 #define LAUNCH_SETTLE_TICKS 4          // 4 * 5000ms = ~20s launch stabilization
 #define IDC_HOTKEY 1001
 #define IDC_AUTOFIX 1002
+#define IDC_AUTOSTART 1003
 #define IDC_LINK_MAIL 1101
 #define IDC_LINK_REPO 1102
 #define IDC_ABOUT_COPY 1103
@@ -278,6 +279,18 @@ static DWORD ReadLastGoodBuild(){ HKEY hk; DWORD v=0,cb=sizeof(v);
     if(RegOpenKeyExW(HKEY_CURRENT_USER,L"Software\\VirtualDesktopsExtention",0,KEY_READ,&hk)==ERROR_SUCCESS){ RegQueryValueExW(hk,L"LastGoodBuild",0,0,(LPBYTE)&v,&cb); RegCloseKey(hk); } return v; }
 static void WriteLastGoodBuild(DWORD b){ HKEY hk;
     if(RegCreateKeyExW(HKEY_CURRENT_USER,L"Software\\VirtualDesktopsExtention",0,nullptr,0,KEY_WRITE,nullptr,&hk,nullptr)==ERROR_SUCCESS){ RegSetValueExW(hk,L"LastGoodBuild",0,REG_DWORD,(LPBYTE)&b,sizeof(b)); RegCloseKey(hk); } }
+// Autostart: HKCU..\Run value pointing at this exe.
+static const wchar_t* RUN_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t* RUN_VAL = L"VirtualDesktopsExtention";
+static bool GetRunAtLogon(){ HKEY hk; bool r=false;
+    if(RegOpenKeyExW(HKEY_CURRENT_USER,RUN_KEY,0,KEY_READ,&hk)==ERROR_SUCCESS){ r=(RegQueryValueExW(hk,RUN_VAL,0,0,0,0)==ERROR_SUCCESS); RegCloseKey(hk); } return r; }
+static void SetRunAtLogon(bool on){ HKEY hk;
+    if(RegOpenKeyExW(HKEY_CURRENT_USER,RUN_KEY,0,KEY_WRITE,&hk)!=ERROR_SUCCESS) return;
+    if(on){ wchar_t p[MAX_PATH]; GetModuleFileNameW(nullptr,p,MAX_PATH); std::wstring q=L"\""+std::wstring(p)+L"\"";
+        RegSetValueExW(hk,RUN_VAL,0,REG_SZ,(LPBYTE)q.c_str(),(DWORD)((q.size()+1)*sizeof(wchar_t))); }
+    else RegDeleteValueW(hk,RUN_VAL);
+    RegCloseKey(hk);
+}
 static IVirtualDesktop* GetDesktopByIndex(UINT index){ IObjectArray* a=nullptr; if(FAILED(g_vdmi->GetDesktops(&a))||!a)return nullptr; IVirtualDesktop* d=nullptr; a->GetAt(index,kIID_IVirtualDesktop,(void**)&d); a->Release(); return d; }
 static IVirtualDesktop* GetDesktopByGuid(const GUID& t){ IObjectArray* a=nullptr; if(FAILED(g_vdmi->GetDesktops(&a))||!a)return nullptr; UINT n=0;a->GetCount(&n); IVirtualDesktop* r=nullptr;
     for(UINT i=0;i<n;++i){ IVirtualDesktop* d=nullptr; if(SUCCEEDED(a->GetAt(i,kIID_IVirtualDesktop,(void**)&d))&&d){ GUID g={0};d->GetID(&g); if(IsEqualGUID(g,t)){r=d;break;} d->Release(); } } a->Release(); return r; }
@@ -746,10 +759,11 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     case WM_CREATE:{
         CreateWindowW(L"STATIC",L"Global hotkey:",WS_CHILD|WS_VISIBLE,S(16),S(20),S(110),S(20),hwnd,nullptr,g_inst,nullptr);
         HWND hk=CreateWindowW(L"msctls_hotkey32",L"",WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_BORDER,S(130),S(17),S(200),S(24),hwnd,(HMENU)IDC_HOTKEY,g_inst,nullptr);
-        CreateWindowW(L"BUTTON",L"Automatically fix Firefox window layout",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,S(16),S(58),S(330),S(22),hwnd,(HMENU)IDC_AUTOFIX,g_inst,nullptr);
-        CreateWindowW(L"STATIC",L"Saves the layout when Firefox changes (~10 s) so Restore works after reboot.",WS_CHILD|WS_VISIBLE,S(16),S(84),S(332),S(34),hwnd,nullptr,g_inst,nullptr);
-        CreateWindowW(L"BUTTON",L"OK",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON|WS_TABSTOP,S(176),S(128),S(75),S(28),hwnd,(HMENU)IDOK,g_inst,nullptr);
-        CreateWindowW(L"BUTTON",L"Cancel",WS_CHILD|WS_VISIBLE|WS_TABSTOP,S(260),S(128),S(75),S(28),hwnd,(HMENU)IDCANCEL,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Auto-save && auto-restore layout",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,S(16),S(56),S(330),S(22),hwnd,(HMENU)IDC_AUTOFIX,g_inst,nullptr);
+        CreateWindowW(L"STATIC",L"Automatically saves your layout and restores it after a reboot or browser restart.",WS_CHILD|WS_VISIBLE,S(16),S(80),S(332),S(32),hwnd,nullptr,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Start with Windows (run at logon)",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,S(16),S(116),S(330),S(22),hwnd,(HMENU)IDC_AUTOSTART,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"OK",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON|WS_TABSTOP,S(176),S(156),S(75),S(28),hwnd,(HMENU)IDOK,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Cancel",WS_CHILD|WS_VISIBLE|WS_TABSTOP,S(260),S(156),S(75),S(28),hwnd,(HMENU)IDCANCEL,g_inst,nullptr);
         SetChildFont(hwnd);
         // init values
         WORD hf=0;
@@ -758,6 +772,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         if(g_hotMods&MOD_ALT)hf|=HOTKEYF_ALT;
         SendMessageW(hk,HKM_SETHOTKEY,MAKEWORD((BYTE)g_hotVk,(BYTE)hf),0);
         SendMessageW(GetDlgItem(hwnd,IDC_AUTOFIX),BM_SETCHECK,g_autoFix?BST_CHECKED:BST_UNCHECKED,0);
+        SendMessageW(GetDlgItem(hwnd,IDC_AUTOSTART),BM_SETCHECK,GetRunAtLogon()?BST_CHECKED:BST_UNCHECKED,0);
         return 0;
     }
     case WM_COMMAND:
@@ -772,6 +787,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                 g_hotVk=vk; g_hotMods=mods;
             }
             g_autoFix = (IsDlgButtonChecked(hwnd,IDC_AUTOFIX)==BST_CHECKED);
+            SetRunAtLogon(IsDlgButtonChecked(hwnd,IDC_AUTOSTART)==BST_CHECKED);
             SaveSettings();
             bool ok=ApplyHotkey();
             ApplyAutoFix();
@@ -794,7 +810,7 @@ static void OpenSettings(){
         wc.hCursor=LoadCursorW(nullptr,IDC_ARROW); wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
         wc.hIcon=LoadAppIcon(GetSystemMetrics(SM_CXICON),GetSystemMetrics(SM_CYICON));
         RegisterClassW(&wc); reg=true; }
-    int W=S(364),H=S(204);
+    int W=S(364),H=S(232);
     RECT wr={0,0,W,H}; AdjustWindowRect(&wr,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,FALSE);
     int ww=wr.right-wr.left, wh=wr.bottom-wr.top;
     int sx=(GetSystemMetrics(SM_CXSCREEN)-ww)/2, sy=(GetSystemMetrics(SM_CYSCREEN)-wh)/2;
