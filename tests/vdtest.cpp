@@ -73,6 +73,29 @@ static void test_fingerprint_key_generic_vs_domain(){
     CHECK(FingerprintKey("explorer",{},"Downloads") != FingerprintKey("explorer",{},"Documents"));
 }
 
+static void test_grace_seen_resets_unseen_increments(){
+    std::vector<LayoutWin> recs = { LW("firefox",0,{{"a.com",1}}), LW("firefox",1,{{"b.com",1}}) };
+    recs[0].missingRuns=2; recs[1].missingRuns=0;
+    std::set<std::string> seen = { FingerprintKey("firefox",{{"a.com",1}},"") };  // only a.com seen
+    std::set<std::string> apps = { "firefox" };
+    auto out = ReconcileGrace(recs, seen, apps, MISSING_RUNS_MAX);
+    CHECK(out.size()==2);
+    int ai=-1,bi=-1; for(int i=0;i<(int)out.size();++i){ if(out[i].counts.count("a.com"))ai=i; if(out[i].counts.count("b.com"))bi=i; }
+    CHECK(out[ai].missingRuns==0); CHECK(out[bi].missingRuns==1);
+}
+static void test_grace_drops_at_threshold(){
+    std::vector<LayoutWin> recs = { LW("firefox",0,{{"b.com",1}}) };
+    recs[0].missingRuns = MISSING_RUNS_MAX - 1;                 // 2 -> 3 ⇒ dropped
+    auto out = ReconcileGrace(recs, {}, {"firefox"}, MISSING_RUNS_MAX);
+    CHECK(out.size()==0);
+}
+static void test_grace_untouched_when_app_not_observed(){
+    std::vector<LayoutWin> recs = { LW("chrome",0,{{"c.com",1}}) };
+    recs[0].missingRuns = 2;
+    auto out = ReconcileGrace(recs, {}, {"firefox"} /*chrome not observed*/, MISSING_RUNS_MAX);
+    CHECK(out.size()==1); CHECK(out[0].missingRuns==2);
+}
+
 int main(){
     test_etld1();
     test_b64();
@@ -81,6 +104,9 @@ int main(){
     test_merge_upsert_and_keep();
     test_merge_adds_new();
     test_fingerprint_key_generic_vs_domain();
+    test_grace_seen_resets_unseen_increments();
+    test_grace_drops_at_threshold();
+    test_grace_untouched_when_app_not_observed();
     printf("%d/%d passed\n", g_total - g_fail, g_total);
     return g_fail ? 1 : 0;
 }

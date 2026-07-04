@@ -97,3 +97,19 @@ inline std::vector<LayoutWin> MergeAutoLayout(const std::vector<LayoutWin>& exis
     }
     return out;
 }
+
+// Age the auto layout by one utility run. For apps observed this run: seen
+// windows reset to 0, unseen windows increment and are dropped at maxMissing.
+// Records for apps NOT observed this run are left untouched.
+inline std::vector<LayoutWin> ReconcileGrace(const std::vector<LayoutWin>& records,
+        const std::set<std::string>& seenKeys, const std::set<std::string>& observedApps, int maxMissing){
+    std::vector<LayoutWin> out;
+    for(const auto& r : records){
+        if(!observedApps.count(r.app)){ out.push_back(r); continue; }
+        LayoutWin w = r;
+        std::string key = FingerprintKey(w.app,w.counts,w.activeTitle);
+        if(seenKeys.count(key)) w.missingRuns = 0; else w.missingRuns += 1;
+        if(w.missingRuns < maxMissing) out.push_back(w);
+    }
+    return out;
+}
