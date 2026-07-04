@@ -77,6 +77,9 @@ static const bool SWITCH_AFTER_MOVE = false;    // переключаться н
 #define IDC_HOTKEY 1001
 #define IDC_AUTOFIX 1002
 #define IDC_AUTOSTART 1003
+#define IDC_APP_FF 1004
+#define IDC_APP_CR 1005
+#define IDC_APP_ED 1006
 #define IDC_LINK_MAIL 1101
 #define IDC_LINK_REPO 1102
 #define IDC_ABOUT_COPY 1103
@@ -701,6 +704,9 @@ static void LoadSettings(){
         cb=sizeof(v); if(RegQueryValueExW(hk,L"HotkeyMods",0,0,(LPBYTE)&v,&cb)==ERROR_SUCCESS)g_hotMods=v;
         cb=sizeof(v); if(RegQueryValueExW(hk,L"HotkeyVk",0,0,(LPBYTE)&v,&cb)==ERROR_SUCCESS)g_hotVk=v;
         cb=sizeof(v); if(RegQueryValueExW(hk,L"AutoFix",0,0,(LPBYTE)&v,&cb)==ERROR_SUCCESS)g_autoFix=(v!=0);
+        cb=sizeof(v); if(RegQueryValueExW(hk,L"AppFirefox",0,0,(LPBYTE)&v,&cb)==ERROR_SUCCESS)g_appFirefox=(v!=0);
+        cb=sizeof(v); if(RegQueryValueExW(hk,L"AppChrome",0,0,(LPBYTE)&v,&cb)==ERROR_SUCCESS)g_appChrome=(v!=0);
+        cb=sizeof(v); if(RegQueryValueExW(hk,L"AppEdge",0,0,(LPBYTE)&v,&cb)==ERROR_SUCCESS)g_appEdge=(v!=0);
         RegCloseKey(hk);
     }
 }
@@ -711,6 +717,9 @@ static void SaveSettings(){
         v=g_hotMods;     RegSetValueExW(hk,L"HotkeyMods",0,REG_DWORD,(LPBYTE)&v,sizeof(v));
         v=g_hotVk;       RegSetValueExW(hk,L"HotkeyVk",0,REG_DWORD,(LPBYTE)&v,sizeof(v));
         v=g_autoFix?1:0; RegSetValueExW(hk,L"AutoFix",0,REG_DWORD,(LPBYTE)&v,sizeof(v));
+        v=g_appFirefox?1:0; RegSetValueExW(hk,L"AppFirefox",0,REG_DWORD,(LPBYTE)&v,sizeof(v));
+        v=g_appChrome?1:0;  RegSetValueExW(hk,L"AppChrome",0,REG_DWORD,(LPBYTE)&v,sizeof(v));
+        v=g_appEdge?1:0;    RegSetValueExW(hk,L"AppEdge",0,REG_DWORD,(LPBYTE)&v,sizeof(v));
         RegCloseKey(hk);
     }
 }
@@ -765,8 +774,12 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         CreateWindowW(L"BUTTON",L"Auto-save && auto-restore layout",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,S(16),S(56),S(330),S(22),hwnd,(HMENU)IDC_AUTOFIX,g_inst,nullptr);
         CreateWindowW(L"STATIC",L"Automatically saves your layout and restores it after a reboot or browser restart.",WS_CHILD|WS_VISIBLE,S(16),S(80),S(332),S(32),hwnd,nullptr,g_inst,nullptr);
         CreateWindowW(L"BUTTON",L"Start with Windows (run at logon)",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,S(16),S(116),S(330),S(22),hwnd,(HMENU)IDC_AUTOSTART,g_inst,nullptr);
-        CreateWindowW(L"BUTTON",L"OK",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON|WS_TABSTOP,S(176),S(156),S(75),S(28),hwnd,(HMENU)IDOK,g_inst,nullptr);
-        CreateWindowW(L"BUTTON",L"Cancel",WS_CHILD|WS_VISIBLE|WS_TABSTOP,S(260),S(156),S(75),S(28),hwnd,(HMENU)IDCANCEL,g_inst,nullptr);
+        CreateWindowW(L"STATIC",L"Track these apps:",WS_CHILD|WS_VISIBLE,S(16),S(146),S(330),S(20),hwnd,nullptr,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Firefox",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,S(16),S(168),S(90),S(22),hwnd,(HMENU)IDC_APP_FF,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Chrome",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,S(120),S(168),S(90),S(22),hwnd,(HMENU)IDC_APP_CR,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Edge",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,S(224),S(168),S(90),S(22),hwnd,(HMENU)IDC_APP_ED,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"OK",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON|WS_TABSTOP,S(176),S(206),S(75),S(28),hwnd,(HMENU)IDOK,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Cancel",WS_CHILD|WS_VISIBLE|WS_TABSTOP,S(260),S(206),S(75),S(28),hwnd,(HMENU)IDCANCEL,g_inst,nullptr);
         SetChildFont(hwnd);
         // init values
         WORD hf=0;
@@ -776,6 +789,9 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         SendMessageW(hk,HKM_SETHOTKEY,MAKEWORD((BYTE)g_hotVk,(BYTE)hf),0);
         SendMessageW(GetDlgItem(hwnd,IDC_AUTOFIX),BM_SETCHECK,g_autoFix?BST_CHECKED:BST_UNCHECKED,0);
         SendMessageW(GetDlgItem(hwnd,IDC_AUTOSTART),BM_SETCHECK,GetRunAtLogon()?BST_CHECKED:BST_UNCHECKED,0);
+        SendMessageW(GetDlgItem(hwnd,IDC_APP_FF),BM_SETCHECK,g_appFirefox?BST_CHECKED:BST_UNCHECKED,0);
+        SendMessageW(GetDlgItem(hwnd,IDC_APP_CR),BM_SETCHECK,g_appChrome?BST_CHECKED:BST_UNCHECKED,0);
+        SendMessageW(GetDlgItem(hwnd,IDC_APP_ED),BM_SETCHECK,g_appEdge?BST_CHECKED:BST_UNCHECKED,0);
         return 0;
     }
     case WM_COMMAND:
@@ -791,6 +807,9 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             }
             g_autoFix = (IsDlgButtonChecked(hwnd,IDC_AUTOFIX)==BST_CHECKED);
             SetRunAtLogon(IsDlgButtonChecked(hwnd,IDC_AUTOSTART)==BST_CHECKED);
+            g_appFirefox=(IsDlgButtonChecked(hwnd,IDC_APP_FF)==BST_CHECKED);
+            g_appChrome =(IsDlgButtonChecked(hwnd,IDC_APP_CR)==BST_CHECKED);
+            g_appEdge   =(IsDlgButtonChecked(hwnd,IDC_APP_ED)==BST_CHECKED);
             SaveSettings();
             bool ok=ApplyHotkey();
             ApplyAutoFix();
@@ -813,7 +832,7 @@ static void OpenSettings(){
         wc.hCursor=LoadCursorW(nullptr,IDC_ARROW); wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
         wc.hIcon=LoadAppIcon(GetSystemMetrics(SM_CXICON),GetSystemMetrics(SM_CYICON));
         RegisterClassW(&wc); reg=true; }
-    int W=S(364),H=S(232);
+    int W=S(364),H=S(280);
     RECT wr={0,0,W,H}; AdjustWindowRect(&wr,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,FALSE);
     int ww=wr.right-wr.left, wh=wr.bottom-wr.top;
     int sx=(GetSystemMetrics(SM_CXSCREEN)-ww)/2, sy=(GetSystemMetrics(SM_CYSCREEN)-wh)/2;
