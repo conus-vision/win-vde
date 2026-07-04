@@ -46,6 +46,7 @@
 #include "layout.hpp"     // DeskRec, CountsToStr, StrToCounts (+ v3 layout logic)
 #include "lifecycle.hpp"  // LcState/LcAction, LcOnStartup/LcOnTick/LcOnExit
 #include "session.hpp"    // WinFp, Chromium SNSS reader (ReadChromiumWindows)
+#include "appprofile.hpp" // AppProfile, BuiltinProfiles
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
@@ -64,6 +65,7 @@ static UINT g_hotMods = MOD_CONTROL | MOD_ALT;  // Ctrl+Alt+D по умолча�
 static UINT g_hotVk   = 'D';
 static bool g_autoFix = true;                   // монитор: авто-сохранение и авто-восстановление раскладки
 static bool g_degraded = false;                 // недокументированный COM не работает (обновление Windows) -> урезанный режим
+static bool g_appFirefox = true, g_appChrome = true, g_appEdge = true;  // какие приложения отслеживать
 static const bool SWITCH_AFTER_MOVE = false;    // переключаться на десктоп после переноса окна
 
 #define IDI_APPICON 101    // должен совпадать с ID в vde.rc
@@ -314,26 +316,28 @@ static bool MoveWindowToDesktop(HWND hwnd, IVirtualDesktop* pDest, const GUID& d
 // ============================ Firefox windows =================================
 static std::wstring ProcessImageName(DWORD pid){ HANDLE h=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid); if(!h)return L""; wchar_t b[MAX_PATH]; DWORD sz=MAX_PATH; std::wstring r; if(QueryFullProcessImageNameW(h,0,b,&sz))r.assign(b,sz); CloseHandle(h); return r; }
 static bool EndsWithI(const std::wstring& s, const std::wstring& suf){ if(s.size()<suf.size())return false; return CompareStringOrdinal(s.c_str()+(s.size()-suf.size()),(int)suf.size(),suf.c_str(),(int)suf.size(),TRUE)==CSTR_EQUAL; }
-static std::wstring StripFirefoxSuffix(std::wstring t){
-    static const wchar_t* sfx[]={L" \x2014 Mozilla Firefox (Private Browsing)",L" - Mozilla Firefox (Private Browsing)",L" \x2014 Mozilla Firefox",L" - Mozilla Firefox"};
-    for(auto s:sfx){ size_t l=wcslen(s); if(t.size()>=l&&_wcsicmp(t.c_str()+(t.size()-l),s)==0){t.resize(t.size()-l);return t;} }
-    if(_wcsicmp(t.c_str(),L"Mozilla Firefox")==0)return L"";
+static std::wstring StripSuffixes(std::wstring t, const std::vector<std::wstring>& sfx){
+    for(auto& s:sfx){ size_t l=s.size(); if(t.size()>=l&&_wcsicmp(t.c_str()+(t.size()-l),s.c_str())==0){ t.resize(t.size()-l); return t; } }
     return t;
 }
 struct LiveWin { HWND hwnd; std::wstring rawTitle; GUID desktop; };
-static BOOL CALLBACK EnumFF(HWND hwnd, LPARAM lp){
-    auto* out=(std::vector<LiveWin>*)lp; wchar_t cls[64]={0};
+struct EnumCtx { std::vector<LiveWin>* out; const AppProfile* prof; };
+static BOOL CALLBACK EnumAppCb(HWND hwnd, LPARAM lp){
+    auto* ctx=(EnumCtx*)lp; wchar_t cls[64]={0};
     if(GetClassNameW(hwnd,cls,64)<=0)return TRUE;
-    if(wcscmp(cls,L"MozillaWindowClass")!=0)return TRUE;
+    bool clsOk=false; for(auto& c:ctx->prof->classNames) if(c==cls){clsOk=true;break;} if(!clsOk)return TRUE;
     if(!(GetWindowLongPtrW(hwnd,GWL_STYLE)&WS_VISIBLE))return TRUE;
     int len=GetWindowTextLengthW(hwnd); if(len<=0)return TRUE;
     DWORD pid=0; GetWindowThreadProcessId(hwnd,&pid);
-    std::wstring img=ProcessImageName(pid); if(!img.empty()&&!EndsWithI(img,L"firefox.exe"))return TRUE;
+    std::wstring img=ProcessImageName(pid); if(!img.empty()&&!EndsWithI(img,ctx->prof->exeName))return TRUE;
     std::wstring title(len+1,0); GetWindowTextW(hwnd,&title[0],len+1); title.resize(wcslen(title.c_str()));
-    LiveWin w; w.hwnd=hwnd; w.rawTitle=title; w.desktop=GUID{0}; out->push_back(w);
+    LiveWin w; w.hwnd=hwnd; w.rawTitle=title; w.desktop=GUID{0}; ctx->out->push_back(w);
     return TRUE;
 }
-static std::vector<LiveWin> EnumFirefoxWindows(){ std::vector<LiveWin> v; EnumWindows(EnumFF,(LPARAM)&v); if(g_vdmDoc)for(auto&w:v)g_vdmDoc->GetWindowDesktopId(w.hwnd,&w.desktop); return v; }
+static std::vector<LiveWin> EnumAppWindows(const AppProfile& prof){
+    std::vector<LiveWin> v; EnumCtx ctx{&v,&prof}; EnumWindows(EnumAppCb,(LPARAM)&ctx);
+    if(g_vdmDoc)for(auto&w:v)g_vdmDoc->GetWindowDesktopId(w.hwnd,&w.desktop); return v;
+}
 
 // ============================ sessionstore IO =================================
 // ReadFileBytes / FileExists → moved to str_util.hpp
@@ -370,24 +374,32 @@ static std::vector<WinFp> ReadSessionstore(std::wstring* usedPathOut=nullptr){
 
 // ============================ fingerprint / scoring ===========================
 struct Fp {
+    std::string app;
     HWND hwnd=nullptr; GUID desktop={0}; int deskIndex=-1;
     std::string activeTitle, activeDomain; std::map<std::string,int> counts; int tabCount=0;
     bool hasDomains() const { return !counts.empty(); }
 };
-static std::vector<Fp> BuildLiveFingerprints(int* boundCount=nullptr){
-    std::vector<LiveWin> live=EnumFirefoxWindows();
-    std::vector<WinFp> ss=ReadSessionstore();
+static std::vector<AppProfile> ActiveProfiles(){ return BuiltinProfiles(g_appFirefox,g_appChrome,g_appEdge); }
+static std::vector<WinFp> ReadSessionFor(const AppProfile& prof){
+    if(prof.session==AppProfile::FIREFOX) return ReadSessionstore();
+    if(prof.session==AppProfile::CHROMIUM) return ReadChromiumWindows(prof.userDataDir);
+    return {};
+}
+static std::vector<Fp> BuildLiveFingerprintsFor(const AppProfile& prof, int* boundCount=nullptr){
+    std::vector<LiveWin> live=EnumAppWindows(prof);
+    std::vector<WinFp> ss=ReadSessionFor(prof);
     std::vector<bool> used(ss.size(),false); int bound=0; std::vector<Fp> out;
     for(auto& w:live){
-        std::string sTitle=W2U8(StripFirefoxSuffix(w.rawTitle));
-        Fp fp; fp.hwnd=w.hwnd; fp.desktop=w.desktop; fp.activeTitle=sTitle;
-        int bi=-1; for(size_t i=0;i<ss.size();++i) if(!used[i]&&ss[i].activeTitle==sTitle){bi=(int)i;break;}
+        std::string sTitle=W2U8(StripSuffixes(w.rawTitle,prof.titleSuffixes));
+        Fp fp; fp.app=prof.id; fp.hwnd=w.hwnd; fp.desktop=w.desktop; fp.activeTitle=sTitle;
+        int bi=-1; for(size_t i=0;i<ss.size();++i) if(!used[i]&&ss[i].activeTitle==sTitle){bi=(int)i;break;}   // bind by active-tab title
         if(bi>=0){ used[bi]=true; bound++; fp.counts=ss[bi].counts; fp.activeDomain=ss[bi].activeDomain; fp.tabCount=ss[bi].tabCount; if(!ss[bi].activeTitle.empty())fp.activeTitle=ss[bi].activeTitle; }
         out.push_back(std::move(fp));
     }
     if(boundCount)*boundCount=bound;
     return out;
 }
+static bool AnyAppPresent(){ for(auto& prof:ActiveProfiles()) if(!EnumAppWindows(prof).empty()) return true; return false; }
 static double Score(const Fp& s, const Fp& l){
     if(s.hasDomains()&&l.hasDomains()){
         double dot=0,na=0,nb=0;
@@ -428,9 +440,10 @@ static std::vector<DeskRec> CurrentDesktops(){
 // Currently-open windows (Phase 1: Firefox) as LayoutWin with desktop assigned.
 // Accumulates each window's FingerprintKey into `seen` and app into `apps` (for grace bookkeeping).
 static std::vector<LayoutWin> CollectPresentWindows(std::set<std::string>* seen, std::set<std::string>* apps){
-    std::vector<LayoutWin> out; auto fps=BuildLiveFingerprints();
-    for(auto& f:fps){ if(GuidIsZero(f.desktop))continue;
-        LayoutWin w; w.app="firefox"; w.deskIndex=GetDesktopIndexByGuid(f.desktop);
+    std::vector<LayoutWin> out;
+    for(auto& prof:ActiveProfiles()) for(auto& f:BuildLiveFingerprintsFor(prof)){
+        if(GuidIsZero(f.desktop))continue;
+        LayoutWin w; w.app=f.app; w.deskIndex=GetDesktopIndexByGuid(f.desktop);
         w.desktop=f.desktop; w.activeTitle=f.activeTitle; w.activeDomain=f.activeDomain; w.tabCount=f.tabCount; w.counts=f.counts; w.missingRuns=0;
         out.push_back(w);
         if(seen) seen->insert(FingerprintKey(w.app,w.counts,w.activeTitle));
@@ -438,7 +451,6 @@ static std::vector<LayoutWin> CollectPresentWindows(std::set<std::string>* seen,
     }
     return out;
 }
-static bool FirefoxPresent(){ return !EnumFirefoxWindows().empty(); }
 
 // ============================ save / restore cores ============================
 // Возвращают краткую сводку (UTF-8) для трей-балуна; CLI печатает её и детали.
@@ -470,13 +482,13 @@ static std::string RunRestore(bool manual, std::vector<std::string>* linesOut=nu
     std::vector<DeskRec> savedDesks; std::vector<LayoutWin> saved;
     { std::string t; if(!ReadFileBytes(LayoutPath(manual),t) || !ParseLayout(t,savedDesks,saved) || saved.empty())
         return manual?"No saved layout. Use 'Save windows layout' first.":"No auto layout yet."; }
-    auto live=BuildLiveFingerprints();
+    std::vector<Fp> live; for(auto& prof:ActiveProfiles()){ auto l=BuildLiveFingerprintsFor(prof); for(auto& x:l) live.push_back(std::move(x)); }
     if(live.empty())return "No browser windows to restore.";
     UINT count=0; g_vdmi->GetCount(&count);
     const double T_FLOOR=0.35,T_ACCEPT=0.55;
     struct Pair{ double sc; int si,li; }; std::vector<Pair> pairs;
-    for(int i=0;i<(int)saved.size();++i){ if(saved[i].app!="firefox")continue; Fp S=SavedToFp(saved[i]);   // Phase 1: live windows are Firefox
-        for(int j=0;j<(int)live.size();++j){ double sc=Score(S,live[j]); if(sc>=T_FLOOR)pairs.push_back({sc,i,j}); } }
+    for(int i=0;i<(int)saved.size();++i){ Fp S=SavedToFp(saved[i]);
+        for(int j=0;j<(int)live.size();++j){ if(saved[i].app!=live[j].app)continue; double sc=Score(S,live[j]); if(sc>=T_FLOOR)pairs.push_back({sc,i,j}); } }   // only match same app
     std::sort(pairs.begin(),pairs.end(),[](const Pair&a,const Pair&b){return a.sc>b.sc;});
     std::vector<int> usedS(saved.size(),0),usedL(live.size(),0),assignL2S(live.size(),-1); int matched=0;
     for(auto& p:pairs) if(!usedS[p.si]&&!usedL[p.li]&&p.sc>=T_ACCEPT){ usedS[p.si]=usedL[p.li]=1; assignL2S[p.li]=p.si; matched++; }
@@ -505,14 +517,14 @@ static int CliRun(const std::wstring& cmd){
         for(UINT i=0;i<count;++i){ IVirtualDesktop* d=GetDesktopByIndex(i); if(!d)continue; GUID g={0};d->GetID(&g);
             std::wstring nm=DesktopNameFromRegistry(g); std::string nmU8=nm.empty()?std::string():("("+W2U8(nm)+")");
             printf("  [%u] %s  %s\n",i,W2U8(GuidToString(g)).c_str(),nmU8.c_str()); d->Release(); }
-        if(cmd==L"status"){ std::wstring up; auto ss=ReadSessionstore(&up);
-            if(!up.empty())printf("\nsessionstore: %s (%d windows)\n",W2U8(up).c_str(),(int)ss.size());
-            else printf("\nsessionstore: NOT available (title-only mode)\n");
-            int bound=0; auto fps=BuildLiveFingerprints(&bound);
-            printf("Firefox live windows: %d (bound to sessionstore: %d)\n",(int)fps.size(),bound);
-            for(auto& f:fps){ int idx=GuidIsZero(f.desktop)?-1:GetDesktopIndexByGuid(f.desktop);
-                printf("  hwnd=0x%p desktop=[%d] tabs=%d active=\"%s\"\n",(void*)f.hwnd,idx,f.tabCount,f.activeTitle.c_str());
-                printf("        domains:"); for(auto& kv:f.counts)printf(" %s:%d",kv.first.c_str(),kv.second); printf("\n"); }
+        if(cmd==L"status"){
+            for(auto& prof:ActiveProfiles()){ int bound=0; auto fps=BuildLiveFingerprintsFor(prof,&bound);
+                if(fps.empty())continue;
+                printf("\n%s: %d live window(s) (bound to session data: %d)\n",prof.id.c_str(),(int)fps.size(),bound);
+                for(auto& f:fps){ int idx=GuidIsZero(f.desktop)?-1:GetDesktopIndexByGuid(f.desktop);
+                    printf("  hwnd=0x%p desktop=[%d] tabs=%d active=\"%s\"\n",(void*)f.hwnd,idx,f.tabCount,f.activeTitle.c_str());
+                    printf("        domains:"); for(auto& kv:f.counts)printf(" %s:%d",kv.first.c_str(),kv.second); printf("\n"); }
+            }
         }
         return 0;
     }
@@ -667,23 +679,20 @@ static ULONGLONG FileMtime(const std::wstring& p){ WIN32_FILE_ATTRIBUTE_DATA fd;
 
 // Дешёвая подпись раскладки: только окна Firefox + их десктоп (без разбора sessionstore).
 // Порядко-независимая (сумма пер-оконных хэшей), чтобы смена z-порядка при фокусе не считалась изменением.
-static BOOL CALLBACK EnumSig(HWND hwnd, LPARAM lp){
-    unsigned long long* acc=(unsigned long long*)lp;
-    wchar_t cls[64]={0};
-    if(GetClassNameW(hwnd,cls,64)<=0) return TRUE;
-    if(wcscmp(cls,L"MozillaWindowClass")!=0) return TRUE;
-    if(!(GetWindowLongPtrW(hwnd,GWL_STYLE)&WS_VISIBLE)) return TRUE;
-    if(GetWindowTextLengthW(hwnd)<=0) return TRUE;
-    GUID g={0};
-    if(!g_vdmDoc||FAILED(g_vdmDoc->GetWindowDesktopId(hwnd,&g))) return TRUE;
-    unsigned long long h=1469598103934665603ULL; // FNV-1a
-    unsigned long long hv=(unsigned long long)(uintptr_t)hwnd;
-    const unsigned char* b=(const unsigned char*)&hv; for(size_t i=0;i<sizeof(hv);++i){ h^=b[i]; h*=1099511628211ULL; }
-    b=(const unsigned char*)&g; for(size_t i=0;i<sizeof(g);++i){ h^=b[i]; h*=1099511628211ULL; }
-    *acc += h;
-    return TRUE;
+// Cheap order-independent signature of {window -> desktop} across all tracked apps.
+// Changes when any tracked window moves desktops or appears/disappears -> triggers auto-save.
+static unsigned long long LayoutSignature(){
+    unsigned long long acc=0;
+    for(auto& prof:ActiveProfiles()) for(auto& w:EnumAppWindows(prof)){
+        if(GuidIsZero(w.desktop)) continue;
+        unsigned long long h=1469598103934665603ULL; // FNV-1a
+        unsigned long long hv=(unsigned long long)(uintptr_t)w.hwnd;
+        const unsigned char* b=(const unsigned char*)&hv; for(size_t i=0;i<sizeof(hv);++i){ h^=b[i]; h*=1099511628211ULL; }
+        b=(const unsigned char*)&w.desktop; for(size_t i=0;i<sizeof(w.desktop);++i){ h^=b[i]; h*=1099511628211ULL; }
+        acc += h;
+    }
+    return acc;
 }
-static unsigned long long LayoutSignature(){ unsigned long long acc=0; EnumWindows(EnumSig,(LPARAM)&acc); return acc; }
 
 static void LoadSettings(){
     HKEY hk;
@@ -945,11 +954,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     case WM_TIMER:
         if(wp==TIMER_STARTUP){                                // one-shot: startup settle finished
             KillTimer(hwnd,TIMER_STARTUP);
-            if(g_autoFix && FirefoxPresent()){ Balloon(U82W(RunRestore(false))); g_lastLayoutSig=LayoutSignature(); }
+            if(g_autoFix && AnyAppPresent()){ Balloon(U82W(RunRestore(false))); g_lastLayoutSig=LayoutSignature(); }
             return 0;
         }
         if(wp==TIMER_MONITOR && g_autoFix && !g_degraded){
-            bool present = FirefoxPresent();
+            bool present = AnyAppPresent();
             LcAction a = LcOnTick(g_lc, present, LAUNCH_SETTLE_TICKS);
             if(a==LcAction::DoRestore){                        // app appeared & stabilized ⇒ restore
                 Balloon(U82W(RunRestore(false))); g_lastLayoutSig=LayoutSignature();
@@ -986,7 +995,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         } else if(LOWORD(lp)==WM_LBUTTONDBLCLK) ShowPicker();
         return 0;
     case WM_DESTROY:
-        if(g_autoFix && !g_degraded && LcOnExit(g_lc, FirefoxPresent())==LcAction::FinalSave){   // save only if windows are open (R2)
+        if(g_autoFix && !g_degraded && LcOnExit(g_lc, AnyAppPresent())==LcAction::FinalSave){   // save only if windows are open (R2)
             RunSaveAuto(&g_seenKeys,&g_observedApps);
             std::vector<DeskRec> dd; std::vector<LayoutWin> recs; std::string t;   // age grace counters by one run
             if(ReadFileBytes(LayoutPath(false),t) && ParseLayout(t,dd,recs)){
@@ -1020,7 +1029,7 @@ static int RunGui(HINSTANCE hInst){
                                L"Another app may be using it. Change it in Settings,\n"
                                L"or open the picker via double-click on the tray icon.",APP_NAME,MB_ICONWARNING);
     ApplyAutoFix();   // start the lifecycle monitor timer if enabled
-    if(!g_degraded){ bool present=FirefoxPresent(); LcAction a=LcOnStartup(g_lc,present);   // R1: restore now if windows already open
+    if(!g_degraded){ bool present=AnyAppPresent(); LcAction a=LcOnStartup(g_lc,present);   // R1: restore now if windows already open
       if(g_autoFix && a==LcAction::StartupRestore) SetTimer(g_main,TIMER_STARTUP,STARTUP_SETTLE_MS,nullptr); }
     Balloon(g_degraded ? L"Running in limited mode (compatibility issue). See About for details."
                        : (g_autoFix ? L"Running. Auto-restore of your window layout is on."
