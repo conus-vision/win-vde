@@ -9,8 +9,8 @@ window between desktops.
 - **Repository:** https://github.com/conus-vision/win-vde
 - **License:** MIT
 
-> Firefox is fully supported today. Chrome/Edge and other multi-window apps,
-> plus picker search/scroll, are the next phases (see [Roadmap](#roadmap)).
+> Supports **Firefox, Chrome, and Edge** today. The picker has search, scrolling,
+> and full-name tooltips.
 
 ## Why this exists
 
@@ -30,9 +30,13 @@ restart, and moves each matched window to the desktop it was saved on.
 
 ## Features
 
-- **Automatic restore** — on utility start (if the browser is already open) and
-  when the browser launches (after a ~20 s stabilization), windows are returned
-  to their saved desktops.
+- **Multi-browser** — Firefox (via its session store), Chrome and Edge (via
+  their SNSS session files); each can be toggled in Settings. Windows are
+  re-identified after a restart by their tab domains, falling back to the window
+  title.
+- **Automatic restore** — on utility start (if a browser is already open) and
+  when a browser launches (after a ~20 s stabilization), windows are returned to
+  their saved desktops.
 - **Wipe-proof auto layout** — closing windows never erases your saved layout.
   A window that disappears is kept and only forgotten after it has been gone
   for a few utility runs (grace period), so temporarily closing and reopening a
@@ -40,7 +44,9 @@ restart, and moves each matched window to the desktop it was saved on.
 - **Two layouts** — a rolling *auto* layout plus a manual checkpoint you save on
   demand.
 - **Desktop picker** — global hotkey (default `Ctrl+Alt+D`) opens a grid of
-  desktops. Click to switch; `Ctrl`+click to move the active window there.
+  desktops. Click to switch; `Ctrl`+click to move the active window there. Type
+  to filter windows, scroll tiles with the wheel, hover a clipped name for its
+  full title.
 - **Start with Windows** — optional run-at-logon toggle.
 - **Honest about breakage** — if a Windows update changes the undocumented
   interfaces, the app explains what happened and runs in a limited mode instead
@@ -84,7 +90,7 @@ window there. Arrow keys / number keys navigate; `Esc` closes.
 
 ```
 vde.exe list          list virtual desktops
-vde.exe status        desktops + live Firefox windows and their fingerprints
+vde.exe status        desktops + live browser windows and their fingerprints
 vde.exe save          save current layout to layout-manual.txt
 vde.exe restore       restore from layout-manual.txt
 vde.exe restore-auto  restore from the last auto-saved layout
@@ -120,10 +126,8 @@ restore work unattended.
 
 ## Roadmap
 
-- **Phase 2** — Chrome/Edge support (parsing their session files) and generic
-  multi-window apps.
-- **Phase 3** — picker search box, per-tile scrolling, full-title tooltips, and
-  a highlighted `Ctrl`+click hint.
+- Generic (user-defined) multi-window apps beyond the three built-in browsers.
+- Optional restore of on-screen geometry (size/position), not just the desktop.
 
 ## License
 
