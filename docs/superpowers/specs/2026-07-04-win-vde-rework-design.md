@@ -47,6 +47,8 @@ R7. Строка поиска в пикере: сверху, placeholder «Type 
 R8. Скролл в плитках, если окна не помещаются.
 R9. Тултип полного имени окна при наведении, если имя обрезано по горизонтали (как alt у картинок).
 R10. Подсказку Ctrl+Click визуально выделить.
+R11. Пункт меню `About`: кратко об утилите, автор **Volodymyr Moskvin**, e-mail **info@conus.vision**, ссылка на **https://github.com/conus-vision/win-vde**.
+R12. Если обновление Windows сломало работу — показать окно с пояснением, что это **ожидаемо** (используются недокументированные функции), и предложением написать на **info@conus.vision** (чтобы автор сообщил, когда починит) или зайти на **https://github.com/conus-vision/win-vde**.
 
 Мета: создать `win-vde/`, git, залить на GitHub, написать README.
 
@@ -166,8 +168,21 @@ struct AppProfile {
 
 - `RunSave(target)` обобщается: `AUTO` (merge в `layout-auto.txt`, grace) и `MANUAL` (полная перезапись `layout-manual.txt`, без grace).
 - `RunRestore(file)` — из указанного файла. Ядро сопоставления (`Score`, назначение по порогам `T_FLOOR=0.35`, `T_ACCEPT=0.55`) остаётся; добавляется фильтр по `app` (окно сопоставляется только с записями своего приложения).
-- Меню (R5): `Save windows layout` → MANUAL save; `Restore saved windows layout` → restore из manual; `Restore last auto saved layout` → restore из auto.
 - Тексты балунов обновляются («N windows across M desktops»). Ярлык «Firefox» в меню убирается (теперь мульти-app).
+
+### 7.1 Меню трея (R5, R11)
+
+```
+Open desktop picker            (id 200)
+──────────────
+Save windows layout            (id 201)  → MANUAL save в layout-manual.txt
+Restore saved windows layout   (id 202)  → restore из layout-manual.txt
+Restore last auto saved layout (id 204)  → restore из layout-auto.txt
+──────────────
+Settings…                      (id 203)
+About…                         (id 205)
+Exit                           (id 209)
+```
 
 ## 8. Пикер (Switch popup) — UX
 
@@ -203,6 +218,35 @@ Child-контрол `EDIT` сверху окна пикера. Placeholder «Ty
 
 Все значения — в `HKCU\Software\VirtualDesktopsExtention` (как `AutoFix`, `HotkeyMods`, `HotkeyVk`).
 
+### 9.1 About (R11)
+
+Пункт меню `About…` открывает небольшое окно (стиль как `SettingsProc`) с кликабельными ссылками:
+
+- Название + версия: `Virtual Desktops Extension for Windows 11 — v{APP_VERSION}` (вводится константа `APP_VERSION`, старт «1.0.0»).
+- Короткое описание: «Saves and restores browser windows across Windows 11 virtual desktops.»
+- Автор: **Volodymyr Moskvin**.
+- E-mail: **info@conus.vision** (кликабельно, `mailto:`).
+- GitHub: **https://github.com/conus-vision/win-vde** (кликабельно).
+- Лицензия: MIT. Внизу — обнаруженный build Windows (полезно для баг-репортов).
+
+Кликабельность — через `SysLink` (класс `WC_LINK`), для чего требуется Common Controls v6 (см. §10: манифест). Кнопка «Copy» кладёт в буфер имя+версию+e-mail+build.
+
+### 9.2 Детект поломки после обновления Windows (R12)
+
+**Как ловим.** Утилита зависит от недокументированных COM-интерфейсов с захардкоженными IID под конкретные сборки Windows 11. Обновление ОС может сменить vtable/IID. Точки детекта:
+
+1. `InitServices()` вернул ошибку (`CoCreateInstance`/`QueryService` для internal-интерфейса) — основной, чистый сигнал.
+2. **Sanity-check после init** (`SanityCheckServices()`): `GetCount(&n)` даёт правдоподобное `n∈[1..64]`, `GetCurrentDesktop`→`GetID` успешны. Провал → вероятен сдвиг vtable.
+3. В реестре храним `LastGoodBuild`. Если `GetWindowsBuild()` изменился с прошлого удачного запуска и теперь (1) или (2) провалились — сообщение формулируем уверенно («после обновления Windows …»).
+
+**Что показываем.** Окно `CompatIssue` (TaskDialog с гиперссылками либо custom-окно с `SysLink`):
+
+- Заголовок: «Virtual Desktops Extension — compatibility issue».
+- Текст: перемещение чужих окон между виртуальными десктопами **не имеет публичного API** в Windows, поэтому используются недокументированные функции. Обновление Windows, вероятно, изменило их — **это ожидаемое поведение, не сбой вашей системы**. Показать текущий build. Просьба: написать на **info@conus.vision** (укажите build), чтобы автор сообщил, когда выйдет исправление, или следить за **https://github.com/conus-vision/win-vde**.
+- Кнопки/ссылки: «Copy details» (build + e-mail в буфер), открыть e-mail, открыть GitHub, «Close».
+
+**Degraded mode.** При провале утилита **не падает и не закрывается молча**: показывает окно `CompatIssue`, затем работает в трее в урезанном режиме — иконка в warning-состоянии, tooltip поясняет проблему, действия переноса/restore/пикер отключены (или сообщают о недоступности). Повторный детект — на следующем запуске. Это заменяет текущее поведение (generic `MessageBox` + выход).
+
 ## 10. Репозиторий
 
 ```
@@ -210,18 +254,19 @@ win-vde/
   src/vde.cpp
   src/vde.rc
   src/vde.ico
+  src/vde.exe.manifest # Common Controls v6 (SysLink/TaskDialog, темы) — встраивается через rc
   build.bat            # cl /utf-8 /EHsc /W3 /std:c++14 src/vde.cpp /Fe:vde.exe (+rc)
   README.md            # что это, сборка, использование, ограничения, скрин
-  LICENSE              # MIT (год 2026, conus-vision)
+  LICENSE              # MIT, © 2026 Volodymyr Moskvin (conus.vision)
   .gitignore           # *.obj *.exe *.res .vs/ build/
   docs/superpowers/specs/2026-07-04-win-vde-rework-design.md
 ```
 
-README покрывает: назначение (3 задачи, которые Windows/браузер не решают), поддержку Firefox/Chrome/Edge, установку, автозапуск, пункты меню, хоткей/пикер, ограничения (недокументированные COM-IID → зависимость от сборки Windows, degraded mode), сборку из исходников. Пуш на GitHub — outward-facing, **только по явной команде пользователя**, требует настроенной авторизации (`gh`/креды).
+README покрывает: назначение (3 задачи, которые Windows/браузер не решают), поддержку Firefox/Chrome/Edge, установку, автозапуск, пункты меню (вкл. About), хоткей/пикер, ограничения (недокументированные COM-IID → зависимость от сборки Windows, degraded mode + окно CompatIssue), сборку из исходников. Автор/контакты: **Volodymyr Moskvin — info@conus.vision**. Пуш на GitHub — outward-facing, **только по явной команде пользователя**, требует настроенной авторизации (`gh`/креды).
 
 ## 11. Фазы реализации
 
-1. **Ядро (Firefox):** два файла + grace/merge + `missingRuns`; автомат жизненного цикла (старт-restore, ожидание запуска +20 c, save-on-exit, no-wipe); relabel меню (R5); автозапуск-переключатель; миграция `layout.txt`. + инициализация repo (src/, build.bat, .gitignore, LICENSE, README).
+1. **Ядро (Firefox):** два файла + grace/merge + `missingRuns`; автомат жизненного цикла (старт-restore, ожидание запуска +20 c, save-on-exit, no-wipe); relabel меню (R5); About (R11); детект поломки + окно CompatIssue + degraded mode (R12); v6-манифест; автозапуск-переключатель; миграция `layout.txt`. + инициализация repo (src/, build.bat, .gitignore, LICENSE, README).
 2. **Мульти-app:** `AppProfile`/коллекторы; Chromium SNSS-ридер (Chrome+Edge) + фолбэк на generic; фильтр по `app` в сопоставлении; чекбоксы приложений.
 3. **Пикер UX:** строка поиска, скролл в плитках, тултип полного имени, бейдж Ctrl+Click.
 
@@ -230,7 +275,7 @@ README покрывает: назначение (3 задачи, которые 
 ## 12. Edge cases и риски
 
 - **SNSS-хрупкость** — главный риск. Митигируется try/best-effort + generic-фолбэк + изоляция в Фазу 2.
-- **Неизвестная сборка Windows** (COM-IID не совпали) — как сейчас: сервисы не инициализируются, GUI показывает ошибку / degraded. Авто-restore при этом не выполняется.
+- **Неизвестная сборка Windows** (COM-IID не совпали / vtable сдвинут) — детект по §9.2 (init-fail + sanity-check), пользователю показывается окно CompatIssue с пояснением и контактами, утилита уходит в degraded mode (не падает). Авто-restore/перенос при этом не выполняются.
 - **DPI/geometry** — не актуально: geometry не восстанавливаем.
 - **Приватные окна** Firefox — sessionstore их не содержит → сопоставляются только по заголовку (как сейчас).
 - **Несколько профилей** браузера — берём активный/дефолтный; несовпадение не критично (деградация до заголовка).
