@@ -47,11 +47,40 @@ static void test_layout_parse_v2(){
     CHECK(w[0].tabCount==5); CHECK(w[0].counts["docs.python.org"]==1);
 }
 
+static LayoutWin LW(const char* app, int desk, std::map<std::string,int> c, const char* title=""){
+    LayoutWin w; w.app=app; w.deskIndex=desk; w.counts=c; w.activeTitle=title; return w;
+}
+static void test_merge_upsert_and_keep(){
+    std::vector<LayoutWin> existing = { LW("firefox",0,{{"github.com",3}}), LW("firefox",1,{{"jira.com",2}}) };
+    existing[0].missingRuns=1; existing[1].missingRuns=1;
+    std::vector<LayoutWin> present = { LW("firefox",2,{{"github.com",3}}) };  // only github present, moved to desk 2
+    auto merged = MergeAutoLayout(existing, present);
+    CHECK(merged.size()==2);                       // jira window kept (not wiped)
+    int gi=-1, ji=-1;
+    for(int i=0;i<(int)merged.size();++i){ if(merged[i].counts.count("github.com"))gi=i; if(merged[i].counts.count("jira.com"))ji=i; }
+    CHECK(gi>=0 && ji>=0);
+    CHECK(merged[gi].deskIndex==2); CHECK(merged[gi].missingRuns==0);  // present ⇒ updated + reset
+    CHECK(merged[ji].deskIndex==1); CHECK(merged[ji].missingRuns==1);  // absent ⇒ untouched
+}
+static void test_merge_adds_new(){
+    std::vector<LayoutWin> existing = {};
+    std::vector<LayoutWin> present = { LW("firefox",0,{{"x.com",1}}) };
+    auto merged = MergeAutoLayout(existing, present);
+    CHECK(merged.size()==1); CHECK(merged[0].missingRuns==0);
+}
+static void test_fingerprint_key_generic_vs_domain(){
+    CHECK(FingerprintKey("firefox",{{"a.com",2}},"T") == FingerprintKey("firefox",{{"a.com",2}},"OTHER"));
+    CHECK(FingerprintKey("explorer",{},"Downloads") != FingerprintKey("explorer",{},"Documents"));
+}
+
 int main(){
     test_etld1();
     test_b64();
     test_layout_roundtrip_v3();
     test_layout_parse_v2();
+    test_merge_upsert_and_keep();
+    test_merge_adds_new();
+    test_fingerprint_key_generic_vs_domain();
     printf("%d/%d passed\n", g_total - g_fail, g_total);
     return g_fail ? 1 : 0;
 }

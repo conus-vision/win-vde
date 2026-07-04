@@ -68,3 +68,32 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desks, st
     }
     return true;
 }
+
+// ---- Cross-restart identity + merge/grace ----
+// Key that re-identifies a window across a restart (HWND is ephemeral):
+// domain multiset when available (robust — session restore recreates tabs),
+// else the active-window title (generic apps without tab data).
+inline std::string FingerprintKey(const std::string& app, const std::map<std::string,int>& counts, const std::string& activeTitle){
+    std::string k = app + "|";
+    if(!counts.empty()){ bool f=true; for(const auto& kv:counts){ if(!f)k+=","; f=false; k+=kv.first+":"+std::to_string(kv.second);} }
+    else k += "t:" + activeTitle;
+    return k;
+}
+
+// Merge currently-present windows into the existing auto layout WITHOUT deleting
+// absent windows (anti-wipe). Present windows: desk updated, missingRuns reset to 0.
+inline std::vector<LayoutWin> MergeAutoLayout(const std::vector<LayoutWin>& existing, const std::vector<LayoutWin>& present){
+    std::vector<LayoutWin> out = existing;
+    std::map<std::string,int> idx;
+    for(size_t i=0;i<out.size();++i) idx[FingerprintKey(out[i].app,out[i].counts,out[i].activeTitle)] = (int)i;
+    for(const auto& p : present){
+        std::string key = FingerprintKey(p.app,p.counts,p.activeTitle);
+        auto it = idx.find(key);
+        if(it!=idx.end()){
+            LayoutWin& e = out[it->second];
+            e.deskIndex=p.deskIndex; e.desktop=p.desktop; e.activeTitle=p.activeTitle;
+            e.activeDomain=p.activeDomain; e.tabCount=p.tabCount; e.counts=p.counts; e.missingRuns=0;
+        } else { LayoutWin n=p; n.missingRuns=0; idx[key]=(int)out.size(); out.push_back(n); }
+    }
+    return out;
+}
