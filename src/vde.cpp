@@ -72,6 +72,10 @@ static const bool SWITCH_AFTER_MOVE = false;    // переключаться н
 #define LAUNCH_SETTLE_TICKS 4          // 4 * 5000ms = ~20s launch stabilization
 #define IDC_HOTKEY 1001
 #define IDC_AUTOFIX 1002
+#define IDC_LINK_MAIL 1101
+#define IDC_LINK_REPO 1102
+#define IDC_ABOUT_COPY 1103
+static const wchar_t* APP_VERSION = L"1.0.0";
 
 // ---- lifecycle monitor state (this run) ----
 static LcState g_lc;
@@ -781,7 +785,62 @@ static void OpenSettings(){
     if(g_settings){ ShowWindow(g_settings,SW_SHOW); SetForegroundWindow(g_settings); }
 }
 
-static void OpenAbout(){ /* implemented in Task 10 */ }
+// --------------------------- About window ------------------------------------
+static HWND g_about=nullptr;
+static void AboutCopy(HWND hwnd){
+    std::wstring s=std::wstring(L"Virtual Desktops Extension v")+APP_VERSION+L" | info@conus.vision | Windows build "+std::to_wstring(GetWindowsBuild());
+    if(OpenClipboard(hwnd)){ EmptyClipboard();
+        size_t bytes=(s.size()+1)*sizeof(wchar_t); HGLOBAL h=GlobalAlloc(GMEM_MOVEABLE,bytes);
+        if(h){ void* d=GlobalLock(h); if(d){ memcpy(d,s.c_str(),bytes); GlobalUnlock(h); SetClipboardData(CF_UNICODETEXT,h); } }
+        CloseClipboard();
+    }
+}
+static LRESULT CALLBACK AboutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
+    switch(msg){
+    case WM_CREATE:{
+        int y=S(16);
+        std::wstring title=std::wstring(L"Virtual Desktops Extension for Windows 11  \x2014  v")+APP_VERSION;
+        CreateWindowW(L"STATIC",title.c_str(),WS_CHILD|WS_VISIBLE,S(16),y,S(352),S(20),hwnd,nullptr,g_inst,nullptr); y+=S(26);
+        CreateWindowW(L"STATIC",L"Saves and restores browser windows across Windows 11 virtual desktops.",WS_CHILD|WS_VISIBLE,S(16),y,S(352),S(34),hwnd,nullptr,g_inst,nullptr); y+=S(40);
+        CreateWindowW(L"STATIC",L"Author:  Volodymyr Moskvin",WS_CHILD|WS_VISIBLE,S(16),y,S(352),S(20),hwnd,nullptr,g_inst,nullptr); y+=S(24);
+        CreateWindowW(L"SysLink",L"Email:  <a href=\"mailto:info@conus.vision\">info@conus.vision</a>",WS_CHILD|WS_VISIBLE|WS_TABSTOP,S(16),y,S(352),S(20),hwnd,(HMENU)IDC_LINK_MAIL,g_inst,nullptr); y+=S(24);
+        CreateWindowW(L"SysLink",L"GitHub:  <a href=\"https://github.com/conus-vision/win-vde\">github.com/conus-vision/win-vde</a>",WS_CHILD|WS_VISIBLE|WS_TABSTOP,S(16),y,S(352),S(20),hwnd,(HMENU)IDC_LINK_REPO,g_inst,nullptr); y+=S(28);
+        std::wstring lic=std::wstring(L"License: MIT        Windows build: ")+std::to_wstring(GetWindowsBuild());
+        CreateWindowW(L"STATIC",lic.c_str(),WS_CHILD|WS_VISIBLE,S(16),y,S(352),S(20),hwnd,nullptr,g_inst,nullptr); y+=S(32);
+        CreateWindowW(L"BUTTON",L"Copy",WS_CHILD|WS_VISIBLE|WS_TABSTOP,S(200),y,S(78),S(28),hwnd,(HMENU)IDC_ABOUT_COPY,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Close",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON|WS_TABSTOP,S(288),y,S(80),S(28),hwnd,(HMENU)IDOK,g_inst,nullptr);
+        SetChildFont(hwnd);
+        return 0;
+    }
+    case WM_NOTIFY:{ NMHDR* n=(NMHDR*)lp;
+        if(n->code==NM_CLICK||n->code==NM_RETURN){
+            if(n->idFrom==IDC_LINK_MAIL) ShellExecuteW(hwnd,L"open",L"mailto:info@conus.vision",nullptr,nullptr,SW_SHOW);
+            else if(n->idFrom==IDC_LINK_REPO) ShellExecuteW(hwnd,L"open",L"https://github.com/conus-vision/win-vde",nullptr,nullptr,SW_SHOW);
+        } return 0; }
+    case WM_COMMAND:
+        if(LOWORD(wp)==IDC_ABOUT_COPY){ AboutCopy(hwnd); return 0; }
+        if(LOWORD(wp)==IDOK){ DestroyWindow(hwnd); return 0; }
+        return 0;
+    case WM_CTLCOLORSTATIC:{ HDC dc=(HDC)wp; SetBkMode(dc,TRANSPARENT); return (LRESULT)GetSysColorBrush(COLOR_BTNFACE); }
+    case WM_CLOSE: DestroyWindow(hwnd); return 0;
+    case WM_DESTROY: g_about=nullptr; return 0;
+    }
+    return DefWindowProcW(hwnd,msg,wp,lp);
+}
+static void OpenAbout(){
+    if(g_about){ SetForegroundWindow(g_about); return; }
+    static bool reg=false;
+    if(!reg){ WNDCLASSW wc={0}; wc.lpfnWndProc=AboutProc; wc.hInstance=g_inst; wc.lpszClassName=L"VdeAbout";
+        wc.hCursor=LoadCursorW(nullptr,IDC_ARROW); wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
+        wc.hIcon=LoadAppIcon(GetSystemMetrics(SM_CXICON),GetSystemMetrics(SM_CYICON));
+        RegisterClassW(&wc); reg=true; }
+    int W=S(396),H=S(286);
+    RECT wr={0,0,W,H}; AdjustWindowRect(&wr,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,FALSE);
+    int ww=wr.right-wr.left, wh=wr.bottom-wr.top;
+    int sx=(GetSystemMetrics(SM_CXSCREEN)-ww)/2, sy=(GetSystemMetrics(SM_CYSCREEN)-wh)/2;
+    g_about=CreateWindowExW(0,L"VdeAbout",L"About - Virtual Desktops Extension",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,sx,sy,ww,wh,nullptr,nullptr,g_inst,nullptr);
+    if(g_about){ ShowWindow(g_about,SW_SHOW); SetForegroundWindow(g_about); }
+}
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     switch(msg){
@@ -864,7 +923,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
 // ================================ entry ======================================
 static int RunGui(HINSTANCE hInst){
     g_inst=hInst;
-    INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_HOTKEY_CLASS|ICC_STANDARD_CLASSES}; InitCommonControlsEx(&icc);
+    INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_HOTKEY_CLASS|ICC_STANDARD_CLASSES|ICC_LINK_CLASS}; InitCommonControlsEx(&icc);
     InitMetrics();
     g_uiFont=CreateFontW(-S(12),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     LoadSettings();
@@ -889,6 +948,7 @@ static int RunGui(HINSTANCE hInst){
     MSG msg;
     while(GetMessageW(&msg,nullptr,0,0)){
         if(g_settings && IsDialogMessageW(g_settings,&msg)) continue;
+        if(g_about && IsDialogMessageW(g_about,&msg)) continue;
         TranslateMessage(&msg); DispatchMessageW(&msg);
     }
     if(g_uiFont)DeleteObject(g_uiFont);
