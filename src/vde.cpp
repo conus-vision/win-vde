@@ -781,6 +781,8 @@ static void OpenSettings(){
     if(g_settings){ ShowWindow(g_settings,SW_SHOW); SetForegroundWindow(g_settings); }
 }
 
+static void OpenAbout(){ /* implemented in Task 10 */ }
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     switch(msg){
     case WM_HOTKEY: ShowPicker(); return 0;
@@ -827,17 +829,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             POINT pt; GetCursorPos(&pt); HMENU m=CreatePopupMenu();
             AppendMenuW(m,MF_STRING,200,L"Open desktop picker");
             AppendMenuW(m,MF_SEPARATOR,0,nullptr);
-            AppendMenuW(m,MF_STRING,201,L"Save Firefox layout");
-            AppendMenuW(m,MF_STRING,202,L"Restore Firefox layout");
+            AppendMenuW(m,MF_STRING,201,L"Save windows layout");
+            AppendMenuW(m,MF_STRING,202,L"Restore saved windows layout");
+            AppendMenuW(m,MF_STRING,204,L"Restore last auto saved layout");
             AppendMenuW(m,MF_SEPARATOR,0,nullptr);
             AppendMenuW(m,MF_STRING,203,L"Settings...");
+            AppendMenuW(m,MF_STRING,205,L"About...");
             AppendMenuW(m,MF_STRING,209,L"Exit");
             SetForegroundWindow(hwnd);
             int cmd=TrackPopupMenu(m,TPM_RETURNCMD|TPM_RIGHTBUTTON,pt.x,pt.y,0,hwnd,nullptr); DestroyMenu(m);
             if(cmd==200)ShowPicker();
             else if(cmd==201)Balloon(U82W(RunSaveManual()));
             else if(cmd==202)Balloon(U82W(RunRestore(true)));
+            else if(cmd==204)Balloon(U82W(RunRestore(false)));
             else if(cmd==203)OpenSettings();
+            else if(cmd==205)OpenAbout();
             else if(cmd==209)DestroyWindow(hwnd);
         } else if(LOWORD(lp)==WM_LBUTTONDBLCLK) ShowPicker();
         return 0;
