@@ -544,7 +544,7 @@ static int CliRun(const std::wstring& cmd){
 
 // ================================ GUI: picker ================================
 struct WinItem { HWND hwnd; std::wstring title; HICON icon; };
-struct Tile { GUID guid; std::wstring name; int index; std::vector<WinItem> windows; RECT rc; };
+struct Tile { GUID guid; std::wstring name; int index; std::vector<WinItem> windows; RECT rc; int scroll=0; };
 static std::vector<Tile> g_tiles;
 static int  g_sel=0;
 static HWND g_target=nullptr; static std::wstring g_targetTitle;
@@ -558,12 +558,19 @@ static const UINT WM_TRAY=WM_APP+1;
 static NOTIFYICONDATAW g_nid={0};
 static int g_dpi=96;
 static int S(int v){ return MulDiv(v,g_dpi,96); }   // px@96dpi -> px@текущий DPI
-static int TILE_W=240,TILE_H=150,PAD=16,HEADER=44;  // базовые (96 dpi); пересчёт в InitMetrics
+static int TILE_W=240,TILE_H=150,PAD=16,HEADER=44,SEARCH_H=40;  // базовые (96 dpi); пересчёт в InitMetrics
 static int g_cols=1,g_rows=1;
 static void InitMetrics(){
     HDC dc=GetDC(nullptr); g_dpi=GetDeviceCaps(dc,LOGPIXELSX); ReleaseDC(nullptr,dc);
-    TILE_W=S(240); TILE_H=S(150); PAD=S(16); HEADER=S(44);
+    TILE_W=S(240); TILE_H=S(150); PAD=S(16); HEADER=S(44); SEARCH_H=S(40);
 }
+// ---- picker search / scroll / tooltip state ----
+static HWND g_search=nullptr; static WNDPROC g_searchOrigProc=nullptr; static std::wstring g_searchText;
+static HWND g_tip=nullptr;
+struct RowRec { RECT rc; std::wstring full; bool trunc; };
+static std::vector<RowRec> g_hoverRows;                  // window rows drawn this Paint (for hover tooltip)
+static std::wstring LowerW(std::wstring s){ if(!s.empty()) CharLowerW(&s[0]); return s; }
+static bool MatchesSearch(const std::wstring& title){ return g_searchText.empty() || LowerW(title).find(g_searchText)!=std::wstring::npos; }
 
 static bool IsAltTabWindow(HWND h){ if(!IsWindowVisible(h))return false; if(GetWindowTextLengthW(h)<=0)return false; LONG_PTR ex=GetWindowLongPtrW(h,GWL_EXSTYLE); if(ex&WS_EX_TOOLWINDOW)return false; if(GetAncestor(h,GA_ROOTOWNER)!=h)return false; return true; }
 static HICON WindowIcon(HWND h){ DWORD_PTR r=0; SendMessageTimeoutW(h,WM_GETICON,ICON_SMALL2,0,SMTO_ABORTIFHUNG,200,&r); HICON i=(HICON)r;
@@ -589,59 +596,117 @@ static void LayoutTiles(int clientW){
     int n=(int)g_tiles.size();
     g_cols=std::max(1,std::min(n,std::max(1,(clientW-PAD)/(TILE_W+PAD)))); g_cols=std::min(g_cols,5);
     g_rows=(n+g_cols-1)/g_cols;
-    for(int i=0;i<n;++i){ int r=i/g_cols,c=i%g_cols; RECT rc; rc.left=PAD+c*(TILE_W+PAD); rc.top=HEADER+PAD+r*(TILE_H+PAD); rc.right=rc.left+TILE_W; rc.bottom=rc.top+TILE_H; g_tiles[i].rc=rc; }
+    for(int i=0;i<n;++i){ int r=i/g_cols,c=i%g_cols; RECT rc; rc.left=PAD+c*(TILE_W+PAD); rc.top=SEARCH_H+HEADER+PAD+r*(TILE_H+PAD); rc.right=rc.left+TILE_W; rc.bottom=rc.top+TILE_H; g_tiles[i].rc=rc; }
 }
-static SIZE DesiredClientSize(){ int n=(int)g_tiles.size(); int cols=std::min(std::max(1,n),5); int rows=(n+cols-1)/cols; SIZE s; s.cx=PAD+cols*(TILE_W+PAD); s.cy=HEADER+PAD+rows*(TILE_H+PAD); return s; }
+static SIZE DesiredClientSize(){ int n=(int)g_tiles.size(); int cols=std::min(std::max(1,n),5); int rows=(n+cols-1)/cols; SIZE s; s.cx=PAD+cols*(TILE_W+PAD); s.cy=SEARCH_H+HEADER+PAD+rows*(TILE_H+PAD); return s; }
 static void Paint(HDC hdcReal, RECT client){
+    g_hoverRows.clear();
     HDC hdc=CreateCompatibleDC(hdcReal); HBITMAP bmp=CreateCompatibleBitmap(hdcReal,client.right,client.bottom); HBITMAP old=(HBITMAP)SelectObject(hdc,bmp);
     HBRUSH bg=CreateSolidBrush(RGB(28,28,32)); FillRect(hdc,&client,bg); DeleteObject(bg); SetBkMode(hdc,TRANSPARENT);
     HFONT fT=CreateFontW(S(22),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     HFONT fN=CreateFontW(S(18),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     HFONT fI=CreateFontW(S(15),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
-    SelectObject(hdc,fT); SetTextColor(hdc,RGB(235,235,235));
-    RECT h=client; h.left=PAD; h.top=S(12); h.bottom=HEADER;
     bool ctrlHeld=(GetKeyState(VK_CONTROL)&0x8000)!=0;
+
+    // ---- header row (below the search box) + Ctrl+Click badge ----
+    SelectObject(hdc,fI);
+    const wchar_t* bMove=L"Ctrl+Click = move window"; const wchar_t* bClick=L"Click = switch";
+    SIZE szMove; GetTextExtentPoint32W(hdc,bMove,(int)wcslen(bMove),&szMove);
+    SIZE szClick; GetTextExtentPoint32W(hdc,bClick,(int)wcslen(bClick),&szClick);
+    int badgeW=szMove.cx+S(20), badgeH=S(22);
+    int badgeX=client.right-PAD-badgeW, badgeY=SEARCH_H+(HEADER-badgeH)/2;
+    RECT cr2; cr2.left=badgeX-S(14)-szClick.cx; cr2.top=SEARCH_H; cr2.right=badgeX-S(14); cr2.bottom=SEARCH_H+HEADER;
+    SetTextColor(hdc,RGB(150,150,160)); DrawTextW(hdc,bClick,-1,&cr2,DT_RIGHT|DT_SINGLELINE|DT_VCENTER);
+    // header title (clipped so it can't overlap the hint)
+    SelectObject(hdc,fT); SetTextColor(hdc,RGB(235,235,235));
     std::wstring head;
     if(ctrlHeld) head=L"Move window:  "+(g_targetTitle.empty()?L"(no window)":g_targetTitle);
     else { std::wstring nm=(g_sel>=0&&g_sel<(int)g_tiles.size())?g_tiles[g_sel].name:L""; head=L"Switch to:  "+nm; }
+    RECT h; h.left=PAD; h.top=SEARCH_H; h.right=cr2.left-S(10); h.bottom=SEARCH_H+HEADER;
     DrawTextW(hdc,head.c_str(),-1,&h,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS|DT_VCENTER);
-    SelectObject(hdc,fI); SetTextColor(hdc,RGB(150,150,160));
-    RECT hint=client; hint.left=PAD; hint.right=client.right-PAD; hint.top=S(12); hint.bottom=HEADER;
-    DrawTextW(hdc,L"Click: switch    Ctrl+Click: move window",-1,&hint,DT_RIGHT|DT_SINGLELINE|DT_VCENTER);
+    // badge
+    COLORREF acc = ctrlHeld?RGB(0,120,215):RGB(0,90,158);
+    HBRUSH ab=CreateSolidBrush(acc); HPEN apn=CreatePen(PS_SOLID,1,acc);
+    HBRUSH aob=(HBRUSH)SelectObject(hdc,ab); HPEN aop=(HPEN)SelectObject(hdc,apn);
+    RoundRect(hdc,badgeX,badgeY,badgeX+badgeW,badgeY+badgeH,S(8),S(8));
+    SelectObject(hdc,aob); SelectObject(hdc,aop); DeleteObject(ab); DeleteObject(apn);
+    SelectObject(hdc,fI); SetTextColor(hdc,RGB(255,255,255));
+    RECT br={badgeX,badgeY,badgeX+badgeW,badgeY+badgeH}; DrawTextW(hdc,bMove,-1,&br,DT_CENTER|DT_SINGLELINE|DT_VCENTER);
+
+    // ---- tiles ----
     GUID cur={0}; bool haveCur=g_vdmDoc&&g_target&&SUCCEEDED(g_vdmDoc->GetWindowDesktopId(g_target,&cur));
-    for(size_t i=0;i<g_tiles.size();++i){ const Tile& t=g_tiles[i]; bool isSel=((int)i==g_sel); bool isCur=haveCur&&GuidEq(t.guid,cur);
-        HBRUSH tb=CreateSolidBrush(isCur?RGB(45,48,58):RGB(38,38,44)); FillRect(hdc,&t.rc,tb); DeleteObject(tb);
+    bool searching=!g_searchText.empty();
+    for(size_t i=0;i<g_tiles.size();++i){ Tile& t=g_tiles[i]; bool isSel=((int)i==g_sel); bool isCur=haveCur&&GuidEq(t.guid,cur);
+        std::vector<const WinItem*> fw; for(auto& w:t.windows) if(MatchesSearch(w.title)) fw.push_back(&w);
+        bool dim = searching && fw.empty();
+        HBRUSH tb=CreateSolidBrush(dim?RGB(32,32,36):(isCur?RGB(45,48,58):RGB(38,38,44))); FillRect(hdc,&t.rc,tb); DeleteObject(tb);
         HPEN pen=CreatePen(PS_SOLID,isSel?S(3):1,isSel?RGB(0,160,255):RGB(70,70,80)); HPEN op=(HPEN)SelectObject(hdc,pen); HBRUSH ob=(HBRUSH)SelectObject(hdc,(HBRUSH)GetStockObject(NULL_BRUSH));
         Rectangle(hdc,t.rc.left,t.rc.top,t.rc.right,t.rc.bottom); SelectObject(hdc,op); SelectObject(hdc,ob); DeleteObject(pen);
-        SelectObject(hdc,fN); SetTextColor(hdc,RGB(245,245,245));
+        SelectObject(hdc,fN); SetTextColor(hdc,dim?RGB(120,120,128):RGB(245,245,245));
         RECT nr=t.rc; nr.left+=S(12); nr.top+=S(8); nr.right-=S(10); nr.bottom=nr.top+S(24);
         std::wstring title=std::to_wstring(t.index+1)+L". "+t.name; DrawTextW(hdc,title.c_str(),-1,&nr,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
         SelectObject(hdc,fI); SetTextColor(hdc,RGB(200,200,205));
-        int y=nr.bottom+S(6),shown=0,maxShow=5;
-        for(auto& w:t.windows){ if(shown>=maxShow)break; if(y+S(20)>t.rc.bottom-S(8))break;
-            if(w.icon)DrawIconEx(hdc,t.rc.left+S(12),y,w.icon,S(16),S(16),0,nullptr,DI_NORMAL);
-            RECT ir; ir.left=t.rc.left+S(34); ir.top=y; ir.right=t.rc.right-S(10); ir.bottom=y+S(18); DrawTextW(hdc,w.title.c_str(),-1,&ir,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
-            y+=S(20); shown++; }
-        int extra=(int)t.windows.size()-shown;
-        if(extra>0){ SetTextColor(hdc,RGB(140,140,150)); RECT er; er.left=t.rc.left+S(12); er.top=y; er.right=t.rc.right-S(10); er.bottom=y+S(18); std::wstring more=L"+"+std::to_wstring(extra)+L" more"; DrawTextW(hdc,more.c_str(),-1,&er,DT_LEFT|DT_SINGLELINE); }
+        int rowH=S(20), listTop=nr.bottom+S(6), listBot=t.rc.bottom-S(8);
+        int visRows=std::max(0,(listBot-listTop)/rowH); int maxScroll=std::max(0,(int)fw.size()-visRows);
+        if(t.scroll>maxScroll)t.scroll=maxScroll; if(t.scroll<0)t.scroll=0;
+        int y=listTop;
+        for(int k=t.scroll; k<(int)fw.size(); ++k){ if(y+rowH>listBot)break; const WinItem* w=fw[k];
+            if(w->icon)DrawIconEx(hdc,t.rc.left+S(12),y,w->icon,S(16),S(16),0,nullptr,DI_NORMAL);
+            RECT ir; ir.left=t.rc.left+S(34); ir.top=y; ir.right=t.rc.right-S(14); ir.bottom=y+S(18);
+            DrawTextW(hdc,w->title.c_str(),-1,&ir,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
+            SIZE ts; GetTextExtentPoint32W(hdc,w->title.c_str(),(int)w->title.size(),&ts);
+            RowRec rr; rr.rc=ir; rr.full=w->title; rr.trunc=(ts.cx>(ir.right-ir.left)); g_hoverRows.push_back(rr);
+            y+=rowH;
+        }
+        SetTextColor(hdc,RGB(150,150,160));
+        if(t.scroll>0){ RECT ur={t.rc.right-S(16),listTop-S(2),t.rc.right-S(2),listTop+S(14)}; DrawTextW(hdc,L"\x25B2",-1,&ur,DT_CENTER|DT_SINGLELINE); }
+        if(t.scroll<maxScroll){ RECT dr={t.rc.right-S(16),listBot-S(14),t.rc.right-S(2),listBot}; DrawTextW(hdc,L"\x25BC",-1,&dr,DT_CENTER|DT_SINGLELINE); }
     }
     BitBlt(hdcReal,0,0,client.right,client.bottom,hdc,0,0,SRCCOPY);
     DeleteObject(fT); DeleteObject(fN); DeleteObject(fI); SelectObject(hdc,old); DeleteObject(bmp); DeleteDC(hdc);
 }
-static void HidePicker(){ ShowWindow(g_main,SW_HIDE); }
+static void TipDeactivate(){ if(g_tip){ TOOLINFOW ti={0}; ti.cbSize=sizeof(ti); ti.hwnd=g_main; ti.uId=1; SendMessageW(g_tip,TTM_TRACKACTIVATE,FALSE,(LPARAM)&ti); } }
+static void HidePicker(){ TipDeactivate(); ShowWindow(g_main,SW_HIDE); }
+// Search EDIT subclass: forward navigation keys to the grid; let letters/numbers type.
+static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM wp, LPARAM lp){
+    if((m==WM_KEYDOWN||m==WM_KEYUP)&&wp==VK_CONTROL){ InvalidateRect(g_main,nullptr,FALSE); return 0; }
+    if(m==WM_KEYDOWN){ switch(wp){
+        case VK_ESCAPE: case VK_RETURN: case VK_UP: case VK_DOWN: case VK_LEFT: case VK_RIGHT: case VK_TAB:
+            SendMessageW(g_main,WM_KEYDOWN,wp,lp); return 0; } }
+    if(m==WM_CHAR && (wp==L'\r'||wp==27||wp==L'\t')) return 0;   // swallow -> no message beep
+    return CallWindowProcW(g_searchOrigProc,h,m,wp,lp);
+}
+static void EnsurePickerChildren(){
+    if(!g_search){
+        g_search=CreateWindowExW(0,L"EDIT",L"",WS_CHILD|ES_AUTOHSCROLL|WS_BORDER,0,0,10,10,g_main,nullptr,g_inst,nullptr);
+        if(g_search){ if(g_uiFont)SendMessageW(g_search,WM_SETFONT,(WPARAM)g_uiFont,TRUE);
+            SendMessageW(g_search,EM_SETCUEBANNER,TRUE,(LPARAM)L"Type window name to search");
+            g_searchOrigProc=(WNDPROC)SetWindowLongPtrW(g_search,GWLP_WNDPROC,(LONG_PTR)EditProc); }
+    }
+    if(!g_tip){
+        g_tip=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASS,nullptr,WS_POPUP|TTS_NOPREFIX|TTS_ALWAYSTIP,0,0,0,0,g_main,nullptr,g_inst,nullptr);
+        if(g_tip){ TOOLINFOW ti={0}; ti.cbSize=sizeof(ti); ti.uFlags=TTF_TRACK|TTF_ABSOLUTE; ti.hwnd=g_main; ti.uId=1; ti.lpszText=(LPWSTR)L"";
+            SendMessageW(g_tip,TTM_ADDTOOLW,0,(LPARAM)&ti); SendMessageW(g_tip,TTM_SETMAXTIPWIDTH,0,S(600)); }
+    }
+}
 static void Commit(int idx){ if(idx<0||idx>=(int)g_tiles.size())return; HidePicker(); if(g_target&&IsWindow(g_target)){ IVirtualDesktop* d=GetDesktopByIndex((UINT)g_tiles[idx].index); if(d){ GUID g={0};d->GetID(&g); MoveWindowToDesktop(g_target,d,g); if(SWITCH_AFTER_MOVE)g_vdmi->SwitchDesktop(d); d->Release(); } } }
 static void ShowPicker(){
     if(g_degraded) return;   // desktop COM unavailable; startup dialog + tray tip already explain
     g_target=GetForegroundWindow(); if(g_target==g_main)g_target=nullptr;
     if(g_target&&IsWindow(g_target)){ int len=GetWindowTextLengthW(g_target); std::wstring t(len+1,0); GetWindowTextW(g_target,&t[0],len+1); t.resize(wcslen(t.c_str())); g_targetTitle=t; } else g_targetTitle.clear();
-    BuildModel(); SIZE sz=DesiredClientSize();
+    BuildModel(); g_searchText.clear(); for(auto& t:g_tiles) t.scroll=0;
+    SIZE sz=DesiredClientSize();
     HMONITOR mon=MonitorFromWindow(g_target?g_target:g_main,MONITOR_DEFAULTTOPRIMARY); MONITORINFO mi={sizeof(mi)}; GetMonitorInfo(mon,&mi);
     RECT wr={0,0,sz.cx,sz.cy}; AdjustWindowRectEx(&wr,WS_POPUP,FALSE,WS_EX_TOOLWINDOW|WS_EX_TOPMOST);
     int ww=wr.right-wr.left,wh=wr.bottom-wr.top;
     int wx=mi.rcWork.left+((mi.rcWork.right-mi.rcWork.left)-ww)/2, wy=mi.rcWork.top+((mi.rcWork.bottom-mi.rcWork.top)-wh)/2;
     SetWindowPos(g_main,HWND_TOPMOST,wx,wy,ww,wh,SWP_NOACTIVATE);
     RECT cr; GetClientRect(g_main,&cr); LayoutTiles(cr.right);
-    ShowWindow(g_main,SW_SHOW); SetForegroundWindow(g_main); InvalidateRect(g_main,nullptr,FALSE);
+    EnsurePickerChildren();
+    if(g_search){ SetWindowTextW(g_search,L""); MoveWindow(g_search,PAD,S(8),cr.right-2*PAD,S(26),TRUE); ShowWindow(g_search,SW_SHOW); }
+    ShowWindow(g_main,SW_SHOW); SetForegroundWindow(g_main);
+    if(g_search) SetFocus(g_search);
+    InvalidateRect(g_main,nullptr,FALSE);
 }
 static void MoveSel(int dx,int dy){ if(g_tiles.empty())return; int r=g_sel/g_cols,c=g_sel%g_cols; c+=dx;r+=dy; int n=(int)g_tiles.size();
     if(c<0)c=0; if(c>=g_cols)c=g_cols-1; if(r<0)r=0; int idx=r*g_cols+c; if(idx>=n)idx=n-1; if(idx<0)idx=0; g_sel=idx; InvalidateRect(g_main,nullptr,FALSE); }
@@ -969,7 +1034,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         return 0;
     case WM_LBUTTONDOWN:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
         for(size_t i=0;i<g_tiles.size();++i) if(PtInRect(&g_tiles[i].rc,pt)){ Activate((int)i,ctrl); return 0; } return 0; }
-    case WM_MOUSEMOVE:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; for(size_t i=0;i<g_tiles.size();++i) if(PtInRect(&g_tiles[i].rc,pt)){ if(g_sel!=(int)i){g_sel=(int)i; InvalidateRect(hwnd,nullptr,FALSE);} break; } return 0; }
+    case WM_MOUSEMOVE:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+        int hovRow=-1; for(size_t i=0;i<g_hoverRows.size();++i) if(PtInRect(&g_hoverRows[i].rc,pt)){ hovRow=(int)i; break; }
+        if(hovRow>=0 && g_hoverRows[hovRow].trunc && g_tip){    // R9: full name on hover when truncated
+            TOOLINFOW ti={0}; ti.cbSize=sizeof(ti); ti.hwnd=hwnd; ti.uId=1; ti.lpszText=(LPWSTR)g_hoverRows[hovRow].full.c_str();
+            SendMessageW(g_tip,TTM_UPDATETIPTEXTW,0,(LPARAM)&ti);
+            POINT sp=pt; ClientToScreen(hwnd,&sp);
+            SendMessageW(g_tip,TTM_TRACKPOSITION,0,(LPARAM)MAKELONG(sp.x+S(16),sp.y+S(20)));
+            SendMessageW(g_tip,TTM_TRACKACTIVATE,TRUE,(LPARAM)&ti);
+        } else TipDeactivate();
+        for(size_t i=0;i<g_tiles.size();++i) if(PtInRect(&g_tiles[i].rc,pt)){ if(g_sel!=(int)i){g_sel=(int)i; InvalidateRect(hwnd,nullptr,FALSE);} break; }
+        TRACKMOUSEEVENT tme={sizeof(tme)}; tme.dwFlags=TME_LEAVE; tme.hwndTrack=hwnd; TrackMouseEvent(&tme);
+        return 0; }
+    case WM_MOUSELEAVE: TipDeactivate(); return 0;
+    case WM_MOUSEWHEEL:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; ScreenToClient(hwnd,&pt); int delta=GET_WHEEL_DELTA_WPARAM(wp);   // R8: scroll a tile's window list
+        for(auto& t:g_tiles) if(PtInRect(&t.rc,pt)){ t.scroll += (delta<0?1:-1); if(t.scroll<0)t.scroll=0; InvalidateRect(hwnd,nullptr,FALSE); break; }
+        return 0; }
+    case WM_COMMAND:                                            // R7: live-filter as the search text changes
+        if(g_search && (HWND)lp==g_search && HIWORD(wp)==EN_CHANGE){
+            int n=GetWindowTextLengthW(g_search); std::wstring s(n+1,0); GetWindowTextW(g_search,&s[0],n+1); s.resize(wcslen(s.c_str()));
+            g_searchText=LowerW(s); InvalidateRect(hwnd,nullptr,FALSE);
+        }
+        return 0;
     case WM_TIMER:
         if(wp==TIMER_STARTUP){                                // one-shot: startup settle finished
             KillTimer(hwnd,TIMER_STARTUP);
@@ -1030,7 +1116,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
 // ================================ entry ======================================
 static int RunGui(HINSTANCE hInst){
     g_inst=hInst;
-    INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_HOTKEY_CLASS|ICC_STANDARD_CLASSES|ICC_LINK_CLASS}; InitCommonControlsEx(&icc);
+    INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_HOTKEY_CLASS|ICC_STANDARD_CLASSES|ICC_LINK_CLASS|ICC_BAR_CLASSES|ICC_TAB_CLASSES}; InitCommonControlsEx(&icc);
     InitMetrics();
     g_uiFont=CreateFontW(-S(12),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     LoadSettings();
@@ -1040,7 +1126,7 @@ static int RunGui(HINSTANCE hInst){
     wc.hIcon=LoadAppIcon(GetSystemMetrics(SM_CXICON),GetSystemMetrics(SM_CYICON));
     wc.hIconSm=LoadAppIcon(GetSystemMetrics(SM_CXSMICON),GetSystemMetrics(SM_CYSMICON));
     RegisterClassExW(&wc);
-    g_main=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST,L"VdeWindow",APP_NAME,WS_POPUP,0,0,400,300,nullptr,nullptr,hInst,nullptr);
+    g_main=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST,L"VdeWindow",APP_NAME,WS_POPUP|WS_CLIPCHILDREN,0,0,400,300,nullptr,nullptr,hInst,nullptr);
     if(!g_main)return 3;
     TrayAdd(g_main);
     bool hk=ApplyHotkey();
