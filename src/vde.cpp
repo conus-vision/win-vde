@@ -44,6 +44,7 @@
 
 #include "str_util.hpp"   // W2U8/U82W, GUID helpers, b64, GetWindowsBuild, hostOf, etld1
 #include "layout.hpp"     // DeskRec, CountsToStr, StrToCounts (+ v3 layout logic)
+#include "lifecycle.hpp"  // LcState/LcAction, LcOnStartup/LcOnTick/LcOnExit
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
@@ -60,14 +61,22 @@ static const wchar_t* APP_SHORT = L"Virtual Desktops Extention"; // <=63 chars f
 
 static UINT g_hotMods = MOD_CONTROL | MOD_ALT;  // Ctrl+Alt+D по умолчанию
 static UINT g_hotVk   = 'D';
-static bool g_autoFix = false;                  // авто-фиксация раскладки Firefox
+static bool g_autoFix = true;                   // монитор: авто-сохранение и авто-восстановление раскладки
 static const bool SWITCH_AFTER_MOVE = false;    // переключаться на десктоп после переноса окна
 
 #define IDI_APPICON 101    // должен совпадать с ID в vde.rc
-#define TIMER_AUTOFIX 1
-#define AUTOFIX_INTERVAL_MS 10000
+#define TIMER_MONITOR 1
+#define TIMER_STARTUP 2
+#define MONITOR_INTERVAL_MS 5000
+#define STARTUP_SETTLE_MS 2500
+#define LAUNCH_SETTLE_TICKS 4          // 4 * 5000ms = ~20s launch stabilization
 #define IDC_HOTKEY 1001
 #define IDC_AUTOFIX 1002
+
+// ---- lifecycle monitor state (this run) ----
+static LcState g_lc;
+static std::set<std::string> g_seenKeys;      // window fingerprints seen at least once this run
+static std::set<std::string> g_observedApps;  // apps observed at least once this run
 
 // ============================ PER-BUILD IIDs (24H2/25H2) ======================
 static const GUID kCLSID_ImmersiveShell =
@@ -404,6 +413,7 @@ static std::vector<LayoutWin> CollectPresentWindows(std::set<std::string>* seen,
     }
     return out;
 }
+static bool FirefoxPresent(){ return !EnumFirefoxWindows().empty(); }
 
 // ============================ save / restore cores ============================
 // Возвращают краткую сводку (UTF-8) для трей-балуна; CLI печатает её и детали.
@@ -670,9 +680,9 @@ static bool ApplyHotkey(){
     UnregisterHotKey(g_main,1);
     return RegisterHotKey(g_main,1,g_hotMods|MOD_NOREPEAT,g_hotVk)!=0;
 }
-static void ApplyAutoFix(){
-    if(g_autoFix){ g_lastMtime=0; g_lastLayoutSig=0; SetTimer(g_main,TIMER_AUTOFIX,AUTOFIX_INTERVAL_MS,nullptr); }
-    else KillTimer(g_main,TIMER_AUTOFIX);
+static void ApplyAutoFix(){   // enable/disable the lifecycle monitor timer
+    if(g_autoFix){ g_lastLayoutSig=0; SetTimer(g_main,TIMER_MONITOR,MONITOR_INTERVAL_MS,nullptr); }
+    else KillTimer(g_main,TIMER_MONITOR);
 }
 
 // Переключиться на десктоп. SwitchDesktop = слот 6 vtable (совпадает на 23H2/24H2).
@@ -793,18 +803,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         for(size_t i=0;i<g_tiles.size();++i) if(PtInRect(&g_tiles[i].rc,pt)){ Activate((int)i,ctrl); return 0; } return 0; }
     case WM_MOUSEMOVE:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; for(size_t i=0;i<g_tiles.size();++i) if(PtInRect(&g_tiles[i].rc,pt)){ if(g_sel!=(int)i){g_sel=(int)i; InvalidateRect(hwnd,nullptr,FALSE);} break; } return 0; }
     case WM_TIMER:
-        if(wp==TIMER_AUTOFIX && g_autoFix){
-            std::wstring p=CurrentSessionstorePath();        // профиль кэширован -> дёшево
-            if(!p.empty()){
-                ULONGLONG m=FileMtime(p);
-                if(m && m!=g_lastMtime){                      // 1) файл реально изменился
-                    g_lastMtime=m;
-                    unsigned long long sig=LayoutSignature(); // 2) изменилась ли раскладка окно->десктоп
-                    if(sig!=g_lastLayoutSig){                 //    тяжёлый разбор+запись только тогда
-                        g_lastLayoutSig=sig;
-                        RunSaveAuto(nullptr,nullptr);
-                    }
-                }
+        if(wp==TIMER_STARTUP){                                // one-shot: startup settle finished
+            KillTimer(hwnd,TIMER_STARTUP);
+            if(g_autoFix && FirefoxPresent()){ Balloon(U82W(RunRestore(false))); g_lastLayoutSig=LayoutSignature(); }
+            return 0;
+        }
+        if(wp==TIMER_MONITOR && g_autoFix){
+            bool present = FirefoxPresent();
+            LcAction a = LcOnTick(g_lc, present, LAUNCH_SETTLE_TICKS);
+            if(a==LcAction::DoRestore){                        // app appeared & stabilized ⇒ restore
+                Balloon(U82W(RunRestore(false))); g_lastLayoutSig=LayoutSignature();
+            } else if(a==LcAction::AutoSave){                  // steady state: track + save-on-change
+                g_observedApps.insert("firefox");
+                std::set<std::string> s; CollectPresentWindows(&s,nullptr); for(auto& k:s) g_seenKeys.insert(k);
+                unsigned long long sig=LayoutSignature();
+                if(sig!=g_lastLayoutSig){ g_lastLayoutSig=sig; RunSaveAuto(&g_seenKeys,&g_observedApps); }
             }
         }
         return 0;
@@ -828,7 +841,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             else if(cmd==209)DestroyWindow(hwnd);
         } else if(LOWORD(lp)==WM_LBUTTONDBLCLK) ShowPicker();
         return 0;
-    case WM_DESTROY: TrayRemove(); UnregisterHotKey(hwnd,1); PostQuitMessage(0); return 0;
+    case WM_DESTROY:
+        if(g_autoFix && LcOnExit(g_lc, FirefoxPresent())==LcAction::FinalSave){   // save only if windows are open (R2)
+            RunSaveAuto(&g_seenKeys,&g_observedApps);
+            std::vector<DeskRec> dd; std::vector<LayoutWin> recs; std::string t;   // age grace counters by one run
+            if(ReadFileBytes(LayoutPath(false),t) && ParseLayout(t,dd,recs)){
+                auto kept = ReconcileGrace(recs, g_seenKeys, g_observedApps, MISSING_RUNS_MAX);
+                WriteTextFile(LayoutPath(false), SerializeLayout(CurrentDesktops(), kept));
+            }
+        }
+        TrayRemove(); UnregisterHotKey(hwnd,1); PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd,msg,wp,lp);
 }
@@ -853,8 +875,11 @@ static int RunGui(HINSTANCE hInst){
     if(!hk) MessageBoxW(nullptr,L"Could not register the global hotkey.\n"
                                L"Another app may be using it. Change it in Settings,\n"
                                L"or open the picker via double-click on the tray icon.",APP_NAME,MB_ICONWARNING);
-    ApplyAutoFix();
-    Balloon(L"Running. Press your hotkey to move the active window to a desktop.");
+    ApplyAutoFix();   // start the lifecycle monitor timer if enabled
+    { bool present=FirefoxPresent(); LcAction a=LcOnStartup(g_lc,present);   // R1: restore now if windows already open
+      if(g_autoFix && a==LcAction::StartupRestore) SetTimer(g_main,TIMER_STARTUP,STARTUP_SETTLE_MS,nullptr); }
+    Balloon(g_autoFix ? L"Running. Auto-restore of your window layout is on."
+                      : L"Running. Press your hotkey to move the active window to a desktop.");
     MSG msg;
     while(GetMessageW(&msg,nullptr,0,0)){
         if(g_settings && IsDialogMessageW(g_settings,&msg)) continue;
