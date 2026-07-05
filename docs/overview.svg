@@ -41,7 +41,7 @@
   </g>
 
   <!-- ============ ROW 2 : win-vde restores ============ -->
-  <text class="cap" x="40" y="214">2.  win-vde remembers the layout and puts every window back</text>
+  <text class="cap" x="40" y="214">2.  VDE remembers the layout and puts every window back</text>
 
   <!-- correct -->
   <g transform="translate(60,228)">
@@ -53,15 +53,15 @@
   </g>
   <text class="lbl" x="310" y="266" text-anchor="middle">After reboot</text>
   <line class="arw" x1="282" y1="278" x2="336" y2="278" marker-end="url(#ah)"/>
-  <!-- scrambled -->
+  <!-- scrambled: 3 windows piled on Desktop 1, only 1 on Desktop 2 -->
   <g transform="translate(345,228)">
     <rect class="st" width="210" height="100" rx="12"/>
     <rect class="dbox" x="12" y="12" width="90" height="76" rx="8"/><text class="dt" x="18" y="28">Desktop 1</text>
-    <rect x="18" y="35" width="78" height="13" rx="3" fill="#e6bf4f"/><rect x="18" y="53" width="78" height="13" rx="3" fill="#57b877"/>
+    <rect x="18" y="34" width="78" height="13" rx="3" fill="#e05a54"/><rect x="18" y="50" width="78" height="13" rx="3" fill="#4f8fe6"/><rect x="18" y="66" width="78" height="13" rx="3" fill="#e6bf4f"/>
     <rect class="dbox" x="108" y="12" width="90" height="76" rx="8"/><text class="dt" x="114" y="28">Desktop 2</text>
-    <rect x="114" y="35" width="78" height="13" rx="3" fill="#e05a54"/><rect x="114" y="53" width="78" height="13" rx="3" fill="#4f8fe6"/>
+    <rect x="114" y="50" width="78" height="13" rx="3" fill="#57b877"/>
   </g>
-  <text class="lbl" x="590" y="266" text-anchor="middle">win-vde restores</text>
+  <text class="lbl" x="590" y="266" text-anchor="middle">VDE restores</text>
   <line class="arw" x1="562" y1="278" x2="616" y2="278" marker-end="url(#ah)"/>
   <!-- restored -->
   <g transform="translate(625,228)">
@@ -76,7 +76,7 @@
     <rect class="brand" width="26" height="26" rx="6"/>
     <rect x="6" y="6" width="6" height="6" rx="1" fill="#141418"/><rect x="14" y="6" width="6" height="6" rx="1" fill="#141418"/>
     <rect x="6" y="14" width="6" height="6" rx="1" fill="#141418"/><rect x="14" y="14" width="6" height="6" rx="1" fill="#141418"/>
-    <text x="34" y="18" font-size="12" font-weight="600" fill="#f29605">win-vde</text>
+    <text x="34" y="18" font-size="13" font-weight="700" fill="#f29605">VDE</text>
   </g>
 
   <!-- ============ ROW 3 : the picker + features ============ -->
