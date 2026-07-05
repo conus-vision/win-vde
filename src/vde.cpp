@@ -564,9 +564,16 @@ static int g_dpi=96;
 static int S(int v){ return MulDiv(v,g_dpi,96); }   // px@96dpi -> px@текущий DPI
 static int TILE_W=240,TILE_H=150,PAD=16,HEADER=44,SEARCH_H=40;  // базовые (96 dpi); пересчёт в InitMetrics
 static int g_cols=1,g_rows=1;
+static HFONT g_fPT=nullptr,g_fPN=nullptr,g_fPI=nullptr,g_fPX=nullptr;   // cached picker fonts (avoid re-create per repaint)
+static int g_lastHoverRow=-1;                                          // last tooltip row (avoid redundant TTM churn)
 static void InitMetrics(){
     HDC dc=GetDC(nullptr); g_dpi=GetDeviceCaps(dc,LOGPIXELSX); ReleaseDC(nullptr,dc);
     TILE_W=S(240); TILE_H=S(150); PAD=S(16); HEADER=S(38); SEARCH_H=S(58);
+    if(g_fPT)DeleteObject(g_fPT); if(g_fPN)DeleteObject(g_fPN); if(g_fPI)DeleteObject(g_fPI); if(g_fPX)DeleteObject(g_fPX);
+    g_fPT=CreateFontW(S(20),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+    g_fPN=CreateFontW(S(17),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+    g_fPI=CreateFontW(S(15),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+    g_fPX=CreateFontW(S(30),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
 }
 // ---- picker search / scroll / tooltip state ----
 static HWND g_search=nullptr; static WNDPROC g_searchOrigProc=nullptr; static std::wstring g_searchText;
@@ -621,10 +628,7 @@ static void Paint(HDC hdcReal, RECT client){
     g_hoverRows.clear();
     HDC hdc=CreateCompatibleDC(hdcReal); HBITMAP bmp=CreateCompatibleBitmap(hdcReal,client.right,client.bottom); HBITMAP old=(HBITMAP)SelectObject(hdc,bmp);
     HBRUSH bg=CreateSolidBrush(CLR_BG); FillRect(hdc,&client,bg); DeleteObject(bg); SetBkMode(hdc,TRANSPARENT);
-    HFONT fT=CreateFontW(S(20),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
-    HFONT fN=CreateFontW(S(17),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
-    HFONT fI=CreateFontW(S(15),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
-    HFONT fX=CreateFontW(S(19),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+    HFONT fT=g_fPT, fN=g_fPN, fI=g_fPI, fX=g_fPX;   // cached (created in InitMetrics)
     bool ctrlHeld=(GetKeyState(VK_CONTROL)&0x8000)!=0;
 
     // subtle rounded outer border
@@ -632,15 +636,14 @@ static void Paint(HDC hdcReal, RECT client){
       RoundRect(hdc,0,0,client.right-1,client.bottom-1,S(18),S(18)); SelectObject(hdc,op); SelectObject(hdc,ob); DeleteObject(p); }
 
     // ---- search box (rounded) + clear (x) button ----
+    bool searchFocused=(GetFocus()==g_search);
     RECT sb=SearchBoxRect(client.right);
-    FillRoundRect(hdc, sb, S(12), CLR_SEARCH, CLR_PASSIVE, S(1));
+    FillRoundRect(hdc, sb, S(12), CLR_SEARCH, searchFocused?CLR_ACTIVE:CLR_PASSIVE, searchFocused?S(2):S(1));   // active border while typing
     g_clearBtn.left=g_clearBtn.right=0;
-    if(!g_searchText.empty()){
-        int cs=S(26), cx=sb.right-S(10)-cs, cy=sb.top+((sb.bottom-sb.top)-cs)/2;
+    if(!g_searchText.empty()){                                   // big × (no circle)
+        int cs=S(30), cx=sb.right-S(10)-cs, cy=sb.top+((sb.bottom-sb.top)-cs)/2;
         g_clearBtn={cx,cy,cx+cs,cy+cs};
-        HPEN p=CreatePen(PS_SOLID,1,CLR_HINT); HPEN op=(HPEN)SelectObject(hdc,p); HBRUSH ob=(HBRUSH)SelectObject(hdc,(HBRUSH)GetStockObject(NULL_BRUSH));
-        Ellipse(hdc,cx,cy,cx+cs,cy+cs); SelectObject(hdc,op); SelectObject(hdc,ob); DeleteObject(p);
-        SelectObject(hdc,fX); SetTextColor(hdc,CLR_HINT); RECT xr=g_clearBtn; xr.top-=S(1); DrawTextW(hdc,L"\x00D7",-1,&xr,DT_CENTER|DT_SINGLELINE|DT_VCENTER);
+        SelectObject(hdc,fX); SetTextColor(hdc,CLR_HINT); RECT xr=g_clearBtn; DrawTextW(hdc,L"\x2715",-1,&xr,DT_CENTER|DT_SINGLELINE|DT_VCENTER);
     }
 
     // ---- header: left title + right Ctrl+Click hint ----
@@ -686,7 +689,7 @@ static void Paint(HDC hdcReal, RECT client){
         }
     }
     BitBlt(hdcReal,0,0,client.right,client.bottom,hdc,0,0,SRCCOPY);
-    DeleteObject(fT); DeleteObject(fN); DeleteObject(fI); DeleteObject(fX); SelectObject(hdc,old); DeleteObject(bmp); DeleteDC(hdc);
+    SelectObject(hdc,old); DeleteObject(bmp); DeleteDC(hdc);
 }
 static void TipDeactivate(){ if(g_tip){ TOOLINFOW ti={0}; ti.cbSize=sizeof(ti); ti.hwnd=g_main; ti.uId=1; SendMessageW(g_tip,TTM_TRACKACTIVATE,FALSE,(LPARAM)&ti); } }
 static void HidePicker(){ TipDeactivate(); ShowWindow(g_main,SW_HIDE); }
@@ -1122,16 +1125,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     case WM_MOUSEMOVE:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
         int hovRow=-1; for(size_t i=0;i<g_hoverRows.size();++i) if(PtInRect(&g_hoverRows[i].rc,pt)){ hovRow=(int)i; break; }
         if(hovRow>=0 && g_hoverRows[hovRow].trunc && g_tip){    // R9: full name on hover when truncated
-            TOOLINFOW ti={0}; ti.cbSize=sizeof(ti); ti.hwnd=hwnd; ti.uId=1; ti.lpszText=(LPWSTR)g_hoverRows[hovRow].full.c_str();
-            SendMessageW(g_tip,TTM_UPDATETIPTEXTW,0,(LPARAM)&ti);
-            POINT sp=pt; ClientToScreen(hwnd,&sp);
-            SendMessageW(g_tip,TTM_TRACKPOSITION,0,(LPARAM)MAKELONG(sp.x+S(16),sp.y+S(20)));
-            SendMessageW(g_tip,TTM_TRACKACTIVATE,TRUE,(LPARAM)&ti);
-        } else TipDeactivate();
+            if(hovRow!=g_lastHoverRow){                        // update text/activate only on row change (avoid churn/lag)
+                TOOLINFOW ti={0}; ti.cbSize=sizeof(ti); ti.hwnd=hwnd; ti.uId=1; ti.lpszText=(LPWSTR)g_hoverRows[hovRow].full.c_str();
+                SendMessageW(g_tip,TTM_UPDATETIPTEXTW,0,(LPARAM)&ti);
+                SendMessageW(g_tip,TTM_TRACKACTIVATE,TRUE,(LPARAM)&ti);
+                g_lastHoverRow=hovRow;
+            }
+            POINT sp=pt; ClientToScreen(hwnd,&sp); SendMessageW(g_tip,TTM_TRACKPOSITION,0,(LPARAM)MAKELONG(sp.x+S(16),sp.y+S(20)));
+        } else if(g_lastHoverRow!=-1){ TipDeactivate(); g_lastHoverRow=-1; }
         for(size_t i=0;i<g_tiles.size();++i) if(PtInRect(&g_tiles[i].rc,pt)){ if(g_sel!=(int)i){g_sel=(int)i; InvalidateRect(hwnd,nullptr,FALSE);} break; }
         TRACKMOUSEEVENT tme={sizeof(tme)}; tme.dwFlags=TME_LEAVE; tme.hwndTrack=hwnd; TrackMouseEvent(&tme);
         return 0; }
-    case WM_MOUSELEAVE: TipDeactivate(); return 0;
+    case WM_MOUSELEAVE: TipDeactivate(); g_lastHoverRow=-1; return 0;
     case WM_MOUSEWHEEL:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; ScreenToClient(hwnd,&pt); int delta=GET_WHEEL_DELTA_WPARAM(wp);   // R8: scroll a tile's window list
         for(auto& t:g_tiles) if(PtInRect(&t.rc,pt)){ t.scroll += (delta<0?1:-1); if(t.scroll<0)t.scroll=0; InvalidateRect(hwnd,nullptr,FALSE); break; }
         return 0; }
