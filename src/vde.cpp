@@ -83,6 +83,7 @@ static const bool SWITCH_AFTER_MOVE = false;    // переключаться н
 #define IDC_LINK_MAIL 1101
 #define IDC_LINK_REPO 1102
 #define IDC_ABOUT_COPY 1103
+#define IDC_HELP_TEXT 1104
 static const wchar_t* APP_VERSION = L"1.0.0";
 
 // ---- lifecycle monitor state (this run) ----
@@ -480,7 +481,7 @@ static std::string RunSaveAuto(std::set<std::string>* seen, std::set<std::string
     WriteTextFile(LayoutPath(false), SerializeLayout(CurrentDesktops(), merged));
     return "auto-saved";
 }
-static std::string RunRestore(bool manual, std::vector<std::string>* linesOut=nullptr){
+static std::string RunRestore(bool manual, std::vector<std::string>* linesOut=nullptr, int* movedOut=nullptr){
     if(g_degraded) return "Virtual-desktop features are unavailable on this Windows build.";
     std::vector<DeskRec> savedDesks; std::vector<LayoutWin> saved;
     { std::string t; if(!ReadFileBytes(LayoutPath(manual),t) || !ParseLayout(t,savedDesks,saved) || saved.empty())
@@ -495,7 +496,7 @@ static std::string RunRestore(bool manual, std::vector<std::string>* linesOut=nu
     std::sort(pairs.begin(),pairs.end(),[](const Pair&a,const Pair&b){return a.sc>b.sc;});
     std::vector<int> usedS(saved.size(),0),usedL(live.size(),0),assignL2S(live.size(),-1); int matched=0;
     for(auto& p:pairs) if(!usedS[p.si]&&!usedL[p.li]&&p.sc>=T_ACCEPT){ usedS[p.si]=usedL[p.li]=1; assignL2S[p.li]=p.si; matched++; }
-    int moved=0,failed=0;
+    int moved=0,failed=0,realMoved=0;
     for(int li=0;li<(int)live.size();++li){ Fp& L=live[li];
         if(assignL2S[li]<0){ if(linesOut)linesOut->push_back("[no match] "+L.activeTitle); continue; }
         const LayoutWin& S=saved[assignL2S[li]];
@@ -505,9 +506,10 @@ static std::string RunRestore(bool manual, std::vector<std::string>* linesOut=nu
         if(!dest){ if(linesOut)linesOut->push_back("[no target] "+L.activeTitle); failed++; continue; }
         if(!GuidIsZero(L.desktop)&&GuidEq(L.desktop,destGuid)){ if(linesOut)linesOut->push_back("[already there] "+L.activeTitle); dest->Release(); moved++; continue; }
         bool ok=MoveWindowToDesktop(L.hwnd,dest,destGuid); dest->Release();
-        if(ok){ moved++; if(linesOut)linesOut->push_back("[moved] "+L.activeTitle); }
+        if(ok){ moved++; realMoved++; if(linesOut)linesOut->push_back("[moved] "+L.activeTitle); }
         else  { failed++; if(linesOut)linesOut->push_back("[FAILED] "+L.activeTitle); }
     }
+    if(movedOut)*movedOut=realMoved;
     char b[160]; sprintf_s(b,"Restore: matched %d/%d, moved %d, failed %d.",matched,(int)live.size(),moved,failed);
     return b;
 }
@@ -1014,6 +1016,61 @@ static void ShowCompatIssue(bool buildChanged){
     if(g_compat){ ShowWindow(g_compat,SW_SHOW); SetForegroundWindow(g_compat); }
 }
 
+// --------------------------- Help window -------------------------------------
+static const wchar_t* HELP_TEXT =
+L"What this solves\r\n"
+L"Windows 11 does not remember which virtual desktop your app windows were on after a reboot, and browsers change their window handles when they restore a session - so nothing external can recognize the windows. win-vde fingerprints each browser window by the domains of its tabs, matches old windows to new ones after a restart, and moves each one back to the desktop it was saved on.\r\n\r\n"
+L"Picker  (hotkey Ctrl+Alt+D)\r\n"
+L"A grid of your virtual desktops. Click a desktop to switch to it; Ctrl+click to move the active window there. Type in the box to filter windows by name, scroll a tile with the mouse wheel, and hover a clipped name to see it in full.\r\n\r\n"
+L"Menu\r\n"
+L"- Save windows layout: save the current windows to a manual checkpoint file.\r\n"
+L"- Restore saved windows layout: put windows back from that manual checkpoint.\r\n"
+L"- Restore last auto saved layout: put windows back from the rolling automatic layout.\r\n\r\n"
+L"Settings\r\n"
+L"- Auto-save & auto-restore layout: the utility watches your browsers and restores the layout automatically at startup and about 20 seconds after a browser launches. Just closing windows never erases the layout - a window is only forgotten after it has been gone for a few runs, so reopening it restores it.\r\n"
+L"- Track these apps: choose which of Firefox, Chrome and Edge to manage.\r\n"
+L"- Start with Windows: launch the utility at sign-in.\r\n\r\n"
+L"Notes\r\n"
+L"Only the virtual desktop of each window is restored; on-screen size and position are left to the browser. Moving other apps' windows between desktops relies on undocumented Windows interfaces, so a Windows update can temporarily break it - the app will tell you if that happens.";
+static HWND g_help=nullptr;
+static LRESULT CALLBACK HelpProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
+    switch(msg){
+    case WM_CREATE:{
+        CreateWindowExW(0,L"EDIT",HELP_TEXT,WS_CHILD|WS_VISIBLE|WS_VSCROLL|WS_BORDER|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL,S(14),S(12),S(500),S(320),hwnd,(HMENU)IDC_HELP_TEXT,g_inst,nullptr);
+        CreateWindowW(L"SysLink",L"Email:  <a href=\"mailto:info@conus.vision\">info@conus.vision</a>",WS_CHILD|WS_VISIBLE|WS_TABSTOP,S(14),S(342),S(250),S(20),hwnd,(HMENU)IDC_LINK_MAIL,g_inst,nullptr);
+        CreateWindowW(L"SysLink",L"GitHub:  <a href=\"https://github.com/conus-vision/win-vde\">github.com/conus-vision/win-vde</a>",WS_CHILD|WS_VISIBLE|WS_TABSTOP,S(14),S(366),S(320),S(20),hwnd,(HMENU)IDC_LINK_REPO,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Close",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON|WS_TABSTOP,S(434),S(360),S(80),S(28),hwnd,(HMENU)IDOK,g_inst,nullptr);
+        SetChildFont(hwnd);
+        return 0;
+    }
+    case WM_NOTIFY:{ NMHDR* n=(NMHDR*)lp; if(n->code==NM_CLICK||n->code==NM_RETURN){
+        if(n->idFrom==IDC_LINK_MAIL) ShellExecuteW(hwnd,L"open",L"mailto:info@conus.vision",nullptr,nullptr,SW_SHOW);
+        else if(n->idFrom==IDC_LINK_REPO) ShellExecuteW(hwnd,L"open",L"https://github.com/conus-vision/win-vde",nullptr,nullptr,SW_SHOW);
+    } return 0; }
+    case WM_COMMAND: if(LOWORD(wp)==IDOK){ DestroyWindow(hwnd); return 0; } return 0;
+    case WM_CTLCOLORSTATIC:{ HDC dc=(HDC)wp; HWND ctl=(HWND)lp;
+        if(GetDlgCtrlID(ctl)==IDC_HELP_TEXT){ SetTextColor(dc,RGB(0,0,0)); SetBkColor(dc,RGB(255,255,255)); return (LRESULT)GetStockObject(WHITE_BRUSH); }
+        SetBkMode(dc,TRANSPARENT); return (LRESULT)GetSysColorBrush(COLOR_BTNFACE); }
+    case WM_CLOSE: DestroyWindow(hwnd); return 0;
+    case WM_DESTROY: g_help=nullptr; return 0;
+    }
+    return DefWindowProcW(hwnd,msg,wp,lp);
+}
+static void OpenHelp(){
+    if(g_help){ SetForegroundWindow(g_help); return; }
+    static bool reg=false;
+    if(!reg){ WNDCLASSW wc={0}; wc.lpfnWndProc=HelpProc; wc.hInstance=g_inst; wc.lpszClassName=L"VdeHelp";
+        wc.hCursor=LoadCursorW(nullptr,IDC_ARROW); wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
+        wc.hIcon=LoadAppIcon(GetSystemMetrics(SM_CXICON),GetSystemMetrics(SM_CYICON));
+        RegisterClassW(&wc); reg=true; }
+    int W=S(532),H=S(410);
+    RECT wr={0,0,W,H}; AdjustWindowRect(&wr,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,FALSE);
+    int ww=wr.right-wr.left, wh=wr.bottom-wr.top;
+    int sx=(GetSystemMetrics(SM_CXSCREEN)-ww)/2, sy=(GetSystemMetrics(SM_CYSCREEN)-wh)/2;
+    g_help=CreateWindowExW(0,L"VdeHelp",L"Help - Virtual Desktops Extension",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,sx,sy,ww,wh,nullptr,nullptr,g_inst,nullptr);
+    if(g_help){ ShowWindow(g_help,SW_SHOW); SetForegroundWindow(g_help); }
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     switch(msg){
     case WM_HOTKEY: ShowPicker(); return 0;
@@ -1059,14 +1116,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     case WM_TIMER:
         if(wp==TIMER_STARTUP){                                // one-shot: startup settle finished
             KillTimer(hwnd,TIMER_STARTUP);
-            if(g_autoFix && AnyAppPresent()){ Balloon(U82W(RunRestore(false))); g_lastLayoutSig=LayoutSignature(); }
+            if(g_autoFix && AnyAppPresent()){ int mv=0; std::string s=RunRestore(false,nullptr,&mv); if(mv>0)Balloon(U82W(s)); g_lastLayoutSig=LayoutSignature(); }   // no balloon if nothing moved
             return 0;
         }
         if(wp==TIMER_MONITOR && g_autoFix && !g_degraded){
             bool present = AnyAppPresent();
             LcAction a = LcOnTick(g_lc, present, LAUNCH_SETTLE_TICKS);
             if(a==LcAction::DoRestore){                        // app appeared & stabilized ⇒ restore
-                Balloon(U82W(RunRestore(false))); g_lastLayoutSig=LayoutSignature();
+                int mv=0; std::string s=RunRestore(false,nullptr,&mv); if(mv>0)Balloon(U82W(s)); g_lastLayoutSig=LayoutSignature();   // no balloon if nothing moved
             } else if(a==LcAction::AutoSave){                  // steady state: track + save-on-change
                 g_observedApps.insert("firefox");
                 std::set<std::string> s; CollectPresentWindows(&s,nullptr); for(auto& k:s) g_seenKeys.insert(k);
@@ -1086,6 +1143,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             AppendMenuW(m,MF_STRING,204,L"Restore last auto saved layout");
             AppendMenuW(m,MF_SEPARATOR,0,nullptr);
             AppendMenuW(m,MF_STRING,203,L"Settings...");
+            AppendMenuW(m,MF_STRING,206,L"Help...");
             AppendMenuW(m,MF_STRING,205,L"About...");
             AppendMenuW(m,MF_STRING,209,L"Exit");
             SetForegroundWindow(hwnd);
@@ -1095,6 +1153,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             else if(cmd==202)Balloon(U82W(RunRestore(true)));
             else if(cmd==204)Balloon(U82W(RunRestore(false)));
             else if(cmd==203)OpenSettings();
+            else if(cmd==206)OpenHelp();
             else if(cmd==205)OpenAbout();
             else if(cmd==209)DestroyWindow(hwnd);
         } else if(LOWORD(lp)==WM_LBUTTONDBLCLK) ShowPicker();
@@ -1144,6 +1203,7 @@ static int RunGui(HINSTANCE hInst){
         if(g_settings && IsDialogMessageW(g_settings,&msg)) continue;
         if(g_about && IsDialogMessageW(g_about,&msg)) continue;
         if(g_compat && IsDialogMessageW(g_compat,&msg)) continue;
+        if(g_help && IsDialogMessageW(g_help,&msg)) continue;
         TranslateMessage(&msg); DispatchMessageW(&msg);
     }
     if(g_uiFont)DeleteObject(g_uiFont);
