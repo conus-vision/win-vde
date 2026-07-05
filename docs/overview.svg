@@ -31,13 +31,13 @@
   <!-- arrow -->
   <text class="lbl" x="310" y="94" text-anchor="middle">After reboot</text>
   <line class="arw" x1="282" y1="106" x2="336" y2="106" marker-end="url(#ah)"/>
-  <!-- state B: scrambled (desktops swapped) -->
+  <!-- state B: scrambled — 3 windows piled on Desktop 1, only 1 on Desktop 2 -->
   <g transform="translate(345,56)">
     <rect class="st" width="210" height="100" rx="12"/>
     <rect class="dbox" x="12" y="12" width="90" height="76" rx="8"/><text class="dt" x="18" y="28">Desktop 1</text>
-    <rect x="18" y="35" width="78" height="13" rx="3" fill="#e6bf4f"/><rect x="18" y="53" width="78" height="13" rx="3" fill="#57b877"/>
+    <rect x="18" y="34" width="78" height="13" rx="3" fill="#e05a54"/><rect x="18" y="50" width="78" height="13" rx="3" fill="#4f8fe6"/><rect x="18" y="66" width="78" height="13" rx="3" fill="#e6bf4f"/>
     <rect class="dbox" x="108" y="12" width="90" height="76" rx="8"/><text class="dt" x="114" y="28">Desktop 2</text>
-    <rect x="114" y="35" width="78" height="13" rx="3" fill="#e05a54"/><rect x="114" y="53" width="78" height="13" rx="3" fill="#4f8fe6"/>
+    <rect x="114" y="50" width="78" height="13" rx="3" fill="#57b877"/>
   </g>
 
   <!-- ============ ROW 2 : win-vde restores ============ -->
@@ -71,8 +71,8 @@
     <rect class="dbox" x="108" y="12" width="90" height="76" rx="8"/><text class="dt" x="114" y="28">Desktop 2</text>
     <rect x="114" y="35" width="78" height="13" rx="3" fill="#e6bf4f"/><rect x="114" y="53" width="78" height="13" rx="3" fill="#57b877"/>
   </g>
-  <!-- VDE icon, bottom-right corner -->
-  <g transform="translate(786,336)">
+  <!-- VDE icon, centered between rows 2 and 3 -->
+  <g transform="translate(418,338)">
     <rect class="brand" width="26" height="26" rx="6"/>
     <rect x="6" y="6" width="6" height="6" rx="1" fill="#141418"/><rect x="14" y="6" width="6" height="6" rx="1" fill="#141418"/>
     <rect x="6" y="14" width="6" height="6" rx="1" fill="#141418"/><rect x="14" y="14" width="6" height="6" rx="1" fill="#141418"/>
