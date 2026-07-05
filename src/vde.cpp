@@ -47,6 +47,8 @@
 #include "lifecycle.hpp"  // LcState/LcAction, LcOnStartup/LcOnTick/LcOnExit
 #include "session.hpp"    // WinFp, Chromium SNSS reader (ReadChromiumWindows)
 #include "appprofile.hpp" // AppProfile, BuiltinProfiles
+#include <dwmapi.h>
+#pragma comment(lib, "dwmapi.lib")
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
@@ -564,7 +566,7 @@ static int TILE_W=240,TILE_H=150,PAD=16,HEADER=44,SEARCH_H=40;  // базовы�
 static int g_cols=1,g_rows=1;
 static void InitMetrics(){
     HDC dc=GetDC(nullptr); g_dpi=GetDeviceCaps(dc,LOGPIXELSX); ReleaseDC(nullptr,dc);
-    TILE_W=S(240); TILE_H=S(150); PAD=S(16); HEADER=S(44); SEARCH_H=S(40);
+    TILE_W=S(240); TILE_H=S(150); PAD=S(16); HEADER=S(38); SEARCH_H=S(58);
 }
 // ---- picker search / scroll / tooltip state ----
 static HWND g_search=nullptr; static WNDPROC g_searchOrigProc=nullptr; static std::wstring g_searchText;
@@ -573,6 +575,20 @@ struct RowRec { RECT rc; std::wstring full; bool trunc; };
 static std::vector<RowRec> g_hoverRows;                  // window rows drawn this Paint (for hover tooltip)
 static std::wstring LowerW(std::wstring s){ if(!s.empty()) CharLowerW(&s[0]); return s; }
 static bool MatchesSearch(const std::wstring& title){ return g_searchText.empty() || LowerW(title).find(g_searchText)!=std::wstring::npos; }
+// ---- picker palette (per mockup) ----
+static const COLORREF CLR_BG=RGB(20,20,24), CLR_TILE=RGB(28,28,33), CLR_TILE_DIM=RGB(22,22,26), CLR_SEARCH=RGB(34,33,38),
+    CLR_ACTIVE=RGB(0xF2,0x96,0x05) /*#f29605*/, CLR_PASSIVE=RGB(0x6B,0x60,0x4F) /*#6b604f*/, CLR_BORDER=RGB(58,55,52),
+    CLR_TEXT=RGB(208,206,210), CLR_HEAD=RGB(238,238,242), CLR_HINT=RGB(150,145,135), CLR_DIM=RGB(110,108,112),
+    CLR_SCROLL_TRK=RGB(40,40,46), CLR_SCROLL_THB=RGB(96,92,86);
+static RECT g_clearBtn={0,0,0,0};       // × clear-search hit rect (empty when hidden)
+static HFONT g_searchFont=nullptr;
+static RECT SearchBoxRect(int clientW){ RECT r; r.left=PAD; r.top=S(12); r.right=clientW-PAD; r.bottom=S(12)+S(40); return r; }
+static void FillRoundRect(HDC hdc, RECT r, int rad, COLORREF fill, COLORREF border, int bw){
+    HBRUSH b=CreateSolidBrush(fill); HPEN p=CreatePen(PS_SOLID,bw,border);
+    HBRUSH ob=(HBRUSH)SelectObject(hdc,b); HPEN op=(HPEN)SelectObject(hdc,p);
+    RoundRect(hdc,r.left,r.top,r.right,r.bottom,rad,rad);
+    SelectObject(hdc,ob); SelectObject(hdc,op); DeleteObject(b); DeleteObject(p);
+}
 
 static bool IsAltTabWindow(HWND h){ if(!IsWindowVisible(h))return false; if(GetWindowTextLengthW(h)<=0)return false; LONG_PTR ex=GetWindowLongPtrW(h,GWL_EXSTYLE); if(ex&WS_EX_TOOLWINDOW)return false; if(GetAncestor(h,GA_ROOTOWNER)!=h)return false; return true; }
 static HICON WindowIcon(HWND h){ DWORD_PTR r=0; SendMessageTimeoutW(h,WM_GETICON,ICON_SMALL2,0,SMTO_ABORTIFHUNG,200,&r); HICON i=(HICON)r;
@@ -604,68 +620,73 @@ static SIZE DesiredClientSize(){ int n=(int)g_tiles.size(); int cols=std::min(st
 static void Paint(HDC hdcReal, RECT client){
     g_hoverRows.clear();
     HDC hdc=CreateCompatibleDC(hdcReal); HBITMAP bmp=CreateCompatibleBitmap(hdcReal,client.right,client.bottom); HBITMAP old=(HBITMAP)SelectObject(hdc,bmp);
-    HBRUSH bg=CreateSolidBrush(RGB(28,28,32)); FillRect(hdc,&client,bg); DeleteObject(bg); SetBkMode(hdc,TRANSPARENT);
-    HFONT fT=CreateFontW(S(22),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
-    HFONT fN=CreateFontW(S(18),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+    HBRUSH bg=CreateSolidBrush(CLR_BG); FillRect(hdc,&client,bg); DeleteObject(bg); SetBkMode(hdc,TRANSPARENT);
+    HFONT fT=CreateFontW(S(20),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+    HFONT fN=CreateFontW(S(17),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     HFONT fI=CreateFontW(S(15),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+    HFONT fX=CreateFontW(S(19),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     bool ctrlHeld=(GetKeyState(VK_CONTROL)&0x8000)!=0;
 
-    // ---- header row (below the search box) + Ctrl+Click badge ----
-    SelectObject(hdc,fI);
-    const wchar_t* bMove=L"Ctrl+Click = move window"; const wchar_t* bClick=L"Click = switch";
-    SIZE szMove; GetTextExtentPoint32W(hdc,bMove,(int)wcslen(bMove),&szMove);
-    SIZE szClick; GetTextExtentPoint32W(hdc,bClick,(int)wcslen(bClick),&szClick);
-    int badgeW=szMove.cx+S(20), badgeH=S(22);
-    int badgeX=client.right-PAD-badgeW, badgeY=SEARCH_H+(HEADER-badgeH)/2;
-    RECT cr2; cr2.left=badgeX-S(14)-szClick.cx; cr2.top=SEARCH_H; cr2.right=badgeX-S(14); cr2.bottom=SEARCH_H+HEADER;
-    SetTextColor(hdc,RGB(150,150,160)); DrawTextW(hdc,bClick,-1,&cr2,DT_RIGHT|DT_SINGLELINE|DT_VCENTER);
-    // header title (clipped so it can't overlap the hint)
-    SelectObject(hdc,fT); SetTextColor(hdc,RGB(235,235,235));
+    // subtle rounded outer border
+    { HPEN p=CreatePen(PS_SOLID,1,CLR_BORDER); HPEN op=(HPEN)SelectObject(hdc,p); HBRUSH ob=(HBRUSH)SelectObject(hdc,(HBRUSH)GetStockObject(NULL_BRUSH));
+      RoundRect(hdc,0,0,client.right-1,client.bottom-1,S(18),S(18)); SelectObject(hdc,op); SelectObject(hdc,ob); DeleteObject(p); }
+
+    // ---- search box (rounded) + clear (x) button ----
+    RECT sb=SearchBoxRect(client.right);
+    FillRoundRect(hdc, sb, S(12), CLR_SEARCH, CLR_PASSIVE, S(1));
+    g_clearBtn.left=g_clearBtn.right=0;
+    if(!g_searchText.empty()){
+        int cs=S(26), cx=sb.right-S(10)-cs, cy=sb.top+((sb.bottom-sb.top)-cs)/2;
+        g_clearBtn={cx,cy,cx+cs,cy+cs};
+        HPEN p=CreatePen(PS_SOLID,1,CLR_HINT); HPEN op=(HPEN)SelectObject(hdc,p); HBRUSH ob=(HBRUSH)SelectObject(hdc,(HBRUSH)GetStockObject(NULL_BRUSH));
+        Ellipse(hdc,cx,cy,cx+cs,cy+cs); SelectObject(hdc,op); SelectObject(hdc,ob); DeleteObject(p);
+        SelectObject(hdc,fX); SetTextColor(hdc,CLR_HINT); RECT xr=g_clearBtn; xr.top-=S(1); DrawTextW(hdc,L"\x00D7",-1,&xr,DT_CENTER|DT_SINGLELINE|DT_VCENTER);
+    }
+
+    // ---- header: left title + right Ctrl+Click hint ----
+    int headTop=SEARCH_H, headBot=SEARCH_H+HEADER;
+    SelectObject(hdc,fI); SetTextColor(hdc,CLR_HINT);
+    const wchar_t* hint=L"Ctrl+Click - Move current window to selected desktop";
+    SIZE hs; GetTextExtentPoint32W(hdc,hint,(int)wcslen(hint),&hs);
+    RECT hr={PAD,headTop,client.right-PAD,headBot}; DrawTextW(hdc,hint,-1,&hr,DT_RIGHT|DT_SINGLELINE|DT_VCENTER);
+    SelectObject(hdc,fT); SetTextColor(hdc,CLR_HEAD);
     std::wstring head;
     if(ctrlHeld) head=L"Move window:  "+(g_targetTitle.empty()?L"(no window)":g_targetTitle);
-    else { std::wstring nm=(g_sel>=0&&g_sel<(int)g_tiles.size())?g_tiles[g_sel].name:L""; head=L"Switch to:  "+nm; }
-    RECT h; h.left=PAD; h.top=SEARCH_H; h.right=cr2.left-S(10); h.bottom=SEARCH_H+HEADER;
-    DrawTextW(hdc,head.c_str(),-1,&h,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS|DT_VCENTER);
-    // badge
-    COLORREF acc = ctrlHeld?RGB(0,120,215):RGB(0,90,158);
-    HBRUSH ab=CreateSolidBrush(acc); HPEN apn=CreatePen(PS_SOLID,1,acc);
-    HBRUSH aob=(HBRUSH)SelectObject(hdc,ab); HPEN aop=(HPEN)SelectObject(hdc,apn);
-    RoundRect(hdc,badgeX,badgeY,badgeX+badgeW,badgeY+badgeH,S(8),S(8));
-    SelectObject(hdc,aob); SelectObject(hdc,aop); DeleteObject(ab); DeleteObject(apn);
-    SelectObject(hdc,fI); SetTextColor(hdc,RGB(255,255,255));
-    RECT br={badgeX,badgeY,badgeX+badgeW,badgeY+badgeH}; DrawTextW(hdc,bMove,-1,&br,DT_CENTER|DT_SINGLELINE|DT_VCENTER);
+    else { std::wstring nm=(g_sel>=0&&g_sel<(int)g_tiles.size())?g_tiles[g_sel].name:L""; head=L"Switch to: "+nm; }
+    RECT h2={PAD,headTop,client.right-PAD-hs.cx-S(24),headBot}; DrawTextW(hdc,head.c_str(),-1,&h2,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS|DT_VCENTER);
 
     // ---- tiles ----
-    GUID cur={0}; bool haveCur=g_vdmDoc&&g_target&&SUCCEEDED(g_vdmDoc->GetWindowDesktopId(g_target,&cur));
     bool searching=!g_searchText.empty();
-    for(size_t i=0;i<g_tiles.size();++i){ Tile& t=g_tiles[i]; bool isSel=((int)i==g_sel); bool isCur=haveCur&&GuidEq(t.guid,cur);
+    for(size_t i=0;i<g_tiles.size();++i){ Tile& t=g_tiles[i]; bool isSel=((int)i==g_sel);
         std::vector<const WinItem*> fw; for(auto& w:t.windows) if(MatchesSearch(w.title)) fw.push_back(&w);
         bool dim = searching && fw.empty();
-        HBRUSH tb=CreateSolidBrush(dim?RGB(32,32,36):(isCur?RGB(45,48,58):RGB(38,38,44))); FillRect(hdc,&t.rc,tb); DeleteObject(tb);
-        HPEN pen=CreatePen(PS_SOLID,isSel?S(3):1,isSel?RGB(0,160,255):RGB(70,70,80)); HPEN op=(HPEN)SelectObject(hdc,pen); HBRUSH ob=(HBRUSH)SelectObject(hdc,(HBRUSH)GetStockObject(NULL_BRUSH));
-        Rectangle(hdc,t.rc.left,t.rc.top,t.rc.right,t.rc.bottom); SelectObject(hdc,op); SelectObject(hdc,ob); DeleteObject(pen);
-        SelectObject(hdc,fN); SetTextColor(hdc,dim?RGB(120,120,128):RGB(245,245,245));
-        RECT nr=t.rc; nr.left+=S(12); nr.top+=S(8); nr.right-=S(10); nr.bottom=nr.top+S(24);
+        FillRoundRect(hdc, t.rc, S(10), dim?CLR_TILE_DIM:CLR_TILE, isSel?CLR_ACTIVE:CLR_PASSIVE, isSel?S(2):S(1));
+        SelectObject(hdc,fN); SetTextColor(hdc,dim?CLR_DIM:CLR_HEAD);
+        RECT nr=t.rc; nr.left+=S(14); nr.top+=S(10); nr.right-=S(12); nr.bottom=nr.top+S(22);
         std::wstring title=std::to_wstring(t.index+1)+L". "+t.name; DrawTextW(hdc,title.c_str(),-1,&nr,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
-        SelectObject(hdc,fI); SetTextColor(hdc,RGB(200,200,205));
-        int rowH=S(20), listTop=nr.bottom+S(6), listBot=t.rc.bottom-S(8);
+        SelectObject(hdc,fI); SetTextColor(hdc,CLR_TEXT);
+        int rowH=S(22), listTop=nr.bottom+S(6), listBot=t.rc.bottom-S(10);
         int visRows=std::max(0,(listBot-listTop)/rowH); int maxScroll=std::max(0,(int)fw.size()-visRows);
         if(t.scroll>maxScroll)t.scroll=maxScroll; if(t.scroll<0)t.scroll=0;
+        bool hasScroll=(int)fw.size()>visRows; int rowRight=t.rc.right-(hasScroll?S(18):S(14));
         int y=listTop;
-        for(int k=t.scroll; k<(int)fw.size(); ++k){ if(y+rowH>listBot)break; const WinItem* w=fw[k];
-            if(w->icon)DrawIconEx(hdc,t.rc.left+S(12),y,w->icon,S(16),S(16),0,nullptr,DI_NORMAL);
-            RECT ir; ir.left=t.rc.left+S(34); ir.top=y; ir.right=t.rc.right-S(14); ir.bottom=y+S(18);
+        for(int k=t.scroll; k<(int)fw.size(); ++k){ if(y+rowH>listBot+S(3))break; const WinItem* w=fw[k];
+            if(w->icon)DrawIconEx(hdc,t.rc.left+S(14),y,w->icon,S(16),S(16),0,nullptr,DI_NORMAL);
+            RECT ir; ir.left=t.rc.left+S(38); ir.top=y; ir.right=rowRight; ir.bottom=y+S(18);
             DrawTextW(hdc,w->title.c_str(),-1,&ir,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
             SIZE ts; GetTextExtentPoint32W(hdc,w->title.c_str(),(int)w->title.size(),&ts);
             RowRec rr; rr.rc=ir; rr.full=w->title; rr.trunc=(ts.cx>(ir.right-ir.left)); g_hoverRows.push_back(rr);
             y+=rowH;
         }
-        SetTextColor(hdc,RGB(150,150,160));
-        if(t.scroll>0){ RECT ur={t.rc.right-S(16),listTop-S(2),t.rc.right-S(2),listTop+S(14)}; DrawTextW(hdc,L"\x25B2",-1,&ur,DT_CENTER|DT_SINGLELINE); }
-        if(t.scroll<maxScroll){ RECT dr={t.rc.right-S(16),listBot-S(14),t.rc.right-S(2),listBot}; DrawTextW(hdc,L"\x25BC",-1,&dr,DT_CENTER|DT_SINGLELINE); }
+        if(hasScroll){                                   // custom rounded scrollbar
+            RECT trk={t.rc.right-S(9),listTop,t.rc.right-S(5),listBot}; FillRoundRect(hdc,trk,S(2),CLR_SCROLL_TRK,CLR_SCROLL_TRK,1);
+            int trkH=listBot-listTop, thbH=std::max(S(24),trkH*visRows/std::max(1,(int)fw.size()));
+            int thbY=listTop+(maxScroll>0?(trkH-thbH)*t.scroll/maxScroll:0);
+            RECT thb={t.rc.right-S(9),thbY,t.rc.right-S(5),thbY+thbH}; FillRoundRect(hdc,thb,S(2),CLR_SCROLL_THB,CLR_SCROLL_THB,1);
+        }
     }
     BitBlt(hdcReal,0,0,client.right,client.bottom,hdc,0,0,SRCCOPY);
-    DeleteObject(fT); DeleteObject(fN); DeleteObject(fI); SelectObject(hdc,old); DeleteObject(bmp); DeleteDC(hdc);
+    DeleteObject(fT); DeleteObject(fN); DeleteObject(fI); DeleteObject(fX); SelectObject(hdc,old); DeleteObject(bmp); DeleteDC(hdc);
 }
 static void TipDeactivate(){ if(g_tip){ TOOLINFOW ti={0}; ti.cbSize=sizeof(ti); ti.hwnd=g_main; ti.uId=1; SendMessageW(g_tip,TTM_TRACKACTIVATE,FALSE,(LPARAM)&ti); } }
 static void HidePicker(){ TipDeactivate(); ShowWindow(g_main,SW_HIDE); }
@@ -679,9 +700,10 @@ static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM wp, LPARAM lp){
     return CallWindowProcW(g_searchOrigProc,h,m,wp,lp);
 }
 static void EnsurePickerChildren(){
+    if(!g_searchFont) g_searchFont=CreateFontW(-S(15),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     if(!g_search){
-        g_search=CreateWindowExW(0,L"EDIT",L"",WS_CHILD|ES_AUTOHSCROLL|WS_BORDER,0,0,10,10,g_main,nullptr,g_inst,nullptr);
-        if(g_search){ if(g_uiFont)SendMessageW(g_search,WM_SETFONT,(WPARAM)g_uiFont,TRUE);
+        g_search=CreateWindowExW(0,L"EDIT",L"",WS_CHILD|ES_AUTOHSCROLL,0,0,10,10,g_main,nullptr,g_inst,nullptr);   // borderless (rounded box drawn behind)
+        if(g_search){ SendMessageW(g_search,WM_SETFONT,(WPARAM)g_searchFont,TRUE);
             SendMessageW(g_search,EM_SETCUEBANNER,TRUE,(LPARAM)L"Type window name to search");
             g_searchOrigProc=(WNDPROC)SetWindowLongPtrW(g_search,GWLP_WNDPROC,(LONG_PTR)EditProc); }
     }
@@ -705,7 +727,9 @@ static void ShowPicker(){
     SetWindowPos(g_main,HWND_TOPMOST,wx,wy,ww,wh,SWP_NOACTIVATE);
     RECT cr; GetClientRect(g_main,&cr); LayoutTiles(cr.right);
     EnsurePickerChildren();
-    if(g_search){ SetWindowTextW(g_search,L""); MoveWindow(g_search,PAD,S(8),cr.right-2*PAD,S(26),TRUE); ShowWindow(g_search,SW_SHOW); }
+    if(g_search){ SetWindowTextW(g_search,L""); RECT sb=SearchBoxRect(cr.right);
+        int eLeft=sb.left+S(14), eRight=sb.right-S(44), eH=S(22), eTop=sb.top+((sb.bottom-sb.top)-eH)/2;
+        MoveWindow(g_search,eLeft,eTop,eRight-eLeft,eH,TRUE); ShowWindow(g_search,SW_SHOW); }
     ShowWindow(g_main,SW_SHOW); SetForegroundWindow(g_main);
     if(g_search) SetFocus(g_search);
     InvalidateRect(g_main,nullptr,FALSE);
@@ -1076,6 +1100,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     case WM_HOTKEY: ShowPicker(); return 0;
     case WM_PAINT:{ PAINTSTRUCT ps; HDC hdc=BeginPaint(hwnd,&ps); RECT cr; GetClientRect(hwnd,&cr); Paint(hdc,cr); EndPaint(hwnd,&ps); return 0; }
     case WM_ERASEBKGND: return 1;
+    case WM_CTLCOLOREDIT: if((HWND)lp==g_search){ HDC dc=(HDC)wp; SetTextColor(dc,CLR_TEXT); SetBkColor(dc,CLR_SEARCH);
+        static HBRUSH sbr=nullptr; if(!sbr)sbr=CreateSolidBrush(CLR_SEARCH); return (LRESULT)sbr; }
+        return DefWindowProcW(hwnd,msg,wp,lp);
     case WM_KEYDOWN:{
         bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
         if(wp==VK_CONTROL){ InvalidateRect(hwnd,nullptr,FALSE); return 0; }
@@ -1090,6 +1117,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         if(wp==VK_CONTROL) InvalidateRect(hwnd,nullptr,FALSE);
         return 0;
     case WM_LBUTTONDOWN:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
+        if(g_clearBtn.right>g_clearBtn.left && PtInRect(&g_clearBtn,pt)){ SetWindowTextW(g_search,L""); SetFocus(g_search); return 0; }   // clear search
         for(size_t i=0;i<g_tiles.size();++i) if(PtInRect(&g_tiles[i].rc,pt)){ Activate((int)i,ctrl); return 0; } return 0; }
     case WM_MOUSEMOVE:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
         int hovRow=-1; for(size_t i=0;i<g_hoverRows.size();++i) if(PtInRect(&g_hoverRows[i].rc,pt)){ hovRow=(int)i; break; }
@@ -1173,6 +1201,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
 }
 
 // ================================ entry ======================================
+static std::wstring HotkeyString(){   // e.g. "Ctrl+Alt+D" from the current hotkey
+    std::wstring s;
+    if(g_hotMods&MOD_CONTROL)s+=L"Ctrl+";
+    if(g_hotMods&MOD_ALT)s+=L"Alt+";
+    if(g_hotMods&MOD_SHIFT)s+=L"Shift+";
+    if(g_hotMods&MOD_WIN)s+=L"Win+";
+    if((g_hotVk>='A'&&g_hotVk<='Z')||(g_hotVk>='0'&&g_hotVk<='9')) s+=(wchar_t)g_hotVk;
+    else { wchar_t nm[32]={0}; if(GetKeyNameTextW((MapVirtualKeyW(g_hotVk,MAPVK_VK_TO_VSC)<<16),nm,32)>0)s+=nm; else s+=(wchar_t)g_hotVk; }
+    return s;
+}
 static int RunGui(HINSTANCE hInst){
     g_inst=hInst;
     INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_HOTKEY_CLASS|ICC_STANDARD_CLASSES|ICC_LINK_CLASS|ICC_BAR_CLASSES|ICC_TAB_CLASSES}; InitCommonControlsEx(&icc);
@@ -1187,6 +1225,7 @@ static int RunGui(HINSTANCE hInst){
     RegisterClassExW(&wc);
     g_main=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST,L"VdeWindow",APP_NAME,WS_POPUP|WS_CLIPCHILDREN,0,0,400,300,nullptr,nullptr,hInst,nullptr);
     if(!g_main)return 3;
+    { DWORD pref=2; DwmSetWindowAttribute(g_main,33,&pref,sizeof(pref)); }   // DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND (Win11)
     TrayAdd(g_main);
     bool hk=ApplyHotkey();
     if(!hk) MessageBoxW(nullptr,L"Could not register the global hotkey.\n"
@@ -1195,9 +1234,11 @@ static int RunGui(HINSTANCE hInst){
     ApplyAutoFix();   // start the lifecycle monitor timer if enabled
     if(!g_degraded){ bool present=AnyAppPresent(); LcAction a=LcOnStartup(g_lc,present);   // R1: restore now if windows already open
       if(g_autoFix && a==LcAction::StartupRestore) SetTimer(g_main,TIMER_STARTUP,STARTUP_SETTLE_MS,nullptr); }
-    Balloon(g_degraded ? L"Running in limited mode (compatibility issue). See About for details."
-                       : (g_autoFix ? L"Running. Auto-restore of your window layout is on."
-                                    : L"Running. Press your hotkey to move the active window to a desktop."));
+    std::wstring hkStr=HotkeyString(), tip;
+    if(g_degraded)     tip=L"Running in limited mode (compatibility issue). See About for details.";
+    else if(g_autoFix) tip=L"Running. Auto-restore is on. Press "+hkStr+L" to open the desktop picker.";
+    else               tip=L"Running. Press "+hkStr+L" to move the active window to a desktop.";
+    Balloon(tip);
     MSG msg;
     while(GetMessageW(&msg,nullptr,0,0)){
         if(g_settings && IsDialogMessageW(g_settings,&msg)) continue;
