@@ -9,6 +9,8 @@ window between desktops.
 - **Repository:** https://github.com/conus-vision/win-vde
 - **License:** MIT
 
+**➡ [Download the latest `vde.exe`](https://github.com/conus-vision/win-vde/releases/latest)** — a single file, no installer. Or build it from source (see [Quick start](#quick-start)).
+
 > Supports **Firefox, Chrome, and Edge** today. The picker has search, scrolling,
 > and full-name tooltips.
 
@@ -16,7 +18,7 @@ window between desktops.
 
 ## Quick start
 
-1. **Get `vde.exe`.** Build it with `build.bat` (see [Install / Build](#install--build)) — it lands at `build\vde.exe`. It is a single, self-contained executable: no installer, no admin rights, no dependencies.
+1. **Get `vde.exe`.** Download it from the [Releases](https://github.com/conus-vision/win-vde/releases/latest) page, or build it with `build.bat` (see [Install / Build](#install--build)) — it lands at `build\vde.exe`. Either way it is a single, self-contained executable: no installer, no admin rights, no dependencies.
 2. **Put it somewhere permanent.** Move `vde.exe` into a folder you intend to keep (for example `C:\Users\<you>\Apps\win-vde\`). Autostart remembers the exe's *current* path, so choose the folder **before** enabling it — if you move the exe later, just toggle autostart off and on again.
 3. **Run it.** Double-click `vde.exe`; a tray icon appears next to the clock and it starts watching your browsers right away.
 4. **Turn on autostart.** Right-click the tray icon → **Settings…** → tick **Start with Windows (run at logon)** → **OK**. Your layout will now be restored automatically after every reboot.
