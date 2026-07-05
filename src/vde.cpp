@@ -588,6 +588,7 @@ static const COLORREF CLR_BG=RGB(20,20,24), CLR_TILE=RGB(28,28,33), CLR_TILE_DIM
     CLR_TEXT=RGB(208,206,210), CLR_HEAD=RGB(238,238,242), CLR_HINT=RGB(150,145,135), CLR_DIM=RGB(110,108,112),
     CLR_SCROLL_TRK=RGB(40,40,46), CLR_SCROLL_THB=RGB(96,92,86);
 static RECT g_clearBtn={0,0,0,0};       // × clear-search hit rect (empty when hidden)
+static bool g_searchActive=false;       // active border: set when user clicks the field or types; cleared by × / on open
 static HFONT g_searchFont=nullptr;
 static RECT SearchBoxRect(int clientW){ RECT r; r.left=PAD; r.top=S(12); r.right=clientW-PAD; r.bottom=S(12)+S(40); return r; }
 static void FillRoundRect(HDC hdc, RECT r, int rad, COLORREF fill, COLORREF border, int bw){
@@ -636,9 +637,8 @@ static void Paint(HDC hdcReal, RECT client){
       RoundRect(hdc,0,0,client.right-1,client.bottom-1,S(18),S(18)); SelectObject(hdc,op); SelectObject(hdc,ob); DeleteObject(p); }
 
     // ---- search box (rounded) + clear (x) button ----
-    bool searchFocused=(GetFocus()==g_search);
     RECT sb=SearchBoxRect(client.right);
-    FillRoundRect(hdc, sb, S(12), CLR_SEARCH, searchFocused?CLR_ACTIVE:CLR_PASSIVE, searchFocused?S(2):S(1));   // active border while typing
+    FillRoundRect(hdc, sb, S(12), CLR_SEARCH, g_searchActive?CLR_ACTIVE:CLR_PASSIVE, g_searchActive?S(2):S(1));   // active only after user clicks/types
     g_clearBtn.left=g_clearBtn.right=0;
     if(!g_searchText.empty()){                                   // big × (no circle)
         int cs=S(30), cx=sb.right-S(10)-cs, cy=sb.top+((sb.bottom-sb.top)-cs)/2;
@@ -699,7 +699,9 @@ static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM wp, LPARAM lp){
     if(m==WM_KEYDOWN){ switch(wp){
         case VK_ESCAPE: case VK_RETURN: case VK_UP: case VK_DOWN: case VK_LEFT: case VK_RIGHT: case VK_TAB:
             SendMessageW(g_main,WM_KEYDOWN,wp,lp); return 0; } }
-    if(m==WM_CHAR && (wp==L'\r'||wp==27||wp==L'\t')) return 0;   // swallow -> no message beep
+    if(m==WM_CHAR){ if(wp==L'\r'||wp==27||wp==L'\t') return 0;    // swallow -> no message beep
+        if(!g_searchActive){ g_searchActive=true; InvalidateRect(g_main,nullptr,FALSE); } }   // typing activates the field
+    if(m==WM_LBUTTONDOWN && !g_searchActive){ g_searchActive=true; InvalidateRect(g_main,nullptr,FALSE); }   // click activates
     return CallWindowProcW(g_searchOrigProc,h,m,wp,lp);
 }
 static void EnsurePickerChildren(){
@@ -721,7 +723,7 @@ static void ShowPicker(){
     if(g_degraded) return;   // desktop COM unavailable; startup dialog + tray tip already explain
     g_target=GetForegroundWindow(); if(g_target==g_main)g_target=nullptr;
     if(g_target&&IsWindow(g_target)){ int len=GetWindowTextLengthW(g_target); std::wstring t(len+1,0); GetWindowTextW(g_target,&t[0],len+1); t.resize(wcslen(t.c_str())); g_targetTitle=t; } else g_targetTitle.clear();
-    BuildModel(); g_searchText.clear(); for(auto& t:g_tiles) t.scroll=0;
+    BuildModel(); g_searchText.clear(); g_searchActive=false; for(auto& t:g_tiles) t.scroll=0;
     SIZE sz=DesiredClientSize();
     HMONITOR mon=MonitorFromWindow(g_target?g_target:g_main,MONITOR_DEFAULTTOPRIMARY); MONITORINFO mi={sizeof(mi)}; GetMonitorInfo(mon,&mi);
     RECT wr={0,0,sz.cx,sz.cy}; AdjustWindowRectEx(&wr,WS_POPUP,FALSE,WS_EX_TOOLWINDOW|WS_EX_TOPMOST);
@@ -1120,7 +1122,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         if(wp==VK_CONTROL) InvalidateRect(hwnd,nullptr,FALSE);
         return 0;
     case WM_LBUTTONDOWN:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
-        if(g_clearBtn.right>g_clearBtn.left && PtInRect(&g_clearBtn,pt)){ SetWindowTextW(g_search,L""); SetFocus(g_search); return 0; }   // clear search
+        if(g_clearBtn.right>g_clearBtn.left && PtInRect(&g_clearBtn,pt)){ SetWindowTextW(g_search,L""); g_searchActive=false; SetFocus(g_search); InvalidateRect(hwnd,nullptr,FALSE); return 0; }   // clear + deactivate border, keep caret
+        { RECT cr; GetClientRect(hwnd,&cr); RECT sb=SearchBoxRect(cr.right); if(PtInRect(&sb,pt)){ g_searchActive=true; SetFocus(g_search); InvalidateRect(hwnd,nullptr,FALSE); return 0; } }   // clicked the search field -> activate
         for(size_t i=0;i<g_tiles.size();++i) if(PtInRect(&g_tiles[i].rc,pt)){ Activate((int)i,ctrl); return 0; } return 0; }
     case WM_MOUSEMOVE:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
         int hovRow=-1; for(size_t i=0;i<g_hoverRows.size();++i) if(PtInRect(&g_hoverRows[i].rc,pt)){ hovRow=(int)i; break; }
