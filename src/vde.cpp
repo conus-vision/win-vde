@@ -547,7 +547,7 @@ static int CliRun(const std::wstring& cmd){
 }
 
 // ================================ GUI: picker ================================
-struct WinItem { HWND hwnd; std::wstring title; HICON icon; };
+struct WinItem { HWND hwnd; std::wstring title; std::wstring titleLC; HICON icon; };   // titleLC precomputed for fast filtering
 struct Tile { GUID guid; std::wstring name; int index; std::vector<WinItem> windows; RECT rc; int scroll=0; };
 static std::vector<Tile> g_tiles;
 static int  g_sel=0;
@@ -606,7 +606,7 @@ static BOOL CALLBACK EnumAll(HWND hwnd, LPARAM){
     if(!IsAltTabWindow(hwnd))return TRUE; GUID g={0};
     if(!g_vdmDoc||FAILED(g_vdmDoc->GetWindowDesktopId(hwnd,&g))||GuidIsZero(g))return TRUE;
     for(auto& t:g_tiles) if(GuidEq(t.guid,g)){ int len=GetWindowTextLengthW(hwnd); std::wstring title(len+1,0); GetWindowTextW(hwnd,&title[0],len+1); title.resize(wcslen(title.c_str()));
-        WinItem wi; wi.hwnd=hwnd; wi.title=title; wi.icon=WindowIcon(hwnd); t.windows.push_back(wi); break; }
+        WinItem wi; wi.hwnd=hwnd; wi.title=title; wi.titleLC=title; if(!wi.titleLC.empty())CharLowerW(&wi.titleLC[0]); wi.icon=WindowIcon(hwnd); t.windows.push_back(wi); break; }
     return TRUE;
 }
 static void BuildModel(){
@@ -625,9 +625,16 @@ static void LayoutTiles(int clientW){
     for(int i=0;i<n;++i){ int r=i/g_cols,c=i%g_cols; RECT rc; rc.left=PAD+c*(TILE_W+PAD); rc.top=SEARCH_H+HEADER+PAD+r*(TILE_H+PAD); rc.right=rc.left+TILE_W; rc.bottom=rc.top+TILE_H; g_tiles[i].rc=rc; }
 }
 static SIZE DesiredClientSize(){ int n=(int)g_tiles.size(); int cols=std::min(std::max(1,n),5); int rows=(n+cols-1)/cols; SIZE s; s.cx=PAD+cols*(TILE_W+PAD); s.cy=SEARCH_H+HEADER+PAD+rows*(TILE_H+PAD); return s; }
+static HDC g_memDC=nullptr; static HBITMAP g_memBmp=nullptr; static int g_memW=0,g_memH=0;   // cached double-buffer
 static void Paint(HDC hdcReal, RECT client){
     g_hoverRows.clear();
-    HDC hdc=CreateCompatibleDC(hdcReal); HBITMAP bmp=CreateCompatibleBitmap(hdcReal,client.right,client.bottom); HBITMAP old=(HBITMAP)SelectObject(hdc,bmp);
+    if(!g_memDC) g_memDC=CreateCompatibleDC(hdcReal);
+    if(!g_memBmp || g_memW!=client.right || g_memH!=client.bottom){
+        if(g_memBmp) DeleteObject(g_memBmp);
+        g_memBmp=CreateCompatibleBitmap(hdcReal,client.right,client.bottom); SelectObject(g_memDC,g_memBmp);
+        g_memW=client.right; g_memH=client.bottom;
+    }
+    HDC hdc=g_memDC;
     HBRUSH bg=CreateSolidBrush(CLR_BG); FillRect(hdc,&client,bg); DeleteObject(bg); SetBkMode(hdc,TRANSPARENT);
     HFONT fT=g_fPT, fN=g_fPN, fI=g_fPI, fX=g_fPX;   // cached (created in InitMetrics)
     bool ctrlHeld=(GetKeyState(VK_CONTROL)&0x8000)!=0;
@@ -640,7 +647,7 @@ static void Paint(HDC hdcReal, RECT client){
     RECT sb=SearchBoxRect(client.right);
     FillRoundRect(hdc, sb, S(12), CLR_SEARCH, g_searchActive?CLR_ACTIVE:CLR_PASSIVE, g_searchActive?S(2):S(1));   // active only after user clicks/types
     g_clearBtn.left=g_clearBtn.right=0;
-    if(!g_searchText.empty()){                                   // big × (no circle)
+    if(g_searchActive){                                          // big × (no circle) — shown whenever the field is active
         int cs=S(30), cx=sb.right-S(10)-cs, cy=sb.top+((sb.bottom-sb.top)-cs)/2;
         g_clearBtn={cx,cy,cx+cs,cy+cs};
         SelectObject(hdc,fX); SetTextColor(hdc,CLR_HINT); RECT xr=g_clearBtn; DrawTextW(hdc,L"\x2715",-1,&xr,DT_CENTER|DT_SINGLELINE|DT_VCENTER);
@@ -661,7 +668,7 @@ static void Paint(HDC hdcReal, RECT client){
     // ---- tiles ----
     bool searching=!g_searchText.empty();
     for(size_t i=0;i<g_tiles.size();++i){ Tile& t=g_tiles[i]; bool isSel=((int)i==g_sel);
-        std::vector<const WinItem*> fw; for(auto& w:t.windows) if(MatchesSearch(w.title)) fw.push_back(&w);
+        std::vector<const WinItem*> fw; for(auto& w:t.windows) if(g_searchText.empty()||w.titleLC.find(g_searchText)!=std::wstring::npos) fw.push_back(&w);   // precomputed lowercase
         bool dim = searching && fw.empty();
         FillRoundRect(hdc, t.rc, S(10), dim?CLR_TILE_DIM:CLR_TILE, isSel?CLR_ACTIVE:CLR_PASSIVE, isSel?S(2):S(1));
         SelectObject(hdc,fN); SetTextColor(hdc,dim?CLR_DIM:CLR_HEAD);
@@ -689,7 +696,6 @@ static void Paint(HDC hdcReal, RECT client){
         }
     }
     BitBlt(hdcReal,0,0,client.right,client.bottom,hdc,0,0,SRCCOPY);
-    SelectObject(hdc,old); DeleteObject(bmp); DeleteDC(hdc);
 }
 static void TipDeactivate(){ if(g_tip){ TOOLINFOW ti={0}; ti.cbSize=sizeof(ti); ti.hwnd=g_main; ti.uId=1; SendMessageW(g_tip,TTM_TRACKACTIVATE,FALSE,(LPARAM)&ti); } }
 static void HidePicker(){ TipDeactivate(); ShowWindow(g_main,SW_HIDE); }
@@ -1124,6 +1130,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     case WM_LBUTTONDOWN:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
         if(g_clearBtn.right>g_clearBtn.left && PtInRect(&g_clearBtn,pt)){ SetWindowTextW(g_search,L""); g_searchActive=false; SetFocus(g_search); InvalidateRect(hwnd,nullptr,FALSE); return 0; }   // clear + deactivate border, keep caret
         { RECT cr; GetClientRect(hwnd,&cr); RECT sb=SearchBoxRect(cr.right); if(PtInRect(&sb,pt)){ g_searchActive=true; SetFocus(g_search); InvalidateRect(hwnd,nullptr,FALSE); return 0; } }   // clicked the search field -> activate
+        if(g_searchActive){ g_searchActive=false; InvalidateRect(hwnd,nullptr,FALSE); }   // clicked outside the field -> deactivate border
         for(size_t i=0;i<g_tiles.size();++i) if(PtInRect(&g_tiles[i].rc,pt)){ Activate((int)i,ctrl); return 0; } return 0; }
     case WM_MOUSEMOVE:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
         int hovRow=-1; for(size_t i=0;i<g_hoverRows.size();++i) if(PtInRect(&g_hoverRows[i].rc,pt)){ hovRow=(int)i; break; }
