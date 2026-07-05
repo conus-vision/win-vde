@@ -14,6 +14,15 @@ window between desktops.
 
 <p align="center"><img src="docs/overview.svg" alt="How win-vde works: Windows scatters browser windows across virtual desktops after a reboot; win-vde remembers the layout and restores it; plus a fast searchable desktop picker" width="840"></p>
 
+## Quick start
+
+1. **Get `vde.exe`.** Build it with `build.bat` (see [Install / Build](#install--build)) — it lands at `build\vde.exe`. It is a single, self-contained executable: no installer, no admin rights, no dependencies.
+2. **Put it somewhere permanent.** Move `vde.exe` into a folder you intend to keep (for example `C:\Users\<you>\Apps\win-vde\`). Autostart remembers the exe's *current* path, so choose the folder **before** enabling it — if you move the exe later, just toggle autostart off and on again.
+3. **Run it.** Double-click `vde.exe`; a tray icon appears next to the clock and it starts watching your browsers right away.
+4. **Turn on autostart.** Right-click the tray icon → **Settings…** → tick **Start with Windows (run at logon)** → **OK**. Your layout will now be restored automatically after every reboot.
+
+That's all — arrange your browser windows across your virtual desktops and forget about it. Press **Ctrl+Alt+D** whenever you want the desktop picker.
+
 ## Why this exists
 
 Three things Windows and the browser don't solve on their own:
