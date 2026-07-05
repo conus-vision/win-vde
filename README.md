@@ -12,6 +12,8 @@ window between desktops.
 > Supports **Firefox, Chrome, and Edge** today. The picker has search, scrolling,
 > and full-name tooltips.
 
+<p align="center"><img src="docs/overview.svg" alt="How win-vde works: Windows scatters browser windows across virtual desktops after a reboot; win-vde remembers the layout and restores it; plus a fast searchable desktop picker" width="840"></p>
+
 ## Why this exists
 
 Three things Windows and the browser don't solve on their own:

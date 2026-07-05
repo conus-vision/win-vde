@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 582" font-family="Segoe UI, system-ui, sans-serif">
+  <style>
+    text{font-family:'Segoe UI',system-ui,sans-serif;}
+    .cap{font-size:15px;font-weight:600;fill:#ececf0;}
+    .lbl{font-size:11px;fill:#a8a6b0;}
+    .dt{font-size:9px;fill:#8a8892;}
+    .feat{font-size:13.5px;fill:#d8d6dc;}
+    .st{fill:#22222a;stroke:#3a3a44;stroke-width:1;}
+    .dbox{fill:#1a1a20;stroke:#33333c;stroke-width:1;}
+    .arw{stroke:#f29605;stroke-width:2.5;fill:none;}
+    .brand{fill:#f29605;}
+  </style>
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#f29605"/></marker>
+    <!-- one desktop = box + label + 2 window bars; windows filled per-instance below -->
+  </defs>
+
+  <rect x="1" y="1" width="898" height="580" rx="18" fill="#16161a" stroke="#2a2a32"/>
+
+  <!-- ============ ROW 1 : the problem ============ -->
+  <text class="cap" x="40" y="42">1.  After a reboot, Windows scatters your browser windows</text>
+
+  <!-- state A: correct -->
+  <g transform="translate(60,56)">
+    <rect class="st" width="210" height="100" rx="12"/>
+    <rect class="dbox" x="12" y="12" width="90" height="76" rx="8"/><text class="dt" x="18" y="28">Desktop 1</text>
+    <rect x="18" y="35" width="78" height="13" rx="3" fill="#e05a54"/><rect x="18" y="53" width="78" height="13" rx="3" fill="#4f8fe6"/>
+    <rect class="dbox" x="108" y="12" width="90" height="76" rx="8"/><text class="dt" x="114" y="28">Desktop 2</text>
+    <rect x="114" y="35" width="78" height="13" rx="3" fill="#e6bf4f"/><rect x="114" y="53" width="78" height="13" rx="3" fill="#57b877"/>
+  </g>
+  <!-- arrow -->
+  <text class="lbl" x="310" y="94" text-anchor="middle">After reboot</text>
+  <line class="arw" x1="282" y1="106" x2="336" y2="106" marker-end="url(#ah)"/>
+  <!-- state B: scrambled (desktops swapped) -->
+  <g transform="translate(345,56)">
+    <rect class="st" width="210" height="100" rx="12"/>
+    <rect class="dbox" x="12" y="12" width="90" height="76" rx="8"/><text class="dt" x="18" y="28">Desktop 1</text>
+    <rect x="18" y="35" width="78" height="13" rx="3" fill="#e6bf4f"/><rect x="18" y="53" width="78" height="13" rx="3" fill="#57b877"/>
+    <rect class="dbox" x="108" y="12" width="90" height="76" rx="8"/><text class="dt" x="114" y="28">Desktop 2</text>
+    <rect x="114" y="35" width="78" height="13" rx="3" fill="#e05a54"/><rect x="114" y="53" width="78" height="13" rx="3" fill="#4f8fe6"/>
+  </g>
+
+  <!-- ============ ROW 2 : win-vde restores ============ -->
+  <text class="cap" x="40" y="214">2.  win-vde remembers the layout and puts every window back</text>
+
+  <!-- correct -->
+  <g transform="translate(60,228)">
+    <rect class="st" width="210" height="100" rx="12"/>
+    <rect class="dbox" x="12" y="12" width="90" height="76" rx="8"/><text class="dt" x="18" y="28">Desktop 1</text>
+    <rect x="18" y="35" width="78" height="13" rx="3" fill="#e05a54"/><rect x="18" y="53" width="78" height="13" rx="3" fill="#4f8fe6"/>
+    <rect class="dbox" x="108" y="12" width="90" height="76" rx="8"/><text class="dt" x="114" y="28">Desktop 2</text>
+    <rect x="114" y="35" width="78" height="13" rx="3" fill="#e6bf4f"/><rect x="114" y="53" width="78" height="13" rx="3" fill="#57b877"/>
+  </g>
+  <text class="lbl" x="310" y="266" text-anchor="middle">After reboot</text>
+  <line class="arw" x1="282" y1="278" x2="336" y2="278" marker-end="url(#ah)"/>
+  <!-- scrambled -->
+  <g transform="translate(345,228)">
+    <rect class="st" width="210" height="100" rx="12"/>
+    <rect class="dbox" x="12" y="12" width="90" height="76" rx="8"/><text class="dt" x="18" y="28">Desktop 1</text>
+    <rect x="18" y="35" width="78" height="13" rx="3" fill="#e6bf4f"/><rect x="18" y="53" width="78" height="13" rx="3" fill="#57b877"/>
+    <rect class="dbox" x="108" y="12" width="90" height="76" rx="8"/><text class="dt" x="114" y="28">Desktop 2</text>
+    <rect x="114" y="35" width="78" height="13" rx="3" fill="#e05a54"/><rect x="114" y="53" width="78" height="13" rx="3" fill="#4f8fe6"/>
+  </g>
+  <text class="lbl" x="590" y="266" text-anchor="middle">win-vde restores</text>
+  <line class="arw" x1="562" y1="278" x2="616" y2="278" marker-end="url(#ah)"/>
+  <!-- restored -->
+  <g transform="translate(625,228)">
+    <rect class="st" width="210" height="100" rx="12"/>
+    <rect class="dbox" x="12" y="12" width="90" height="76" rx="8"/><text class="dt" x="18" y="28">Desktop 1</text>
+    <rect x="18" y="35" width="78" height="13" rx="3" fill="#e05a54"/><rect x="18" y="53" width="78" height="13" rx="3" fill="#4f8fe6"/>
+    <rect class="dbox" x="108" y="12" width="90" height="76" rx="8"/><text class="dt" x="114" y="28">Desktop 2</text>
+    <rect x="114" y="35" width="78" height="13" rx="3" fill="#e6bf4f"/><rect x="114" y="53" width="78" height="13" rx="3" fill="#57b877"/>
+  </g>
+  <!-- VDE icon, bottom-right corner -->
+  <g transform="translate(786,336)">
+    <rect class="brand" width="26" height="26" rx="6"/>
+    <rect x="6" y="6" width="6" height="6" rx="1" fill="#141418"/><rect x="14" y="6" width="6" height="6" rx="1" fill="#141418"/>
+    <rect x="6" y="14" width="6" height="6" rx="1" fill="#141418"/><rect x="14" y="14" width="6" height="6" rx="1" fill="#141418"/>
+    <text x="34" y="18" font-size="12" font-weight="600" fill="#f29605">win-vde</text>
+  </g>
+
+  <!-- ============ ROW 3 : the picker + features ============ -->
+  <text class="cap" x="40" y="392">3.  Plus a fast, searchable desktop picker</text>
+
+  <!-- base state -->
+  <g transform="translate(60,406)">
+    <rect class="st" width="210" height="100" rx="12"/>
+    <rect class="dbox" x="12" y="12" width="90" height="76" rx="8"/><text class="dt" x="18" y="28">Desktop 1</text>
+    <rect x="18" y="35" width="78" height="13" rx="3" fill="#e05a54"/><rect x="18" y="53" width="78" height="13" rx="3" fill="#4f8fe6"/>
+    <rect class="dbox" x="108" y="12" width="90" height="76" rx="8"/><text class="dt" x="114" y="28">Desktop 2</text>
+    <rect x="114" y="35" width="78" height="13" rx="3" fill="#e6bf4f"/><rect x="114" y="53" width="78" height="13" rx="3" fill="#57b877"/>
+  </g>
+  <!-- custom popup overlaid on top -->
+  <g transform="translate(104,446)">
+    <rect width="252" height="98" rx="11" fill="#1b1b22" stroke="#f29605" stroke-width="2"/>
+    <rect x="12" y="12" width="228" height="22" rx="7" fill="#2a2a32" stroke="#f29605" stroke-width="1.4"/>
+    <text class="lbl" x="22" y="27">Type window name to search</text>
+    <rect x="12" y="44" width="70" height="44" rx="7" fill="#242430" stroke="#f29605" stroke-width="1.6"/>
+    <rect x="20" y="54" width="54" height="7" rx="2" fill="#e05a54"/><rect x="20" y="66" width="54" height="7" rx="2" fill="#4f8fe6"/>
+    <rect x="91" y="44" width="70" height="44" rx="7" fill="#242430" stroke="#3a3a44"/>
+    <rect x="99" y="54" width="54" height="7" rx="2" fill="#e6bf4f"/><rect x="99" y="66" width="54" height="7" rx="2" fill="#57b877"/>
+    <rect x="170" y="44" width="70" height="44" rx="7" fill="#242430" stroke="#3a3a44"/>
+    <rect x="178" y="54" width="54" height="7" rx="2" fill="#e05a54"/><rect x="178" y="66" width="54" height="7" rx="2" fill="#e6bf4f"/>
+  </g>
+
+  <!-- features -->
+  <g transform="translate(404,0)">
+    <circle cx="6" cy="428" r="3.5" class="brand"/><text class="feat" x="20" y="432">Custom desktop switcher</text>
+    <circle cx="6" cy="452" r="3.5" class="brand"/><text class="feat" x="20" y="456">Search open windows</text>
+    <circle cx="6" cy="476" r="3.5" class="brand"/><text class="feat" x="20" y="480">Move a window in one click</text>
+    <circle cx="6" cy="500" r="3.5" class="brand"/><text class="feat" x="20" y="504">Start with Windows</text>
+    <circle cx="6" cy="524" r="3.5" class="brand"/><text class="feat" x="20" y="528">Automatic layout restore</text>
+    <circle cx="6" cy="548" r="3.5" class="brand"/><text class="feat" x="20" y="552">Customizable hotkey</text>
+  </g>
+</svg>
