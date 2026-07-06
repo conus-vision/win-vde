@@ -26,7 +26,7 @@ inline std::vector<WinFp> ParseChromiumSNSS(const std::string& data){
     const uint8_t* b=(const uint8_t*)data.data(); size_t sz=data.size();
     if(sz<8 || !(b[0]=='S'&&b[1]=='N'&&b[2]=='S'&&b[3]=='S')) return out;
     std::map<int,int> tabWin, tabIdx, winSel, tabSelNav;
-    std::map<int,std::map<int,std::pair<std::string,std::string>>> tabNav;   // tab -> navIdx -> {domain,title}
+    std::map<int,std::map<int,std::pair<std::string,std::string>>> tabNav;   // tab -> navIdx -> {url,title}
     size_t pos=8;
     while(pos+2<=sz){
         uint16_t cs=(uint16_t)(b[pos]|(b[pos+1]<<8)); pos+=2; if(cs==0||pos+cs>sz)break;
@@ -43,7 +43,7 @@ inline std::vector<WinFp> ParseChromiumSNSS(const std::string& data){
         else if(id==6 && clen>=4){ SnssPR pr{c+4,clen-4};           // skip 4-byte pickle header
             int32_t t,ni; std::string url,title;                    // url = UTF-8 WriteString, title = UTF-16 WriteString16
             if(pr.rInt(t)&&pr.rInt(ni)&&pr.rStr(url)&&pr.rStr16(title))
-                tabNav[t][ni]={ etld1(hostOf(url)), title };        // domain "" for chrome://, about:, etc.
+                tabNav[t][ni]={ url, title };                       // keep full URL; domain computed at aggregation
         }
     }
     std::map<int,std::vector<int>> winTabs; for(auto& kv:tabWin) winTabs[kv.second].push_back(kv.first);
@@ -54,11 +54,11 @@ inline std::vector<WinFp> ParseChromiumSNSS(const std::string& data){
     };
     for(auto& kv:winTabs){ int w=kv.first; WinFp fp;
         int selIdx = winSel.count(w)?winSel[w]:-1; int activeTab=-1;
-        for(int t:kv.second){ auto nav=curNav(t); if(!nav.first.empty()) fp.counts[nav.first]++; fp.tabCount++;
-            fp.tabsBlob += nav.second; fp.tabsBlob += ' '; fp.tabsBlob += nav.first; fp.tabsBlob += ' ';   // every tab: title + domain
+        for(int t:kv.second){ auto nav=curNav(t); std::string dom=etld1(hostOf(nav.first)); if(!dom.empty()) fp.counts[dom]++; fp.tabCount++;
+            fp.tabsBlob += nav.second; fp.tabsBlob += ' '; fp.tabsBlob += nav.first; fp.tabsBlob += ' ';   // every tab: title + full URL (address bar)
             if(tabIdx.count(t)&&tabIdx[t]==selIdx) activeTab=t; }
         if(activeTab<0 && !kv.second.empty()) activeTab=kv.second.front();
-        auto an=curNav(activeTab); fp.activeTitle=an.second; fp.activeDomain=an.first;
+        auto an=curNav(activeTab); fp.activeTitle=an.second; fp.activeDomain=etld1(hostOf(an.first));
         if(fp.tabCount>0) out.push_back(fp);
     }
     return out;

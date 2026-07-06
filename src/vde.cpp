@@ -256,7 +256,7 @@ static std::vector<WinFp> extractWindows(const JValue& root){
             std::string url=cur.find("url")?cur.find("url")->asStr():"";
             std::string dom=etld1(hostOf(url)); if(!dom.empty())sw.counts[dom]++;
             std::string ttl=cur.find("title")?cur.find("title")->asStr():"";
-            sw.tabsBlob += ttl; sw.tabsBlob += ' '; sw.tabsBlob += dom; sw.tabsBlob += ' ';   // every tab: title + domain
+            sw.tabsBlob += ttl; sw.tabsBlob += ' '; sw.tabsBlob += url; sw.tabsBlob += ' ';   // every tab: title + full URL (address bar)
             if((int)ti==selected-1){ sw.activeTitle=ttl; sw.activeDomain=dom; }
         }
         out.push_back(std::move(sw));

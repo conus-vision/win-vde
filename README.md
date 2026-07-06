@@ -59,8 +59,8 @@ restart, and moves each matched window to the desktop it was saved on.
 - **Desktop picker** — global hotkey (default `Ctrl+Alt+D`) opens a grid of
   desktops. Click to switch; `Ctrl`+click to move the active window there. Type
   to filter windows — matching **any of their browser tabs**, not just the
-  active one — scroll tiles with the wheel, hover a clipped name for its full
-  title.
+  active one, by tab title *or* full **URL** (address bar) — scroll tiles with
+  the wheel, hover a clipped name for its full title.
 - **Start with Windows** — optional run-at-logon toggle.
 - **Honest about breakage** — if a Windows update changes the undocumented
   interfaces, the app explains what happened and runs in a limited mode instead
