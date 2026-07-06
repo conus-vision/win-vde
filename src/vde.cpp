@@ -515,7 +515,7 @@ static std::string RunRestore(bool manual, std::vector<std::string>* linesOut=nu
     std::sort(pairs.begin(),pairs.end(),[](const Pair&a,const Pair&b){return a.sc>b.sc;});
     std::vector<int> usedS(saved.size(),0),usedL(live.size(),0),assignL2S(live.size(),-1); int matched=0;
     for(auto& p:pairs) if(!usedS[p.si]&&!usedL[p.li]&&p.sc>=T_ACCEPT){ usedS[p.si]=usedL[p.li]=1; assignL2S[p.li]=p.si; matched++; }
-    int moved=0,failed=0,realMoved=0;
+    int already=0,failed=0,realMoved=0;
     for(int li=0;li<(int)live.size();++li){ Fp& L=live[li];
         if(assignL2S[li]<0){ if(linesOut)linesOut->push_back("[no match] "+L.activeTitle); continue; }
         const LayoutWin& S=saved[assignL2S[li]];
@@ -523,13 +523,17 @@ static std::string RunRestore(bool manual, std::vector<std::string>* linesOut=nu
         if(GetDesktopIndexByGuid(S.desktop)>=0){ dest=GetDesktopByGuid(S.desktop); destGuid=S.desktop; }
         else if(S.deskIndex>=0&&(UINT)S.deskIndex<count){ dest=GetDesktopByIndex((UINT)S.deskIndex); if(dest)dest->GetID(&destGuid); }
         if(!dest){ if(linesOut)linesOut->push_back("[no target] "+L.activeTitle); failed++; continue; }
-        if(!GuidIsZero(L.desktop)&&GuidEq(L.desktop,destGuid)){ if(linesOut)linesOut->push_back("[already there] "+L.activeTitle); dest->Release(); moved++; continue; }
+        if(!GuidIsZero(L.desktop)&&GuidEq(L.desktop,destGuid)){ if(linesOut)linesOut->push_back("[already there] "+L.activeTitle); dest->Release(); already++; continue; }
         bool ok=MoveWindowToDesktop(L.hwnd,dest,destGuid); dest->Release();
-        if(ok){ moved++; realMoved++; if(linesOut)linesOut->push_back("[moved] "+L.activeTitle); }
+        if(ok){ realMoved++; if(linesOut)linesOut->push_back("[moved] "+L.activeTitle); }
         else  { failed++; if(linesOut)linesOut->push_back("[FAILED] "+L.activeTitle); }
     }
-    if(movedOut)*movedOut=realMoved;
-    char b[160]; sprintf_s(b,"Restore: matched %d/%d, moved %d, failed %d.",matched,(int)live.size(),moved,failed);
+    if(movedOut)*movedOut=realMoved;                        // real moves only (excludes "already in place")
+    char b[200];
+    if(matched==0)                     sprintf_s(b,"Restore: no matching windows (%d open, %d saved).",(int)live.size(),(int)saved.size());
+    else if(realMoved==0 && failed==0) sprintf_s(b,"Restore: nothing to move - all %d matched window(s) already in place.",matched);
+    else if(failed==0)                 sprintf_s(b,"Restore: moved %d, %d already in place (%d/%d matched).",realMoved,already,matched,(int)live.size());
+    else                               sprintf_s(b,"Restore: moved %d, %d already in place, %d failed (%d/%d matched).",realMoved,already,failed,matched,(int)live.size());
     return b;
 }
 
