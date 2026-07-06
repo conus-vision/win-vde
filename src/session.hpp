@@ -6,7 +6,7 @@
 #include "str_util.hpp"   // hostOf, etld1, ReadFileBytes
 #include <iterator>
 
-struct WinFp { std::string activeTitle, activeDomain; std::map<std::string,int> counts; int tabCount=0; };
+struct WinFp { std::string activeTitle, activeDomain; std::map<std::string,int> counts; int tabCount=0; std::string tabsBlob; };  // tabsBlob = all tab titles+domains (UTF-8), for search-all-tabs
 
 // ---- Chromium SNSS session reader ----------------------------------------
 // File = "SNSS" + int32 version + repeated [uint16 size][uint8 id][pickle].
@@ -55,6 +55,7 @@ inline std::vector<WinFp> ParseChromiumSNSS(const std::string& data){
     for(auto& kv:winTabs){ int w=kv.first; WinFp fp;
         int selIdx = winSel.count(w)?winSel[w]:-1; int activeTab=-1;
         for(int t:kv.second){ auto nav=curNav(t); if(!nav.first.empty()) fp.counts[nav.first]++; fp.tabCount++;
+            fp.tabsBlob += nav.second; fp.tabsBlob += ' '; fp.tabsBlob += nav.first; fp.tabsBlob += ' ';   // every tab: title + domain
             if(tabIdx.count(t)&&tabIdx[t]==selIdx) activeTab=t; }
         if(activeTab<0 && !kv.second.empty()) activeTab=kv.second.front();
         auto an=curNav(activeTab); fp.activeTitle=an.second; fp.activeDomain=an.first;

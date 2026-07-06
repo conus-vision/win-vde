@@ -154,6 +154,8 @@ static void test_snss_parse(){
     CHECK(wi10>=0 && wi11>=0);
     CHECK(w[wi10].tabCount==2); CHECK(w[wi10].counts["github.com"]==1); CHECK(w[wi10].counts["python.org"]==1);
     CHECK(w[wi10].activeTitle=="Python"); CHECK(w[wi10].activeDomain=="python.org");
+    CHECK(w[wi10].tabsBlob.find("GitHub")!=std::string::npos);     // all-tab blob has BOTH tabs (not just active)
+    CHECK(w[wi10].tabsBlob.find("python.org")!=std::string::npos);
     CHECK(w[wi11].tabCount==1); CHECK(w[wi11].activeTitle=="Example");
 }
 static void test_snss_garbage(){ auto w=ParseChromiumSNSS("not an snss file...."); CHECK(w.empty()); }

@@ -255,7 +255,9 @@ static std::vector<WinFp> extractWindows(const JValue& root){
             const JValue& cur=entries->arr[idx-1];
             std::string url=cur.find("url")?cur.find("url")->asStr():"";
             std::string dom=etld1(hostOf(url)); if(!dom.empty())sw.counts[dom]++;
-            if((int)ti==selected-1){ sw.activeTitle=cur.find("title")?cur.find("title")->asStr():""; sw.activeDomain=dom; }
+            std::string ttl=cur.find("title")?cur.find("title")->asStr():"";
+            sw.tabsBlob += ttl; sw.tabsBlob += ' '; sw.tabsBlob += dom; sw.tabsBlob += ' ';   // every tab: title + domain
+            if((int)ti==selected-1){ sw.activeTitle=ttl; sw.activeDomain=dom; }
         }
         out.push_back(std::move(sw));
     }
@@ -406,6 +408,21 @@ static std::vector<Fp> BuildLiveFingerprintsFor(const AppProfile& prof, int* bou
     return out;
 }
 static bool AnyAppPresent(){ for(auto& prof:ActiveProfiles()) if(!EnumAppWindows(prof).empty()) return true; return false; }
+// HWND -> lowercased text of ALL tabs (titles + domains) for each browser window; used to search across all tabs, not just the active one.
+static std::map<HWND,std::wstring> BuildTabBlobs(){
+    std::map<HWND,std::wstring> out;
+    for(auto& prof:ActiveProfiles()){
+        if(prof.session==AppProfile::NONE) continue;
+        auto live=EnumAppWindows(prof); auto ss=ReadSessionFor(prof);
+        std::vector<bool> used(ss.size(),false);
+        for(auto& w:live){
+            std::string sTitle=W2U8(StripSuffixes(w.rawTitle,prof.titleSuffixes));
+            int bi=-1; for(size_t i=0;i<ss.size();++i) if(!used[i]&&ss[i].activeTitle==sTitle){ bi=(int)i; break; }
+            if(bi>=0){ used[bi]=true; std::wstring blob=U82W(ss[bi].tabsBlob); if(!blob.empty())CharLowerW(&blob[0]); out[w.hwnd]=std::move(blob); }
+        }
+    }
+    return out;
+}
 static double Score(const Fp& s, const Fp& l){
     if(s.hasDomains()&&l.hasDomains()){
         double dot=0,na=0,nb=0;
@@ -547,7 +564,7 @@ static int CliRun(const std::wstring& cmd){
 }
 
 // ================================ GUI: picker ================================
-struct WinItem { HWND hwnd; std::wstring title; std::wstring titleLC; HICON icon; };   // titleLC precomputed for fast filtering
+struct WinItem { HWND hwnd; std::wstring title; std::wstring titleLC; std::wstring search; HICON icon; };   // search = titleLC (+ all-tab text for browser windows)
 struct Tile { GUID guid; std::wstring name; int index; std::vector<WinItem> windows; RECT rc; int scroll=0; };
 static std::vector<Tile> g_tiles;
 static int  g_sel=0;
@@ -606,7 +623,7 @@ static BOOL CALLBACK EnumAll(HWND hwnd, LPARAM){
     if(!IsAltTabWindow(hwnd))return TRUE; GUID g={0};
     if(!g_vdmDoc||FAILED(g_vdmDoc->GetWindowDesktopId(hwnd,&g))||GuidIsZero(g))return TRUE;
     for(auto& t:g_tiles) if(GuidEq(t.guid,g)){ int len=GetWindowTextLengthW(hwnd); std::wstring title(len+1,0); GetWindowTextW(hwnd,&title[0],len+1); title.resize(wcslen(title.c_str()));
-        WinItem wi; wi.hwnd=hwnd; wi.title=title; wi.titleLC=title; if(!wi.titleLC.empty())CharLowerW(&wi.titleLC[0]); wi.icon=WindowIcon(hwnd); t.windows.push_back(wi); break; }
+        WinItem wi; wi.hwnd=hwnd; wi.title=title; wi.titleLC=title; if(!wi.titleLC.empty())CharLowerW(&wi.titleLC[0]); wi.search=wi.titleLC; wi.icon=WindowIcon(hwnd); t.windows.push_back(wi); break; }
     return TRUE;
 }
 static void BuildModel(){
@@ -617,6 +634,13 @@ static void BuildModel(){
     g_sel=0; GUID cur={0};
     if(g_vdmDoc&&g_target&&SUCCEEDED(g_vdmDoc->GetWindowDesktopId(g_target,&cur)))
         for(size_t i=0;i<g_tiles.size();++i) if(GuidEq(g_tiles[i].guid,cur)){g_sel=(int)i;break;}
+}
+static bool g_tabBlobsBuilt=false;
+// Lazily fold each browser window's all-tab text into its search field (first time the user searches).
+static void EnsureTabSearch(){
+    if(g_tabBlobsBuilt) return; g_tabBlobsBuilt=true;
+    auto blobs=BuildTabBlobs(); if(blobs.empty()) return;
+    for(auto& t:g_tiles) for(auto& w:t.windows){ auto it=blobs.find(w.hwnd); if(it!=blobs.end() && !it->second.empty()) w.search = w.titleLC + L" " + it->second; }
 }
 static void LayoutTiles(int clientW){
     int n=(int)g_tiles.size();
@@ -668,7 +692,7 @@ static void Paint(HDC hdcReal, RECT client){
     // ---- tiles ----
     bool searching=!g_searchText.empty();
     for(size_t i=0;i<g_tiles.size();++i){ Tile& t=g_tiles[i]; bool isSel=((int)i==g_sel);
-        std::vector<const WinItem*> fw; for(auto& w:t.windows) if(g_searchText.empty()||w.titleLC.find(g_searchText)!=std::wstring::npos) fw.push_back(&w);   // precomputed lowercase
+        std::vector<const WinItem*> fw; for(auto& w:t.windows) if(g_searchText.empty()||w.search.find(g_searchText)!=std::wstring::npos) fw.push_back(&w);   // search = title + all tabs (browsers)
         bool dim = searching && fw.empty();
         FillRoundRect(hdc, t.rc, S(10), dim?CLR_TILE_DIM:CLR_TILE, isSel?CLR_ACTIVE:CLR_PASSIVE, isSel?S(2):S(1));
         SelectObject(hdc,fN); SetTextColor(hdc,dim?CLR_DIM:CLR_HEAD);
@@ -729,7 +753,7 @@ static void ShowPicker(){
     if(g_degraded) return;   // desktop COM unavailable; startup dialog + tray tip already explain
     g_target=GetForegroundWindow(); if(g_target==g_main)g_target=nullptr;
     if(g_target&&IsWindow(g_target)){ int len=GetWindowTextLengthW(g_target); std::wstring t(len+1,0); GetWindowTextW(g_target,&t[0],len+1); t.resize(wcslen(t.c_str())); g_targetTitle=t; } else g_targetTitle.clear();
-    BuildModel(); g_searchText.clear(); g_searchActive=false; for(auto& t:g_tiles) t.scroll=0;
+    BuildModel(); g_searchText.clear(); g_searchActive=false; g_tabBlobsBuilt=false; for(auto& t:g_tiles) t.scroll=0;
     SIZE sz=DesiredClientSize();
     HMONITOR mon=MonitorFromWindow(g_target?g_target:g_main,MONITOR_DEFAULTTOPRIMARY); MONITORINFO mi={sizeof(mi)}; GetMonitorInfo(mon,&mi);
     RECT wr={0,0,sz.cx,sz.cy}; AdjustWindowRectEx(&wr,WS_POPUP,FALSE,WS_EX_TOOLWINDOW|WS_EX_TOPMOST);
@@ -1153,7 +1177,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     case WM_COMMAND:                                            // R7: live-filter as the search text changes
         if(g_search && (HWND)lp==g_search && HIWORD(wp)==EN_CHANGE){
             int n=GetWindowTextLengthW(g_search); std::wstring s(n+1,0); GetWindowTextW(g_search,&s[0],n+1); s.resize(wcslen(s.c_str()));
-            g_searchText=LowerW(s); InvalidateRect(hwnd,nullptr,FALSE);
+            g_searchText=LowerW(s); if(!g_searchText.empty()) EnsureTabSearch(); InvalidateRect(hwnd,nullptr,FALSE);
         }
         return 0;
     case WM_TIMER:
