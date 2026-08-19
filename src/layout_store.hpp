@@ -200,12 +200,19 @@ inline bool EnsurePromotionMarker(const std::wstring& rollback,const std::wstrin
     if(markerState==ExactFileState::Mismatch)
         return SetFailure(errorOut,"rollback-promotion marker conflicts with captured rollback");
     if(markerState==ExactFileState::Exact){
-        ExactFileState stageState=InspectExactFile(stage,expected,ops,&error);
-        if(stageState==ExactFileState::Unavailable)
+        PathState stageState=QueryPath(stage,ops,&error);
+        if(stageState==PathState::Unavailable)
             return SetFailure(errorOut,"cannot inspect obsolete rollback-promotion stage: "+error);
-        if(stageState!=ExactFileState::Missing &&
-           !DeleteArtifactChecked(stage,"obsolete rollback-promotion stage",ops,errorOut))
-            return false;
+        if(stageState==PathState::File){
+            if(!VerifyExactFile(promote,expected,ops,&error))
+                return SetFailure(errorOut,
+                    "cannot verify promotion marker before obsolete stage cleanup: "+error);
+            if(!DeleteArtifactChecked(stage,"obsolete rollback-promotion stage",ops,errorOut))
+                return false;
+            if(!VerifyExactFile(promote,expected,ops,&error))
+                return SetFailure(errorOut,
+                    "promotion marker changed during obsolete stage cleanup: "+error);
+        }
         return true;
     }
 
@@ -213,21 +220,22 @@ inline bool EnsurePromotionMarker(const std::wstring& rollback,const std::wstrin
     if(rollbackState!=ExactFileState::Exact)
         return SetFailure(errorOut,"cannot verify rollback before promotion-marker creation: "+error);
 
-    ExactFileState stageState=InspectExactFile(stage,expected,ops,&error);
-    if(stageState==ExactFileState::Unavailable)
+    PathState staleStageState=QueryPath(stage,ops,&error);
+    if(staleStageState==PathState::Unavailable)
         return SetFailure(errorOut,"cannot inspect rollback-promotion stage: "+error);
-    if(stageState==ExactFileState::Mismatch){
-        if(!DeleteArtifactChecked(stage,"poisoned rollback-promotion stage",ops,errorOut)) return false;
-        stageState=ExactFileState::Missing;
+    if(staleStageState==PathState::File){
+        if(!DeleteArtifactChecked(stage,"uncommitted rollback-promotion stage",ops,errorOut))
+            return false;
+        if(!VerifyExactFile(rollback,expected,ops,&error))
+            return SetFailure(errorOut,
+                "rollback changed during uncommitted promotion-stage cleanup: "+error);
     }
-    if(stageState==ExactFileState::Missing){
-        if(!ops.copyFile(rollback,stage,TRUE))
-            return SetFailure(errorOut,Win32Failure("CopyFileW rollback-promotion stage failed",
-                LastErrorOr(ERROR_GEN_FAILURE)));
-        stageState=InspectExactFile(stage,expected,ops,&error);
-        if(stageState!=ExactFileState::Exact)
-            return SetFailure(errorOut,"rollback-promotion stage verification failed: "+error);
-    }
+    if(!ops.copyFile(rollback,stage,TRUE))
+        return SetFailure(errorOut,Win32Failure("CopyFileW rollback-promotion stage failed",
+            LastErrorOr(ERROR_GEN_FAILURE)));
+    ExactFileState committedStageState=InspectExactFile(stage,expected,ops,&error);
+    if(committedStageState!=ExactFileState::Exact)
+        return SetFailure(errorOut,"rollback-promotion stage verification failed: "+error);
     if(!ops.moveFile(stage,promote,MOVEFILE_WRITE_THROUGH))
         return SetFailure(errorOut,Win32Failure("MoveFileExW rollback-promotion marker publish failed",
             LastErrorOr(ERROR_UNABLE_TO_MOVE_REPLACEMENT)));
@@ -392,6 +400,24 @@ inline bool ResolveDisplacedForRecovery(const std::wstring& primary,const std::w
     return true;
 }
 
+inline bool ResolveRedundantDisplaced(const std::wstring& primary,const std::wstring& displaced,
+        const std::string& currentPrimary,const LayoutFsOps& ops,std::string* errorOut){
+    OptionalBytes staleDisplaced;
+    std::string error;
+    if(!CaptureOptional(displaced,ops,staleDisplaced,&error))
+        return SetFailure(errorOut,"cannot inspect displaced artifact beside valid primary: "+error);
+    if(!staleDisplaced.exists) return true;
+    if(!VerifyExactFile(primary,currentPrimary,ops,&error) ||
+       !VerifyCaptured(staleDisplaced,ops,&error))
+        return SetFailure(errorOut,
+            "cannot verify valid primary before displaced cleanup: "+error);
+    if(!DeleteArtifactChecked(displaced,"redundant displaced artifact",ops,errorOut)) return false;
+    if(!VerifyExactFile(primary,currentPrimary,ops,&error))
+        return SetFailure(errorOut,
+            "primary changed during redundant displaced cleanup: "+error);
+    return true;
+}
+
 inline bool ResolveDisplacedWithoutPrimary(const std::wstring& displaced,
         OptionalBytes& preservedBackup,OptionalBytes& preservedRollback,
         const LayoutFsOps& ops,OptionalBytes& cleanupPending,std::string* errorOut){
@@ -458,25 +484,32 @@ inline bool ResolveStaleBakPrevious(const OptionalBytes& currentPrimary,
         return true;
     };
 
-    OptionalBytes staged,orphanStage;
-    if(!CaptureOptional(previous,ops,staged,&error) ||
-       !CaptureOptional(stagingTemp,ops,orphanStage,&error))
+    OptionalBytes staged;
+    if(!CaptureOptional(previous,ops,staged,&error))
         return SetFailure(errorOut,"cannot inspect staged prior backup: "+error);
+    PathState orphanStageState=QueryPath(stagingTemp,ops,&error);
+    if(orphanStageState==PathState::Unavailable)
+        return SetFailure(errorOut,"cannot inspect prior-backup staging temp: "+error);
     if(!staged.exists){
-        OptionalBytes currentRollback,currentBackup,promotionCopy,promotionStageCopy,restoreCopy;
+        OptionalBytes currentRollback,currentBackup,promotionCopy,restoreCopy;
         if(!CaptureOptional(rollback,ops,currentRollback,&error) ||
            !CaptureOptional(backup,ops,currentBackup,&error) ||
            !CaptureOptional(promote,ops,promotionCopy,&error) ||
-           !CaptureOptional(promoteStage,ops,promotionStageCopy,&error) ||
            !CaptureOptional(restore,ops,restoreCopy,&error))
             return SetFailure(errorOut,"cannot inspect recovery staging without prior backup: "+error);
-        if(promotionStageCopy.exists){
+        PathState promotionStageState=QueryPath(promoteStage,ops,&error);
+        if(promotionStageState==PathState::Unavailable)
+            return SetFailure(errorOut,"cannot inspect rollback-promotion stage: "+error);
+        if(promotionStageState==PathState::File){
             if(promotionCopy.exists){
+                if(!VerifyCaptured(promotionCopy,ops,&error))
+                    return SetFailure(errorOut,
+                        "cannot verify promotion marker before stage cleanup: "+error);
                 if(!deleteChecked(promoteStage,"obsolete rollback-promotion stage")) return false;
+                if(!VerifyCaptured(promotionCopy,ops,&error))
+                    return SetFailure(errorOut,
+                        "promotion marker changed during stage cleanup: "+error);
             } else if(currentRollback.exists){
-                if(promotionStageCopy.bytes!=currentRollback.bytes &&
-                   !deleteChecked(promoteStage,"poisoned rollback-promotion stage"))
-                    return false;
                 if(!EnsurePromotionMarker(rollback,promote,currentRollback.bytes,ops,errorOut)) return false;
                 promotionCopy.path=promote;
                 promotionCopy.exists=true;
@@ -498,7 +531,6 @@ inline bool ResolveStaleBakPrevious(const OptionalBytes& currentPrimary,
                    !VerifyCaptured(currentBackup,ops,&error))
                     return SetFailure(errorOut,
                         "canonical state changed during rollback-promotion stage cleanup: "+error);
-                promotionStageCopy.exists=false;
             }
         }
         if(promotionCopy.exists){
@@ -536,7 +568,7 @@ inline bool ResolveStaleBakPrevious(const OptionalBytes& currentPrimary,
             currentBackup.bytes=restoreCopy.bytes;
             if(!deleteChecked(restore,"backup-restoration staging")) return false;
         }
-        if(!orphanStage.exists) return true;
+        if(orphanStageState!=PathState::File) return true;
         if(!currentPrimary.exists && !currentRollback.exists && !currentBackup.exists)
             return SetFailure(errorOut,"cannot discard orphan staging without a canonical layout stream");
         if(!VerifyCaptured(currentPrimary,ops,&error) || !VerifyCaptured(currentRollback,ops,&error) ||
@@ -549,21 +581,26 @@ inline bool ResolveStaleBakPrevious(const OptionalBytes& currentPrimary,
         return true;
     }
 
-    OptionalBytes currentRollback,currentBackup,restoreCopy,promotionCopy,promotionStageCopy;
+    OptionalBytes currentRollback,currentBackup,restoreCopy,promotionCopy;
     if(!CaptureOptional(rollback,ops,currentRollback,&error) ||
        !CaptureOptional(backup,ops,currentBackup,&error) ||
        !CaptureOptional(restore,ops,restoreCopy,&error) ||
-       !CaptureOptional(promote,ops,promotionCopy,&error) ||
-       !CaptureOptional(promoteStage,ops,promotionStageCopy,&error))
+       !CaptureOptional(promote,ops,promotionCopy,&error))
         return SetFailure(errorOut,"cannot inspect recovery streams beside staged backup: "+error);
+    PathState promotionStageState=QueryPath(promoteStage,ops,&error);
+    if(promotionStageState==PathState::Unavailable)
+        return SetFailure(errorOut,"cannot inspect rollback-promotion stage: "+error);
 
-    if(promotionStageCopy.exists){
+    if(promotionStageState==PathState::File){
         if(promotionCopy.exists){
+            if(!VerifyCaptured(promotionCopy,ops,&error))
+                return SetFailure(errorOut,
+                    "cannot verify promotion marker before stage cleanup: "+error);
             if(!deleteChecked(promoteStage,"obsolete rollback-promotion stage")) return false;
+            if(!VerifyCaptured(promotionCopy,ops,&error))
+                return SetFailure(errorOut,
+                    "promotion marker changed during stage cleanup: "+error);
         } else if(currentRollback.exists){
-            if(promotionStageCopy.bytes!=currentRollback.bytes &&
-               !deleteChecked(promoteStage,"poisoned rollback-promotion stage"))
-                return false;
             if(!EnsurePromotionMarker(rollback,promote,currentRollback.bytes,ops,errorOut)) return false;
             promotionCopy.path=promote;
             promotionCopy.exists=true;
@@ -580,7 +617,6 @@ inline bool ResolveStaleBakPrevious(const OptionalBytes& currentPrimary,
                !VerifyCaptured(staged,ops,&error))
                 return SetFailure(errorOut,
                     "canonical state changed during rollback-promotion stage cleanup: "+error);
-            promotionStageCopy.exists=false;
         }
     }
 
@@ -670,7 +706,14 @@ inline bool ResolveStaleBakPrevious(const OptionalBytes& currentPrimary,
     if(!VerifyCaptured(currentPrimary,ops,&error) || !VerifyCaptured(currentBackup,ops,&error) ||
        !VerifyCaptured(staged,ops,&error))
         return SetFailure(errorOut,"cannot verify canonical state before staged-backup cleanup: "+error);
-    if(orphanStage.exists && !deleteChecked(stagingTemp,"orphan prior-backup staging temp")) return false;
+    if(orphanStageState==PathState::File){
+        if(!deleteChecked(stagingTemp,"orphan prior-backup staging temp")) return false;
+        if(!VerifyCaptured(currentPrimary,ops,&error) ||
+           !VerifyCaptured(currentBackup,ops,&error) ||
+           !VerifyCaptured(staged,ops,&error))
+            return SetFailure(errorOut,
+                "canonical state changed during prior-backup stage cleanup: "+error);
+    }
     if(!deleteChecked(previous,"staged prior backup")) return false;
     if(!VerifyCaptured(currentPrimary,ops,&error) || !VerifyCaptured(currentBackup,ops,&error))
         return SetFailure(errorOut,"canonical state verification failed after staged-backup cleanup: "+error);
@@ -694,13 +737,15 @@ inline bool StagePriorBackup(const std::wstring& backup,const std::wstring& prev
             return SetFailure(errorOut,std::string("DeleteFileW reported success but ")+label+" remains");
         return true;
     };
-    OptionalBytes staleStage;
-    if(!CaptureOptional(stage,ops,staleStage,&error))
+    PathState staleStageState=QueryPath(stage,ops,&error);
+    if(staleStageState==PathState::Unavailable)
         return SetFailure(errorOut,"cannot inspect prior-backup staging temp: "+error);
-    if(staleStage.exists){
+    if(staleStageState==PathState::File){
         if(!VerifyCaptured(oldBackup,ops,&error))
             return SetFailure(errorOut,"cannot verify backup before stale staging cleanup: "+error);
         if(!deleteChecked(stage,"stale prior-backup staging temp")) return false;
+        if(!VerifyCaptured(oldBackup,ops,&error))
+            return SetFailure(errorOut,"backup changed during stale staging cleanup: "+error);
     }
     if(!ops.copyFile(backup,stage,TRUE))
         return SetFailure(errorOut,Win32Failure("CopyFileW prior-backup staging temp failed",
@@ -1104,7 +1149,20 @@ inline bool AtomicWriteText(const std::wstring& path,const std::string& data,std
         priorPrimary=currentPrimary.bytes;
     }
 
-    if(preserveExistingBackup){
+    if(!preserveExistingBackup){
+        if(primaryState==PathState::File){
+            if(!ResolveRedundantDisplaced(path,displaced,priorPrimary,ops,&queryError))
+                return SetFailure(errorOut,queryError);
+        } else {
+            if(!CaptureOptional(backup,ops,preservedBackup,&queryError))
+                return SetFailure(errorOut,"cannot inspect backup beside missing primary: "+queryError);
+            if(!CaptureOptional(rollback,ops,preservedRollback,&queryError))
+                return SetFailure(errorOut,"cannot inspect rollback beside missing primary: "+queryError);
+            if(!ResolveDisplacedWithoutPrimary(displaced,preservedBackup,preservedRollback,ops,
+                    displacedCleanupPending,&queryError))
+                return SetFailure(errorOut,queryError);
+        }
+    } else {
         if(!CaptureOptional(backup,ops,preservedBackup,&queryError))
             return SetFailure(errorOut,"cannot preserve existing backup: "+queryError);
         if(!CaptureOptional(rollback,ops,preservedRollback,&queryError))
@@ -1275,6 +1333,10 @@ inline LayoutLoadResult LoadLayoutWithBackupLocked(const std::wstring& path,Unix
     const std::wstring promotionStagePath=promotionPath+L".stage";
     const std::wstring previousBackupPath=path+L".bak.previous";
     if(primary.state==CandidateState::Valid){
+        std::string displacedError;
+        if(!ResolveRedundantDisplaced(path,path+L".displaced",primary.bytes,ops,&displacedError))
+            return UnavailableLoad(path,
+                "cannot reconcile displaced artifact beside valid primary: "+displacedError);
         // A committed promotion marker represents an unfinished transaction,
         // even though the new primary is already parse-valid.  Settle it
         // before advertising a writable Valid state so the prior generation
@@ -1333,6 +1395,32 @@ inline LayoutLoadResult LoadLayoutWithBackupLocked(const std::wstring& path,Unix
         return UnavailableLoad(promotionPath,"authoritative rollback-promotion marker is corrupt");
     }
     const bool promotionActive=promotion.state==CandidateState::Valid;
+
+    if(primary.state==CandidateState::Missing && !promotionActive){
+        const std::wstring displacedPath=path+L".displaced";
+        std::string displacedError;
+        PathState displacedState=QueryPath(displacedPath,ops,&displacedError);
+        if(displacedState==PathState::Unavailable)
+            return UnavailableLoad(displacedPath,
+                "cannot inspect displaced recovery artifact: "+displacedError);
+        if(displacedState==PathState::File){
+            PathState rollbackState=QueryPath(path+L".rollback",ops,&displacedError);
+            if(rollbackState==PathState::Unavailable)
+                return UnavailableLoad(path+L".rollback",displacedError);
+            PathState backupState=QueryPath(path+L".bak",ops,&displacedError);
+            if(backupState==PathState::Unavailable)
+                return UnavailableLoad(path+L".bak",displacedError);
+            if(rollbackState==PathState::Missing && backupState==PathState::Missing){
+                OptionalBytes missingBackup,missingRollback,pendingCleanup;
+                missingBackup.path=path+L".bak";
+                missingRollback.path=path+L".rollback";
+                if(!ResolveDisplacedWithoutPrimary(displacedPath,missingBackup,missingRollback,
+                        ops,pendingCleanup,&displacedError))
+                    return UnavailableLoad(displacedPath,
+                        "cannot canonicalize sole displaced recovery: "+displacedError);
+            }
+        }
+    }
 
     LayoutCandidate rollback=ReadCandidate(path+L".rollback",nowUtc,ops);
     if(rollback.state==CandidateState::Unavailable)
