@@ -420,7 +420,8 @@ inline bool ResolveRedundantDisplaced(const std::wstring& primary,const std::wst
 
 inline bool ResolveDisplacedWithoutPrimary(const std::wstring& displaced,
         OptionalBytes& preservedBackup,OptionalBytes& preservedRollback,
-        const LayoutFsOps& ops,OptionalBytes& cleanupPending,std::string* errorOut){
+        const LayoutFsOps& ops,OptionalBytes& cleanupPending,std::string* errorOut,
+        const std::string* expectedDisplaced=nullptr){
     cleanupPending=OptionalBytes();
     cleanupPending.path=displaced;
     OptionalBytes staleDisplaced;
@@ -428,6 +429,8 @@ inline bool ResolveDisplacedWithoutPrimary(const std::wstring& displaced,
     if(!CaptureOptional(displaced,ops,staleDisplaced,&error))
         return SetFailure(errorOut,"cannot inspect displaced artifact beside missing primary: "+error);
     if(!staleDisplaced.exists) return true;
+    if(expectedDisplaced && staleDisplaced.bytes!=*expectedDisplaced)
+        return SetFailure(errorOut,"displaced recovery changed after strict validation");
     if(!VerifyCaptured(staleDisplaced,ops,&error) ||
        !VerifyCaptured(preservedBackup,ops,&error) || !VerifyCaptured(preservedRollback,ops,&error))
         return SetFailure(errorOut,"cannot verify recovery beside displaced artifact: "+error);
@@ -933,7 +936,17 @@ inline bool PreserveCorruptCandidate(const LayoutCandidate& candidate,UnixSecond
             std::to_wstring(counter);
         if(!ops.copyFile(candidate.path,diagnostic,TRUE)){
             DWORD error=LastErrorOr(ERROR_GEN_FAILURE);
-            if(error==ERROR_FILE_EXISTS || error==ERROR_ALREADY_EXISTS) continue;
+            if(error==ERROR_FILE_EXISTS || error==ERROR_ALREADY_EXISTS){
+                std::string existing;
+                LayoutRevision existingRevision;
+                std::string readError;
+                if(ReadExactBytes(diagnostic,ops,existing,&existingRevision,&readError) &&
+                   existingRevision.size==candidate.revision.size &&
+                   existingRevision.contentHash==candidate.revision.contentHash &&
+                   existing==candidate.bytes)
+                    return true;
+                continue;
+            }
             return SetFailure(errorOut,Win32Failure("CopyFileW diagnostic preservation failed",error));
         }
         std::string copied;
@@ -1037,8 +1050,16 @@ inline bool TryRecoverSoleTemp(const std::wstring& path,UnixSeconds nowUtc,const
     }
     if(candidate.state==CandidateState::Corrupt){
         std::string error;
-        if(!PreserveCorruptCandidate(candidate,nowUtc,ops,&error) ||
-           !DeleteArtifactChecked(temp,"preserved corrupt temporary layout",ops,&error)){
+        if(!PreserveCorruptCandidate(candidate,nowUtc,ops,&error)){
+            result=UnavailableLoad(temp,error);
+            return true;
+        }
+        if(!VerifyExactFile(temp,candidate.bytes,ops,&error)){
+            result=UnavailableLoad(temp,
+                "corrupt temporary layout changed after diagnostic preservation: "+error);
+            return true;
+        }
+        if(!DeleteArtifactChecked(temp,"preserved corrupt temporary layout",ops,&error)){
             result=UnavailableLoad(temp,error);
             return true;
         }
@@ -1383,6 +1404,8 @@ inline LayoutLoadResult LoadLayoutWithBackupLocked(const std::wstring& path,Unix
 
     std::vector<const LayoutCandidate*> corrupt;
     if(primary.state==CandidateState::Corrupt) corrupt.push_back(&primary);
+    LayoutCandidate displacedCandidate;
+    bool corruptDisplacedPendingCleanup=false;
 
     LayoutCandidate promotion=ReadCandidate(promotionPath,nowUtc,ops);
     if(promotion.state==CandidateState::Unavailable)
@@ -1396,7 +1419,8 @@ inline LayoutLoadResult LoadLayoutWithBackupLocked(const std::wstring& path,Unix
     }
     const bool promotionActive=promotion.state==CandidateState::Valid;
 
-    if(primary.state==CandidateState::Missing && !promotionActive){
+    if((primary.state==CandidateState::Missing || primary.state==CandidateState::Corrupt) &&
+       !promotionActive){
         const std::wstring displacedPath=path+L".displaced";
         std::string displacedError;
         PathState displacedState=QueryPath(displacedPath,ops,&displacedError);
@@ -1411,13 +1435,27 @@ inline LayoutLoadResult LoadLayoutWithBackupLocked(const std::wstring& path,Unix
             if(backupState==PathState::Unavailable)
                 return UnavailableLoad(path+L".bak",displacedError);
             if(rollbackState==PathState::Missing && backupState==PathState::Missing){
-                OptionalBytes missingBackup,missingRollback,pendingCleanup;
-                missingBackup.path=path+L".bak";
-                missingRollback.path=path+L".rollback";
-                if(!ResolveDisplacedWithoutPrimary(displacedPath,missingBackup,missingRollback,
-                        ops,pendingCleanup,&displacedError))
+                displacedCandidate=ReadCandidate(displacedPath,nowUtc,ops);
+                if(displacedCandidate.state==CandidateState::Unavailable)
                     return UnavailableLoad(displacedPath,
-                        "cannot canonicalize sole displaced recovery: "+displacedError);
+                        "sole displaced recovery unavailable: "+displacedCandidate.error);
+                if(displacedCandidate.state==CandidateState::Valid){
+                    if(primary.state==CandidateState::Corrupt){
+                        std::string preserveError;
+                        if(!PreserveAll(corrupt,nowUtc,ops,&preserveError))
+                            return UnavailableLoad(path,preserveError);
+                    }
+                    OptionalBytes missingBackup,missingRollback,pendingCleanup;
+                    missingBackup.path=path+L".bak";
+                    missingRollback.path=path+L".rollback";
+                    if(!ResolveDisplacedWithoutPrimary(displacedPath,missingBackup,missingRollback,
+                            ops,pendingCleanup,&displacedError,&displacedCandidate.bytes))
+                        return UnavailableLoad(displacedPath,
+                            "cannot canonicalize sole displaced recovery: "+displacedError);
+                } else if(displacedCandidate.state==CandidateState::Corrupt){
+                    corrupt.push_back(&displacedCandidate);
+                    corruptDisplacedPendingCleanup=true;
+                }
             }
         }
     }
@@ -1456,6 +1494,10 @@ inline LayoutLoadResult LoadLayoutWithBackupLocked(const std::wstring& path,Unix
         std::string preserveError;
         if(!PreserveAll(corrupt,nowUtc,ops,&preserveError))
             return UnavailableLoad(path,preserveError);
+        if(backup.state==CandidateState::Corrupt &&
+           !VerifyExactFile(backup.path,backup.bytes,ops,&preserveError))
+            return UnavailableLoad(backup.path,
+                "corrupt backup changed after diagnostic preservation: "+preserveError);
         bool repaired=false;
         std::string repairError;
         if(!EnsureExactFromMarker(promotion.path,backup.path,promotion.bytes,ops,repaired,&repairError))
@@ -1471,6 +1513,15 @@ inline LayoutLoadResult LoadLayoutWithBackupLocked(const std::wstring& path,Unix
     std::string preserveError;
     if(!corrupt.empty() && !PreserveAll(corrupt,nowUtc,ops,&preserveError))
         return UnavailableLoad(path,preserveError);
+    if(corruptDisplacedPendingCleanup){
+        std::string cleanupError;
+        if(!VerifyExactFile(displacedCandidate.path,displacedCandidate.bytes,ops,&cleanupError))
+            return UnavailableLoad(displacedCandidate.path,
+                "corrupt displaced evidence changed before cleanup: "+cleanupError);
+        if(!DeleteArtifactChecked(displacedCandidate.path,
+                "diagnostically preserved corrupt displaced artifact",ops,&cleanupError))
+            return UnavailableLoad(displacedCandidate.path,cleanupError);
+    }
     std::string transactionError;
     if(!NoUnresolvedTransactionArtifacts(path,ops,&transactionError,false))
         return UnavailableLoad(path,transactionError);
