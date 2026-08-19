@@ -33,6 +33,17 @@ enum class SessionDataStatus { Fresh, CachedStale, Unavailable, Superseded };
 enum class SessionPurpose {
     AutoReconcile, HeartbeatSave, ManualSave, ManualRestore, Search, MetadataProbe
 };
+enum class SessionWorkerStep {
+    RequestPrepare, ResultPrepare, AfterChoose, ActiveCopy, CacheLookup,
+    GenerationPrepare, GenerationPublish
+};
+enum class SessionCoordinatorStep {
+    RequestPrepare, PendingInsert, LatestRequestInsert, AcceptPrepare, LatestResultInsert
+};
+
+struct SessionCoordinatorOps {
+    std::function<void(SessionCoordinatorStep)> beforeStep;
+};
 
 struct SessionRequest {
     uint64_t requestId=0;
@@ -163,6 +174,7 @@ enum class SessionCachePutStep {
 
 struct SessionCacheOps {
     std::function<void(SessionCachePutStep)> beforePutStep;
+    std::function<void()> beforeLookupOutput;
 };
 
 class SessionCache {
@@ -177,12 +189,16 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         for(size_t i=0;i<entries_.size();++i){
             if(entries_[i].app==app && entries_[i].value.path==path && entries_[i].value.stamp==stamp){
+                SessionCacheValue prepared;
+                try {
+                    if(ops_.beforeLookupOutput) ops_.beforeLookupOutput();
+                    prepared=entries_[i].value;
+                } catch(...) { return false; }
                 entries_[i].lastUse=++clock_;
-                output=entries_[i].value;
+                PublishValue(output,prepared);
                 return true;
             }
         }
-        output=SessionCacheValue{};
         return false;
     }
 
@@ -196,22 +212,26 @@ public:
                 best=i; newest=entries_[i].inserted;
             }
         }
-        if(best==entries_.size()){ output=SessionCacheValue{}; return false; }
+        if(best==entries_.size()) return false;
+        SessionCacheValue prepared;
+        try {
+            if(ops_.beforeLookupOutput) ops_.beforeLookupOutput();
+            prepared=entries_[best].value;
+        } catch(...) { return false; }
         entries_[best].lastUse=++clock_;
-        output=entries_[best].value;
+        PublishValue(output,prepared);
         return true;
     }
 
     bool Put(const std::string& app,const std::wstring& path,const SessionStamp& stamp,
              std::vector<WinFp>&& windows,uint64_t contentHash,uint64_t dataGeneration,
              SessionCacheValue& output){
-        output=SessionCacheValue{};
         size_t retained=EstimateSessionPayloadBytes(windows);
         if(maxEntries_==0 || retained>budget_->Limit()) return false;
         std::lock_guard<std::mutex> lock(mutex_);
         std::vector<bool> remove;
         try { remove.assign(entries_.size(),false); }
-        catch(const std::bad_alloc&) { return false; }
+        catch(...) { return false; }
         size_t remaining=entries_.size(),reclaimable=0;
         auto mark=[&](size_t index){
             if(remove[index]) return;
@@ -260,8 +280,7 @@ public:
             if(duplicate) PutStep(SessionCachePutStep::DuplicateReplacement);
             PutStep(SessionCachePutStep::ContainerInsert);
             PutStep(SessionCachePutStep::OrderPublish);
-        } catch(const std::bad_alloc&) { return false; }
-          catch(const std::length_error&) { return false; }
+        } catch(...) { return false; }
 
         // All potentially-throwing work is complete. Because Put is serialized
         // by mutex_, and only cache-owned payloads were counted reclaimable,
@@ -297,6 +316,14 @@ private:
                   "cache commit requires nothrow Entry move construction");
     static_assert(std::is_nothrow_move_assignable<Entry>::value,
                   "cache eviction requires nothrow Entry move assignment");
+    static void PublishValue(SessionCacheValue& output,SessionCacheValue& prepared){
+        output.path.swap(prepared.path);
+        output.stamp=prepared.stamp;
+        output.contentHash=prepared.contentHash;
+        output.dataGeneration=prepared.dataGeneration;
+        output.retainedBytes=prepared.retainedBytes;
+        output.windows.swap(prepared.windows);
+    }
     void PutStep(SessionCachePutStep step){ if(ops_.beforePutStep) ops_.beforePutStep(step); }
     size_t maxEntries_;
     std::shared_ptr<SessionRetainedBudget> budget_;
@@ -425,6 +452,10 @@ struct SessionWorkerOps {
     std::function<bool(const std::wstring&,SessionStamp&)> getStamp;
     std::function<FileReadResult(const std::wstring&)> readFile;
     std::function<bool(const AppProfile&,const std::string&,std::vector<WinFp>&)> parse;
+    std::function<bool()> beforePost;
+    std::function<bool()> beforeJoinWait;
+    std::function<void(SessionWorkerStep)> beforeWorkerStep;
+    std::function<std::unique_ptr<SessionResult>()> makeResult;
     std::function<bool(HWND,UINT,WPARAM,LPARAM)> postMessage;
 };
 
@@ -434,6 +465,7 @@ inline SessionWorkerOps DefaultSessionWorkerOps(){
     ops.getStamp=[](const std::wstring& path,SessionStamp& stamp){ return GetSessionStamp(path,stamp); };
     ops.readFile=[](const std::wstring& path){ return ReadFileBytesBounded(path,MAX_BROWSER_SESSION_BYTES); };
     ops.parse=[](const AppProfile& profile,const std::string& bytes,std::vector<WinFp>& output){ return ParseBrowserSessionData(profile,bytes,output); };
+    ops.makeResult=[](){ return std::unique_ptr<SessionResult>(new SessionResult()); };
     ops.postMessage=[](HWND window,UINT message,WPARAM wp,LPARAM lp){ return PostMessageW(window,message,wp,lp)!=FALSE; };
     return ops;
 }
@@ -444,6 +476,7 @@ inline void FillMissingSessionWorkerOps(SessionWorkerOps& ops){
     if(!ops.getStamp) ops.getStamp=defaults.getStamp;
     if(!ops.readFile) ops.readFile=defaults.readFile;
     if(!ops.parse) ops.parse=defaults.parse;
+    if(!ops.makeResult) ops.makeResult=defaults.makeResult;
     if(!ops.postMessage) ops.postMessage=defaults.postMessage;
 }
 
@@ -484,6 +517,10 @@ inline uint64_t HashSessionWindows(const std::vector<WinFp>& windows){
     return hash;
 }
 
+inline uint64_t NextSessionDataGeneration(uint64_t current){
+    return current==(std::numeric_limits<uint64_t>::max)()?current:current+1;
+}
+
 inline int SessionPurposePriority(SessionPurpose purpose){
     if(purpose==SessionPurpose::ManualSave||purpose==SessionPurpose::ManualRestore) return 4;
     if(purpose==SessionPurpose::AutoReconcile||purpose==SessionPurpose::HeartbeatSave) return 3;
@@ -506,6 +543,9 @@ public:
                            size_t maxCacheBytes=MAX_SESSION_CACHE_BYTES)
         :window_(window),ops_(supplied),cache_(maxCacheEntries,maxCacheBytes){
         FillMissingSessionWorkerOps(ops_);
+        generations_.emplace("firefox",GenerationState{});
+        generations_.emplace("chrome",GenerationState{});
+        generations_.emplace("msedge",GenerationState{});
         thread_=std::thread(&SessionWorker::Run,this);
     }
     ~SessionWorker(){ Stop(); }
@@ -513,22 +553,40 @@ public:
     SessionWorker& operator=(const SessionWorker&)=delete;
 
     bool Request(const SessionRequest& request){
+        if(!SessionRequestProfileSupported(request)) return false;
+        Queued incoming;
+        try {
+            WorkerStep(SessionWorkerStep::RequestPrepare);
+            incoming.request=request;
+            incoming.activeApp=request.app;
+        } catch(...) { return false; }
         std::unique_ptr<SessionResult> superseded;
-        {
+        bool queued=false;
+        try {
             std::lock_guard<std::mutex> lock(mutex_);
-            if(stopping_ || !SessionRequestProfileSupported(request)) return false;
+            if(stopping_) return false;
             std::map<std::string,Queued>::iterator found=pending_.find(request.app);
             if(found!=pending_.end()){
                 if(SessionPurposePriority(request.purpose)<SessionPurposePriority(found->second.request.purpose))
-                    superseded=MakeSuperseded(request);
+                    superseded=MakeSuperseded(incoming.request);
                 else {
                     superseded=MakeSuperseded(found->second.request);
-                    found->second=Queued{request,++queueClock_};
+                    incoming.order=NextQueueOrder();
+                    found->second=std::move(incoming);
+                    queueClock_=found->second.order;
+                    queued=true;
                 }
-            } else pending_[request.app]=Queued{request,++queueClock_};
-        }
+            } else {
+                incoming.order=NextQueueOrder();
+                std::pair<std::map<std::string,Queued>::iterator,bool> inserted=
+                    pending_.emplace(incoming.request.app,std::move(incoming));
+                if(!inserted.second) return false;
+                queueClock_=inserted.first->second.order;
+                queued=true;
+            }
+        } catch(...) { return false; }
         if(superseded) PostIfRunning(std::move(superseded));
-        changed_.notify_one();
+        if(queued) changed_.notify_one();
         return true;
     }
 
@@ -543,12 +601,18 @@ public:
                 pending_.clear();
                 notify=true;
             }
-            if(workerThreadId_==std::this_thread::get_id()){
+            if(workerThreadId_==std::this_thread::get_id() || PostingWorkerSlot()==this){
                 lock.unlock();
                 if(notify) changed_.notify_all();
-                return false; // the external owner performs the required join
+                return false; // a later external owner performs the required join
             }
             if(joinInProgress_){
+                lock.unlock();
+                bool shouldWait=true;
+                try { shouldWait=!ops_.beforeJoinWait || ops_.beforeJoinWait(); }
+                catch(...) { shouldWait=true; }
+                lock.lock();
+                if(!shouldWait) return false;
                 changed_.wait(lock,[&]{ return stopped_; });
                 return true;
             }
@@ -557,9 +621,8 @@ public:
         if(notify) changed_.notify_all();
         if(thread_.joinable()) thread_.join();
         {
-            // The real PostMessage call is non-reentrant. The recursive fence
-            // also keeps injected callbacks safe when they call Stop/Request.
-            std::lock_guard<std::recursive_mutex> fence(postMutex_);
+            std::unique_lock<std::mutex> lock(mutex_);
+            changed_.wait(lock,[&]{ return postsInFlight_==0; });
         }
         cache_.Clear();
         {
@@ -580,30 +643,91 @@ public:
     size_t RetainedBytes() const { return cache_.RetainedBytes(); }
 
 private:
-    struct Queued { SessionRequest request; uint64_t order=0; };
+    struct Queued { SessionRequest request; std::string activeApp; uint64_t order=0; };
+    static_assert(std::is_nothrow_move_constructible<Queued>::value,
+                  "queue dequeue requires nothrow move construction");
+    static_assert(std::is_nothrow_move_assignable<Queued>::value,
+                  "queue replacement requires nothrow move assignment");
     struct GenerationState {
         std::wstring path; SessionStamp stamp; uint64_t hash=0,generation=0; bool known=false;
     };
+    static SessionWorker*& PostingWorkerSlot(){
+        static thread_local SessionWorker* current=nullptr;
+        return current;
+    }
+    struct PostingScope {
+        SessionWorker* previous;
+        explicit PostingScope(SessionWorker* current):previous(PostingWorkerSlot()){
+            PostingWorkerSlot()=current;
+        }
+        ~PostingScope(){ PostingWorkerSlot()=previous; }
+    };
+    void FinishPost(){
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if(postsInFlight_>0) --postsInFlight_;
+        }
+        changed_.notify_all();
+    }
 
+    uint64_t NextQueueOrder() const {
+        return queueClock_==(std::numeric_limits<uint64_t>::max)()?queueClock_:queueClock_+1;
+    }
+    void WorkerStep(SessionWorkerStep step){
+        if(ops_.beforeWorkerStep) ops_.beforeWorkerStep(step);
+    }
+    static void SwapSessionResult(SessionResult& left,SessionResult& right) noexcept {
+        using std::swap;
+        swap(left.requestId,right.requestId);
+        left.app.swap(right.app);
+        left.path.swap(right.path);
+        swap(left.purpose,right.purpose);
+        swap(left.identityGeneration,right.identityGeneration);
+        swap(left.sourceStamp,right.sourceStamp);
+        swap(left.sourceStampKnown,right.sourceStampKnown);
+        swap(left.dataStamp,right.dataStamp);
+        swap(left.dataGeneration,right.dataGeneration);
+        swap(left.status,right.status);
+        left.windows.swap(right.windows);
+    }
+    static void PrepareUnavailable(const SessionRequest& request,SessionResult& output){
+        SessionResult prepared;
+        prepared.requestId=request.requestId;
+        prepared.app=request.app;
+        prepared.purpose=request.purpose;
+        prepared.identityGeneration=request.identityGeneration;
+        prepared.status=SessionDataStatus::Unavailable;
+        SwapSessionResult(output,prepared);
+    }
+    std::unique_ptr<SessionResult> MakeResult(){
+        return ops_.makeResult?ops_.makeResult():std::unique_ptr<SessionResult>();
+    }
     static std::unique_ptr<SessionResult> MakeSuperseded(const SessionRequest& request){
         std::unique_ptr<SessionResult> result(new SessionResult());
+        PrepareUnavailable(request,*result);
         result->requestId=request.requestId; result->app=request.app; result->purpose=request.purpose;
         result->identityGeneration=request.identityGeneration; result->status=SessionDataStatus::Superseded;
         return result;
     }
-    void PostIfRunning(std::unique_ptr<SessionResult> result){
-        {
+    void PostIfRunning(std::unique_ptr<SessionResult> result) noexcept {
+        if(!result) return;
+        HWND target=nullptr;
+        try {
             std::lock_guard<std::mutex> lock(mutex_);
             if(stopping_ || !window_) return;
-        }
-        std::lock_guard<std::recursive_mutex> postLock(postMutex_);
-        HWND target=nullptr;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if(!stopping_ && window_) target=window_;
-        }
-        if(!target) return;
-        PostSessionResultOwned(ops_,target,std::move(result));
+            target=window_;
+            ++postsInFlight_;
+        } catch(...) { return; }
+        struct PostCompletion {
+            SessionWorker* worker;
+            explicit PostCompletion(SessionWorker* value):worker(value){}
+            ~PostCompletion(){ worker->FinishPost(); }
+        } completion(this);
+        try {
+            PostingScope posting(this);
+            bool proceed=!ops_.beforePost || ops_.beforePost();
+            if(proceed) PostSessionResultOwned(ops_,target,std::move(result));
+        } catch(...) {}
     }
     bool Choose(Queued& output){
         if(pending_.empty()) return false;
@@ -612,9 +736,36 @@ private:
             int candidate=SessionPurposePriority(it->second.request.purpose),current=SessionPurposePriority(best->second.request.purpose);
             if(candidate>current || (candidate==current&&it->second.order<best->second.order)) best=it;
         }
-        output=best->second; pending_.erase(best); return true;
+        output=std::move(best->second); pending_.erase(best); return true;
     }
-    void Run(){
+    void ClearActive() noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex_);
+            active_=false;
+            activeApp_.clear();
+        } catch(...) {}
+        changed_.notify_all();
+    }
+    void ProcessQueued(Queued& queued) noexcept {
+        std::unique_ptr<SessionResult> result;
+        bool resultIdentified=false;
+        try {
+            result=MakeResult();
+            if(!result) throw std::bad_alloc();
+            WorkerStep(SessionWorkerStep::ResultPrepare);
+            PrepareUnavailable(queued.request,*result);
+            resultIdentified=true;
+            WorkerStep(SessionWorkerStep::AfterChoose);
+            WorkerStep(SessionWorkerStep::ActiveCopy);
+            SessionResult processed;
+            PrepareUnavailable(queued.request,processed);
+            Process(queued.request,processed);
+            SwapSessionResult(*result,processed);
+        } catch(...) { if(!resultIdentified) result.reset(); }
+        ClearActive();
+        PostIfRunning(std::move(result));
+    }
+    void RunLoop(){
         {
             std::lock_guard<std::mutex> lock(mutex_);
             workerThreadId_=std::this_thread::get_id();
@@ -626,16 +777,13 @@ private:
                 changed_.wait(lock,[&]{ return stopping_||!pending_.empty(); });
                 if(stopping_) break;
                 if(!Choose(queued)) continue;
-                active_=true; activeApp_=queued.request.app;
+                active_=true; activeApp_.swap(queued.activeApp);
             }
-            std::unique_ptr<SessionResult> result=Process(queued.request);
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                active_=false; activeApp_.clear();
-            }
-            changed_.notify_all();
-            PostIfRunning(std::move(result));
+            ProcessQueued(queued);
         }
+    }
+    void Run() noexcept {
+        try { RunLoop(); } catch(...) { ClearActive(); }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             workerThreadId_=std::thread::id();
@@ -651,69 +799,104 @@ private:
         try { result.sourceStampKnown=!current.empty()&&ops_.getStamp(current,stamp); } catch(...) { result.sourceStampKnown=false; }
         if(result.sourceStampKnown) result.sourceStamp=stamp;
     }
+    bool GenerationIdentityMatches(const GenerationState& state,const std::wstring& path,
+                                   const SessionStamp& stamp,uint64_t hash) const {
+        return state.known && state.path==path && state.stamp==stamp && state.hash==hash;
+    }
+    void PrepareGeneration(const std::string& app,const std::wstring& path,
+                           const SessionStamp& stamp,uint64_t hash,GenerationState& prepared){
+        WorkerStep(SessionWorkerStep::GenerationPrepare);
+        std::map<std::string,GenerationState>::const_iterator found=generations_.find(app);
+        if(found==generations_.end()) throw std::runtime_error("unsupported session generation app");
+        GenerationState next;
+        next.path=path;
+        next.stamp=stamp;
+        next.hash=hash;
+        next.generation=GenerationIdentityMatches(found->second,path,stamp,hash)?
+            found->second.generation:NextSessionDataGeneration(found->second.generation);
+        next.known=true;
+        WorkerStep(SessionWorkerStep::GenerationPublish);
+        prepared.path.swap(next.path);
+        prepared.stamp=next.stamp;
+        prepared.hash=next.hash;
+        prepared.generation=next.generation;
+        prepared.known=true;
+    }
+    void PublishGeneration(const std::string& app,GenerationState& prepared) noexcept {
+        std::map<std::string,GenerationState>::iterator found=generations_.find(app);
+        if(found==generations_.end()) return;
+        found->second.path.swap(prepared.path);
+        found->second.stamp=prepared.stamp;
+        found->second.hash=prepared.hash;
+        found->second.generation=prepared.generation;
+        found->second.known=prepared.known;
+    }
+    uint64_t ObserveCachedGeneration(const std::string& app,const SessionCacheValue& cached){
+        GenerationState prepared;
+        PrepareGeneration(app,cached.path,cached.stamp,cached.contentHash,prepared);
+        uint64_t generation=prepared.generation;
+        PublishGeneration(app,prepared);
+        return generation;
+    }
     void ApplyFallback(SessionResult& result,const std::wstring& attemptedPath){
         SessionCacheValue stale;
         if(!attemptedPath.empty()&&cache_.FindLatestPath(result.app,attemptedPath,stale)){
             result.status=SessionDataStatus::CachedStale; result.windows=stale.windows;
-            result.dataStamp=stale.stamp; result.dataGeneration=stale.dataGeneration;
+            result.dataStamp=stale.stamp; result.dataGeneration=ObserveCachedGeneration(result.app,stale);
         } else result.status=SessionDataStatus::Unavailable;
     }
-    std::unique_ptr<SessionResult> Process(const SessionRequest& request){
-        std::unique_ptr<SessionResult> result(new SessionResult());
-        result->requestId=request.requestId; result->app=request.app; result->purpose=request.purpose;
-        result->identityGeneration=request.identityGeneration;
+    void Process(const SessionRequest& request,SessionResult& result){
         std::wstring before;
         try { before=ops_.resolvePath(request.profile); } catch(...) { before.clear(); }
-        result->path=before;
+        result.path=before;
         SessionStamp stampBefore;
         bool beforeKnown=false;
         try { beforeKnown=!before.empty()&&ops_.getStamp(before,stampBefore); } catch(...) { beforeKnown=false; }
-        if(beforeKnown){ result->sourceStampKnown=true; result->sourceStamp=stampBefore; }
+        if(beforeKnown){ result.sourceStampKnown=true; result.sourceStamp=stampBefore; }
         SessionCacheValue cached;
+        WorkerStep(SessionWorkerStep::CacheLookup);
         if(beforeKnown&&cache_.FindExact(request.app,before,stampBefore,cached)){
-            result->status=SessionDataStatus::Fresh; result->windows=cached.windows;
-            result->dataStamp=cached.stamp; result->dataGeneration=cached.dataGeneration;
-            return result;
+            result.status=SessionDataStatus::Fresh; result.windows=cached.windows;
+            result.dataStamp=cached.stamp; result.dataGeneration=ObserveCachedGeneration(request.app,cached);
+            return;
         }
-        if(!beforeKnown){ ObserveCurrent(*result,request.profile); ApplyFallback(*result,before); return result; }
+        if(!beforeKnown){ ObserveCurrent(result,request.profile); ApplyFallback(result,before); return; }
         FileReadResult read;
         try { read=ops_.readFile(before); } catch(...) { read.status=FileReadStatus::Unavailable; }
-        if(read.status!=FileReadStatus::Ok){ ObserveCurrent(*result,request.profile); ApplyFallback(*result,before); return result; }
+        if(read.status!=FileReadStatus::Ok){ ObserveCurrent(result,request.profile); ApplyFallback(result,before); return; }
         std::vector<WinFp> parsed;
         bool parsedOk=false;
         try { parsedOk=ops_.parse(request.profile,read.bytes,parsed); } catch(...) { parsed.clear(); parsedOk=false; }
         std::wstring after;
         try { after=ops_.resolvePath(request.profile); } catch(...) { after.clear(); }
-        result->path=after;
+        result.path=after;
         SessionStamp stampAfter;
-        result->sourceStamp=SessionStamp{};
-        try { result->sourceStampKnown=!after.empty()&&ops_.getStamp(after,stampAfter); } catch(...) { result->sourceStampKnown=false; }
-        if(result->sourceStampKnown) result->sourceStamp=stampAfter;
-        if(parsedOk&&result->sourceStampKnown&&before==after&&stampBefore==stampAfter){
-            uint64_t hash=HashSessionWindows(parsed),generation=0;
-            GenerationState& state=generations_[request.app];
-            if(state.known&&state.path==after&&state.stamp==stampAfter&&state.hash==hash) generation=state.generation;
-            else generation=state.known?state.generation+1:1;
+        result.sourceStamp=SessionStamp{};
+        try { result.sourceStampKnown=!after.empty()&&ops_.getStamp(after,stampAfter); } catch(...) { result.sourceStampKnown=false; }
+        if(result.sourceStampKnown) result.sourceStamp=stampAfter;
+        if(parsedOk&&result.sourceStampKnown&&before==after&&stampBefore==stampAfter){
+            uint64_t hash=HashSessionWindows(parsed);
+            GenerationState generation;
+            PrepareGeneration(request.app,after,stampAfter,hash,generation);
             SessionCacheValue inserted;
-            if(cache_.Put(request.app,after,stampAfter,std::move(parsed),hash,generation,inserted)){
-                state.path=after; state.stamp=stampAfter; state.hash=hash; state.generation=generation; state.known=true;
-                result->status=SessionDataStatus::Fresh; result->windows=inserted.windows;
-                result->dataStamp=inserted.stamp; result->dataGeneration=inserted.dataGeneration;
-                return result;
+            if(cache_.Put(request.app,after,stampAfter,std::move(parsed),hash,generation.generation,inserted)){
+                PublishGeneration(request.app,generation);
+                result.status=SessionDataStatus::Fresh; result.windows=inserted.windows;
+                result.dataStamp=inserted.stamp; result.dataGeneration=inserted.dataGeneration;
+                return;
             }
         }
-        ApplyFallback(*result,before);
-        return result;
+        ApplyFallback(result,before);
     }
 
     mutable std::mutex mutex_;
-    std::recursive_mutex postMutex_;
     std::condition_variable changed_;
     HWND window_=nullptr;
     SessionWorkerOps ops_;
     SessionCache cache_;
     std::thread thread_;
     bool stopping_=false,stopped_=false,joinInProgress_=false,active_=false;
+    size_t postsInFlight_=0;
     std::thread::id workerThreadId_;
     std::string activeApp_;
     std::map<std::string,Queued> pending_;
@@ -724,27 +907,69 @@ private:
 class SessionCoordinator {
 public:
     typedef std::function<bool(const SessionRequest&)> Submit;
-    explicit SessionCoordinator(const Submit& submit):submit_(submit){}
+    explicit SessionCoordinator(const Submit& submit,
+                                const SessionCoordinatorOps& ops=SessionCoordinatorOps())
+        :submit_(submit),ops_(ops){}
 
     uint64_t RequestSessionData(const AppProfile& profile,uint64_t identityGeneration,
                                 SessionPurpose purpose){
         SessionRequest request;
-        request.requestId=++nextRequestId_;
-        request.app=profile.id;
-        request.profile=profile;
-        request.purpose=purpose;
-        request.identityGeneration=identityGeneration;
+        Pending expected;
+        uint64_t requestId=0;
+        try {
+            Step(SessionCoordinatorStep::RequestPrepare);
+            if(nextRequestId_==(std::numeric_limits<uint64_t>::max)()) return 0;
+            requestId=nextRequestId_+1;
+            request.requestId=requestId;
+            request.app=profile.id;
+            request.profile=profile;
+            request.purpose=purpose;
+            request.identityGeneration=identityGeneration;
+            expected.app=request.app;
+            expected.profile=profile;
+            expected.purpose=purpose;
+            expected.identityGeneration=identityGeneration;
+        } catch(...) { return 0; }
+
+        bool latestInserted=false,latestChanged=false;
+        uint64_t previousLatest=0;
+        try {
+            Step(SessionCoordinatorStep::PendingInsert);
+            std::pair<std::map<uint64_t,Pending>::iterator,bool> pendingInserted=
+                pending_.emplace(requestId,std::move(expected));
+            if(!pendingInserted.second) return 0;
+            try {
+                Step(SessionCoordinatorStep::LatestRequestInsert);
+                std::map<std::string,uint64_t>::iterator latest=latestRequest_.find(request.app);
+                if(latest==latestRequest_.end()){
+                    std::pair<std::map<std::string,uint64_t>::iterator,bool> inserted=
+                        latestRequest_.emplace(request.app,requestId);
+                    if(!inserted.second) throw std::runtime_error("session latest insertion failed");
+                    latestInserted=true;
+                } else {
+                    previousLatest=latest->second;
+                    latest->second=requestId;
+                    latestChanged=true;
+                }
+            } catch(...) {
+                pending_.erase(requestId);
+                throw;
+            }
+        } catch(...) { return 0; }
+
         bool submitted=false;
         try { submitted=submit_&&submit_(request); } catch(...) { submitted=false; }
-        if(!submitted) return 0;
-        Pending expected;
-        expected.app=request.app;
-        expected.profile=profile;
-        expected.purpose=purpose;
-        expected.identityGeneration=identityGeneration;
-        pending_[request.requestId]=expected;
-        latestRequest_[request.app]=request.requestId;
-        return request.requestId;
+        if(!submitted){
+            pending_.erase(requestId);
+            if(latestInserted) latestRequest_.erase(request.app);
+            else if(latestChanged){
+                std::map<std::string,uint64_t>::iterator latest=latestRequest_.find(request.app);
+                if(latest!=latestRequest_.end()) latest->second=previousLatest;
+            }
+            return 0;
+        }
+        nextRequestId_=requestId;
+        return requestId;
     }
 
     bool AcceptSessionResult(std::unique_ptr<SessionResult> result,
@@ -752,7 +977,11 @@ public:
         if(!result) return false;
         std::map<uint64_t,Pending>::iterator found=pending_.find(result->requestId);
         if(found==pending_.end()) return false;
-        const Pending expected=found->second;
+        Pending expected;
+        try {
+            Step(SessionCoordinatorStep::AcceptPrepare);
+            expected=found->second;
+        } catch(...) { return false; }
         if(result->app!=expected.app || result->purpose!=expected.purpose ||
            result->identityGeneration!=expected.identityGeneration) return false;
         if(result->status==SessionDataStatus::Superseded){
@@ -767,8 +996,19 @@ public:
             pending_.erase(found);
             return false;
         }
+        std::map<std::string,std::unique_ptr<SessionResult> >::iterator destination=
+            latestResults_.find(expected.app);
+        if(destination==latestResults_.end()){
+            try {
+                Step(SessionCoordinatorStep::LatestResultInsert);
+                std::pair<std::map<std::string,std::unique_ptr<SessionResult> >::iterator,bool> inserted=
+                    latestResults_.emplace(expected.app,std::unique_ptr<SessionResult>());
+                if(!inserted.second) return false;
+                destination=inserted.first;
+            } catch(...) { return false; }
+        }
         pending_.erase(found);
-        latestResults_[expected.app]=std::move(result);
+        destination->second.swap(result);
         return true;
     }
 
@@ -786,6 +1026,9 @@ private:
         uint64_t identityGeneration=0;
         Pending(){ profile.session=AppProfile::NONE; }
     };
+    static_assert(std::is_nothrow_move_constructible<Pending>::value,
+                  "coordinator commit requires nothrow Pending move construction");
+    void Step(SessionCoordinatorStep step){ if(ops_.beforeStep) ops_.beforeStep(step); }
     void RefreshLatest(const std::string& app,uint64_t removed){
         std::map<std::string,uint64_t>::iterator latest=latestRequest_.find(app);
         if(latest==latestRequest_.end() || latest->second!=removed) return;
@@ -796,6 +1039,7 @@ private:
         else latestRequest_.erase(latest);
     }
     Submit submit_;
+    SessionCoordinatorOps ops_;
     uint64_t nextRequestId_=0;
     std::map<uint64_t,Pending> pending_;
     std::map<std::string,uint64_t> latestRequest_;

@@ -593,17 +593,40 @@ inline bool MozLz4Decompress(const std::string& data,unsigned long long outputLi
 }
 
 struct SessionStamp {
-    unsigned long long size=0,mtime=0;
-    bool operator==(const SessionStamp& other) const { return size==other.size&&mtime==other.mtime; }
+    unsigned long long size=0,mtime=0,changeTime=0,volumeSerial=0,fileIdLow=0,fileIdHigh=0;
+    bool operator==(const SessionStamp& other) const {
+        return size==other.size && mtime==other.mtime && changeTime==other.changeTime &&
+               volumeSerial==other.volumeSerial && fileIdLow==other.fileIdLow &&
+               fileIdHigh==other.fileIdHigh;
+    }
     bool operator!=(const SessionStamp& other) const { return !(*this==other); }
 };
 
 inline bool GetSessionStamp(const std::wstring& path,SessionStamp& output){
-    WIN32_FILE_ATTRIBUTE_DATA attributes{};
-    if(!GetFileAttributesExW(path.c_str(),GetFileExInfoStandard,&attributes)||(attributes.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)) return false;
-    ULARGE_INTEGER size{},mtime{};
-    size.LowPart=attributes.nFileSizeLow; size.HighPart=attributes.nFileSizeHigh;
-    mtime.LowPart=attributes.ftLastWriteTime.dwLowDateTime; mtime.HighPart=attributes.ftLastWriteTime.dwHighDateTime;
-    if(size.QuadPart>MAX_BROWSER_SESSION_BYTES) return false;
-    SessionStamp stamp; stamp.size=size.QuadPart; stamp.mtime=mtime.QuadPart; output=stamp; return true;
+    HANDLE file=CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,
+                            FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                            nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(file==INVALID_HANDLE_VALUE) return false;
+    FILE_BASIC_INFO basicBefore{},basicAfter{};
+    FILE_STANDARD_INFO standard{};
+    FILE_ID_INFO identity{};
+    bool ok=GetFileInformationByHandleEx(file,FileBasicInfo,&basicBefore,sizeof(basicBefore))!=FALSE &&
+            GetFileInformationByHandleEx(file,FileStandardInfo,&standard,sizeof(standard))!=FALSE &&
+            GetFileInformationByHandleEx(file,FileIdInfo,&identity,sizeof(identity))!=FALSE &&
+            GetFileInformationByHandleEx(file,FileBasicInfo,&basicAfter,sizeof(basicAfter))!=FALSE;
+    bool closed=CloseHandle(file)!=FALSE;
+    if(!ok || !closed || standard.Directory || standard.EndOfFile.QuadPart<0 ||
+       basicBefore.LastWriteTime.QuadPart!=basicAfter.LastWriteTime.QuadPart ||
+       basicBefore.ChangeTime.QuadPart!=basicAfter.ChangeTime.QuadPart) return false;
+    unsigned long long size=(unsigned long long)standard.EndOfFile.QuadPart;
+    if(size>MAX_BROWSER_SESSION_BYTES) return false;
+    SessionStamp stamp;
+    stamp.size=size;
+    stamp.mtime=(unsigned long long)basicAfter.LastWriteTime.QuadPart;
+    stamp.changeTime=(unsigned long long)basicAfter.ChangeTime.QuadPart;
+    stamp.volumeSerial=(unsigned long long)identity.VolumeSerialNumber;
+    std::memcpy(&stamp.fileIdLow,identity.FileId.Identifier,sizeof(stamp.fileIdLow));
+    std::memcpy(&stamp.fileIdHigh,identity.FileId.Identifier+sizeof(stamp.fileIdLow),sizeof(stamp.fileIdHigh));
+    output=stamp;
+    return true;
 }
