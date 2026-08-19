@@ -236,6 +236,65 @@ static LayoutWin OldStyleRecord(){
 }
 static std::string FailingRecordIdGenerator(){ return std::string(); }
 static std::string ConstantRecordIdGenerator(){ return "{00000000-0000-0000-0000-000000000099}"; }
+static std::string MalformedRecordIdGenerator(){ return "not-a-guid"; }
+static std::string ZeroRecordIdGenerator(){ return "{00000000-0000-0000-0000-000000000000}"; }
+
+static void test_layout_legacy_migration_rejects_generated_id_collision_transactionally(){
+    std::string data = "# VDE snapshot v3\n"
+        "W\tfirefox\t0\t{231A0000-0000-0000-0000-000000000001}\t" + b64enc("Inbox") +
+        "\tmail.example\t1\tmail.example:1\t0\n"
+        "W\tchrome\t1\t{231A0000-0000-0000-0000-000000000002}\t" + b64enc("Calendar") +
+        "\tcalendar.example\t1\tcalendar.example:1\t0\n";
+    DeskRec sentinelDesk{}; sentinelDesk.index=77; sentinelDesk.name=L"sentinel desk";
+    LayoutWin sentinelWin; sentinelWin.app="sentinel"; sentinelWin.activeTitle="sentinel title";
+    std::vector<DeskRec> desks={sentinelDesk}; std::vector<LayoutWin> wins={sentinelWin};
+    std::string error;
+    CHECK(!ParseLayout(data,desks,wins,1800000000,&error,nullptr,ConstantRecordIdGenerator));
+    CHECK(!error.empty());
+    CHECK(desks.size()==1 && desks[0].index==77 && desks[0].name==L"sentinel desk");
+    CHECK(wins.size()==1 && wins[0].app=="sentinel" && wins[0].activeTitle=="sentinel title");
+}
+
+static void test_layout_legacy_migration_rejects_invalid_generated_ids_transactionally(){
+    std::string data = "# VDE snapshot v2\n"
+        "W\t0\t{231A0000-0000-0000-0000-000000000001}\t" + b64enc("Inbox") +
+        "\tmail.example\t1\tmail.example:1\n";
+    RecordIdGenerator generators[]={MalformedRecordIdGenerator,ZeroRecordIdGenerator};
+    for(auto generator : generators){
+        DeskRec sentinelDesk{}; sentinelDesk.index=77; sentinelDesk.name=L"sentinel desk";
+        LayoutWin sentinelWin; sentinelWin.app="sentinel"; sentinelWin.activeTitle="sentinel title";
+        std::vector<DeskRec> desks={sentinelDesk}; std::vector<LayoutWin> wins={sentinelWin};
+        std::string error;
+        CHECK(!ParseLayout(data,desks,wins,1800000000,&error,nullptr,generator));
+        CHECK(!error.empty());
+        CHECK(desks.size()==1 && desks[0].index==77 && desks[0].name==L"sentinel desk");
+        CHECK(wins.size()==1 && wins[0].app=="sentinel" && wins[0].activeTitle=="sentinel title");
+    }
+}
+
+static void test_layout_rejects_embedded_carriage_returns_transactionally(){
+    const std::string guid="{231A0000-0000-0000-0000-000000000001}";
+    const std::string id="{00000000-0000-0000-0000-000000000101}";
+    const std::string title=b64enc("Inbox");
+    const std::string invalid[]={
+        "# VDE snapshot v4\nW\tfirefox\t"+id+"\t0\t"+guid+"\t"+title+"\tmail.example\rhidden\t1\tmail.example:1\t1700000000\t0\n",
+        "# VDE snapshot v4\nW\tfirefox\t"+id+"\t0\t"+guid+"\t"+title+"\tmail.example\t1\tmail.example\rhidden:1\t1700000000\t0\n",
+        "# VDE snapshot v3\nW\tfirefox\t0\t"+guid+"\t"+title+"\tmail.example\rhidden\t1\tmail.example:1\t0\n",
+        "# VDE snapshot v3\nW\tfirefox\t0\t"+guid+"\t"+title+"\tmail.example\t1\tmail.example\rhidden:1\t0\n",
+        "# VDE snapshot v2\nW\t0\t"+guid+"\t"+title+"\tmail.example\rhidden\t1\tmail.example:1\n",
+        "# VDE snapshot v2\nW\t0\t"+guid+"\t"+title+"\tmail.example\t1\tmail.example\rhidden:1\n"
+    };
+    for(const auto& data : invalid){
+        DeskRec sentinelDesk{}; sentinelDesk.index=77; sentinelDesk.name=L"sentinel desk";
+        LayoutWin sentinelWin; sentinelWin.app="sentinel"; sentinelWin.activeTitle="sentinel title";
+        std::vector<DeskRec> desks={sentinelDesk}; std::vector<LayoutWin> wins={sentinelWin};
+        std::string error;
+        CHECK(!ParseLayout(data,desks,wins,1800000000,&error,nullptr,ConstantRecordIdGenerator));
+        CHECK(!error.empty());
+        CHECK(desks.size()==1 && desks[0].index==77 && desks[0].name==L"sentinel desk");
+        CHECK(wins.size()==1 && wins[0].app=="sentinel" && wins[0].activeTitle=="sentinel title");
+    }
+}
 
 static void test_checked_snapshot_enforces_combined_record_cap(){
     DeskRec desk{}; desk.index=0; desk.guid=G(L"{231A0000-0000-0000-0000-000000000001}"); desk.name=L"Desk";
@@ -314,6 +373,28 @@ static void test_checked_snapshot_rejects_negative_missing_bridge_clock_transact
     CHECK(!BuildCheckedLayoutSnapshot({},wins,-1,output,&error));
     CHECK(!error.empty()); CHECK(output=="prior snapshot bytes");
     CHECK(wins.size()==1 && wins[0].recordId.empty() && wins[0].missingSinceUtc==0 && wins[0].missingRuns==1);
+}
+
+static void test_checked_snapshot_rejects_zero_missing_bridge_clock_transactionally(){
+    std::vector<LayoutWin> wins={OldStyleRecord()};
+    wins[0].recordId="{00000000-0000-0000-0000-000000000101}";
+    wins[0].lastSeenUtc=1700000000; wins[0].missingRuns=1;
+    std::string output="prior snapshot bytes", error;
+    CHECK(!BuildCheckedLayoutSnapshot({},wins,0,output,&error));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes");
+    CHECK(wins.size()==1 && wins[0].recordId=="{00000000-0000-0000-0000-000000000101}");
+    CHECK(wins[0].lastSeenUtc==1700000000 && wins[0].missingSinceUtc==0 && wins[0].missingRuns==1);
+}
+
+static void test_checked_snapshot_rejects_negative_transitional_missing_runs_transactionally(){
+    std::vector<LayoutWin> wins={OldStyleRecord()};
+    wins[0].recordId="{00000000-0000-0000-0000-000000000101}";
+    wins[0].lastSeenUtc=1700000000; wins[0].missingRuns=-1;
+    std::string output="prior snapshot bytes", error;
+    CHECK(!BuildCheckedLayoutSnapshot({},wins,1700000100,output,&error));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes");
+    CHECK(wins.size()==1 && wins[0].recordId=="{00000000-0000-0000-0000-000000000101}");
+    CHECK(wins[0].lastSeenUtc==1700000000 && wins[0].missingSinceUtc==0 && wins[0].missingRuns==-1);
 }
 
 static void test_checked_snapshot_accepts_supported_browser_apps(){
@@ -522,6 +603,9 @@ int main(){
     test_layout_rejects_integer_trailing_junk_transactionally();
     test_layout_migrates_v3_record();
     test_layout_rejects_negative_v3_missing_counter_transactionally();
+    test_layout_legacy_migration_rejects_generated_id_collision_transactionally();
+    test_layout_legacy_migration_rejects_invalid_generated_ids_transactionally();
+    test_layout_rejects_embedded_carriage_returns_transactionally();
     test_layout_rejects_trailing_columns();
     test_layout_rejects_duplicate_record_ids();
     test_layout_enforces_total_record_cap_transactionally();
@@ -533,6 +617,8 @@ int main(){
     test_checked_snapshot_rejects_generated_id_collision_transactionally();
     test_checked_snapshot_rejects_negative_missing_since_transactionally();
     test_checked_snapshot_rejects_negative_missing_bridge_clock_transactionally();
+    test_checked_snapshot_rejects_zero_missing_bridge_clock_transactionally();
+    test_checked_snapshot_rejects_negative_transitional_missing_runs_transactionally();
     test_checked_snapshot_accepts_supported_browser_apps();
     test_checked_snapshot_rejects_unsupported_app_transactionally();
     test_checked_snapshot_rejects_negative_tab_count_transactionally();

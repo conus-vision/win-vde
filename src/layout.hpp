@@ -107,6 +107,7 @@ inline bool PrepareTransitionalV4Records(std::vector<LayoutWin>& records, UnixSe
         if(!AreLayoutCountsSerializable(record.counts)) return fail("window record has invalid domain counts");
         if(record.lastSeenUtc<0) return fail("window record has a negative last-seen time");
         if(record.missingSinceUtc<0) return fail("window record has a negative missing-since time");
+        if(record.missingRuns<0) return fail("window record has a negative legacy missing-run count");
         if(record.recordId.empty()){
             if(!idGenerator) return fail("record ID generator is unavailable");
             record.recordId = idGenerator();
@@ -120,7 +121,7 @@ inline bool PrepareTransitionalV4Records(std::vector<LayoutWin>& records, UnixSe
             record.lastSeenUtc = nowUtc;
         }
         if(record.missingRuns>0 && record.missingSinceUtc==0){
-            if(nowUtc<0) return fail("cannot initialize missing-since time from a negative clock");
+            if(nowUtc<=0) return fail("cannot initialize missing-since time from a nonpositive clock");
             record.missingSinceUtc = nowUtc;
         }
     }
@@ -130,7 +131,8 @@ inline bool PrepareTransitionalV4Records(std::vector<LayoutWin>& records, UnixSe
 }
 
 inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut, std::vector<LayoutWin>& winsOut,
-        UnixSeconds migrationNow, std::string* errorOut=nullptr, int* sourceVersionOut=nullptr){
+        UnixSeconds migrationNow, std::string* errorOut=nullptr, int* sourceVersionOut=nullptr,
+        RecordIdGenerator idGenerator=NewRecordId){
     std::vector<DeskRec> desks;
     std::vector<LayoutWin> wins;
     std::set<std::string> recordIds;
@@ -155,6 +157,16 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
             fieldPos = tab + 1;
         }
         return fields;
+    };
+    auto assignGeneratedRecordId = [&](LayoutWin& record)->bool {
+        if(!idGenerator) return failLine("record ID generator is unavailable");
+        std::string generated = idGenerator();
+        if(generated.empty()) return failLine("failed to generate record ID");
+        GUID id{}; std::string idKey;
+        if(!ParseNonzeroLayoutGuid(generated,id,&idKey)) return failLine("generated an invalid record ID");
+        if(!recordIds.insert(idKey).second) return failLine("generated a duplicate record ID");
+        record.recordId = generated;
+        return true;
     };
 
     while(pos < data.size()){
@@ -203,9 +215,8 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
             if(col.size()!=11) return failLine("v4 window record must have exactly 11 fields");
             w.app = col[1];
             if(!IsSupportedLayoutApp(w.app)) return failLine("unsupported window app");
-            GUID id{};
-            if(!ParseNonzeroLayoutGuid(col[2], id)) return failLine("invalid record ID");
-            std::string idKey = W2U8(GuidToString(id));
+            GUID id{}; std::string idKey;
+            if(!ParseNonzeroLayoutGuid(col[2], id, &idKey)) return failLine("invalid record ID");
             if(!recordIds.insert(idKey).second) return failLine("duplicate record ID");
             w.recordId = col[2];
             if(!ParseIntStrict(col[3], w.deskIndex)) return failLine("invalid window desktop index");
@@ -213,8 +224,10 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
             if(!b64decStrict(col[5], title)) return failLine("invalid window title encoding");
             w.activeTitle = title;
             w.activeDomain = col[6];
+            if(HasLayoutFieldBreak(w.activeDomain)) return failLine("window domain contains a field delimiter");
             if(!ParseIntStrict(col[7], w.tabCount) || w.tabCount<0) return failLine("invalid window tab count");
             if(!ParseCountsStrict(col[8], w.counts)) return failLine("invalid window domain counts");
+            if(!AreLayoutCountsSerializable(w.counts)) return failLine("window domain counts contain a field delimiter");
             if(!ParseI64Strict(col[9], w.lastSeenUtc) || w.lastSeenUtc<=0) return failLine("invalid last-seen time");
             if(!ParseI64Strict(col[10], w.missingSinceUtc) || w.missingSinceUtc<0) return failLine("invalid missing-since time");
         } else if(version==3){
@@ -226,12 +239,13 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
             if(!b64decStrict(col[4], title)) return failLine("invalid window title encoding");
             w.activeTitle = title;
             w.activeDomain = col[5];
+            if(HasLayoutFieldBreak(w.activeDomain)) return failLine("window domain contains a field delimiter");
             if(!ParseIntStrict(col[6], w.tabCount) || w.tabCount<0) return failLine("invalid window tab count");
             if(!ParseCountsStrict(col[7], w.counts)) return failLine("invalid window domain counts");
+            if(!AreLayoutCountsSerializable(w.counts)) return failLine("window domain counts contain a field delimiter");
             int oldMissing = 0;
             if(!ParseIntStrict(col[8], oldMissing) || oldMissing<0) return failLine("invalid legacy missing-run count");
-            w.recordId = NewRecordId();
-            if(w.recordId.empty()) return failLine("failed to generate record ID");
+            if(!assignGeneratedRecordId(w)) return false;
             w.lastSeenUtc = migrationNow;
             w.missingSinceUtc = oldMissing>0 ? migrationNow : 0;
         } else {
@@ -242,10 +256,11 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
             if(!b64decStrict(col[3], title)) return failLine("invalid window title encoding");
             w.activeTitle = title;
             w.activeDomain = col[4];
+            if(HasLayoutFieldBreak(w.activeDomain)) return failLine("window domain contains a field delimiter");
             if(!ParseIntStrict(col[5], w.tabCount) || w.tabCount<0) return failLine("invalid window tab count");
             if(!ParseCountsStrict(col[6], w.counts)) return failLine("invalid window domain counts");
-            w.recordId = NewRecordId();
-            if(w.recordId.empty()) return failLine("failed to generate record ID");
+            if(!AreLayoutCountsSerializable(w.counts)) return failLine("window domain counts contain a field delimiter");
+            if(!assignGeneratedRecordId(w)) return false;
             w.lastSeenUtc = migrationNow;
         }
         wins.push_back(w);
