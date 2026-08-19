@@ -10,6 +10,9 @@
 #include <map>
 #include <set>
 #include <cstdint>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
 #pragma comment(lib, "ole32.lib")
 
 inline std::string W2U8(const std::wstring& w) {
@@ -45,6 +48,68 @@ inline std::string b64dec(const std::string& in) {
     std::string out; int val=0, bits=-8;
     for (unsigned char c : in){ if(c=='='||T[c]==-1)break; val=(val<<6)+T[c]; bits+=6; if(bits>=0){out.push_back(char((val>>bits)&0xFF)); bits-=8;} }
     return out;
+}
+inline bool ParseI64Strict(const std::string& s, long long& out) {
+    if (s.empty()) return false;
+    errno = 0;
+    char* end = nullptr;
+    long long value = _strtoi64(s.c_str(), &end, 10);
+    if (errno == ERANGE || end != s.c_str() + s.size()) return false;
+    out = value;
+    return true;
+}
+inline bool ParseIntStrict(const std::string& s, int& out) {
+    long long value = 0;
+    if (!ParseI64Strict(s, value) || value < INT_MIN || value > INT_MAX) return false;
+    out = (int)value;
+    return true;
+}
+inline bool b64decStrict(const std::string& in, std::string& out) {
+    if (in.size() % 4 != 0) return false;
+    static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    bool alphabet[256] = {};
+    for (int i=0; i<64; ++i) alphabet[(unsigned char)B64[i]] = true;
+
+    size_t firstPadding = in.size();
+    for (size_t i=0; i<in.size(); ++i) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '=') {
+            if (firstPadding == in.size()) firstPadding = i;
+        } else {
+            if (!alphabet[c] || firstPadding != in.size()) return false;
+        }
+    }
+    if (firstPadding != in.size()) {
+        size_t padding = in.size() - firstPadding;
+        if (padding > 2 || firstPadding < in.size() - 2) return false;
+    }
+
+    std::string decoded = b64dec(in);
+    out.swap(decoded);
+    return true;
+}
+inline bool ParseCountsStrict(const std::string& s, std::map<std::string,int>& out) {
+    std::map<std::string,int> parsed;
+    if (!s.empty()) {
+        size_t pos = 0;
+        for (;;) {
+            size_t comma = s.find(',', pos);
+            size_t end = comma == std::string::npos ? s.size() : comma;
+            if (end == pos) return false;
+            std::string item = s.substr(pos, end - pos);
+            size_t colon = item.rfind(':');
+            if (colon == std::string::npos || colon == 0 || colon + 1 == item.size()) return false;
+            std::string domain = item.substr(0, colon);
+            int count = 0;
+            if (!ParseIntStrict(item.substr(colon + 1), count) || count <= 0) return false;
+            if (!parsed.emplace(domain, count).second) return false;
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+            if (pos == s.size()) return false;
+        }
+    }
+    out.swap(parsed);
+    return true;
 }
 inline DWORD GetWindowsBuild() {
     typedef LONG (WINAPI *P)(PRTL_OSVERSIONINFOW);

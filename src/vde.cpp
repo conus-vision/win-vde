@@ -43,7 +43,7 @@
 #include <algorithm>
 
 #include "str_util.hpp"   // W2U8/U82W, GUID helpers, b64, GetWindowsBuild, hostOf, etld1
-#include "layout.hpp"     // DeskRec, CountsToStr, StrToCounts (+ v3 layout logic)
+#include "layout.hpp"     // DeskRec + v4 layout serialization/migration logic
 #include "lifecycle.hpp"  // LcState/LcAction, LcOnStartup/LcOnTick/LcOnExit
 #include "session.hpp"    // WinFp, Chromium SNSS reader (ReadChromiumWindows)
 #include "appprofile.hpp" // AppProfile, BuiltinProfiles
@@ -441,6 +441,13 @@ static double Score(const Fp& s, const Fp& l){
 }
 
 // ============================ snapshot storage ================================
+static UnixSeconds UtcNowSeconds(){
+    FILETIME ft{}; GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER ticks{}; ticks.LowPart=ft.dwLowDateTime; ticks.HighPart=ft.dwHighDateTime;
+    const ULONGLONG WINDOWS_TO_UNIX_EPOCH=116444736000000000ULL;
+    if(ticks.QuadPart<WINDOWS_TO_UNIX_EPOCH)return 0;
+    return (UnixSeconds)((ticks.QuadPart-WINDOWS_TO_UNIX_EPOCH)/10000000ULL);
+}
 static std::wstring DataDir(){
     wchar_t base[MAX_PATH]={0}; GetEnvironmentVariableW(L"LOCALAPPDATA",base,MAX_PATH);
     std::wstring dir=std::wstring(base)+L"\\VirtualDesktopsExtention"; CreateDirectoryW(dir.c_str(),nullptr); return dir;
@@ -486,6 +493,8 @@ static std::string RunSaveManual(){
     if(g_degraded) return "Virtual-desktop features are unavailable on this Windows build.";
     auto present=CollectPresentWindows(nullptr,nullptr);
     if(present.empty()) return "No browser windows found. Nothing to save.";
+    std::string prepareError;
+    if(!PrepareTransitionalV4Records(present,UtcNowSeconds(),&prepareError)) return "Failed to prepare manual layout: "+prepareError;
     if(!WriteTextFile(LayoutPath(true), SerializeLayout(CurrentDesktops(), present))) return "Failed to write manual layout.";
     char b[160]; sprintf_s(b,"Saved layout: %d window(s).",(int)present.size()); return b;
 }
@@ -493,17 +502,20 @@ static std::string RunSaveManual(){
 // no windows are open (anti-wipe). Absent windows are kept (grace, aged only on exit).
 static std::string RunSaveAuto(std::set<std::string>* seen, std::set<std::string>* apps){
     if(g_degraded) return "";
+    UnixSeconds nowUtc=UtcNowSeconds();
     auto present=CollectPresentWindows(seen,apps);
     if(present.empty()) return "";
-    std::vector<DeskRec> ed; std::vector<LayoutWin> existing; { std::string t; if(ReadFileBytes(LayoutPath(false),t)) ParseLayout(t,ed,existing); }
+    std::vector<DeskRec> ed; std::vector<LayoutWin> existing; { std::string t; if(ReadFileBytes(LayoutPath(false),t)) ParseLayout(t,ed,existing,nowUtc); }
     auto merged=MergeAutoLayout(existing, present);
+    std::string prepareError;
+    if(!PrepareTransitionalV4Records(merged,nowUtc,&prepareError)) return "Failed to prepare auto layout: "+prepareError;
     WriteTextFile(LayoutPath(false), SerializeLayout(CurrentDesktops(), merged));
     return "auto-saved";
 }
 static std::string RunRestore(bool manual, std::vector<std::string>* linesOut=nullptr, int* movedOut=nullptr){
     if(g_degraded) return "Virtual-desktop features are unavailable on this Windows build.";
     std::vector<DeskRec> savedDesks; std::vector<LayoutWin> saved;
-    { std::string t; if(!ReadFileBytes(LayoutPath(manual),t) || !ParseLayout(t,savedDesks,saved) || saved.empty())
+    { std::string t; if(!ReadFileBytes(LayoutPath(manual),t) || !ParseLayout(t,savedDesks,saved,UtcNowSeconds()) || saved.empty())
         return manual?"No saved layout. Use 'Save windows layout' first.":"No auto layout yet."; }
     std::vector<Fp> live; for(auto& prof:ActiveProfiles()){ auto l=BuildLiveFingerprintsFor(prof); for(auto& x:l) live.push_back(std::move(x)); }
     if(live.empty())return "No browser windows to restore.";
@@ -1233,9 +1245,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         if(g_autoFix && !g_degraded && LcOnExit(g_lc, AnyAppPresent())==LcAction::FinalSave){   // save only if windows are open (R2)
             RunSaveAuto(&g_seenKeys,&g_observedApps);
             std::vector<DeskRec> dd; std::vector<LayoutWin> recs; std::string t;   // age grace counters by one run
-            if(ReadFileBytes(LayoutPath(false),t) && ParseLayout(t,dd,recs)){
+            UnixSeconds nowUtc=UtcNowSeconds();
+            if(ReadFileBytes(LayoutPath(false),t) && ParseLayout(t,dd,recs,nowUtc)){
                 auto kept = ReconcileGrace(recs, g_seenKeys, g_observedApps, MISSING_RUNS_MAX);
-                WriteTextFile(LayoutPath(false), SerializeLayout(CurrentDesktops(), kept));
+                if(PrepareTransitionalV4Records(kept,nowUtc))
+                    WriteTextFile(LayoutPath(false), SerializeLayout(CurrentDesktops(), kept));
             }
         }
         TrayRemove(); UnregisterHotKey(hwnd,1); PostQuitMessage(0); return 0;
