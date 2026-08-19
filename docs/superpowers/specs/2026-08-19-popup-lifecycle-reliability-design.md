@@ -3,7 +3,8 @@
 Дата: 2026-08-19
 
 Статус: утверждено пользователем
-База: `main` на коммите `26481fc`
+База исходного кода: `main` на коммите `26481fc`; утверждённый design-документ
+зафиксирован отдельным коммитом `e4ca435`.
 
 ## 1. Цель и границы
 
@@ -223,7 +224,7 @@ HWND + PID + process creation time -> recordId
 Под сеткой tiles, внутри нижней части popup, рисуется:
 
 ```text
-Virtual Desktop Extension for Windows 11 by Volodymyr Moskvin © 2026 Conus Vision
+Virtual Desktop Extension for Windows 11 by Volodymyr Moskvin (c) 2026 Conus Vision
 ```
 
 - текст `Virtual Desktop Extension` — ссылка на `https://github.com/conus-vision/win-vde`;
