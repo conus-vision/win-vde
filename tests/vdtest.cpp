@@ -74,8 +74,9 @@ static void test_layout_roundtrip_v4(){
     w.push_back(w0);
 
     std::string s = SerializeLayout(d, w);
-    std::vector<DeskRec> d2; std::vector<LayoutWin> w2;
-    CHECK(ParseLayout(s, d2, w2, 1800000000));
+    std::vector<DeskRec> d2; std::vector<LayoutWin> w2; std::string error;
+    CHECK(ParseLayout(s, d2, w2, 1800000000, &error));
+    CHECK(error.empty());
     CHECK(d2.size()==1); CHECK(w2.size()==1);
     CHECK(w2[0].recordId=="{00000000-0000-0000-0000-000000000101}");
     CHECK(w2[0].app=="firefox"); CHECK(w2[0].deskIndex==0); CHECK(w2[0].activeTitle=="PR #42");
@@ -156,6 +157,53 @@ static void test_layout_rejects_duplicate_record_ids(){
     std::vector<DeskRec> d; std::vector<LayoutWin> w; std::string error;
     CHECK(!ParseLayout(data, d, w, 1800000000, &error));
     CHECK(!error.empty()); CHECK(d.empty()); CHECK(w.empty());
+}
+
+static void test_layout_enforces_total_record_cap_transactionally(){
+    const char* desktop="{231A0000-0000-0000-0000-000000000001}";
+    std::string data="# VDE snapshot v4\n";
+    data.reserve(600000);
+    std::string deskLine=std::string("D\t0\t")+desktop+"\t"+b64enc("Desk")+"\n";
+    for(int i=0;i<2048;++i) data+=deskLine;
+    for(int i=0;i<2048;++i){
+        char id[64]; sprintf_s(id,"{00000000-0000-0000-0000-%012d}",i+1);
+        data+=V4Line(desktop,id,"1700000000","0");
+    }
+
+    std::vector<DeskRec> acceptedDesks; std::vector<LayoutWin> acceptedWins; std::string error="stale";
+    CHECK(ParseLayout(data,acceptedDesks,acceptedWins,1800000000,&error));
+    CHECK(error.empty()); CHECK(acceptedDesks.size()==2048); CHECK(acceptedWins.size()==2048);
+    CHECK(acceptedDesks.size()==2048 && acceptedDesks.front().name==L"Desk");
+    CHECK(acceptedWins.size()==2048 && acceptedWins.back().recordId=="{00000000-0000-0000-0000-000000002048}");
+
+    char overflowId[64]; sprintf_s(overflowId,"{00000000-0000-0000-0000-%012d}",2049);
+    std::string overflow=data+V4Line(desktop,overflowId,"1700000000","0");
+    DeskRec sentinelDesk{}; sentinelDesk.index=77;
+    sentinelDesk.guid=G(L"{231A0000-0000-0000-0000-000000000077}"); sentinelDesk.name=L"sentinel desk";
+    LayoutWin sentinelWin; sentinelWin.recordId="{00000000-0000-0000-0000-000000000077}";
+    sentinelWin.app="chrome"; sentinelWin.deskIndex=-7;
+    sentinelWin.desktop=G(L"{231A0000-0000-0000-0000-000000000078}");
+    sentinelWin.activeTitle="sentinel title"; sentinelWin.activeDomain="sentinel.example";
+    sentinelWin.tabCount=7; sentinelWin.counts={{"sentinel.example",7}};
+    sentinelWin.lastSeenUtc=1700000077; sentinelWin.missingSinceUtc=1700000088; sentinelWin.missingRuns=2;
+    std::vector<DeskRec> desksOut={sentinelDesk}; std::vector<LayoutWin> winsOut={sentinelWin}; error.clear();
+
+    CHECK(!ParseLayout(overflow,desksOut,winsOut,1800000000,&error));
+    CHECK(!error.empty());
+    CHECK(desksOut.size()==1 && desksOut[0].index==77);
+    CHECK(desksOut.size()==1 && GuidEq(desksOut[0].guid,sentinelDesk.guid));
+    CHECK(desksOut.size()==1 && desksOut[0].name==L"sentinel desk");
+    CHECK(winsOut.size()==1 && winsOut[0].recordId==sentinelWin.recordId);
+    CHECK(winsOut.size()==1 && winsOut[0].app=="chrome");
+    CHECK(winsOut.size()==1 && winsOut[0].deskIndex==-7);
+    CHECK(winsOut.size()==1 && GuidEq(winsOut[0].desktop,sentinelWin.desktop));
+    CHECK(winsOut.size()==1 && winsOut[0].activeTitle=="sentinel title");
+    CHECK(winsOut.size()==1 && winsOut[0].activeDomain=="sentinel.example");
+    CHECK(winsOut.size()==1 && winsOut[0].tabCount==7);
+    CHECK(winsOut.size()==1 && winsOut[0].counts==sentinelWin.counts);
+    CHECK(winsOut.size()==1 && winsOut[0].lastSeenUtc==1700000077);
+    CHECK(winsOut.size()==1 && winsOut[0].missingSinceUtc==1700000088);
+    CHECK(winsOut.size()==1 && winsOut[0].missingRuns==2);
 }
 
 static LayoutWin OldStyleRecord(){
@@ -300,6 +348,7 @@ int main(){
     test_layout_migrates_v3_record();
     test_layout_rejects_trailing_columns();
     test_layout_rejects_duplicate_record_ids();
+    test_layout_enforces_total_record_cap_transactionally();
     test_prepare_transitional_records_roundtrip_and_keep_stable_id();
     test_prepare_transitional_records_rejects_zero_desktop_transactionally();
     test_prepare_transitional_records_rejects_negative_last_seen_transactionally();
