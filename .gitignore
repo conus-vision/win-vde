@@ -3,3 +3,4 @@ build/
 *.res
 *.exe
 .vs/
+.worktrees/
