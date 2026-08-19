@@ -36,17 +36,40 @@ inline bool GuidIsZero(const GUID& g) { GUID z = {0}; return GuidEq(g, z); }
 
 inline std::string b64enc(const std::string& in) {
     static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::string out; int val=0, bits=-6;
-    for (unsigned char c : in) { val=(val<<8)+c; bits+=8; while(bits>=0){ out.push_back(B64[(val>>bits)&0x3F]); bits-=6; } }
-    if (bits>-6) out.push_back(B64[((val<<8)>>(bits+8))&0x3F]);
-    while (out.size()%4) out.push_back('=');
+    std::string out; out.reserve(((in.size()+2)/3)*4);
+    size_t i=0;
+    while(in.size()-i>=3){
+        uint32_t value=(uint32_t)(unsigned char)in[i]<<16 |
+            (uint32_t)(unsigned char)in[i+1]<<8 | (uint32_t)(unsigned char)in[i+2];
+        out.push_back(B64[(value>>18)&0x3F]); out.push_back(B64[(value>>12)&0x3F]);
+        out.push_back(B64[(value>>6)&0x3F]); out.push_back(B64[value&0x3F]);
+        i+=3;
+    }
+    size_t remaining=in.size()-i;
+    if(remaining==1){
+        uint32_t value=(uint32_t)(unsigned char)in[i]<<16;
+        out.push_back(B64[(value>>18)&0x3F]); out.push_back(B64[(value>>12)&0x3F]);
+        out.push_back('='); out.push_back('=');
+    } else if(remaining==2){
+        uint32_t value=(uint32_t)(unsigned char)in[i]<<16 | (uint32_t)(unsigned char)in[i+1]<<8;
+        out.push_back(B64[(value>>18)&0x3F]); out.push_back(B64[(value>>12)&0x3F]);
+        out.push_back(B64[(value>>6)&0x3F]); out.push_back('=');
+    }
     return out;
 }
 inline std::string b64dec(const std::string& in) {
     static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     int T[256]; for(int i=0;i<256;i++)T[i]=-1; for(int i=0;i<64;i++)T[(unsigned char)B64[i]]=i;
-    std::string out; int val=0, bits=-8;
-    for (unsigned char c : in){ if(c=='='||T[c]==-1)break; val=(val<<6)+T[c]; bits+=6; if(bits>=0){out.push_back(char((val>>bits)&0xFF)); bits-=8;} }
+    std::string out; size_t i=0;
+    while(i<in.size()){
+        int a=T[(unsigned char)in[i++]]; if(a<0)break;
+        if(i>=in.size())break; int b=T[(unsigned char)in[i++]]; if(b<0)break;
+        out.push_back((char)(((unsigned)a<<2)|((unsigned)b>>4)));
+        if(i>=in.size()||in[i]=='=')break; int c=T[(unsigned char)in[i++]]; if(c<0)break;
+        out.push_back((char)((((unsigned)b&0x0F)<<4)|((unsigned)c>>2)));
+        if(i>=in.size()||in[i]=='=')break; int d=T[(unsigned char)in[i++]]; if(d<0)break;
+        out.push_back((char)((((unsigned)c&0x03)<<6)|(unsigned)d));
+    }
     return out;
 }
 inline bool ParseI64Strict(const std::string& s, long long& out) {
@@ -85,6 +108,7 @@ inline bool b64decStrict(const std::string& in, std::string& out) {
     }
 
     std::string decoded = b64dec(in);
+    if (b64enc(decoded) != in) return false;
     out.swap(decoded);
     return true;
 }

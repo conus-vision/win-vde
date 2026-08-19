@@ -461,11 +461,18 @@ static bool WriteTextFile(const std::wstring& path, const std::string& text){
     HANDLE f=CreateFileW(path.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
     if(f==INVALID_HANDLE_VALUE)return false; DWORD wr=0; BOOL ok=WriteFile(f,text.data(),(DWORD)text.size(),&wr,nullptr); CloseHandle(f); return ok&&wr==text.size();
 }
-static std::vector<DeskRec> CurrentDesktops(){
-    std::vector<DeskRec> desks; UINT count=0; if(g_vdmi) g_vdmi->GetCount(&count);
-    for(UINT i=0;i<count;++i){ IVirtualDesktop* d=GetDesktopByIndex(i); if(!d)continue; GUID g={0};d->GetID(&g);
-        DeskRec dr; dr.index=(int)i; dr.guid=g; dr.name=DesktopNameFromRegistry(g); desks.push_back(dr); d->Release(); }
-    return desks;
+static bool CurrentDesktops(std::vector<DeskRec>& desksOut, std::string* errorOut=nullptr){
+    auto fail=[&](const std::string& message)->bool{ if(errorOut)*errorOut=message; return false; };
+    if(!g_vdmi)return fail("virtual desktop manager is unavailable");
+    UINT count=0; if(FAILED(g_vdmi->GetCount(&count)))return fail("failed to get virtual desktop count");
+    std::vector<DeskRec> desks;
+    for(UINT i=0;i<count;++i){
+        IVirtualDesktop* d=GetDesktopByIndex(i); if(!d)return fail("failed to get virtual desktop");
+        GUID g={0}; HRESULT idHr=d->GetID(&g);
+        if(FAILED(idHr)||GuidIsZero(g)){ d->Release(); return fail("failed to get virtual desktop GUID"); }
+        DeskRec dr; dr.index=(int)i; dr.guid=g; dr.name=DesktopNameFromRegistry(g); desks.push_back(dr); d->Release();
+    }
+    desksOut.swap(desks); if(errorOut)errorOut->clear(); return true;
 }
 // Currently-open windows (Phase 1: Firefox) as LayoutWin with desktop assigned.
 // Accumulates each window's FingerprintKey into `seen` and app into `apps` (for grace bookkeeping).
@@ -493,9 +500,10 @@ static std::string RunSaveManual(){
     if(g_degraded) return "Virtual-desktop features are unavailable on this Windows build.";
     auto present=CollectPresentWindows(nullptr,nullptr);
     if(present.empty()) return "No browser windows found. Nothing to save.";
-    std::string prepareError;
-    if(!PrepareTransitionalV4Records(present,UtcNowSeconds(),&prepareError)) return "Failed to prepare manual layout: "+prepareError;
-    if(!WriteTextFile(LayoutPath(true), SerializeLayout(CurrentDesktops(), present))) return "Failed to write manual layout.";
+    std::vector<DeskRec> desks; std::string prepareError, snapshot;
+    if(!CurrentDesktops(desks,&prepareError)) return "Failed to collect desktops: "+prepareError;
+    if(!BuildCheckedLayoutSnapshot(desks,present,UtcNowSeconds(),snapshot,&prepareError)) return "Failed to prepare manual layout: "+prepareError;
+    if(!WriteTextFile(LayoutPath(true), snapshot)) return "Failed to write manual layout.";
     char b[160]; sprintf_s(b,"Saved layout: %d window(s).",(int)present.size()); return b;
 }
 // Auto save: merge present windows into layout-auto.txt. Never touches the file when
@@ -505,11 +513,12 @@ static std::string RunSaveAuto(std::set<std::string>* seen, std::set<std::string
     UnixSeconds nowUtc=UtcNowSeconds();
     auto present=CollectPresentWindows(seen,apps);
     if(present.empty()) return "";
-    std::vector<DeskRec> ed; std::vector<LayoutWin> existing; { std::string t; if(ReadFileBytes(LayoutPath(false),t)) ParseLayout(t,ed,existing,nowUtc); }
-    auto merged=MergeAutoLayout(existing, present);
-    std::string prepareError;
-    if(!PrepareTransitionalV4Records(merged,nowUtc,&prepareError)) return "Failed to prepare auto layout: "+prepareError;
-    WriteTextFile(LayoutPath(false), SerializeLayout(CurrentDesktops(), merged));
+    std::vector<DeskRec> desks; std::string prepareError, snapshot;
+    if(!CurrentDesktops(desks,&prepareError)) return "Failed to collect desktops: "+prepareError;
+    std::string existingBytes; bool haveExisting=ReadFileBytes(LayoutPath(false),existingBytes);
+    if(!BuildAutoLayoutSnapshot(haveExisting?&existingBytes:nullptr,desks,present,nowUtc,snapshot,&prepareError))
+        return "Failed to prepare auto layout: "+prepareError;
+    WriteTextFile(LayoutPath(false), snapshot);
     return "auto-saved";
 }
 static std::string RunRestore(bool manual, std::vector<std::string>* linesOut=nullptr, int* movedOut=nullptr){
@@ -1248,8 +1257,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             UnixSeconds nowUtc=UtcNowSeconds();
             if(ReadFileBytes(LayoutPath(false),t) && ParseLayout(t,dd,recs,nowUtc)){
                 auto kept = ReconcileGrace(recs, g_seenKeys, g_observedApps, MISSING_RUNS_MAX);
-                if(PrepareTransitionalV4Records(kept,nowUtc))
-                    WriteTextFile(LayoutPath(false), SerializeLayout(CurrentDesktops(), kept));
+                std::vector<DeskRec> desks; std::string error, snapshot;
+                if(CurrentDesktops(desks,&error) && BuildCheckedLayoutSnapshot(desks,kept,nowUtc,snapshot,&error))
+                    WriteTextFile(LayoutPath(false), snapshot);
             }
         }
         TrayRemove(); UnregisterHotKey(hwnd,1); PostQuitMessage(0); return 0;

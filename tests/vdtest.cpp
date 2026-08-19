@@ -17,8 +17,13 @@ static void test_etld1(){
     CHECK(hostOf("https://www.GitHub.com/x/y") == "github.com");
 }
 static void test_b64(){
-    std::string s = "PR #42 \xE2\x80\x94 Mozilla";   // includes a UTF-8 em dash
+    std::string s = "Inbox \xE2\x80\x94 Mozilla";   // includes a UTF-8 em dash
     CHECK(b64dec(b64enc(s)) == s);
+}
+static void test_b64_long_roundtrip(){
+    std::string input; input.reserve(1024*1024);
+    for(int i=0;i<1024*1024;++i) input.push_back((char)(i&0xFF));
+    CHECK(b64dec(b64enc(input))==input);
 }
 static void test_strict_integer_parsing(){
     long long i64=0;
@@ -43,6 +48,8 @@ static void test_strict_base64_parsing(){
     CHECK(!b64decStrict("A===", out) && out=="sentinel");
     CHECK(!b64decStrict("AA=A", out) && out=="sentinel");
     CHECK(!b64decStrict("=AAA", out) && out=="sentinel");
+    CHECK(!b64decStrict("TR==", out) && out=="sentinel");
+    CHECK(!b64decStrict("TWF=", out) && out=="sentinel");
 }
 static void test_strict_counts_parsing(){
     std::map<std::string,int> counts={{"old",9}};
@@ -140,6 +147,19 @@ static void test_layout_migrates_v3_record(){
     GUID id{}; CHECK(StringToGuid(U82W(w[0].recordId), id) && !GuidIsZero(id));
 }
 
+static void test_layout_rejects_negative_v3_missing_counter_transactionally(){
+    std::string data = "# VDE snapshot v3\n"
+        "W\tfirefox\t0\t{231A0000-0000-0000-0000-000000000001}\t" + b64enc("Inbox") +
+        "\tmail.example\t1\tmail.example:1\t-1\n";
+    std::vector<DeskRec> d(1); d[0].index=77; d[0].name=L"sentinel desk";
+    std::vector<LayoutWin> w(1); w[0].app="sentinel"; w[0].activeTitle="sentinel title";
+    std::string error;
+    CHECK(!ParseLayout(data,d,w,1800000000,&error));
+    CHECK(!error.empty());
+    CHECK(d.size()==1 && d[0].index==77 && d[0].name==L"sentinel desk");
+    CHECK(w.size()==1 && w[0].app=="sentinel" && w[0].activeTitle=="sentinel title");
+}
+
 static void test_layout_rejects_trailing_columns(){
     std::string data = "# VDE snapshot v4\n" +
         V4Line("{231A0000-0000-0000-0000-000000000001}", "{00000000-0000-0000-0000-000000000101}", "1700000000", "0");
@@ -215,6 +235,160 @@ static LayoutWin OldStyleRecord(){
     return w;
 }
 static std::string FailingRecordIdGenerator(){ return std::string(); }
+static std::string ConstantRecordIdGenerator(){ return "{00000000-0000-0000-0000-000000000099}"; }
+
+static void test_checked_snapshot_enforces_combined_record_cap(){
+    DeskRec desk{}; desk.index=0; desk.guid=G(L"{231A0000-0000-0000-0000-000000000001}"); desk.name=L"Desk";
+    std::vector<DeskRec> acceptedDesks(MAX_LAYOUT_RECORDS-1,desk);
+    std::vector<LayoutWin> acceptedWins={OldStyleRecord()};
+    std::string output="sentinel", error="stale";
+    CHECK(BuildCheckedLayoutSnapshot(acceptedDesks,acceptedWins,1700000000,output,&error));
+    CHECK(error.empty()); CHECK(output.find("# VDE snapshot v4\n")==0);
+    CHECK(!acceptedWins[0].recordId.empty()); CHECK(acceptedWins[0].lastSeenUtc==1700000000);
+
+    std::vector<DeskRec> overflowDesks(MAX_LAYOUT_RECORDS,desk);
+    std::vector<LayoutWin> overflowWins={OldStyleRecord()};
+    output="prior snapshot bytes"; error.clear();
+    CHECK(!BuildCheckedLayoutSnapshot(overflowDesks,overflowWins,1700000000,output,&error));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes");
+    CHECK(overflowWins.size()==1 && overflowWins[0].recordId.empty() && overflowWins[0].lastSeenUtc==0);
+}
+
+static void test_checked_snapshot_rejects_zero_desktop_record_transactionally(){
+    DeskRec invalidDesk{}; invalidDesk.index=0; invalidDesk.name=L"Invalid";
+    std::vector<DeskRec> desks={invalidDesk}; std::vector<LayoutWin> wins;
+    std::string output="prior snapshot bytes", error;
+    CHECK(!BuildCheckedLayoutSnapshot(desks,wins,1700000000,output,&error));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes"); CHECK(wins.empty());
+    CHECK(GuidIsZero(desks[0].guid) && desks[0].name==L"Invalid");
+}
+
+static void test_checked_snapshot_rejects_malformed_record_id_transactionally(){
+    std::vector<LayoutWin> wins={OldStyleRecord()}; wins[0].recordId="not-a-guid";
+    std::string output="prior snapshot bytes", error;
+    CHECK(!BuildCheckedLayoutSnapshot({},wins,1700000000,output,&error));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes");
+    CHECK(wins.size()==1 && wins[0].recordId=="not-a-guid" && wins[0].lastSeenUtc==0);
+}
+
+static void test_checked_snapshot_rejects_zero_record_id_transactionally(){
+    std::vector<LayoutWin> wins={OldStyleRecord()}; wins[0].recordId="{00000000-0000-0000-0000-000000000000}";
+    std::string output="prior snapshot bytes", error;
+    CHECK(!BuildCheckedLayoutSnapshot({},wins,1700000000,output,&error));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes");
+    CHECK(wins.size()==1 && wins[0].recordId=="{00000000-0000-0000-0000-000000000000}" && wins[0].lastSeenUtc==0);
+}
+
+static void test_checked_snapshot_rejects_duplicate_record_ids_transactionally(){
+    std::vector<LayoutWin> wins={OldStyleRecord(),OldStyleRecord()};
+    wins[0].recordId="{AAAAAAAA-BBBB-CCCC-DDDD-000000000001}";
+    wins[1].recordId="aaaaaaaa-bbbb-cccc-dddd-000000000001";
+    std::string output="prior snapshot bytes", error;
+    CHECK(!BuildCheckedLayoutSnapshot({},wins,1700000000,output,&error));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes");
+    CHECK(wins.size()==2 && wins[0].lastSeenUtc==0 && wins[1].lastSeenUtc==0);
+    CHECK(wins[0].recordId.front()=='{' && wins[1].recordId.front()=='a');
+}
+
+static void test_checked_snapshot_rejects_generated_id_collision_transactionally(){
+    std::vector<LayoutWin> wins={OldStyleRecord(),OldStyleRecord()};
+    std::string output="prior snapshot bytes", error;
+    CHECK(!BuildCheckedLayoutSnapshot({},wins,1700000000,output,&error,ConstantRecordIdGenerator));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes");
+    CHECK(wins.size()==2 && wins[0].recordId.empty() && wins[1].recordId.empty());
+    CHECK(wins[0].lastSeenUtc==0 && wins[1].lastSeenUtc==0);
+}
+
+static void test_checked_snapshot_rejects_negative_missing_since_transactionally(){
+    std::vector<LayoutWin> wins={OldStyleRecord()}; wins[0].missingSinceUtc=-1;
+    std::string output="prior snapshot bytes", error;
+    CHECK(!BuildCheckedLayoutSnapshot({},wins,1700000000,output,&error));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes");
+    CHECK(wins.size()==1 && wins[0].recordId.empty() && wins[0].lastSeenUtc==0 && wins[0].missingSinceUtc==-1);
+}
+
+static void test_checked_snapshot_rejects_negative_missing_bridge_clock_transactionally(){
+    std::vector<LayoutWin> wins={OldStyleRecord()};
+    wins[0].lastSeenUtc=1700000000; wins[0].missingRuns=1;
+    std::string output="prior snapshot bytes", error;
+    CHECK(!BuildCheckedLayoutSnapshot({},wins,-1,output,&error));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes");
+    CHECK(wins.size()==1 && wins[0].recordId.empty() && wins[0].missingSinceUtc==0 && wins[0].missingRuns==1);
+}
+
+static void test_checked_snapshot_accepts_supported_browser_apps(){
+    const char* apps[]={"firefox","chrome","msedge"};
+    for(const char* app : apps){
+        std::vector<LayoutWin> wins={OldStyleRecord()}; wins[0].app=app;
+        std::string output="sentinel", error="stale";
+        CHECK(BuildCheckedLayoutSnapshot({},wins,1700000000,output,&error));
+        CHECK(error.empty()); CHECK(output.find(std::string("W\t")+app+"\t")!=std::string::npos);
+    }
+}
+
+static void test_checked_snapshot_rejects_unsupported_app_transactionally(){
+    std::vector<LayoutWin> wins={OldStyleRecord()}; wins[0].app="opera";
+    std::string output="prior snapshot bytes", error;
+    CHECK(!BuildCheckedLayoutSnapshot({},wins,1700000000,output,&error));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes"); CHECK(wins[0].recordId.empty());
+}
+
+static void test_checked_snapshot_rejects_negative_tab_count_transactionally(){
+    std::vector<LayoutWin> wins={OldStyleRecord()}; wins[0].tabCount=-1;
+    std::string output="prior snapshot bytes", error;
+    CHECK(!BuildCheckedLayoutSnapshot({},wins,1700000000,output,&error));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes"); CHECK(wins[0].recordId.empty());
+}
+
+static void test_checked_snapshot_rejects_invalid_counts_transactionally(){
+    std::vector<LayoutWin> wins={OldStyleRecord()}; wins[0].counts={{"mail.example",0}};
+    std::string output="prior snapshot bytes", error;
+    CHECK(!BuildCheckedLayoutSnapshot({},wins,1700000000,output,&error));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes"); CHECK(wins[0].recordId.empty());
+
+    wins={OldStyleRecord()}; wins[0].counts={{"mail.example,evil",1}}; error.clear();
+    CHECK(!BuildCheckedLayoutSnapshot({},wins,1700000000,output,&error));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes"); CHECK(wins[0].recordId.empty());
+
+    wins={OldStyleRecord()}; wins[0].counts={{"mail.example\tinjected",1}}; error.clear();
+    CHECK(!BuildCheckedLayoutSnapshot({},wins,1700000000,output,&error));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes"); CHECK(wins[0].recordId.empty());
+}
+
+static void test_checked_snapshot_rejects_raw_domain_line_breaks_transactionally(){
+    std::vector<LayoutWin> wins={OldStyleRecord()}; wins[0].activeDomain="mail.example\tinjected";
+    std::string output="prior snapshot bytes", error;
+    CHECK(!BuildCheckedLayoutSnapshot({},wins,1700000000,output,&error));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes"); CHECK(wins[0].recordId.empty());
+
+    wins={OldStyleRecord()}; wins[0].activeDomain="mail.example\ninjected"; error.clear();
+    CHECK(!BuildCheckedLayoutSnapshot({},wins,1700000000,output,&error));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes"); CHECK(wins[0].recordId.empty());
+}
+
+static void test_auto_snapshot_build_rejects_invalid_existing_bytes_transactionally(){
+    const std::string invalidExisting[]={
+        "# VDE snapshot v4\nW\ttruncated\n",
+        "# VDE snapshot v5\n"
+    };
+    for(const auto& existing : invalidExisting){
+        std::vector<LayoutWin> present={OldStyleRecord()};
+        std::string output="prior snapshot bytes", error;
+        CHECK(!BuildAutoLayoutSnapshot(&existing,{},present,1700000000,output,&error));
+        CHECK(!error.empty()); CHECK(output=="prior snapshot bytes");
+        CHECK(present.size()==1 && present[0].recordId.empty() && present[0].lastSeenUtc==0);
+    }
+}
+
+static void test_auto_snapshot_build_allows_missing_existing_file(){
+    std::vector<LayoutWin> present={OldStyleRecord()};
+    std::string output="sentinel", error="stale";
+    CHECK(BuildAutoLayoutSnapshot(nullptr,{},present,1700000000,output,&error));
+    CHECK(error.empty()); CHECK(output.find("# VDE snapshot v4\n")==0);
+    std::vector<DeskRec> parsedDesks; std::vector<LayoutWin> parsed;
+    CHECK(ParseLayout(output,parsedDesks,parsed,1800000000,&error));
+    CHECK(error.empty()); CHECK(parsed.size()==1 && !parsed[0].recordId.empty());
+}
 
 static void test_prepare_transitional_records_roundtrip_and_keep_stable_id(){
     std::vector<LayoutWin> records={OldStyleRecord()};
@@ -334,6 +508,7 @@ static void test_snss_garbage(){ auto w=ParseChromiumSNSS("not an snss file...."
 int main(){
     test_etld1();
     test_b64();
+    test_b64_long_roundtrip();
     test_strict_integer_parsing();
     test_strict_base64_parsing();
     test_strict_counts_parsing();
@@ -346,9 +521,25 @@ int main(){
     test_layout_rejects_progid_as_desktop_guid();
     test_layout_rejects_integer_trailing_junk_transactionally();
     test_layout_migrates_v3_record();
+    test_layout_rejects_negative_v3_missing_counter_transactionally();
     test_layout_rejects_trailing_columns();
     test_layout_rejects_duplicate_record_ids();
     test_layout_enforces_total_record_cap_transactionally();
+    test_checked_snapshot_enforces_combined_record_cap();
+    test_checked_snapshot_rejects_zero_desktop_record_transactionally();
+    test_checked_snapshot_rejects_malformed_record_id_transactionally();
+    test_checked_snapshot_rejects_zero_record_id_transactionally();
+    test_checked_snapshot_rejects_duplicate_record_ids_transactionally();
+    test_checked_snapshot_rejects_generated_id_collision_transactionally();
+    test_checked_snapshot_rejects_negative_missing_since_transactionally();
+    test_checked_snapshot_rejects_negative_missing_bridge_clock_transactionally();
+    test_checked_snapshot_accepts_supported_browser_apps();
+    test_checked_snapshot_rejects_unsupported_app_transactionally();
+    test_checked_snapshot_rejects_negative_tab_count_transactionally();
+    test_checked_snapshot_rejects_invalid_counts_transactionally();
+    test_checked_snapshot_rejects_raw_domain_line_breaks_transactionally();
+    test_auto_snapshot_build_rejects_invalid_existing_bytes_transactionally();
+    test_auto_snapshot_build_allows_missing_existing_file();
     test_prepare_transitional_records_roundtrip_and_keep_stable_id();
     test_prepare_transitional_records_rejects_zero_desktop_transactionally();
     test_prepare_transitional_records_rejects_negative_last_seen_transactionally();

@@ -6,6 +6,7 @@
 #include <vector>
 #include <map>
 #include <set>
+#include <cstddef>
 
 struct DeskRec { int index; GUID guid; std::wstring name; };
 
@@ -18,6 +19,7 @@ inline std::map<std::string,int> StrToCounts(const std::string& s){ std::map<std
 using UnixSeconds = long long;
 static const UnixSeconds WINDOW_RETENTION_SECONDS = 30LL * 24 * 60 * 60;
 static const int MISSING_RUNS_MAX = 3; // transitional legacy constant
+static const std::size_t MAX_LAYOUT_RECORDS = 4096;
 
 struct LayoutWin {
     std::string recordId, app; int deskIndex=-1; GUID desktop={0};
@@ -26,6 +28,44 @@ struct LayoutWin {
     UnixSeconds lastSeenUtc=0, missingSinceUtc=0;
     int missingRuns=0; // transitional legacy field; ignored by v4 serialization
 };
+
+inline bool ParseNonzeroLayoutGuid(const std::string& text, GUID& guid, std::string* canonicalOut=nullptr){
+    size_t offset = 0;
+    if(text.size()==38){
+        if(text.front()!='{' || text.back()!='}') return false;
+        offset = 1;
+    } else if(text.size()!=36) return false;
+    auto isHex = [](char c)->bool {
+        return (c>='0'&&c<='9') || (c>='a'&&c<='f') || (c>='A'&&c<='F');
+    };
+    for(size_t i=0;i<36;++i){
+        bool dash = i==8 || i==13 || i==18 || i==23;
+        char c = text[offset+i];
+        if(dash ? c!='-' : !isHex(c)) return false;
+    }
+    std::string canonicalText = offset ? text : ("{" + text + "}");
+    GUID parsed{};
+    if(!StringToGuid(U82W(canonicalText), parsed) || GuidIsZero(parsed)) return false;
+    guid = parsed;
+    if(canonicalOut) *canonicalOut=W2U8(GuidToString(parsed));
+    return true;
+}
+
+inline bool IsSupportedLayoutApp(const std::string& app){
+    return app=="firefox" || app=="chrome" || app=="msedge";
+}
+
+inline bool HasLayoutFieldBreak(const std::string& value){
+    return value.find_first_of("\t\r\n")!=std::string::npos;
+}
+
+inline bool AreLayoutCountsSerializable(const std::map<std::string,int>& counts){
+    for(const auto& item : counts){
+        if(item.first.empty() || item.first.find_first_of(",\t\r\n")!=std::string::npos || item.second<=0)
+            return false;
+    }
+    return true;
+}
 
 inline std::string SerializeLayout(const std::vector<DeskRec>& desks, const std::vector<LayoutWin>& wins){
     std::string out = "# VDE snapshot v4\n";
@@ -54,23 +94,35 @@ using RecordIdGenerator = std::string (*)();
 inline bool PrepareTransitionalV4Records(std::vector<LayoutWin>& records, UnixSeconds nowUtc,
         std::string* errorOut=nullptr, RecordIdGenerator idGenerator=NewRecordId){
     std::vector<LayoutWin> prepared = records;
+    std::set<std::string> recordIds;
     auto fail = [&](const std::string& message)->bool {
         if(errorOut) *errorOut = message;
         return false;
     };
     for(auto& record : prepared){
+        if(!IsSupportedLayoutApp(record.app)) return fail("window record has an unsupported app");
         if(GuidIsZero(record.desktop)) return fail("window record has a zero desktop GUID");
+        if(HasLayoutFieldBreak(record.activeDomain)) return fail("window record domain contains a field delimiter");
+        if(record.tabCount<0) return fail("window record has a negative tab count");
+        if(!AreLayoutCountsSerializable(record.counts)) return fail("window record has invalid domain counts");
         if(record.lastSeenUtc<0) return fail("window record has a negative last-seen time");
+        if(record.missingSinceUtc<0) return fail("window record has a negative missing-since time");
         if(record.recordId.empty()){
             if(!idGenerator) return fail("record ID generator is unavailable");
             record.recordId = idGenerator();
             if(record.recordId.empty()) return fail("failed to generate record ID");
         }
+        GUID id{}; std::string idKey;
+        if(!ParseNonzeroLayoutGuid(record.recordId,id,&idKey)) return fail("window record has an invalid record ID");
+        if(!recordIds.insert(idKey).second) return fail("window records contain a duplicate record ID");
         if(record.lastSeenUtc==0){
             if(nowUtc<=0) return fail("cannot initialize last-seen time from a nonpositive clock");
             record.lastSeenUtc = nowUtc;
         }
-        if(record.missingRuns>0 && record.missingSinceUtc==0) record.missingSinceUtc = nowUtc;
+        if(record.missingRuns>0 && record.missingSinceUtc==0){
+            if(nowUtc<0) return fail("cannot initialize missing-since time from a negative clock");
+            record.missingSinceUtc = nowUtc;
+        }
     }
     records.swap(prepared);
     if(errorOut) errorOut->clear();
@@ -92,29 +144,6 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
     };
     auto failLine = [&](const std::string& message)->bool {
         return fail("line " + std::to_string(lineNumber) + ": " + message);
-    };
-    auto validApp = [](const std::string& app)->bool {
-        return app=="firefox" || app=="chrome" || app=="msedge";
-    };
-    auto parseNonzeroGuid = [](const std::string& text, GUID& guid)->bool {
-        size_t offset = 0;
-        if(text.size()==38){
-            if(text.front()!='{' || text.back()!='}') return false;
-            offset = 1;
-        } else if(text.size()!=36) return false;
-        auto isHex = [](char c)->bool {
-            return (c>='0'&&c<='9') || (c>='a'&&c<='f') || (c>='A'&&c<='F');
-        };
-        for(size_t i=0;i<36;++i){
-            bool dash = i==8 || i==13 || i==18 || i==23;
-            char c = text[offset+i];
-            if(dash ? c!='-' : !isHex(c)) return false;
-        }
-        std::string canonical = offset ? text : ("{" + text + "}");
-        GUID parsed{};
-        if(!StringToGuid(U82W(canonical), parsed) || GuidIsZero(parsed)) return false;
-        guid = parsed;
-        return true;
     };
     auto splitTabs = [](const std::string& line)->std::vector<std::string> {
         std::vector<std::string> fields;
@@ -151,7 +180,7 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
 
         if(!headerSeen) return failLine("record appears before snapshot header");
         recordsSeen = true;
-        if(++recordCount > 4096) return failLine("snapshot record limit exceeded");
+        if(++recordCount > MAX_LAYOUT_RECORDS) return failLine("snapshot record limit exceeded");
         std::vector<std::string> col = splitTabs(line);
         if(col.empty()) return failLine("empty record");
 
@@ -159,7 +188,7 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
             if(col.size()!=4) return failLine("desktop record must have exactly 4 fields");
             DeskRec d{};
             if(!ParseIntStrict(col[1], d.index)) return failLine("invalid desktop index");
-            if(!parseNonzeroGuid(col[2], d.guid)) return failLine("invalid desktop GUID");
+            if(!ParseNonzeroLayoutGuid(col[2], d.guid)) return failLine("invalid desktop GUID");
             std::string name;
             if(!b64decStrict(col[3], name)) return failLine("invalid desktop name encoding");
             d.name = U82W(name);
@@ -173,14 +202,14 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
         if(version==4){
             if(col.size()!=11) return failLine("v4 window record must have exactly 11 fields");
             w.app = col[1];
-            if(!validApp(w.app)) return failLine("unsupported window app");
+            if(!IsSupportedLayoutApp(w.app)) return failLine("unsupported window app");
             GUID id{};
-            if(!parseNonzeroGuid(col[2], id)) return failLine("invalid record ID");
+            if(!ParseNonzeroLayoutGuid(col[2], id)) return failLine("invalid record ID");
             std::string idKey = W2U8(GuidToString(id));
             if(!recordIds.insert(idKey).second) return failLine("duplicate record ID");
             w.recordId = col[2];
             if(!ParseIntStrict(col[3], w.deskIndex)) return failLine("invalid window desktop index");
-            if(!parseNonzeroGuid(col[4], w.desktop)) return failLine("invalid window desktop GUID");
+            if(!ParseNonzeroLayoutGuid(col[4], w.desktop)) return failLine("invalid window desktop GUID");
             if(!b64decStrict(col[5], title)) return failLine("invalid window title encoding");
             w.activeTitle = title;
             w.activeDomain = col[6];
@@ -191,16 +220,16 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
         } else if(version==3){
             if(col.size()!=9) return failLine("v3 window record must have exactly 9 fields");
             w.app = col[1];
-            if(!validApp(w.app)) return failLine("unsupported window app");
+            if(!IsSupportedLayoutApp(w.app)) return failLine("unsupported window app");
             if(!ParseIntStrict(col[2], w.deskIndex)) return failLine("invalid window desktop index");
-            if(!parseNonzeroGuid(col[3], w.desktop)) return failLine("invalid window desktop GUID");
+            if(!ParseNonzeroLayoutGuid(col[3], w.desktop)) return failLine("invalid window desktop GUID");
             if(!b64decStrict(col[4], title)) return failLine("invalid window title encoding");
             w.activeTitle = title;
             w.activeDomain = col[5];
             if(!ParseIntStrict(col[6], w.tabCount) || w.tabCount<0) return failLine("invalid window tab count");
             if(!ParseCountsStrict(col[7], w.counts)) return failLine("invalid window domain counts");
             int oldMissing = 0;
-            if(!ParseIntStrict(col[8], oldMissing)) return failLine("invalid legacy missing-run count");
+            if(!ParseIntStrict(col[8], oldMissing) || oldMissing<0) return failLine("invalid legacy missing-run count");
             w.recordId = NewRecordId();
             if(w.recordId.empty()) return failLine("failed to generate record ID");
             w.lastSeenUtc = migrationNow;
@@ -209,7 +238,7 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
             if(col.size()!=7) return failLine("v2 window record must have exactly 7 fields");
             w.app = "firefox";
             if(!ParseIntStrict(col[1], w.deskIndex)) return failLine("invalid window desktop index");
-            if(!parseNonzeroGuid(col[2], w.desktop)) return failLine("invalid window desktop GUID");
+            if(!ParseNonzeroLayoutGuid(col[2], w.desktop)) return failLine("invalid window desktop GUID");
             if(!b64decStrict(col[3], title)) return failLine("invalid window title encoding");
             w.activeTitle = title;
             w.activeDomain = col[4];
@@ -227,6 +256,26 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
     winsOut.swap(wins);
     if(errorOut) errorOut->clear();
     if(sourceVersionOut) *sourceVersionOut = version;
+    return true;
+}
+
+inline bool BuildCheckedLayoutSnapshot(const std::vector<DeskRec>& desks, std::vector<LayoutWin>& wins,
+        UnixSeconds nowUtc, std::string& textOut, std::string* errorOut=nullptr,
+        RecordIdGenerator idGenerator=NewRecordId){
+    auto fail = [&](const std::string& message)->bool {
+        if(errorOut) *errorOut=message;
+        return false;
+    };
+    if(desks.size()>MAX_LAYOUT_RECORDS || wins.size()>MAX_LAYOUT_RECORDS-desks.size())
+        return fail("snapshot record limit exceeded");
+    for(const auto& desk : desks) if(GuidIsZero(desk.guid)) return fail("desktop record has a zero GUID");
+    std::vector<LayoutWin> prepared=wins;
+    std::string prepareError;
+    if(!PrepareTransitionalV4Records(prepared,nowUtc,&prepareError,idGenerator)) return fail(prepareError);
+    std::string serialized=SerializeLayout(desks,prepared);
+    wins.swap(prepared);
+    textOut.swap(serialized);
+    if(errorOut) errorOut->clear();
     return true;
 }
 
@@ -257,6 +306,24 @@ inline std::vector<LayoutWin> MergeAutoLayout(const std::vector<LayoutWin>& exis
         } else { LayoutWin n=p; n.missingRuns=0; idx[key]=(int)out.size(); out.push_back(n); }
     }
     return out;
+}
+
+inline bool BuildAutoLayoutSnapshot(const std::string* existingBytes, const std::vector<DeskRec>& currentDesks,
+        const std::vector<LayoutWin>& present, UnixSeconds nowUtc, std::string& textOut,
+        std::string* errorOut=nullptr, RecordIdGenerator idGenerator=NewRecordId){
+    auto fail = [&](const std::string& message)->bool {
+        if(errorOut) *errorOut=message;
+        return false;
+    };
+    std::vector<LayoutWin> existing;
+    if(existingBytes){
+        std::vector<DeskRec> ignoredDesks;
+        std::string parseError;
+        if(!ParseLayout(*existingBytes,ignoredDesks,existing,nowUtc,&parseError))
+            return fail("invalid existing auto snapshot: "+parseError);
+    }
+    std::vector<LayoutWin> merged=MergeAutoLayout(existing,present);
+    return BuildCheckedLayoutSnapshot(currentDesks,merged,nowUtc,textOut,errorOut,idGenerator);
 }
 
 // Age the auto layout by one utility run. For apps observed this run: seen
