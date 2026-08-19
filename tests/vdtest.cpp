@@ -2,9 +2,15 @@
 // Build/run via build-test.bat. Exit code 0 = all passed.
 #define UNICODE
 #define _UNICODE
-#include <cstdio>
-#include "str_util.hpp"
 #include "layout.hpp"
+#include <algorithm>
+#include <climits>
+#include <cmath>
+#include <cstdio>
+#include <limits>
+#include <random>
+#include <utility>
+#include "str_util.hpp"
 #include "lifecycle.hpp"
 #include "session.hpp"
 
@@ -233,6 +239,399 @@ static LayoutWin OldStyleRecord(){
     w.activeTitle="Inbox"; w.activeDomain="mail.example"; w.tabCount=1;
     w.counts={{"mail.example",1}};
     return w;
+}
+
+static void test_retention_expiration_boundaries(){
+    const UnixSeconds now=1700000000;
+    LayoutWin w=OldStyleRecord();
+    w.missingSinceUtc=now-29LL*24*60*60;
+    CHECK(!IsExpired(w,now));
+    w.missingSinceUtc=now-WINDOW_RETENTION_SECONDS+1;
+    CHECK(!IsExpired(w,now));
+    w.missingSinceUtc=now-WINDOW_RETENTION_SECONDS;
+    CHECK(IsExpired(w,now));
+}
+
+static void test_retention_future_and_zero_missing_are_not_expired(){
+    LayoutWin w=OldStyleRecord();
+    w.missingSinceUtc=LLONG_MAX;
+    CHECK(!IsExpired(w,1700000000));
+    w.missingSinceUtc=0;
+    CHECK(!IsExpired(w,LLONG_MAX));
+}
+
+static void test_retention_mark_seen_clears_missing_and_updates_last_seen(){
+    LayoutWin w=OldStyleRecord();
+    w.lastSeenUtc=1700000000;
+    w.missingSinceUtc=1700000000;
+    const UnixSeconds reappearanceUtc=w.missingSinceUtc+WINDOW_RETENTION_SECONDS-1;
+    CHECK(!IsExpired(w,reappearanceUtc));
+    MarkSeen(w,reappearanceUtc);
+    CHECK(w.lastSeenUtc==reappearanceUtc);
+    CHECK(w.missingSinceUtc==0);
+}
+
+static void test_retention_mark_missing_uses_last_seen_and_is_idempotent(){
+    LayoutWin seen=OldStyleRecord();
+    seen.lastSeenUtc=1700000000;
+    MarkMissing(seen,1800000000);
+    CHECK(seen.missingSinceUtc==1700000000);
+    MarkMissing(seen,1900000000);
+    CHECK(seen.missingSinceUtc==1700000000);
+
+    LayoutWin neverSeen=OldStyleRecord();
+    MarkMissing(neverSeen,1800000000);
+    CHECK(neverSeen.missingSinceUtc==1800000000);
+    MarkMissing(neverSeen,1900000000);
+    CHECK(neverSeen.missingSinceUtc==1800000000);
+}
+
+static void test_retention_prune_preserves_order_duplicates_and_input(){
+    const UnixSeconds now=1700000000;
+    LayoutWin first=OldStyleRecord(); first.recordId="duplicate"; first.lastSeenUtc=11; first.missingSinceUtc=0;
+    LayoutWin expired=OldStyleRecord(); expired.recordId="expired"; expired.lastSeenUtc=22;
+    expired.missingSinceUtc=now-WINDOW_RETENTION_SECONDS;
+    LayoutWin duplicate=first; duplicate.lastSeenUtc=33;
+    LayoutWin recent=OldStyleRecord(); recent.recordId="recent"; recent.lastSeenUtc=44;
+    recent.missingSinceUtc=now-WINDOW_RETENTION_SECONDS+1;
+    std::vector<LayoutWin> input={first,expired,duplicate,recent};
+
+    std::vector<LayoutWin> output=PruneExpired(input,now);
+
+    CHECK(output.size()==3);
+    CHECK(output[0].recordId=="duplicate" && output[0].lastSeenUtc==11);
+    CHECK(output[1].recordId=="duplicate" && output[1].lastSeenUtc==33);
+    CHECK(output[2].recordId=="recent" && output[2].lastSeenUtc==44);
+    CHECK(input.size()==4);
+    CHECK(input[0].recordId=="duplicate" && input[0].lastSeenUtc==11 && input[0].missingSinceUtc==0);
+    CHECK(input[1].recordId=="expired" && input[1].lastSeenUtc==22);
+    CHECK(input[2].recordId=="duplicate" && input[2].lastSeenUtc==33);
+    CHECK(input[3].recordId=="recent" && input[3].lastSeenUtc==44);
+}
+
+static LayoutWin MatchRecord(const char* app, const char* title, const char* domain, int tabs,
+        const std::map<std::string,int>& counts){
+    LayoutWin w=OldStyleRecord();
+    w.app=app; w.activeTitle=title; w.activeDomain=domain; w.tabCount=tabs; w.counts=counts;
+    return w;
+}
+
+static LayoutMatch Candidate(size_t savedIndex, size_t liveIndex, double score){
+    LayoutMatch match;
+    match.savedIndex=savedIndex; match.liveIndex=liveIndex; match.score=score;
+    return match;
+}
+
+static std::vector<std::pair<size_t,size_t>> MatchPairs(const std::vector<LayoutMatch>& matches){
+    std::vector<std::pair<size_t,size_t>> pairs;
+    for(const auto& match : matches) pairs.push_back(std::make_pair(match.savedIndex,match.liveIndex));
+    return pairs;
+}
+
+static bool MatchesAreSortedAndUnique(const std::vector<LayoutMatch>& matches){
+    std::set<size_t> saved,live;
+    for(size_t i=0;i<matches.size();++i){
+        if(i>0 && std::make_pair(matches[i].savedIndex,matches[i].liveIndex)<
+                std::make_pair(matches[i-1].savedIndex,matches[i-1].liveIndex)) return false;
+        if(!saved.insert(matches[i].savedIndex).second || !live.insert(matches[i].liveIndex).second) return false;
+    }
+    return true;
+}
+
+static bool SameCandidateInput(const std::vector<LayoutMatch>& left, const std::vector<LayoutMatch>& right){
+    if(left.size()!=right.size()) return false;
+    for(size_t i=0;i<left.size();++i){
+        if(left[i].savedIndex!=right[i].savedIndex || left[i].liveIndex!=right[i].liveIndex) return false;
+        if(std::isnan(left[i].score) && std::isnan(right[i].score)) continue;
+        if(left[i].score!=right[i].score) return false;
+    }
+    return true;
+}
+
+static void test_layout_score_formula_and_fallback(){
+    LayoutWin saved=MatchRecord("firefox","Same title","same.example",2,{{"a.example",1},{"b.example",1}});
+    LayoutWin live=MatchRecord("firefox","Same title","same.example",2,{{"a.example",1},{"c.example",1}});
+    const double expectedTitle=0.40*0.5+0.25*(1.0/3.0)+0.20+0.15;
+    CHECK(std::fabs(LayoutScore(saved,live)-expectedTitle)<1e-12);
+
+    live.activeTitle="Different title";
+    const double expectedDomain=0.40*0.5+0.25*(1.0/3.0)+0.20*0.5+0.15;
+    CHECK(std::fabs(LayoutScore(saved,live)-expectedDomain)<1e-12);
+
+    saved=MatchRecord("firefox","Proportional","same.example",5,{{"a.example",3},{"b.example",4}});
+    live=MatchRecord("firefox","Proportional","same.example",10,{{"a.example",6},{"b.example",8}});
+    CHECK(std::fabs(LayoutScore(saved,live)-0.925)<1e-12);
+
+    LayoutWin emptySaved=MatchRecord("firefox","Fallback","same.example",1,{});
+    LayoutWin countedLive=MatchRecord("firefox","Fallback","other.example",9,{{"other.example",9}});
+    CHECK(LayoutScore(emptySaved,countedLive)==1.0);
+    countedLive.activeTitle="Other"; countedLive.activeDomain="same.example";
+    CHECK(LayoutScore(emptySaved,countedLive)==0.0);
+    countedLive.counts.clear(); countedLive.activeTitle.clear(); emptySaved.activeTitle.clear();
+    CHECK(LayoutScore(emptySaved,countedLive)==0.0);
+}
+
+static void test_layout_score_browser_symmetry_and_cross_app_rejection(){
+    const char* apps[]={"firefox","chrome","msedge"};
+    for(const char* app : apps){
+        LayoutWin saved=MatchRecord(app,"Inbox","mail.example",2,{{"mail.example",2}});
+        LayoutWin live=saved;
+        CHECK(LayoutScore(saved,live)==1.0);
+    }
+    LayoutWin firefox=MatchRecord("firefox","Inbox","mail.example",2,{{"mail.example",2}});
+    LayoutWin chrome=firefox; chrome.app="chrome";
+    CHECK(LayoutScore(firefox,chrome)==0.0);
+    CHECK(LayoutScore(chrome,firefox)==0.0);
+}
+
+static void test_match_one_to_one_duplicate_fingerprints_are_unique(){
+    LayoutWin fingerprint=MatchRecord("firefox","Inbox","mail.example",2,{{"mail.example",2}});
+    std::vector<LayoutWin> saved(3,fingerprint), live(2,fingerprint);
+    bool tooComplex=true;
+    std::vector<LayoutMatch> matches=MatchOneToOne(saved,live,1.0,&tooComplex);
+    CHECK(!tooComplex);
+    CHECK(matches.size()==2);
+    CHECK(MatchesAreSortedAndUnique(matches));
+    CHECK(saved.size()==3 && live.size()==2);
+}
+
+static void test_match_one_to_one_browser_apps_and_never_crosses_apps(){
+    const char* apps[]={"firefox","chrome","msedge"};
+    for(const char* app : apps){
+        LayoutWin record=MatchRecord(app,"Inbox","mail.example",1,{{"mail.example",1}});
+        bool tooComplex=true;
+        std::vector<LayoutMatch> matches=MatchOneToOne({record},{record},1.0,&tooComplex);
+        CHECK(!tooComplex && matches.size()==1);
+        CHECK(matches.size()==1 && matches[0].savedIndex==0 && matches[0].liveIndex==0);
+    }
+
+    LayoutWin firefox=MatchRecord("firefox","Inbox","mail.example",1,{{"mail.example",1}});
+    LayoutWin chrome=firefox; chrome.app="chrome";
+    bool tooComplex=true;
+    std::vector<LayoutMatch> cross=MatchOneToOne({firefox},{chrome},0.0,&tooComplex);
+    CHECK(!tooComplex);
+    CHECK(cross.empty());
+}
+
+static void test_assignment_maximizes_cardinality_before_score(){
+    std::vector<LayoutMatch> candidates={
+        Candidate(0,0,0.90),Candidate(0,1,0.80),Candidate(1,0,0.85)
+    };
+    bool tooComplex=true;
+    std::vector<LayoutMatch> matches=AssignOneToOne(2,2,candidates,&tooComplex);
+    CHECK(!tooComplex);
+    CHECK((MatchPairs(matches)==std::vector<std::pair<size_t,size_t>>({{0,1},{1,0}})));
+    CHECK(std::fabs(matches[0].score-0.80)<1e-12 && std::fabs(matches[1].score-0.85)<1e-12);
+}
+
+static void test_assignment_maximizes_total_score_at_same_cardinality(){
+    std::vector<LayoutMatch> candidates={
+        Candidate(0,0,0.90),Candidate(0,1,0.80),Candidate(1,0,0.70),Candidate(1,1,0.10)
+    };
+    std::vector<LayoutMatch> matches=AssignOneToOne(2,2,candidates);
+    CHECK((MatchPairs(matches)==std::vector<std::pair<size_t,size_t>>({{0,1},{1,0}})));
+    CHECK(std::fabs(matches[0].score+matches[1].score-1.50)<1e-12);
+}
+
+static void test_assignment_ties_are_deterministic_across_input_order(){
+    std::vector<LayoutMatch> candidates={
+        Candidate(0,0,0.5),Candidate(0,1,0.5),Candidate(1,0,0.5),Candidate(1,1,0.5)
+    };
+    const std::vector<std::pair<size_t,size_t>> expected={{0,0},{1,1}};
+    CHECK(MatchPairs(AssignOneToOne(2,2,candidates))==expected);
+    std::mt19937 rng(0x51A81E);
+    for(int run=0;run<20;++run){
+        std::shuffle(candidates.begin(),candidates.end(),rng);
+        CHECK(MatchPairs(AssignOneToOne(2,2,candidates))==expected);
+    }
+
+    candidates={
+        Candidate(0,0,0.5),Candidate(0,1,0.5),Candidate(0,2,0.5),
+        Candidate(1,1,0.5),Candidate(1,2,0.5),Candidate(2,0,0.5)
+    };
+    const std::vector<std::pair<size_t,size_t>> collisionExpected={{0,2},{1,1},{2,0}};
+    CHECK(MatchPairs(AssignOneToOne(3,3,candidates))==collisionExpected);
+    std::reverse(candidates.begin(),candidates.end());
+    CHECK(MatchPairs(AssignOneToOne(3,3,candidates))==collisionExpected);
+}
+
+static void test_assignment_filters_and_deduplicates_without_mutating_input(){
+    std::vector<LayoutMatch> candidates={
+        Candidate(0,0,0.20),Candidate(0,0,0.90),Candidate(0,0,0.50),
+        Candidate(1,1,0.70),Candidate(2,0,1.00),Candidate(0,2,1.00),
+        Candidate(0,1,std::numeric_limits<double>::quiet_NaN()),
+        Candidate(1,0,std::numeric_limits<double>::infinity()),Candidate(1,0,-0.10)
+    };
+    const std::vector<LayoutMatch> original=candidates;
+    bool tooComplex=true;
+    std::vector<LayoutMatch> matches=AssignOneToOne(2,2,candidates,&tooComplex);
+    CHECK(!tooComplex);
+    CHECK((MatchPairs(matches)==std::vector<std::pair<size_t,size_t>>({{0,0},{1,1}})));
+    CHECK(matches.size()==2 && matches[0].score==0.90 && matches[1].score==0.70);
+    CHECK(SameCandidateInput(candidates,original));
+    CHECK(AssignOneToOne(0,2,candidates).empty());
+    CHECK(AssignOneToOne(2,0,candidates).empty());
+    CHECK(AssignOneToOne(2,2,{}).empty());
+}
+
+struct OracleAssignmentResult {
+    bool initialized=false;
+    long long totalUnits=0;
+    long long deterministicTieSum=0;
+    std::vector<std::pair<size_t,size_t>> pairs;
+};
+
+static void VisitOracleAssignments(size_t savedIndex, size_t savedCount, size_t liveCount,
+        const std::vector<std::vector<long long>>& units, const std::vector<std::vector<long long>>& tieOrders,
+        std::vector<bool>& usedLive, std::vector<std::pair<size_t,size_t>>& current,
+        long long totalUnits, long long deterministicTieSum,
+        OracleAssignmentResult& best){
+    if(savedIndex==savedCount){
+        if(!best.initialized || current.size()>best.pairs.size() ||
+                (current.size()==best.pairs.size() && (totalUnits>best.totalUnits ||
+                (totalUnits==best.totalUnits && deterministicTieSum<best.deterministicTieSum)))){
+            best.initialized=true; best.totalUnits=totalUnits;
+            best.deterministicTieSum=deterministicTieSum; best.pairs=current;
+        }
+        return;
+    }
+    VisitOracleAssignments(savedIndex+1,savedCount,liveCount,units,tieOrders,usedLive,current,
+        totalUnits,deterministicTieSum,best);
+    for(size_t liveIndex=0;liveIndex<liveCount;++liveIndex){
+        if(usedLive[liveIndex] || units[savedIndex][liveIndex]<0) continue;
+        usedLive[liveIndex]=true;
+        current.push_back(std::make_pair(savedIndex,liveIndex));
+        VisitOracleAssignments(savedIndex+1,savedCount,liveCount,units,tieOrders,usedLive,current,
+            totalUnits+units[savedIndex][liveIndex],
+            deterministicTieSum+tieOrders[savedIndex][liveIndex],best);
+        current.pop_back();
+        usedLive[liveIndex]=false;
+    }
+}
+
+static OracleAssignmentResult ExhaustiveAssignmentOracle(size_t savedCount, size_t liveCount,
+        const std::vector<LayoutMatch>& candidates){
+    std::vector<std::vector<long long>> units(savedCount,std::vector<long long>(liveCount,-1));
+    std::vector<std::vector<long long>> tieOrders(savedCount,std::vector<long long>(liveCount,-1));
+    std::map<std::pair<size_t,size_t>,double> bestScores;
+    for(const auto& candidate : candidates){
+        if(candidate.savedIndex>=savedCount || candidate.liveIndex>=liveCount ||
+                !std::isfinite(candidate.score) || candidate.score<0) continue;
+        std::pair<size_t,size_t> key(candidate.savedIndex,candidate.liveIndex);
+        auto existing=bestScores.find(key);
+        if(existing==bestScores.end() || existing->second<candidate.score) bestScores[key]=candidate.score;
+    }
+    long long tieOrder=0;
+    for(const auto& item : bestScores){
+        units[item.first.first][item.first.second]=std::llround(item.second*1000000000.0);
+        tieOrders[item.first.first][item.first.second]=++tieOrder;
+    }
+    OracleAssignmentResult result;
+    std::vector<bool> usedLive(liveCount,false);
+    std::vector<std::pair<size_t,size_t>> current;
+    VisitOracleAssignments(0,savedCount,liveCount,units,tieOrders,usedLive,current,0,0,result);
+    return result;
+}
+
+static long long AssignmentTieSum(const std::vector<LayoutMatch>& candidates,
+        const std::vector<LayoutMatch>& matches){
+    std::map<std::pair<size_t,size_t>,double> bestScores;
+    for(const auto& candidate : candidates){
+        if(!std::isfinite(candidate.score) || candidate.score<0) continue;
+        std::pair<size_t,size_t> key(candidate.savedIndex,candidate.liveIndex);
+        auto existing=bestScores.find(key);
+        if(existing==bestScores.end() || existing->second<candidate.score) bestScores[key]=candidate.score;
+    }
+    std::set<std::pair<size_t,size_t>> selected;
+    for(const auto& match : matches) selected.insert(std::make_pair(match.savedIndex,match.liveIndex));
+    long long tieOrder=0,total=0;
+    for(const auto& item : bestScores) if(++tieOrder && selected.count(item.first)) total+=tieOrder;
+    return total;
+}
+
+static void test_assignment_randomized_against_exhaustive_oracle(){
+    std::mt19937 rng(0xC0FFEE);
+    for(int testCase=0;testCase<240;++testCase){
+        size_t savedCount=rng()%5, liveCount=rng()%5;
+        std::vector<LayoutMatch> candidates;
+        for(size_t savedIndex=0;savedIndex<savedCount;++savedIndex){
+            for(size_t liveIndex=0;liveIndex<liveCount;++liveIndex){
+                if(rng()%100>=62) continue;
+                long long scoreUnits=1+(rng()%7);
+                candidates.push_back(Candidate(savedIndex,liveIndex,scoreUnits/1000000000.0));
+            }
+        }
+        std::shuffle(candidates.begin(),candidates.end(),rng);
+        OracleAssignmentResult expected=ExhaustiveAssignmentOracle(savedCount,liveCount,candidates);
+        std::vector<LayoutMatch> actual=AssignOneToOne(savedCount,liveCount,candidates);
+        long long actualUnits=0;
+        for(const auto& match : actual) actualUnits+=std::llround(match.score*1000000000.0);
+        CHECK(actual.size()==expected.pairs.size());
+        CHECK(actualUnits==expected.totalUnits);
+        CHECK(AssignmentTieSum(candidates,actual)==expected.deterministicTieSum);
+        CHECK(MatchesAreSortedAndUnique(actual));
+    }
+}
+
+static void test_assignment_candidate_cap_direct_and_generated(){
+    std::vector<LayoutMatch> dense;
+    dense.reserve(MAX_MATCH_CANDIDATES+1);
+    for(size_t savedIndex=0;savedIndex<64;++savedIndex)
+        for(size_t liveIndex=0;liveIndex<128;++liveIndex)
+            dense.push_back(Candidate(savedIndex,liveIndex,1.0));
+    CHECK(dense.size()==MAX_MATCH_CANDIDATES);
+    bool tooComplex=true;
+    std::vector<LayoutMatch> exact=AssignOneToOne(64,128,dense,&tooComplex);
+    CHECK(!tooComplex && exact.size()==64 && MatchesAreSortedAndUnique(exact));
+
+    dense.push_back(Candidate(64,0,1.0));
+    tooComplex=false;
+    CHECK(AssignOneToOne(65,128,dense,&tooComplex).empty());
+    CHECK(tooComplex);
+
+    LayoutWin fingerprint=MatchRecord("firefox","Inbox","mail.example",1,{{"mail.example",1}});
+    std::vector<LayoutWin> saved(64,fingerprint),live(128,fingerprint);
+    tooComplex=true;
+    exact=MatchOneToOne(saved,live,1.0,&tooComplex);
+    CHECK(!tooComplex && exact.size()==64 && MatchesAreSortedAndUnique(exact));
+    saved.push_back(fingerprint);
+    tooComplex=false;
+    CHECK(MatchOneToOne(saved,live,1.0,&tooComplex).empty());
+    CHECK(tooComplex);
+
+    std::vector<LayoutMatch> sparse;
+    sparse.reserve(MAX_MATCH_CANDIDATES);
+    for(size_t index=0;index<MAX_MATCH_CANDIDATES;++index)
+        sparse.push_back(Candidate(index,index,1.0));
+    tooComplex=true;
+    std::vector<LayoutMatch> sparseResult=AssignOneToOne(
+        MAX_MATCH_CANDIDATES,MAX_MATCH_CANDIDATES,sparse,&tooComplex);
+    CHECK(!tooComplex);
+    CHECK(sparseResult.size()==MAX_MATCH_CANDIDATES && MatchesAreSortedAndUnique(sparseResult));
+}
+
+static void test_assignment_checked_score_scaling_boundary(){
+    const double nearLimit=9223372036.0;
+    bool tooComplex=true;
+    std::vector<LayoutMatch> accepted=AssignOneToOne(1,1,{Candidate(0,0,nearLimit)},&tooComplex);
+    CHECK(!tooComplex);
+    CHECK(accepted.size()==1 && accepted[0].score==nearLimit);
+
+    const double excessive=9223372037.0;
+    for(int run=0;run<2;++run){
+        tooComplex=false;
+        CHECK(AssignOneToOne(1,1,{Candidate(0,0,excessive)},&tooComplex).empty());
+        CHECK(tooComplex);
+    }
+
+    std::vector<LayoutMatch> widePath={
+        Candidate(0,2,0),Candidate(1,1,0),Candidate(1,2,nearLimit),
+        Candidate(2,0,0),Candidate(2,1,nearLimit)
+    };
+    tooComplex=true;
+    std::vector<LayoutMatch> wideResult=AssignOneToOne(3,3,widePath,&tooComplex);
+    CHECK(!tooComplex);
+    CHECK((MatchPairs(wideResult)==std::vector<std::pair<size_t,size_t>>({{0,2},{1,1},{2,0}})));
 }
 static std::string FailingRecordIdGenerator(){ return std::string(); }
 static std::string ConstantRecordIdGenerator(){ return "{00000000-0000-0000-0000-000000000099}"; }
@@ -626,6 +1025,22 @@ int main(){
     test_layout_rejects_trailing_columns();
     test_layout_rejects_duplicate_record_ids();
     test_layout_enforces_total_record_cap_transactionally();
+    test_retention_expiration_boundaries();
+    test_retention_future_and_zero_missing_are_not_expired();
+    test_retention_mark_seen_clears_missing_and_updates_last_seen();
+    test_retention_mark_missing_uses_last_seen_and_is_idempotent();
+    test_retention_prune_preserves_order_duplicates_and_input();
+    test_layout_score_formula_and_fallback();
+    test_layout_score_browser_symmetry_and_cross_app_rejection();
+    test_match_one_to_one_duplicate_fingerprints_are_unique();
+    test_match_one_to_one_browser_apps_and_never_crosses_apps();
+    test_assignment_maximizes_cardinality_before_score();
+    test_assignment_maximizes_total_score_at_same_cardinality();
+    test_assignment_ties_are_deterministic_across_input_order();
+    test_assignment_filters_and_deduplicates_without_mutating_input();
+    test_assignment_randomized_against_exhaustive_oracle();
+    test_assignment_candidate_cap_direct_and_generated();
+    test_assignment_checked_score_scaling_boundary();
     test_checked_snapshot_enforces_combined_record_cap();
     test_checked_snapshot_rejects_zero_desktop_record_transactionally();
     test_checked_snapshot_rejects_malformed_record_id_transactionally();

@@ -2,11 +2,17 @@
 // Pure logic (no COM / no GUI) so it can be unit-tested (see tests/vdtest.cpp).
 #pragma once
 #include "str_util.hpp"
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <limits>
+#include <queue>
 #include <string>
 #include <vector>
 #include <map>
 #include <set>
 #include <cstddef>
+#include <utility>
 
 struct DeskRec { int index; GUID guid; std::wstring name; };
 
@@ -20,6 +26,7 @@ using UnixSeconds = long long;
 static const UnixSeconds WINDOW_RETENTION_SECONDS = 30LL * 24 * 60 * 60;
 static const int MISSING_RUNS_MAX = 3; // transitional legacy constant
 static const std::size_t MAX_LAYOUT_RECORDS = 4096;
+static const std::size_t MAX_MATCH_CANDIDATES = 8192;
 
 struct LayoutWin {
     std::string recordId, app; int deskIndex=-1; GUID desktop={0};
@@ -28,6 +35,462 @@ struct LayoutWin {
     UnixSeconds lastSeenUtc=0, missingSinceUtc=0;
     int missingRuns=0; // transitional legacy field; ignored by v4 serialization
 };
+
+struct LayoutMatch {
+    size_t savedIndex=0;
+    size_t liveIndex=0;
+    double score=0;
+};
+
+inline bool IsExpired(const LayoutWin& window, UnixSeconds nowUtc){
+    return window.missingSinceUtc>0 && nowUtc>=window.missingSinceUtc &&
+        nowUtc-window.missingSinceUtc>=WINDOW_RETENTION_SECONDS;
+}
+
+inline void MarkSeen(LayoutWin& window, UnixSeconds nowUtc){
+    window.lastSeenUtc=nowUtc;
+    window.missingSinceUtc=0;
+}
+
+inline void MarkMissing(LayoutWin& window, UnixSeconds nowUtc){
+    if(window.missingSinceUtc==0)
+        window.missingSinceUtc=window.lastSeenUtc>0 ? window.lastSeenUtc : nowUtc;
+}
+
+inline std::vector<LayoutWin> PruneExpired(const std::vector<LayoutWin>& input, UnixSeconds nowUtc){
+    std::vector<LayoutWin> output;
+    output.reserve(input.size());
+    for(const auto& window : input) if(!IsExpired(window,nowUtc)) output.push_back(window);
+    return output;
+}
+
+inline double LayoutScore(const LayoutWin& saved, const LayoutWin& live){
+    if(saved.app!=live.app) return 0;
+    if(saved.counts.empty() || live.counts.empty())
+        return !saved.activeTitle.empty() && saved.activeTitle==live.activeTitle ? 1.0 : 0.0;
+
+    long double dot=0, savedSquares=0, liveSquares=0;
+    for(const auto& item : saved.counts){
+        long double value=static_cast<long double>(item.second);
+        savedSquares+=value*value;
+        auto other=live.counts.find(item.first);
+        if(other!=live.counts.end()) dot+=value*static_cast<long double>(other->second);
+    }
+    for(const auto& item : live.counts){
+        long double value=static_cast<long double>(item.second);
+        liveSquares+=value*value;
+    }
+    double cosine=0;
+    if(savedSquares>0 && liveSquares>0){
+        long double raw=dot/(std::sqrt(savedSquares)*std::sqrt(liveSquares));
+        cosine=static_cast<double>(std::max(-1.0L,std::min(1.0L,raw)));
+    }
+
+    size_t intersection=0;
+    for(const auto& item : saved.counts) if(live.counts.count(item.first)) ++intersection;
+    size_t unionSize=saved.counts.size()+live.counts.size()-intersection;
+    double jaccard=unionSize ? static_cast<double>(intersection)/static_cast<double>(unionSize) : 0;
+
+    double active=0;
+    if(!saved.activeTitle.empty() && saved.activeTitle==live.activeTitle) active=1;
+    else if(!saved.activeDomain.empty() && saved.activeDomain==live.activeDomain) active=0.5;
+
+    long long savedTabs=saved.tabCount, liveTabs=live.tabCount;
+    long long difference=savedTabs>=liveTabs ? savedTabs-liveTabs : liveTabs-savedTabs;
+    long long denominator=std::max(1LL,std::max(savedTabs,liveTabs));
+    double tabs=1.0-std::min(1.0,static_cast<double>(difference)/static_cast<double>(denominator));
+    return 0.40*cosine+0.25*jaccard+0.20*active+0.15*tabs;
+}
+
+namespace layout_detail {
+
+struct AssignmentCandidate {
+    LayoutMatch match;
+    long long scoreUnits=0;
+    size_t savedNode=0;
+    size_t liveNode=0;
+    long long tieOrder=0;
+};
+
+inline bool ScaleMatchScore(double score, long long& scoreUnits){
+    if(!std::isfinite(score) || score<0) return false;
+    const long double scaled=static_cast<long double>(score)*1000000000.0L;
+    const long double exclusiveLimit=9223372036854775808.0L;
+    const long double roundingLimit=static_cast<long double>((std::numeric_limits<long long>::max)())-0.5L;
+    if(!std::isfinite(scaled) || scaled>=exclusiveLimit || scaled>roundingLimit) return false;
+    scoreUnits=std::llround(scaled);
+    return scoreUnits>=0;
+}
+
+inline size_t MaximumCardinality(const std::vector<std::vector<size_t>>& adjacency, size_t liveCount){
+    const size_t none=(std::numeric_limits<size_t>::max)();
+    std::vector<size_t> savedMatch(adjacency.size(),none),liveMatch(liveCount,none);
+    size_t cardinality=0;
+    for(size_t root=0;root<adjacency.size();++root){
+        if(savedMatch[root]!=none) continue;
+        std::vector<char> seenSaved(adjacency.size(),0),seenLive(liveCount,0);
+        std::vector<size_t> parentSaved(liveCount,none);
+        std::queue<size_t> pending;
+        seenSaved[root]=1;
+        pending.push(root);
+        size_t endpoint=none;
+        while(!pending.empty() && endpoint==none){
+            size_t savedNode=pending.front(); pending.pop();
+            for(size_t liveNode : adjacency[savedNode]){
+                if(seenLive[liveNode]) continue;
+                seenLive[liveNode]=1;
+                parentSaved[liveNode]=savedNode;
+                if(liveMatch[liveNode]==none){ endpoint=liveNode; break; }
+                size_t nextSaved=liveMatch[liveNode];
+                if(!seenSaved[nextSaved]){ seenSaved[nextSaved]=1; pending.push(nextSaved); }
+            }
+        }
+        if(endpoint==none) continue;
+        for(size_t liveNode=endpoint;liveNode!=none;){
+            size_t savedNode=parentSaved[liveNode];
+            size_t priorLive=savedMatch[savedNode];
+            savedMatch[savedNode]=liveNode;
+            liveMatch[liveNode]=savedNode;
+            liveNode=priorLive;
+        }
+        ++cardinality;
+    }
+    return cardinality;
+}
+
+struct WideSigned {
+    bool negative=false;
+    unsigned long long high=0;
+    unsigned long long low=0;
+};
+
+inline WideSigned WideFromLongLong(long long value){
+    WideSigned result;
+    result.negative=value<0;
+    result.low=result.negative ? 0ULL-static_cast<unsigned long long>(value) :
+        static_cast<unsigned long long>(value);
+    return result;
+}
+
+inline WideSigned WideNegated(WideSigned value){
+    if(value.high!=0 || value.low!=0) value.negative=!value.negative;
+    return value;
+}
+
+inline int CompareWideMagnitude(const WideSigned& left, const WideSigned& right){
+    if(left.high!=right.high) return left.high<right.high ? -1 : 1;
+    if(left.low!=right.low) return left.low<right.low ? -1 : 1;
+    return 0;
+}
+
+inline bool WideLess(const WideSigned& left, const WideSigned& right){
+    if(left.negative!=right.negative) return left.negative;
+    int magnitude=CompareWideMagnitude(left,right);
+    return left.negative ? magnitude>0 : magnitude<0;
+}
+
+inline bool CheckedAdd(const WideSigned& left, const WideSigned& right, WideSigned& result){
+    if(left.negative==right.negative){
+        result.negative=left.negative;
+        result.low=left.low+right.low;
+        unsigned long long carry=result.low<left.low ? 1ULL : 0ULL;
+        result.high=left.high+right.high;
+        if(result.high<left.high) return false;
+        unsigned long long withoutCarry=result.high;
+        result.high+=carry;
+        if(result.high<withoutCarry) return false;
+        return true;
+    }
+    int magnitude=CompareWideMagnitude(left,right);
+    if(magnitude==0){ result=WideSigned(); return true; }
+    const WideSigned& larger=magnitude>0 ? left : right;
+    const WideSigned& smaller=magnitude>0 ? right : left;
+    result.negative=larger.negative;
+    result.low=larger.low-smaller.low;
+    unsigned long long borrow=larger.low<smaller.low ? 1ULL : 0ULL;
+    result.high=larger.high-smaller.high;
+    if(borrow>result.high) return false;
+    result.high-=borrow;
+    if(result.high==0 && result.low==0) result.negative=false;
+    return true;
+}
+
+struct FlowCost {
+    WideSigned negativeScoreUnits;
+    long long deterministicTieSum=0;
+};
+
+inline bool CostLess(const FlowCost& left, const FlowCost& right){
+    return WideLess(left.negativeScoreUnits,right.negativeScoreUnits) ||
+        (!WideLess(right.negativeScoreUnits,left.negativeScoreUnits) &&
+         left.deterministicTieSum<right.deterministicTieSum);
+}
+
+inline bool CheckedAdd(long long left, long long right, long long& result){
+    if(right>0 && left>(std::numeric_limits<long long>::max)()-right) return false;
+    if(right<0 && left<(std::numeric_limits<long long>::min)()-right) return false;
+    result=left+right;
+    return true;
+}
+
+inline bool CheckedAdd(const FlowCost& left, const FlowCost& right, FlowCost& result){
+    return CheckedAdd(left.negativeScoreUnits,right.negativeScoreUnits,result.negativeScoreUnits) &&
+        CheckedAdd(left.deterministicTieSum,right.deterministicTieSum,result.deterministicTieSum);
+}
+
+struct FlowEdge {
+    size_t to=0;
+    size_t reverseIndex=0;
+    int capacity=0;
+    FlowCost cost;
+};
+
+inline size_t AddFlowEdge(std::vector<std::vector<FlowEdge>>& graph, size_t from, size_t to,
+        const FlowCost& cost){
+    FlowEdge forward;
+    forward.to=to; forward.reverseIndex=graph[to].size(); forward.capacity=1; forward.cost=cost;
+    FlowEdge reverse;
+    reverse.to=from; reverse.reverseIndex=graph[from].size(); reverse.capacity=0;
+    reverse.cost.negativeScoreUnits=WideNegated(cost.negativeScoreUnits);
+    reverse.cost.deterministicTieSum=-cost.deterministicTieSum;
+    size_t index=graph[from].size();
+    graph[from].push_back(forward);
+    graph[to].push_back(reverse);
+    return index;
+}
+
+struct CandidateEdgeRef {
+    size_t from=0;
+    size_t edgeIndex=0;
+    LayoutMatch match;
+};
+
+struct DisjointSet {
+    std::vector<size_t> parent;
+    std::vector<unsigned char> rank;
+    explicit DisjointSet(size_t size):parent(size),rank(size,0){
+        for(size_t index=0;index<size;++index) parent[index]=index;
+    }
+    size_t Find(size_t node){
+        while(parent[node]!=node){ parent[node]=parent[parent[node]]; node=parent[node]; }
+        return node;
+    }
+    void Unite(size_t left, size_t right){
+        left=Find(left); right=Find(right);
+        if(left==right) return;
+        if(rank[left]<rank[right]) std::swap(left,right);
+        parent[right]=left;
+        if(rank[left]==rank[right]) ++rank[left];
+    }
+};
+
+inline bool SolveFlowComponent(const std::vector<AssignmentCandidate>& candidates,
+        const std::vector<size_t>& candidateIndices, size_t cardinality,
+        std::vector<LayoutMatch>& result){
+    if(cardinality==0) return true;
+    std::vector<size_t> savedNodes,liveNodes;
+    savedNodes.reserve(candidateIndices.size()); liveNodes.reserve(candidateIndices.size());
+    for(size_t candidateIndex : candidateIndices){
+        savedNodes.push_back(candidates[candidateIndex].savedNode);
+        liveNodes.push_back(candidates[candidateIndex].liveNode);
+    }
+    std::sort(savedNodes.begin(),savedNodes.end());
+    savedNodes.erase(std::unique(savedNodes.begin(),savedNodes.end()),savedNodes.end());
+    std::sort(liveNodes.begin(),liveNodes.end());
+    liveNodes.erase(std::unique(liveNodes.begin(),liveNodes.end()),liveNodes.end());
+
+    const size_t source=0;
+    const size_t savedOffset=1;
+    const size_t liveOffset=savedOffset+savedNodes.size();
+    const size_t sink=liveOffset+liveNodes.size();
+    std::vector<std::vector<FlowEdge>> graph(sink+1);
+    const FlowCost zeroCost{};
+    for(size_t savedNode=0;savedNode<savedNodes.size();++savedNode)
+        AddFlowEdge(graph,source,savedOffset+savedNode,zeroCost);
+
+    std::vector<CandidateEdgeRef> candidateEdges;
+    candidateEdges.reserve(candidateIndices.size());
+    for(size_t candidateIndex : candidateIndices){
+        const AssignmentCandidate& candidate=candidates[candidateIndex];
+        FlowCost cost;
+        cost.negativeScoreUnits=WideFromLongLong(-candidate.scoreUnits);
+        cost.deterministicTieSum=candidate.tieOrder;
+        size_t savedNode=static_cast<size_t>(std::lower_bound(
+            savedNodes.begin(),savedNodes.end(),candidate.savedNode)-savedNodes.begin());
+        size_t liveNode=static_cast<size_t>(std::lower_bound(
+            liveNodes.begin(),liveNodes.end(),candidate.liveNode)-liveNodes.begin());
+        CandidateEdgeRef edgeRef;
+        edgeRef.from=savedOffset+savedNode;
+        edgeRef.edgeIndex=AddFlowEdge(graph,edgeRef.from,liveOffset+liveNode,cost);
+        edgeRef.match=candidate.match;
+        candidateEdges.push_back(edgeRef);
+    }
+    for(size_t liveNode=0;liveNode<liveNodes.size();++liveNode)
+        AddFlowEdge(graph,liveOffset+liveNode,sink,zeroCost);
+
+    const size_t none=(std::numeric_limits<size_t>::max)();
+    for(size_t flow=0;flow<cardinality;++flow){
+        std::vector<FlowCost> distance(graph.size());
+        std::vector<char> reached(graph.size(),0),inQueue(graph.size(),0);
+        std::vector<size_t> previousNode(graph.size(),none),previousEdge(graph.size(),none);
+        std::queue<size_t> pending;
+        reached[source]=1; inQueue[source]=1; pending.push(source);
+        while(!pending.empty()){
+            size_t node=pending.front(); pending.pop(); inQueue[node]=0;
+            for(size_t edgeIndex=0;edgeIndex<graph[node].size();++edgeIndex){
+                const FlowEdge& edge=graph[node][edgeIndex];
+                if(edge.capacity==0) continue;
+                FlowCost next;
+                if(!CheckedAdd(distance[node],edge.cost,next)) return false;
+                if(reached[edge.to] && !CostLess(next,distance[edge.to])) continue;
+                distance[edge.to]=next;
+                reached[edge.to]=1;
+                previousNode[edge.to]=node;
+                previousEdge[edge.to]=edgeIndex;
+                if(!inQueue[edge.to]){ inQueue[edge.to]=1; pending.push(edge.to); }
+            }
+        }
+        if(!reached[sink]) return false;
+        for(size_t node=sink;node!=source;){
+            size_t prior=previousNode[node],edgeIndex=previousEdge[node];
+            if(prior==none || edgeIndex==none) return false;
+            FlowEdge& edge=graph[prior][edgeIndex];
+            --edge.capacity;
+            ++graph[node][edge.reverseIndex].capacity;
+            node=prior;
+        }
+    }
+
+    size_t priorSize=result.size();
+    for(const auto& edgeRef : candidateEdges)
+        if(graph[edgeRef.from][edgeRef.edgeIndex].capacity==0) result.push_back(edgeRef.match);
+    return result.size()-priorSize==cardinality;
+}
+
+} // namespace layout_detail
+
+inline std::vector<LayoutMatch> AssignOneToOne(size_t savedCount, size_t liveCount,
+        const std::vector<LayoutMatch>& inputCandidates, bool* tooComplex=nullptr){
+    if(tooComplex) *tooComplex=false;
+    auto fail = [&]()->std::vector<LayoutMatch> {
+        if(tooComplex) *tooComplex=true;
+        return std::vector<LayoutMatch>();
+    };
+    if(savedCount==0 || liveCount==0 || inputCandidates.empty()) return std::vector<LayoutMatch>();
+
+    std::map<std::pair<size_t,size_t>,double> bestScores;
+    for(const auto& candidate : inputCandidates){
+        if(candidate.savedIndex>=savedCount || candidate.liveIndex>=liveCount ||
+                !std::isfinite(candidate.score) || candidate.score<0) continue;
+        std::pair<size_t,size_t> key(candidate.savedIndex,candidate.liveIndex);
+        auto existing=bestScores.find(key);
+        if(existing!=bestScores.end()){
+            if(candidate.score>existing->second) existing->second=candidate.score;
+            continue;
+        }
+        if(bestScores.size()>=MAX_MATCH_CANDIDATES) return fail();
+        bestScores.insert(std::make_pair(key,candidate.score));
+    }
+    if(bestScores.empty()) return std::vector<LayoutMatch>();
+
+    std::vector<size_t> savedNodes,liveNodes;
+    savedNodes.reserve(bestScores.size()); liveNodes.reserve(bestScores.size());
+    for(const auto& item : bestScores){
+        savedNodes.push_back(item.first.first);
+        liveNodes.push_back(item.first.second);
+    }
+    std::sort(savedNodes.begin(),savedNodes.end());
+    savedNodes.erase(std::unique(savedNodes.begin(),savedNodes.end()),savedNodes.end());
+    std::sort(liveNodes.begin(),liveNodes.end());
+    liveNodes.erase(std::unique(liveNodes.begin(),liveNodes.end()),liveNodes.end());
+
+    std::vector<layout_detail::AssignmentCandidate> candidates;
+    candidates.reserve(bestScores.size());
+    size_t candidateOrder=0;
+    for(const auto& item : bestScores){
+        layout_detail::AssignmentCandidate candidate;
+        candidate.match.savedIndex=item.first.first;
+        candidate.match.liveIndex=item.first.second;
+        candidate.match.score=item.second;
+        if(!layout_detail::ScaleMatchScore(item.second,candidate.scoreUnits)) return fail();
+        candidate.savedNode=static_cast<size_t>(std::lower_bound(savedNodes.begin(),savedNodes.end(),item.first.first)-savedNodes.begin());
+        candidate.liveNode=static_cast<size_t>(std::lower_bound(liveNodes.begin(),liveNodes.end(),item.first.second)-liveNodes.begin());
+        candidate.tieOrder=static_cast<long long>(++candidateOrder);
+        candidates.push_back(candidate);
+    }
+
+    layout_detail::DisjointSet partitions(savedNodes.size()+liveNodes.size());
+    for(const auto& candidate : candidates)
+        partitions.Unite(candidate.savedNode,savedNodes.size()+candidate.liveNode);
+    std::map<size_t,std::vector<size_t>> groupedCandidates;
+    for(size_t candidateIndex=0;candidateIndex<candidates.size();++candidateIndex)
+        groupedCandidates[partitions.Find(candidates[candidateIndex].savedNode)].push_back(candidateIndex);
+
+    struct ComponentPlan {
+        std::vector<size_t> candidateIndices;
+        size_t cardinality=0;
+    };
+    std::vector<ComponentPlan> plans;
+    plans.reserve(groupedCandidates.size());
+    size_t cardinality=0;
+    for(const auto& group : groupedCandidates){
+        std::vector<size_t> componentSaved,componentLive;
+        componentSaved.reserve(group.second.size()); componentLive.reserve(group.second.size());
+        for(size_t candidateIndex : group.second){
+            componentSaved.push_back(candidates[candidateIndex].savedNode);
+            componentLive.push_back(candidates[candidateIndex].liveNode);
+        }
+        std::sort(componentSaved.begin(),componentSaved.end());
+        componentSaved.erase(std::unique(componentSaved.begin(),componentSaved.end()),componentSaved.end());
+        std::sort(componentLive.begin(),componentLive.end());
+        componentLive.erase(std::unique(componentLive.begin(),componentLive.end()),componentLive.end());
+        std::vector<std::vector<size_t>> adjacency(componentSaved.size());
+        for(size_t candidateIndex : group.second){
+            const auto& candidate=candidates[candidateIndex];
+            size_t savedNode=static_cast<size_t>(std::lower_bound(componentSaved.begin(),componentSaved.end(),candidate.savedNode)-componentSaved.begin());
+            size_t liveNode=static_cast<size_t>(std::lower_bound(componentLive.begin(),componentLive.end(),candidate.liveNode)-componentLive.begin());
+            adjacency[savedNode].push_back(liveNode);
+        }
+        ComponentPlan plan;
+        plan.candidateIndices=group.second;
+        plan.cardinality=layout_detail::MaximumCardinality(adjacency,componentLive.size());
+        if(plan.cardinality==0) return fail();
+        cardinality+=plan.cardinality;
+        plans.push_back(plan);
+    }
+
+    std::vector<LayoutMatch> result;
+    result.reserve(cardinality);
+    for(const auto& plan : plans)
+        if(!layout_detail::SolveFlowComponent(candidates,plan.candidateIndices,plan.cardinality,result)) return fail();
+    if(result.size()!=cardinality) return fail();
+    std::sort(result.begin(),result.end(),[](const LayoutMatch& left, const LayoutMatch& right){
+        return left.savedIndex<right.savedIndex ||
+            (left.savedIndex==right.savedIndex && left.liveIndex<right.liveIndex);
+    });
+    return result;
+}
+
+inline std::vector<LayoutMatch> MatchOneToOne(const std::vector<LayoutWin>& saved,
+        const std::vector<LayoutWin>& live, double acceptScore, bool* tooComplex=nullptr){
+    if(tooComplex) *tooComplex=false;
+    std::vector<LayoutMatch> candidates;
+    for(size_t savedIndex=0;savedIndex<saved.size();++savedIndex){
+        for(size_t liveIndex=0;liveIndex<live.size();++liveIndex){
+            if(saved[savedIndex].app!=live[liveIndex].app) continue;
+            double score=LayoutScore(saved[savedIndex],live[liveIndex]);
+            if(!(score>=acceptScore)) continue;
+            if(candidates.size()>=MAX_MATCH_CANDIDATES){
+                if(tooComplex) *tooComplex=true;
+                return std::vector<LayoutMatch>();
+            }
+            LayoutMatch candidate;
+            candidate.savedIndex=savedIndex; candidate.liveIndex=liveIndex; candidate.score=score;
+            candidates.push_back(candidate);
+        }
+    }
+    return AssignOneToOne(saved.size(),live.size(),candidates,tooComplex);
+}
 
 inline bool ParseNonzeroLayoutGuid(const std::string& text, GUID& guid, std::string* canonicalOut=nullptr){
     size_t offset = 0;
