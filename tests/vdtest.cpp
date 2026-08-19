@@ -384,6 +384,18 @@ static void test_layout_score_browser_symmetry_and_cross_app_rejection(){
     CHECK(LayoutScore(chrome,firefox)==0.0);
 }
 
+static void test_layout_score_identical_two_domain_is_exact(){
+    LayoutWin saved=MatchRecord("firefox","Inbox","mail.example",5,
+        {{"docs.example",1},{"mail.example",1}});
+    LayoutWin live=saved;
+    CHECK(LayoutScore(saved,live)==1.0);
+    bool tooComplex=true;
+    std::vector<LayoutMatch> matches=MatchOneToOne({saved},{live},1.0,&tooComplex);
+    CHECK(!tooComplex);
+    CHECK(matches.size()==1 && matches[0].savedIndex==0 && matches[0].liveIndex==0 &&
+        matches[0].score==1.0);
+}
+
 static void test_match_one_to_one_duplicate_fingerprints_are_unique(){
     LayoutWin fingerprint=MatchRecord("firefox","Inbox","mail.example",2,{{"mail.example",2}});
     std::vector<LayoutWin> saved(3,fingerprint), live(2,fingerprint);
@@ -411,6 +423,31 @@ static void test_match_one_to_one_browser_apps_and_never_crosses_apps(){
     std::vector<LayoutMatch> cross=MatchOneToOne({firefox},{chrome},0.0,&tooComplex);
     CHECK(!tooComplex);
     CHECK(cross.empty());
+}
+
+static void test_match_one_to_one_score_evaluation_budget(){
+    CHECK(MAX_MATCH_SCORE_EVALUATIONS==1000000);
+    LayoutWin firefox=MatchRecord("firefox","Inbox","mail.example",1,{});
+    std::vector<LayoutWin> saved(4096,firefox),sameAppLive(4096,firefox);
+    bool tooComplex=false;
+    std::vector<LayoutMatch> result=MatchOneToOne(saved,sameAppLive,2.0,&tooComplex);
+    CHECK(result.empty());
+    CHECK(tooComplex);
+    CHECK(saved.size()==4096 && sameAppLive.size()==4096);
+    CHECK(saved[0].app=="firefox" && sameAppLive[0].activeTitle=="Inbox");
+
+    LayoutWin chrome=firefox; chrome.app="chrome";
+    std::vector<LayoutWin> crossAppLive(4096,chrome);
+    tooComplex=true;
+    result=MatchOneToOne(saved,crossAppLive,2.0,&tooComplex);
+    CHECK(result.empty());
+    CHECK(!tooComplex);
+
+    LayoutWin arbitrary=firefox; arbitrary.app="arbitrary-browser";
+    tooComplex=true;
+    result=MatchOneToOne({arbitrary},{arbitrary},1.0,&tooComplex);
+    CHECK(!tooComplex);
+    CHECK(result.size()==1 && result[0].savedIndex==0 && result[0].liveIndex==0);
 }
 
 static void test_assignment_maximizes_cardinality_before_score(){
@@ -608,6 +645,25 @@ static void test_assignment_candidate_cap_direct_and_generated(){
         MAX_MATCH_CANDIDATES,MAX_MATCH_CANDIDATES,sparse,&tooComplex);
     CHECK(!tooComplex);
     CHECK(sparseResult.size()==MAX_MATCH_CANDIDATES && MatchesAreSortedAndUnique(sparseResult));
+}
+
+static void test_assignment_flow_work_budget_rejects_connected_cycle(){
+    CHECK(MAX_MATCH_FLOW_WORK==1000000);
+    const size_t nodeCount=MAX_MATCH_CANDIDATES/2;
+    std::vector<LayoutMatch> candidates;
+    candidates.reserve(MAX_MATCH_CANDIDATES);
+    for(size_t index=0;index<nodeCount;++index){
+        candidates.push_back(Candidate(index,index,1.0));
+        candidates.push_back(Candidate(index,(index+1)%nodeCount,0.5));
+    }
+    CHECK(candidates.size()==MAX_MATCH_CANDIDATES);
+    bool tooComplex=false;
+    std::vector<LayoutMatch> result=AssignOneToOne(nodeCount,nodeCount,candidates,&tooComplex);
+    CHECK(result.empty());
+    CHECK(tooComplex);
+    CHECK(candidates.size()==MAX_MATCH_CANDIDATES);
+    CHECK(candidates.front().savedIndex==0 && candidates.front().liveIndex==0);
+    CHECK(candidates.back().savedIndex==nodeCount-1 && candidates.back().liveIndex==0);
 }
 
 static void test_assignment_checked_score_scaling_boundary(){
@@ -1032,14 +1088,17 @@ int main(){
     test_retention_prune_preserves_order_duplicates_and_input();
     test_layout_score_formula_and_fallback();
     test_layout_score_browser_symmetry_and_cross_app_rejection();
+    test_layout_score_identical_two_domain_is_exact();
     test_match_one_to_one_duplicate_fingerprints_are_unique();
     test_match_one_to_one_browser_apps_and_never_crosses_apps();
+    test_match_one_to_one_score_evaluation_budget();
     test_assignment_maximizes_cardinality_before_score();
     test_assignment_maximizes_total_score_at_same_cardinality();
     test_assignment_ties_are_deterministic_across_input_order();
     test_assignment_filters_and_deduplicates_without_mutating_input();
     test_assignment_randomized_against_exhaustive_oracle();
     test_assignment_candidate_cap_direct_and_generated();
+    test_assignment_flow_work_budget_rejects_connected_cycle();
     test_assignment_checked_score_scaling_boundary();
     test_checked_snapshot_enforces_combined_record_cap();
     test_checked_snapshot_rejects_zero_desktop_record_transactionally();

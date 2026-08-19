@@ -27,6 +27,8 @@ static const UnixSeconds WINDOW_RETENTION_SECONDS = 30LL * 24 * 60 * 60;
 static const int MISSING_RUNS_MAX = 3; // transitional legacy constant
 static const std::size_t MAX_LAYOUT_RECORDS = 4096;
 static const std::size_t MAX_MATCH_CANDIDATES = 8192;
+static const std::size_t MAX_MATCH_FLOW_WORK = 1000000;
+static const std::size_t MAX_MATCH_SCORE_EVALUATIONS = 1000000;
 
 struct LayoutWin {
     std::string recordId, app; int deskIndex=-1; GUID desktop={0};
@@ -80,8 +82,9 @@ inline double LayoutScore(const LayoutWin& saved, const LayoutWin& live){
         long double value=static_cast<long double>(item.second);
         liveSquares+=value*value;
     }
-    double cosine=0;
-    if(savedSquares>0 && liveSquares>0){
+    bool identicalCounts=saved.counts==live.counts;
+    double cosine=identicalCounts ? 1.0 : 0;
+    if(!identicalCounts && savedSquares>0 && liveSquares>0){
         long double raw=dot/(std::sqrt(savedSquares)*std::sqrt(liveSquares));
         cosine=static_cast<double>(std::max(-1.0L,std::min(1.0L,raw)));
     }
@@ -455,6 +458,7 @@ inline std::vector<LayoutMatch> AssignOneToOne(size_t savedCount, size_t liveCou
         plan.candidateIndices=group.second;
         plan.cardinality=layout_detail::MaximumCardinality(adjacency,componentLive.size());
         if(plan.cardinality==0) return fail();
+        if(plan.cardinality>MAX_MATCH_FLOW_WORK/plan.candidateIndices.size()) return fail();
         cardinality+=plan.cardinality;
         plans.push_back(plan);
     }
@@ -474,16 +478,38 @@ inline std::vector<LayoutMatch> AssignOneToOne(size_t savedCount, size_t liveCou
 inline std::vector<LayoutMatch> MatchOneToOne(const std::vector<LayoutWin>& saved,
         const std::vector<LayoutWin>& live, double acceptScore, bool* tooComplex=nullptr){
     if(tooComplex) *tooComplex=false;
+    auto fail=[&](){
+        if(tooComplex) *tooComplex=true;
+        return std::vector<LayoutMatch>();
+    };
+
+    std::map<std::string,size_t> savedAppCounts, liveAppCounts;
+    for(const auto& window : saved) ++savedAppCounts[window.app];
+    for(const auto& window : live) ++liveAppCounts[window.app];
+    size_t scoreEvaluations=0;
+    for(const auto& savedApp : savedAppCounts){
+        auto liveApp=liveAppCounts.find(savedApp.first);
+        if(liveApp==liveAppCounts.end()) continue;
+        size_t liveCount=liveApp->second;
+        if(savedApp.second>MAX_MATCH_SCORE_EVALUATIONS/liveCount) return fail();
+        size_t appEvaluations=savedApp.second*liveCount;
+        if(scoreEvaluations>MAX_MATCH_SCORE_EVALUATIONS-appEvaluations) return fail();
+        scoreEvaluations+=appEvaluations;
+    }
+
+    std::map<std::string,std::vector<size_t>> liveIndicesByApp;
+    for(size_t liveIndex=0;liveIndex<live.size();++liveIndex)
+        if(savedAppCounts.find(live[liveIndex].app)!=savedAppCounts.end())
+            liveIndicesByApp[live[liveIndex].app].push_back(liveIndex);
+
     std::vector<LayoutMatch> candidates;
     for(size_t savedIndex=0;savedIndex<saved.size();++savedIndex){
-        for(size_t liveIndex=0;liveIndex<live.size();++liveIndex){
-            if(saved[savedIndex].app!=live[liveIndex].app) continue;
+        auto liveIndices=liveIndicesByApp.find(saved[savedIndex].app);
+        if(liveIndices==liveIndicesByApp.end()) continue;
+        for(size_t liveIndex : liveIndices->second){
             double score=LayoutScore(saved[savedIndex],live[liveIndex]);
             if(!(score>=acceptScore)) continue;
-            if(candidates.size()>=MAX_MATCH_CANDIDATES){
-                if(tooComplex) *tooComplex=true;
-                return std::vector<LayoutMatch>();
-            }
+            if(candidates.size()>=MAX_MATCH_CANDIDATES) return fail();
             LayoutMatch candidate;
             candidate.savedIndex=savedIndex; candidate.liveIndex=liveIndex; candidate.score=score;
             candidates.push_back(candidate);
