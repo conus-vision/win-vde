@@ -334,7 +334,7 @@ inline bool BuildAutoLayoutSnapshot(const std::string* existingBytes, const std:
     if(existingBytes){
         std::vector<DeskRec> ignoredDesks;
         std::string parseError;
-        if(!ParseLayout(*existingBytes,ignoredDesks,existing,nowUtc,&parseError))
+        if(!ParseLayout(*existingBytes,ignoredDesks,existing,nowUtc,&parseError,nullptr,idGenerator))
             return fail("invalid existing auto snapshot: "+parseError);
     }
     std::vector<LayoutWin> merged=MergeAutoLayout(existing,present);

@@ -461,6 +461,23 @@ static void test_auto_snapshot_build_rejects_invalid_existing_bytes_transactiona
     }
 }
 
+static void test_auto_snapshot_build_forwards_generator_to_legacy_migration(){
+    const std::string guid="{231A0000-0000-0000-0000-000000000001}";
+    const std::string v2 = "# VDE snapshot v2\n"
+        "W\t0\t"+guid+"\t"+b64enc("Inbox")+"\tmail.example\t1\tmail.example:1\n";
+    const std::string v3 = "# VDE snapshot v3\n"
+        "W\tfirefox\t0\t"+guid+"\t"+b64enc("Inbox")+"\tmail.example\t1\tmail.example:1\t0\n"
+        "W\tchrome\t1\t"+guid+"\t"+b64enc("Calendar")+"\tcalendar.example\t1\tcalendar.example:1\t0\n";
+    const std::string snapshots[]={v2,v3};
+    RecordIdGenerator generators[]={FailingRecordIdGenerator,ConstantRecordIdGenerator};
+    for(size_t i=0;i<2;++i){
+        std::vector<LayoutWin> present;
+        std::string output="prior snapshot bytes", error;
+        CHECK(!BuildAutoLayoutSnapshot(&snapshots[i],{},present,1700000000,output,&error,generators[i]));
+        CHECK(!error.empty()); CHECK(output=="prior snapshot bytes"); CHECK(present.empty());
+    }
+}
+
 static void test_auto_snapshot_build_allows_missing_existing_file(){
     std::vector<LayoutWin> present={OldStyleRecord()};
     std::string output="sentinel", error="stale";
@@ -625,6 +642,7 @@ int main(){
     test_checked_snapshot_rejects_invalid_counts_transactionally();
     test_checked_snapshot_rejects_raw_domain_line_breaks_transactionally();
     test_auto_snapshot_build_rejects_invalid_existing_bytes_transactionally();
+    test_auto_snapshot_build_forwards_generator_to_legacy_migration();
     test_auto_snapshot_build_allows_missing_existing_file();
     test_prepare_transitional_records_roundtrip_and_keep_stable_id();
     test_prepare_transitional_records_rejects_zero_desktop_transactionally();
