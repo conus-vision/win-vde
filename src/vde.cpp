@@ -45,8 +45,9 @@
 #include "str_util.hpp"   // W2U8/U82W, GUID helpers, b64, GetWindowsBuild, hostOf, etld1
 #include "layout.hpp"     // DeskRec + v4 layout serialization/migration logic
 #include "lifecycle.hpp"  // LcState/LcAction, LcOnStartup/LcOnTick/LcOnExit
-#include "session.hpp"    // WinFp, Chromium SNSS reader (ReadChromiumWindows)
+#include "session.hpp"    // bounded browser-session decoding primitives
 #include "appprofile.hpp" // AppProfile, BuiltinProfiles
+#include "session_worker.hpp" // bounded browser-session ownership and transitional helpers
 #include <dwmapi.h>
 #pragma comment(lib, "dwmapi.lib")
 
@@ -149,121 +150,8 @@ static std::wstring DesktopNameFromRegistry(const GUID& g) {
     return res;
 }
 
-// ===================== mozLz4 + JSON (проверено отдельно) =====================
-static long lz4_block_decompress(const uint8_t* src, size_t srcLen, uint8_t* dst, size_t dstCap) {
-    size_t sp=0, dp=0;
-    while (sp<srcLen) {
-        uint8_t token=src[sp++]; size_t litLen=token>>4;
-        if(litLen==15){ uint8_t b; do{ if(sp>=srcLen)return -1; b=src[sp++]; litLen+=b; }while(b==255); }
-        if(sp+litLen>srcLen||dp+litLen>dstCap)return -1;
-        memcpy(dst+dp,src+sp,litLen); dp+=litLen; sp+=litLen;
-        if(dp==dstCap)break; if(sp>=srcLen)break;
-        if(sp+2>srcLen)return -1;
-        size_t offset=(size_t)src[sp]|((size_t)src[sp+1]<<8); sp+=2;
-        if(offset==0||offset>dp)return -1;
-        size_t matchLen=token&0x0F;
-        if(matchLen==15){ uint8_t b; do{ if(sp>=srcLen)return -1; b=src[sp++]; matchLen+=b; }while(b==255); }
-        matchLen+=4;
-        if(dp+matchLen>dstCap)return -1;
-        size_t mp=dp-offset; for(size_t i=0;i<matchLen;++i) dst[dp+i]=dst[mp+i];
-        dp+=matchLen; if(dp==dstCap)break;
-    }
-    return (long)dp;
-}
-static bool mozlz4_decompress(const uint8_t* data, size_t len, std::string& out) {
-    static const uint8_t MAGIC[8]={0x6D,0x6F,0x7A,0x4C,0x7A,0x34,0x30,0x00};
-    if(len<12||memcmp(data,MAGIC,8)!=0)return false;
-    uint32_t usize=(uint32_t)data[8]|((uint32_t)data[9]<<8)|((uint32_t)data[10]<<16)|((uint32_t)data[11]<<24);
-    out.resize(usize); if(usize==0)return true;
-    long n=lz4_block_decompress(data+12,len-12,(uint8_t*)&out[0],usize);
-    return n==(long)usize;
-}
-struct JValue {
-    enum T { NUL, BOOL, NUM, STR, ARR, OBJ } t=NUL;
-    bool b=false; double num=0; std::string str;
-    std::vector<JValue> arr; std::map<std::string,JValue> obj;
-    const JValue* find(const std::string& k) const { if(t!=OBJ)return nullptr; auto it=obj.find(k); return it==obj.end()?nullptr:&it->second; }
-    int asInt(int def=0) const { return t==NUM?(int)num:def; }
-    const std::string& asStr() const { static std::string e; return t==STR?str:e; }
-};
-struct JParser {
-    const char* p; const char* end; bool ok=true;
-    JParser(const std::string& s):p(s.data()),end(s.data()+s.size()){}
-    void ws(){ while(p<end&&(*p==' '||*p=='\t'||*p=='\n'||*p=='\r'))++p; }
-    bool parse(JValue& v){ ws(); bool r=value(v); return r&&ok; }
-    void appendUtf8(std::string& s, unsigned cp){
-        if(cp<=0x7F)s.push_back((char)cp);
-        else if(cp<=0x7FF){s.push_back((char)(0xC0|(cp>>6)));s.push_back((char)(0x80|(cp&0x3F)));}
-        else if(cp<=0xFFFF){s.push_back((char)(0xE0|(cp>>12)));s.push_back((char)(0x80|((cp>>6)&0x3F)));s.push_back((char)(0x80|(cp&0x3F)));}
-        else{s.push_back((char)(0xF0|(cp>>18)));s.push_back((char)(0x80|((cp>>12)&0x3F)));s.push_back((char)(0x80|((cp>>6)&0x3F)));s.push_back((char)(0x80|(cp&0x3F)));}
-    }
-    unsigned hex4(){ unsigned v=0; for(int i=0;i<4&&p<end;++i){char c=*p++;v<<=4; if(c>='0'&&c<='9')v|=c-'0'; else if(c>='a'&&c<='f')v|=c-'a'+10; else if(c>='A'&&c<='F')v|=c-'A'+10; else{ok=false;return 0;}} return v; }
-    bool str(std::string& out){
-        if(p>=end||*p!='"'){ok=false;return false;} ++p;
-        while(p<end){ char c=*p++;
-            if(c=='"')return true;
-            if(c=='\\'){ if(p>=end){ok=false;return false;} char e=*p++;
-                switch(e){
-                    case '"':out.push_back('"');break; case '\\':out.push_back('\\');break; case '/':out.push_back('/');break;
-                    case 'b':out.push_back('\b');break; case 'f':out.push_back('\f');break; case 'n':out.push_back('\n');break;
-                    case 'r':out.push_back('\r');break; case 't':out.push_back('\t');break;
-                    case 'u':{ unsigned cp=hex4();
-                        if(cp>=0xD800&&cp<=0xDBFF){ if(p+1<end&&p[0]=='\\'&&p[1]=='u'){p+=2; unsigned lo=hex4(); if(lo>=0xDC00&&lo<=0xDFFF) cp=0x10000+((cp-0xD800)<<10)+(lo-0xDC00);} }
-                        appendUtf8(out,cp); break; }
-                    default: ok=false; return false;
-                }
-            } else out.push_back(c);
-        }
-        ok=false; return false;
-    }
-    bool value(JValue& v){ ws(); if(p>=end){ok=false;return false;} char c=*p;
-        if(c=='"'){v.t=JValue::STR;return str(v.str);}
-        if(c=='{')return object(v);
-        if(c=='[')return array(v);
-        if(c=='t'){if(end-p>=4&&!memcmp(p,"true",4)){p+=4;v.t=JValue::BOOL;v.b=true;return true;}ok=false;return false;}
-        if(c=='f'){if(end-p>=5&&!memcmp(p,"false",5)){p+=5;v.t=JValue::BOOL;v.b=false;return true;}ok=false;return false;}
-        if(c=='n'){if(end-p>=4&&!memcmp(p,"null",4)){p+=4;v.t=JValue::NUL;return true;}ok=false;return false;}
-        const char* s=p; if(c=='-')++p;
-        while(p<end&&((*p>='0'&&*p<='9')||*p=='.'||*p=='e'||*p=='E'||*p=='+'||*p=='-'))++p;
-        if(p==s){ok=false;return false;}
-        v.t=JValue::NUM; v.num=strtod(std::string(s,p-s).c_str(),nullptr); return true;
-    }
-    bool object(JValue& v){ v.t=JValue::OBJ; ++p; ws(); if(p<end&&*p=='}'){++p;return true;}
-        while(p<end){ ws(); std::string k; if(!str(k))return false; ws(); if(p>=end||*p!=':'){ok=false;return false;} ++p;
-            JValue cv; if(!value(cv))return false; v.obj[k]=std::move(cv); ws();
-            if(p<end&&*p==','){++p;continue;} if(p<end&&*p=='}'){++p;return true;} ok=false;return false; }
-        ok=false; return false; }
-    bool array(JValue& v){ v.t=JValue::ARR; ++p; ws(); if(p<end&&*p==']'){++p;return true;}
-        while(p<end){ JValue cv; if(!value(cv))return false; v.arr.push_back(std::move(cv)); ws();
-            if(p<end&&*p==','){++p;continue;} if(p<end&&*p==']'){++p;return true;} ok=false;return false; }
-        ok=false; return false; }
-};
-// hostOf / etld1 → moved to str_util.hpp
-// struct WinFp → unified as WinFp in session.hpp
-static std::vector<WinFp> extractWindows(const JValue& root){
-    std::vector<WinFp> out;
-    const JValue* wins=root.find("windows"); if(!wins||wins->t!=JValue::ARR)return out;
-    for(const auto& w: wins->arr){
-        const JValue* tabs=w.find("tabs"); if(!tabs||tabs->t!=JValue::ARR)continue;
-        int selected=1; if(const JValue* s=w.find("selected"))selected=s->asInt(1);
-        WinFp sw; sw.tabCount=(int)tabs->arr.size();
-        for(size_t ti=0; ti<tabs->arr.size(); ++ti){
-            const JValue& tab=tabs->arr[ti];
-            const JValue* entries=tab.find("entries"); if(!entries||entries->t!=JValue::ARR||entries->arr.empty())continue;
-            int idx=(int)entries->arr.size(); if(const JValue* e=tab.find("index"))idx=e->asInt(idx);
-            if(idx<1)idx=1; if(idx>(int)entries->arr.size())idx=(int)entries->arr.size();
-            const JValue& cur=entries->arr[idx-1];
-            std::string url=cur.find("url")?cur.find("url")->asStr():"";
-            std::string dom=etld1(hostOf(url)); if(!dom.empty())sw.counts[dom]++;
-            std::string ttl=cur.find("title")?cur.find("title")->asStr():"";
-            sw.tabsBlob += ttl; sw.tabsBlob += ' '; sw.tabsBlob += url; sw.tabsBlob += ' ';   // every tab: title + full URL (address bar)
-            if((int)ti==selected-1){ sw.activeTitle=ttl; sw.activeDomain=dom; }
-        }
-        out.push_back(std::move(sw));
-    }
-    return out;
-}
-
+// Browser-session decoders live in session.hpp. The synchronous callers below
+// are explicitly transitional until Task 8 atomically cuts the UI over.
 // ============================== services ======================================
 static IServiceProvider*               g_shell  = nullptr;
 static IVirtualDesktopManagerInternal* g_vdmi   = nullptr;
@@ -347,37 +235,23 @@ static std::vector<LiveWin> EnumAppWindows(const AppProfile& prof){
     if(g_vdmDoc)for(auto&w:v)g_vdmDoc->GetWindowDesktopId(w.hwnd,&w.desktop); return v;
 }
 
-// ============================ sessionstore IO =================================
-// ReadFileBytes / FileExists → moved to str_util.hpp
-static std::wstring FirefoxProfileDirUncached();
-static std::wstring FirefoxProfileDir(){ static std::wstring c; if(c.empty()) c=FirefoxProfileDirUncached(); return c; }
-static std::wstring FirefoxProfileDirUncached(){
-    wchar_t appdata[MAX_PATH]={0}; if(!GetEnvironmentVariableW(L"APPDATA",appdata,MAX_PATH))return L"";
-    std::wstring base=std::wstring(appdata)+L"\\Mozilla\\Firefox";
-    std::string text; if(!ReadFileBytes(base+L"\\profiles.ini",text))return L"";
-    std::vector<std::pair<std::string,std::map<std::string,std::string>>> sections;
-    { size_t pos=0;
-      while(pos<text.size()){ size_t nl=text.find('\n',pos); std::string line=text.substr(pos,(nl==std::string::npos?text.size():nl)-pos); pos=(nl==std::string::npos?text.size():nl+1);
-        while(!line.empty()&&(line.back()=='\r'||line.back()==' '))line.pop_back();
-        size_t a=0; while(a<line.size()&&line[a]==' ')a++; if(a)line=line.substr(a);
-        if(line.empty()||line[0]==';'||line[0]=='#')continue;
-        if(line[0]=='['&&line.back()==']'){ sections.push_back({line.substr(1,line.size()-2),{}}); continue; }
-        size_t eq=line.find('='); if(eq!=std::string::npos&&!sections.empty())sections.back().second[line.substr(0,eq)]=line.substr(eq+1);
-      } }
-    auto resolve=[&](const std::string& rel, bool relative)->std::wstring{ std::string p=rel; for(auto&c:p)if(c=='/')c='\\'; std::wstring wp=U82W(p); return relative?(base+L"\\"+wp):wp; };
-    for(auto& sec:sections) if(sec.first.rfind("Install",0)==0){ auto it=sec.second.find("Default"); if(it!=sec.second.end()&&!it->second.empty())return resolve(it->second,true); }
-    for(auto& sec:sections) if(sec.first.rfind("Profile",0)==0){ auto d=sec.second.find("Default"),pth=sec.second.find("Path"); if(d!=sec.second.end()&&d->second=="1"&&pth!=sec.second.end()){ bool rel=sec.second.count("IsRelative")?sec.second["IsRelative"]=="1":true; return resolve(pth->second,rel); } }
-    for(auto& sec:sections) if(sec.first.rfind("Profile",0)==0){ auto pth=sec.second.find("Path"); if(pth!=sec.second.end()&&pth->second.find(".default-release")!=std::string::npos){ bool rel=sec.second.count("IsRelative")?sec.second["IsRelative"]=="1":true; return resolve(pth->second,rel); } }
-    return L"";
-}
-static std::vector<WinFp> ReadSessionstore(std::wstring* usedPathOut=nullptr){
-    std::wstring prof=FirefoxProfileDir(); if(prof.empty())return {};
-    const wchar_t* cand[]={L"\\sessionstore-backups\\recovery.jsonlz4",L"\\sessionstore-backups\\recovery.baklz4",L"\\sessionstore.jsonlz4",L"\\sessionstore-backups\\previous.jsonlz4"};
-    for(auto c:cand){ std::wstring path=prof+c; if(!FileExists(path))continue; std::string bytes; if(!ReadFileBytes(path,bytes))continue;
-        std::string json; if(!mozlz4_decompress((const uint8_t*)bytes.data(),bytes.size(),json))continue;
-        JParser jp(json); JValue root; if(!jp.parse(root))continue;
-        if(usedPathOut)*usedPathOut=path; return extractWindows(root); }
-    return {};
+// TRANSITIONAL (removed by Task 8): the legacy monitor remains synchronous,
+// but all discovery, bounded I/O, stamps, decompression, and parsing delegate
+// to the worker-owned primitives. Nothing is published across a rotation.
+static std::vector<WinFp> ReadSessionForTransitional(const AppProfile& profile,
+                                                      std::wstring* usedPathOut=nullptr){
+    std::wstring before=ResolveBrowserSessionPath(profile);
+    SessionStamp beforeStamp;
+    if(before.empty() || !GetSessionStamp(before,beforeStamp)) return {};
+    FileReadResult read=ReadFileBytesBounded(before,MAX_BROWSER_SESSION_BYTES);
+    if(read.status!=FileReadStatus::Ok) return {};
+    std::vector<WinFp> parsed;
+    if(!ParseBrowserSessionData(profile,read.bytes,parsed)) return {};
+    std::wstring after=ResolveBrowserSessionPath(profile);
+    SessionStamp afterStamp;
+    if(after!=before || !GetSessionStamp(after,afterStamp) || afterStamp!=beforeStamp) return {};
+    if(usedPathOut) *usedPathOut=after;
+    return parsed;
 }
 
 // ============================ fingerprint / scoring ===========================
@@ -389,9 +263,7 @@ struct Fp {
 };
 static std::vector<AppProfile> ActiveProfiles(){ return BuiltinProfiles(g_appFirefox,g_appChrome,g_appEdge); }
 static std::vector<WinFp> ReadSessionFor(const AppProfile& prof){
-    if(prof.session==AppProfile::FIREFOX) return ReadSessionstore();
-    if(prof.session==AppProfile::CHROMIUM) return ReadChromiumWindows(prof.userDataDir);
-    return {};
+    return prof.session==AppProfile::NONE?std::vector<WinFp>():ReadSessionForTransitional(prof);
 }
 static std::vector<Fp> BuildLiveFingerprintsFor(const AppProfile& prof, int* boundCount=nullptr){
     std::vector<LiveWin> live=EnumAppWindows(prof);
@@ -595,15 +467,20 @@ static std::vector<Tile> g_tiles;
 static int  g_sel=0;
 static HWND g_target=nullptr; static std::wstring g_targetTitle;
 static HWND g_main=nullptr;
+static std::unique_ptr<SessionWorker> g_sessionWorker; // Task 8 starts submitting work.
 static HWND g_settings=nullptr;
 static HINSTANCE g_inst=nullptr;
 static HFONT g_uiFont=nullptr;
-static ULONGLONG g_lastMtime=0;
 static unsigned long long g_lastLayoutSig=0;
 static const UINT WM_TRAY=WM_APP+1;
 static NOTIFYICONDATAW g_nid={0};
 static int g_dpi=96;
 static int S(int v){ return MulDiv(v,g_dpi,96); }   // px@96dpi -> px@текущий DPI
+
+static void StopSessionWorker(HWND messageWindow){
+    if(g_sessionWorker){ g_sessionWorker->Stop(); g_sessionWorker.reset(); }
+    DrainPostedSessionResults(messageWindow);
+}
 static int TILE_W=240,TILE_H=150,PAD=16,HEADER=44,SEARCH_H=40;  // базовые (96 dpi); пересчёт в InitMetrics
 static int g_cols=1,g_rows=1;
 static HFONT g_fPT=nullptr,g_fPN=nullptr,g_fPI=nullptr,g_fPX=nullptr;   // cached picker fonts (avoid re-create per repaint)
@@ -823,14 +700,6 @@ static void Balloon(const std::wstring& text){
 }
 
 // ============================ settings / autofix =============================
-static std::wstring CurrentSessionstorePath(){
-    std::wstring prof=FirefoxProfileDir(); if(prof.empty())return L"";
-    const wchar_t* cand[]={L"\\sessionstore-backups\\recovery.jsonlz4",L"\\sessionstore-backups\\recovery.baklz4",L"\\sessionstore.jsonlz4",L"\\sessionstore-backups\\previous.jsonlz4"};
-    for(auto c:cand){ std::wstring p=prof+c; if(FileExists(p))return p; }
-    return L"";
-}
-static ULONGLONG FileMtime(const std::wstring& p){ WIN32_FILE_ATTRIBUTE_DATA fd; if(!GetFileAttributesExW(p.c_str(),GetFileExInfoStandard,&fd))return 0; ULARGE_INTEGER u; u.LowPart=fd.ftLastWriteTime.dwLowDateTime; u.HighPart=fd.ftLastWriteTime.dwHighDateTime; return u.QuadPart; }
-
 // Дешёвая подпись раскладки: только окна Firefox + их десктоп (без разбора sessionstore).
 // Порядко-независимая (сумма пер-оконных хэшей), чтобы смена z-порядка при фокусе не считалась изменением.
 // Cheap order-independent signature of {window -> desktop} across all tracked apps.
@@ -1225,6 +1094,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         }
         return 0;
     case WM_ACTIVATE: if(LOWORD(wp)==WA_INACTIVE)HidePicker(); return 0;
+    case WM_SESSION_RESULT: {
+        // Task 8 supplies generation/profile acceptance. Until then no requests
+        // are submitted, but ownership is still consumed immediately and safely.
+        std::unique_ptr<SessionResult> result((SessionResult*)lp);
+        return 0;
+    }
     case WM_TRAY:
         if(LOWORD(lp)==WM_RBUTTONUP){
             POINT pt; GetCursorPos(&pt); HMENU m=CreatePopupMenu();
@@ -1251,6 +1126,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         } else if(LOWORD(lp)==WM_LBUTTONDBLCLK) ShowPicker();
         return 0;
     case WM_DESTROY:
+        StopSessionWorker(hwnd); // join before the message-only owner disappears
         if(g_autoFix && !g_degraded && LcOnExit(g_lc, AnyAppPresent())==LcAction::FinalSave){   // save only if windows are open (R2)
             RunSaveAuto(&g_seenKeys,&g_observedApps);
             std::vector<DeskRec> dd; std::vector<LayoutWin> recs; std::string t;   // age grace counters by one run
@@ -1292,6 +1168,8 @@ static int RunGui(HINSTANCE hInst){
     RegisterClassExW(&wc);
     g_main=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST,L"VdeWindow",APP_NAME,WS_POPUP|WS_CLIPCHILDREN,0,0,400,300,nullptr,nullptr,hInst,nullptr);
     if(!g_main)return 3;
+    try { g_sessionWorker.reset(new SessionWorker(g_main)); }
+    catch(...) { g_sessionWorker.reset(); }
     { DWORD pref=2; DwmSetWindowAttribute(g_main,33,&pref,sizeof(pref)); }   // DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND (Win11)
     TrayAdd(g_main);
     bool hk=ApplyHotkey();

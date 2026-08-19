@@ -2,21 +2,27 @@
 // Build/run via build-test.bat. Exit code 0 = all passed.
 #define UNICODE
 #define _UNICODE
+#include "session_worker.hpp" // must be self-contained at first include
 #include "str_util.hpp"
 #include "layout.hpp"
 #include "layout_store.hpp"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <climits>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
 #include <memory>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <string>
 #include <utility>
 #include <vector>
+#include <thread>
 #include "lifecycle.hpp"
-#include "session.hpp"
 
 static int g_fail = 0, g_total = 0;
 #define CHECK(c) do{ g_total++; if(!(c)){ g_fail++; printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #c);} }while(0)
@@ -1028,7 +1034,7 @@ static void test_lc_exit(){
 // --- minimal SNSS encoder mirroring the REAL format ---
 // cmds 0/2/7/8 = raw fixed structs of two int32 (no pickle header); cmd 6 = base::Pickle
 // (4-byte-aligned fields; url = UTF-8 WriteString, title = UTF-16 WriteString16).
-static void wInt(std::string& p,int v){ for(int i=0;i<4;i++)p.push_back((char)((v>>(8*i))&0xFF)); }   // raw int32
+static void wInt(std::string& p,int v){ uint32_t bits=(uint32_t)(int32_t)v; for(int i=0;i<4;i++)p.push_back((char)((bits>>(8*i))&0xFF)); }   // raw int32
 static void pkInt(std::string& p,int v){ while(p.size()%4)p.push_back(0); wInt(p,v); }                 // aligned
 static void pkStr(std::string& p,const std::string& s){ pkInt(p,(int)s.size()); p+=s; while(p.size()%4)p.push_back(0); }
 static void pkStr16(std::string& p,const std::string& s){ pkInt(p,(int)s.size()); for(char ch:s){ p.push_back(ch); p.push_back(0);} while(p.size()%4)p.push_back(0); }
@@ -1049,7 +1055,8 @@ static std::string makeSnss(){
     return f;
 }
 static void test_snss_parse(){
-    auto w = ParseChromiumSNSS(makeSnss());
+    std::vector<WinFp> w;
+    CHECK(ParseChromiumSNSS(makeSnss(),w));
     CHECK(w.size()==2);
     int wi10=-1,wi11=-1; for(int i=0;i<(int)w.size();++i){ if(w[i].counts.count("github.com"))wi10=i; if(w[i].counts.count("example.com"))wi11=i; }
     CHECK(wi10>=0 && wi11>=0);
@@ -1060,7 +1067,1247 @@ static void test_snss_parse(){
     CHECK(w[wi10].tabsBlob.find("github.com/x")!=std::string::npos);  // full URL path is searchable, not just the domain
     CHECK(w[wi11].tabCount==1); CHECK(w[wi11].activeTitle=="Example");
 }
-static void test_snss_garbage(){ auto w=ParseChromiumSNSS("not an snss file...."); CHECK(w.empty()); }
+static void test_snss_garbage(){ std::vector<WinFp> w(1); CHECK(!ParseChromiumSNSS("not an snss file....",w)); CHECK(w.empty()); }
+
+static void test_snss_truncated_frame_returns_no_partial_windows(){
+    std::string bytes=makeSnss(); bytes.resize(bytes.size()-2);
+    std::vector<WinFp> windows(1);
+    CHECK(!ParseChromiumSNSS(bytes,windows));
+    CHECK(windows.empty());
+}
+
+static void test_mozlz4_rejects_huge_declared_output(){
+    std::string bytes("mozLz40\0",8); bytes.append(4,(char)0xff);
+    std::string output="sentinel";
+    CHECK(!MozLz4Decompress(bytes,MAX_BROWSER_SESSION_BYTES,output));
+    CHECK(output.empty());
+}
+
+static void test_session_stamp_detects_change(){
+    SessionStamp a; a.size=10; a.mtime=20;
+    SessionStamp b=a;
+    CHECK(a==b); b.mtime=21; CHECK(a!=b);
+}
+
+static void test_firefox_json_rejects_trailing_and_excessive_depth(){
+    JValue value;
+    CHECK(!JParser("{} trailing").parse(value));
+    std::string deep(MAX_JSON_DEPTH+1,'['); deep+="null";
+    deep+=std::string(MAX_JSON_DEPTH+1,']');
+    CHECK(!JParser(deep).parse(value));
+}
+
+static bool parseJsonWithLimits(const std::string& input,JValue& output,
+                                const JsonLimits& limits){
+    return JParser(input,limits).parse(output);
+}
+
+static void test_firefox_json_rejects_malformed_unicode_numbers_and_controls(){
+    JValue value;
+    CHECK(JParser("{\"ok\":true}").parse(value));
+    CHECK(value.t==JValue::OBJ && value.find("ok") && value.find("ok")->b);
+    const char* invalid[]={
+        "\"unterminated", "\"raw\nnewline\"", "\"\\x\"", "\"\\u12\"",
+        "\"\\ud800\"", "\"\\ud800\\u0041\"", "\"\\udc00\"",
+        "01", "-01", "1.", ".1", "1e", "1e+", "+1", "--1", "1e309",
+        "NaN", "Infinity"
+    };
+    for(const char* text:invalid){
+        value.t=JValue::OBJ; value.obj["sentinel"]=JValue{};
+        CHECK(!JParser(text).parse(value));
+        CHECK(value.t==JValue::NUL && value.obj.empty() && value.arr.empty() && value.str.empty());
+    }
+    CHECK(JParser("\"\\ud83d\\ude00\"").parse(value));
+    CHECK(value.t==JValue::STR && value.str=="\xf0\x9f\x98\x80");
+    CHECK(JParser("[-0,0,1.25,-2E-3,1e308]").parse(value));
+    const std::string malformedUtf8[]={
+        std::string("\"\xc0\x80\"",4), std::string("\"\x80\"",3),
+        std::string("\"\xed\xa0\x80\"",5), std::string("\"\xf4\x90\x80\x80\"",6),
+        std::string("\"\xe2\x82\"",4)
+    };
+    for(size_t i=0;i<sizeof(malformedUtf8)/sizeof(malformedUtf8[0]);++i){
+        CHECK(!JParser(malformedUtf8[i]).parse(value));
+        CHECK(value.t==JValue::NUL);
+    }
+    CHECK(!JParser("1e-9999").parse(value));
+}
+
+static void test_firefox_json_depth_node_and_string_budget_boundaries(){
+    JValue value;
+    std::string boundary(MAX_JSON_DEPTH,'['); boundary+="null";
+    boundary+=std::string(MAX_JSON_DEPTH,']');
+    CHECK(JParser(boundary).parse(value));
+
+    JsonLimits twoNodes(MAX_JSON_DEPTH,2,64);
+    CHECK(parseJsonWithLimits("[null]",value,twoNodes));
+    CHECK(!parseJsonWithLimits("[null,null]",value,twoNodes));
+    CHECK(value.t==JValue::NUL);
+
+    CHECK(parseJsonWithLimits("{\"aa\":\"bb\"}",value,JsonLimits(MAX_JSON_DEPTH,8,4)));
+    CHECK(!parseJsonWithLimits("{\"aa\":\"bb\"}",value,JsonLimits(MAX_JSON_DEPTH,8,3)));
+    CHECK(value.t==JValue::NUL);
+    CHECK(parseJsonWithLimits("\"\\ud83d\\ude00\"",value,JsonLimits(MAX_JSON_DEPTH,2,4)));
+    CHECK(!parseJsonWithLimits("\"\\ud83d\\ude00\"",value,JsonLimits(MAX_JSON_DEPTH,2,3)));
+}
+
+static void test_browser_parser_default_limits_are_exact(){
+    CHECK(MAX_JSON_DEPTH==128);
+    CHECK(MAX_JSON_NODES==2000000);
+    CHECK(MAX_JSON_DECODED_STRING_BYTES==256ULL*1024ULL*1024ULL);
+    CHECK(MAX_BROWSER_SESSION_BYTES==512ULL*1024ULL*1024ULL);
+    JsonLimits json;
+    CHECK(json.maxDepth==128 && json.maxNodes==2000000);
+    CHECK(json.maxDecodedStringBytes==256ULL*1024ULL*1024ULL);
+    SnssLimits snss;
+    CHECK(snss.maxWindows==10000 && snss.maxTabs==100000);
+    CHECK(snss.maxNavigations==1000000 && snss.maxCommands==2000000);
+    CHECK(snss.maxSearchTextPerWindow==4ULL*1024ULL*1024ULL);
+    CHECK(snss.maxRetainedTextBytes==256ULL*1024ULL*1024ULL);
+}
+
+static std::string snssWithTabWindows(int count){
+    std::string file="SNSS"; wInt(file,3);
+    for(int i=0;i<count;++i) snssRaw(file,0,100+i,1000+i);
+    return file;
+}
+
+static void test_snss_rejects_zero_trailing_and_malformed_known_commands(){
+    std::vector<WinFp> output(1);
+    std::string trailing="SNSS"; wInt(trailing,3); trailing.push_back('\1');
+    CHECK(!ParseChromiumSNSS(trailing,output)); CHECK(output.empty());
+    std::string zero="SNSS"; wInt(zero,3); zero.push_back('\0'); zero.push_back('\0');
+    CHECK(!ParseChromiumSNSS(zero,output)); CHECK(output.empty());
+    std::string shortRaw="SNSS"; wInt(shortRaw,3); snssFrame(shortRaw,0,std::string(7,'x'));
+    CHECK(!ParseChromiumSNSS(shortRaw,output)); CHECK(output.empty());
+    std::string longRaw="SNSS"; wInt(longRaw,3); snssFrame(longRaw,0,std::string(9,'x'));
+    CHECK(!ParseChromiumSNSS(longRaw,output)); CHECK(output.empty());
+    std::string badPickle="SNSS"; wInt(badPickle,3); std::string content; wInt(content,100);
+    snssFrame(badPickle,6,content);
+    CHECK(!ParseChromiumSNSS(badPickle,output)); CHECK(output.empty());
+}
+
+static void test_snss_unique_id_and_command_cap_boundaries(){
+    std::vector<WinFp> output;
+    SnssLimits limits(2,2,2,8,4,1024);
+    CHECK(ParseChromiumSNSS(snssWithTabWindows(2),output,limits));
+    CHECK(output.size()==2);
+    CHECK(!ParseChromiumSNSS(snssWithTabWindows(3),output,limits)); CHECK(output.empty());
+
+    std::string duplicate="SNSS"; wInt(duplicate,3);
+    snssRaw(duplicate,0,1,10); snssRaw(duplicate,0,1,10);
+    CHECK(ParseChromiumSNSS(duplicate,output,limits));
+    std::string negative="SNSS"; wInt(negative,3); snssRaw(negative,0,-1,10);
+    CHECK(!ParseChromiumSNSS(negative,output,limits)); CHECK(output.empty());
+
+    std::string commands="SNSS"; wInt(commands,3);
+    snssFrame(commands,99,""); snssFrame(commands,99,""); snssFrame(commands,99,"");
+    SnssLimits twoCommands(2,2,2,2,64,1024);
+    CHECK(!ParseChromiumSNSS(commands,output,twoCommands)); CHECK(output.empty());
+}
+
+static void test_snss_window_and_tab_maps_have_independent_exact_caps(){
+    std::vector<WinFp> output;
+    std::string windows="SNSS"; wInt(windows,3);
+    snssRaw(windows,8,1,0); snssRaw(windows,8,2,0);
+    CHECK(ParseChromiumSNSS(windows,output,SnssLimits(2,2,2,2,64,64)) && output.empty());
+    snssRaw(windows,8,3,0);
+    CHECK(!ParseChromiumSNSS(windows,output,SnssLimits(2,3,2,3,64,64)) && output.empty());
+    std::string tabs="SNSS"; wInt(tabs,3);
+    snssRaw(tabs,2,10,0); snssRaw(tabs,2,20,0);
+    CHECK(ParseChromiumSNSS(tabs,output,SnssLimits(2,2,2,2,64,64)) && output.empty());
+    snssRaw(tabs,2,30,0);
+    CHECK(!ParseChromiumSNSS(tabs,output,SnssLimits(2,2,2,3,64,64)) && output.empty());
+}
+
+static void test_snss_navigation_duplicate_and_search_budget_boundaries(){
+    std::vector<WinFp> output;
+    SnssLimits limits(2,3,2,16,4,1024);
+    std::string exact="SNSS"; wInt(exact,3);
+    snssRaw(exact,0,1,10); snssRaw(exact,0,1,11);
+    CHECK(ParseChromiumSNSS(exact,output,limits));
+    CHECK(output.size()==1 && output[0].tabsBlob.size()==4);
+    snssRaw(exact,0,1,12);
+    CHECK(!ParseChromiumSNSS(exact,output,limits)); CHECK(output.empty());
+
+    auto nav=[&](std::string& file,int tab,int index){
+        std::string payload; pkInt(payload,tab); pkInt(payload,index);
+        pkStr(payload,"https://example.com/"); pkStr16(payload,"T");
+        snssPickle(file,6,payload);
+    };
+    std::string navigations="SNSS"; wInt(navigations,3);
+    nav(navigations,10,0); nav(navigations,10,0); nav(navigations,10,1);
+    SnssLimits navLimits(2,3,2,16,128,1024);
+    CHECK(ParseChromiumSNSS(navigations,output,navLimits));
+    nav(navigations,10,2);
+    CHECK(!ParseChromiumSNSS(navigations,output,navLimits)); CHECK(output.empty());
+}
+
+static std::string snssWithNavigationText(int window,int tab,int navigation,
+                                          const std::string& url,const std::string& title){
+    std::string file="SNSS"; wInt(file,3); snssRaw(file,0,window,tab);
+    std::string payload; pkInt(payload,tab); pkInt(payload,navigation);
+    pkStr(payload,url); pkStr16(payload,title); snssPickle(file,6,payload);
+    return file;
+}
+
+static void test_snss_per_window_and_global_text_caps_are_exact(){
+    std::vector<WinFp> output(1);
+    std::string one=snssWithNavigationText(1,10,0,"abc","");
+    CHECK(ParseChromiumSNSS(one,output,SnssLimits(1,1,1,2,5,3)));
+    CHECK(output.size()==1 && output[0].tabsBlob==" abc ");
+    CHECK(!ParseChromiumSNSS(one,output,SnssLimits(1,1,1,2,4,3)) && output.empty());
+    CHECK(!ParseChromiumSNSS(one,output,SnssLimits(1,1,1,2,5,2)) && output.empty());
+
+    std::string two="SNSS"; wInt(two,3);
+    snssRaw(two,0,1,10); snssRaw(two,0,2,20);
+    std::string first; pkInt(first,10); pkInt(first,0); pkStr(first,"abc"); pkStr16(first,"");
+    std::string second; pkInt(second,20); pkInt(second,0); pkStr(second,"def"); pkStr16(second,"");
+    snssPickle(two,6,first); snssPickle(two,6,second);
+    CHECK(ParseChromiumSNSS(two,output,SnssLimits(2,2,2,4,5,6)) && output.size()==2);
+    CHECK(!ParseChromiumSNSS(two,output,SnssLimits(2,2,2,4,5,5)) && output.empty());
+    CHECK(!ParseChromiumSNSS(two,output,SnssLimits(2,2,2,3,5,6)) && output.empty());
+}
+
+static std::string makeMozLiteral(const std::string& decoded){
+    std::string bytes("mozLz40\0",8); wInt(bytes,(int)decoded.size());
+    if(decoded.empty()) return bytes;
+    size_t literal=decoded.size();
+    bytes.push_back((char)((literal<15?literal:15)<<4));
+    if(literal>=15){ size_t extra=literal-15;
+        while(extra>=255){ bytes.push_back((char)255); extra-=255; }
+        bytes.push_back((char)extra);
+    }
+    bytes+=decoded; return bytes;
+}
+
+static void test_mozlz4_exact_decode_and_limit_boundaries(){
+    std::string output="sentinel";
+    CHECK(MozLz4Decompress(makeMozLiteral(""),MAX_BROWSER_SESSION_BYTES,output)); CHECK(output.empty());
+    CHECK(MozLz4Decompress(makeMozLiteral("hello"),5,output)); CHECK(output=="hello");
+    output="sentinel";
+    CHECK(!MozLz4Decompress(makeMozLiteral("hello"),4,output)); CHECK(output.empty());
+}
+
+static void test_mozlz4_rejects_malformed_blocks_transactionally(){
+    std::vector<std::string> malformed;
+    malformed.push_back("");
+    malformed.push_back(std::string("mozLz40\0",8));
+    malformed.push_back(std::string("badLz400\0\0\0\0",12));
+    std::string extension("mozLz40\0",8); wInt(extension,16);
+    extension.push_back((char)0xf0); extension.push_back((char)255); malformed.push_back(extension);
+    std::string zeroOffset("mozLz40\0",8); wInt(zeroOffset,5);
+    zeroOffset.push_back((char)0x10); zeroOffset.push_back('a'); zeroOffset.push_back('\0'); zeroOffset.push_back('\0');
+    malformed.push_back(zeroOffset);
+    std::string trailing=makeMozLiteral("a"); trailing.push_back('x'); malformed.push_back(trailing);
+    std::string emptyTrailing=makeMozLiteral(""); emptyTrailing.push_back('\0'); malformed.push_back(emptyTrailing);
+    for(const auto& bytes:malformed){
+        std::string output="sentinel";
+        CHECK(!MozLz4Decompress(bytes,MAX_BROWSER_SESSION_BYTES,output)); CHECK(output.empty());
+    }
+}
+
+static void test_lz4_match_offset_and_extension_arithmetic_edges(){
+    uint8_t output[32]={0};
+    const uint8_t repeated[]={0x10,'a',0x01,0x00};
+    CHECK(Lz4BlockDecompress(repeated,sizeof(repeated),output,5)==5);
+    CHECK(std::string((char*)output,5)=="aaaaa");
+    const uint8_t distant[]={0x10,'a',0x02,0x00};
+    CHECK(Lz4BlockDecompress(distant,sizeof(distant),output,5)<0);
+    const uint8_t truncatedOffset[]={0x10,'a',0x01};
+    CHECK(Lz4BlockDecompress(truncatedOffset,sizeof(truncatedOffset),output,5)<0);
+    const uint8_t truncatedMatchExtension[]={0x1f,'a',0x01,0x00,0xff};
+    CHECK(Lz4BlockDecompress(truncatedMatchExtension,sizeof(truncatedMatchExtension),output,sizeof(output))<0);
+    CHECK(Lz4BlockDecompress(nullptr,1,output,sizeof(output))<0);
+    CHECK(Lz4BlockDecompress(repeated,sizeof(repeated),nullptr,5)<0);
+
+    size_t length=(std::numeric_limits<size_t>::max)()-1;
+    CHECK(Lz4CheckedAdd(length,1) && length==(std::numeric_limits<size_t>::max)());
+    CHECK(!Lz4CheckedAdd(length,1) && length==(std::numeric_limits<size_t>::max)());
+}
+
+static bool setSparseSessionFileSize(const std::wstring& path,unsigned long long size){
+    HANDLE file=CreateFileW(path.c_str(),GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                            nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(file==INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER position; position.QuadPart=(LONGLONG)size;
+    bool ok=SetFilePointerEx(file,position,nullptr,FILE_BEGIN)!=FALSE && SetEndOfFile(file)!=FALSE;
+    CloseHandle(file); return ok;
+}
+
+static void test_get_session_stamp_accepts_exact_cap_and_rejects_over(){
+    wchar_t temp[MAX_PATH+1]={0},path[MAX_PATH+1]={0};
+    DWORD length=GetTempPathW(MAX_PATH,temp);
+    CHECK(length>0 && length<=MAX_PATH);
+    if(length==0 || length>MAX_PATH) return;
+    CHECK(GetTempFileNameW(temp,L"vds",0,path)!=0);
+    if(!path[0]) return;
+    CHECK(setSparseSessionFileSize(path,MAX_BROWSER_SESSION_BYTES));
+    SessionStamp stamp; stamp.size=7; stamp.mtime=8;
+    CHECK(GetSessionStamp(path,stamp) && stamp.size==MAX_BROWSER_SESSION_BYTES);
+    CHECK(setSparseSessionFileSize(path,MAX_BROWSER_SESSION_BYTES+1));
+    SessionStamp sentinel; sentinel.size=17; sentinel.mtime=18; stamp=sentinel;
+    CHECK(!GetSessionStamp(path,stamp) && stamp==sentinel);
+    CHECK(DeleteFileW(path)!=FALSE);
+}
+
+static void test_firefox_profile_ini_default_release_fallback(){
+    const std::string fallback="[Profile0]\nName=release\nIsRelative=1\nPath=Profiles/demo.default-release\n";
+    CHECK(ResolveFirefoxProfileDirectoryFromIni(L"C:\\Firefox",fallback)==
+          L"C:\\Firefox\\Profiles\\demo.default-release");
+    const std::string installed="[Install123]\nDefault=Profiles/main\n[Profile0]\nDefault=1\nPath=Profiles/other\n";
+    CHECK(ResolveFirefoxProfileDirectoryFromIni(L"C:\\Firefox",installed)==
+          L"C:\\Firefox\\Profiles\\main");
+}
+
+static void test_firefox_json_valid_empty_is_distinct_from_failure(){
+    std::vector<WinFp> output(1);
+    CHECK(ParseFirefoxSessionJson("{\"windows\":[]}",output)); CHECK(output.empty());
+    output.push_back(WinFp{});
+    CHECK(!ParseFirefoxSessionJson("{\"windows\":[",output)); CHECK(output.empty());
+}
+
+static void test_firefox_selected_index_rejects_int_min_without_overflow(){
+    CHECK(!FirefoxSelectedTabMatches(INT_MIN,0));
+    CHECK(!FirefoxSelectedTabMatches(0,0));
+    CHECK(FirefoxSelectedTabMatches(1,0));
+    CHECK(FirefoxSelectedTabMatches(INT_MAX,(size_t)INT_MAX-1));
+    std::vector<WinFp> output;
+    CHECK(ParseFirefoxSessionJson(
+        "{\"windows\":[{\"selected\":-2147483648,\"tabs\":[{\"entries\":[{\"url\":\"https://example.com\",\"title\":\"Example\"}]}]}]}",
+        output));
+    CHECK(output.size()==1 && output[0].activeTitle.empty() && output[0].activeDomain.empty());
+}
+
+static AppProfile sessionTestProfile(const std::string& app,AppProfile::Sess session=AppProfile::FIREFOX){
+    AppProfile profile;
+    profile.id=app;
+    profile.classNames.push_back(L"TestWindow");
+    profile.exeName=L"test.exe";
+    profile.titleSuffixes.push_back(L" - Test");
+    profile.session=session;
+    profile.userDataDir=L"test-data";
+    return profile;
+}
+
+struct SessionPathFixture {
+    std::wstring root,defaultDir,sessionsDir;
+    std::vector<std::wstring> files;
+    bool ready=false;
+    SessionPathFixture(){
+        wchar_t temp[MAX_PATH+1]={0},uniquePath[MAX_PATH+1]={0};
+        DWORD length=GetTempPathW(MAX_PATH,temp);
+        if(length==0 || length>MAX_PATH || !GetTempFileNameW(temp,L"vdp",0,uniquePath)) return;
+        root=uniquePath;
+        if(!DeleteFileW(root.c_str()) || !CreateDirectoryW(root.c_str(),nullptr)) return;
+        defaultDir=root+L"\\Default"; sessionsDir=defaultDir+L"\\Sessions";
+        if(!CreateDirectoryW(defaultDir.c_str(),nullptr) || !CreateDirectoryW(sessionsDir.c_str(),nullptr)) return;
+        ready=true;
+    }
+    bool add(const wchar_t* name,unsigned long long modified,unsigned long long size=1){
+        if(!ready) return false;
+        std::wstring path=sessionsDir+L"\\"+name;
+        HANDLE file=CreateFileW(path.c_str(),GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                                nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+        if(file==INVALID_HANDLE_VALUE) return false;
+        LARGE_INTEGER end; end.QuadPart=(LONGLONG)size;
+        FILETIME time; ULARGE_INTEGER bits; bits.QuadPart=modified;
+        time.dwLowDateTime=bits.LowPart; time.dwHighDateTime=bits.HighPart;
+        bool ok=SetFilePointerEx(file,end,nullptr,FILE_BEGIN)!=FALSE && SetEndOfFile(file)!=FALSE &&
+                SetFileTime(file,nullptr,nullptr,&time)!=FALSE;
+        CloseHandle(file);
+        if(ok) files.push_back(path); else DeleteFileW(path.c_str());
+        return ok;
+    }
+    ~SessionPathFixture(){
+        for(size_t i=0;i<files.size();++i) DeleteFileW(files[i].c_str());
+        if(!sessionsDir.empty()) RemoveDirectoryW(sessionsDir.c_str());
+        if(!defaultDir.empty()) RemoveDirectoryW(defaultDir.c_str());
+        if(!root.empty()) RemoveDirectoryW(root.c_str());
+    }
+};
+
+static void test_chromium_resolver_tracks_rotation_and_breaks_stamp_ties(){
+    SessionPathFixture fixture;
+    CHECK(fixture.ready); if(!fixture.ready) return;
+    AppProfile profile=sessionTestProfile("chrome",AppProfile::CHROMIUM);
+    profile.userDataDir=fixture.root;
+    CHECK(fixture.add(L"Session_A",100));
+    CHECK(ResolveBrowserSessionPath(profile)==fixture.sessionsDir+L"\\Session_A");
+    CHECK(fixture.add(L"Session_B",200));
+    CHECK(ResolveBrowserSessionPath(profile)==fixture.sessionsDir+L"\\Session_B");
+    CHECK(fixture.add(L"Session_C",200));
+    CHECK(ResolveBrowserSessionPath(profile)==fixture.sessionsDir+L"\\Session_C");
+    CHECK(fixture.add(L"Session_zero",300,0));
+    CHECK(ResolveBrowserSessionPath(profile)==fixture.sessionsDir+L"\\Session_C");
+}
+
+struct SessionResultSink {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::deque<std::unique_ptr<SessionResult> > results;
+    std::atomic<bool> wrongMessage{false};
+    bool post(HWND,UINT message,WPARAM,LPARAM value){
+        if(message!=WM_SESSION_RESULT) wrongMessage=true;
+        std::unique_ptr<SessionResult> owned((SessionResult*)value);
+        { std::lock_guard<std::mutex> lock(mutex); results.push_back(std::move(owned)); }
+        changed.notify_all();
+        return true;
+    }
+    std::unique_ptr<SessionResult> waitFor(uint64_t requestId){
+        std::unique_lock<std::mutex> lock(mutex);
+        changed.wait_for(lock,std::chrono::seconds(5),[&]{
+            for(size_t i=0;i<results.size();++i) if(results[i]->requestId==requestId) return true;
+            return false;
+        });
+        for(std::deque<std::unique_ptr<SessionResult> >::iterator it=results.begin();it!=results.end();++it){
+            if((*it)->requestId==requestId){
+                std::unique_ptr<SessionResult> found=std::move(*it);
+                results.erase(it);
+                return found;
+            }
+        }
+        return std::unique_ptr<SessionResult>();
+    }
+};
+
+static void test_already_posted_session_results_are_drained_and_freed(){
+    HWND window=CreateWindowExW(0,L"STATIC",L"",0,0,0,0,0,HWND_MESSAGE,nullptr,
+                                GetModuleHandleW(nullptr),nullptr);
+    CHECK(window!=nullptr); if(!window) return;
+    std::shared_ptr<const std::vector<WinFp> > payload(new std::vector<WinFp>(1));
+    SessionResult* result=new SessionResult(); result->windows=payload;
+    CHECK(payload.use_count()==2);
+    CHECK(PostMessageW(window,WM_SESSION_RESULT,0,(LPARAM)result)!=FALSE);
+    CHECK(DrainPostedSessionResults(window)==1);
+    CHECK(payload.use_count()==1);
+    CHECK(DrainPostedSessionResults(window)==0);
+    CHECK(DestroyWindow(window)!=FALSE);
+}
+
+static void test_session_status_and_acceptance_policy_contract(){
+    CHECK(SessionDataUsable(SessionDataStatus::Fresh));
+    CHECK(SessionDataUsable(SessionDataStatus::CachedStale));
+    CHECK(!SessionDataUsable(SessionDataStatus::Unavailable));
+    CHECK(!SessionDataUsable(SessionDataStatus::Superseded));
+    SessionPolicy fresh=SessionAcceptancePolicy(SessionDataStatus::Fresh);
+    CHECK(fresh.matchExisting && fresh.restoreExisting && fresh.createUnmatched);
+    CHECK(fresh.updateFingerprints && fresh.markMissing && !fresh.deferOnce);
+    SessionPolicy stale=SessionAcceptancePolicy(SessionDataStatus::CachedStale);
+    CHECK(stale.matchExisting && stale.restoreExisting && !stale.createUnmatched);
+    CHECK(!stale.updateFingerprints && !stale.markMissing && stale.unmatchedLiveWaits);
+    SessionPolicy unavailable=SessionAcceptancePolicy(SessionDataStatus::Unavailable);
+    CHECK(!unavailable.matchExisting && !unavailable.restoreExisting && !unavailable.createUnmatched);
+    CHECK(!unavailable.updateFingerprints && !unavailable.markMissing && unavailable.deferOnce);
+    SessionPolicy superseded=SessionAcceptancePolicy(SessionDataStatus::Superseded);
+    CHECK(!superseded.matchExisting && !superseded.restoreExisting && !superseded.deferOnce);
+}
+
+static void test_session_cache_shares_payload_and_rejects_oversize(){
+    std::vector<WinFp> seed(1); seed[0].tabsBlob="payload";
+    size_t bytes=EstimateSessionPayloadBytes(seed);
+    SessionCache cache(2,bytes);
+    SessionCacheValue stored;
+    SessionStamp stamp; stamp.size=10; stamp.mtime=20;
+    CHECK(cache.Put("firefox",L"one",stamp,std::move(seed),101,1,stored));
+    CHECK(stored.windows && cache.EntryCount()==1 && cache.RetainedBytes()==bytes);
+    SessionCacheValue hit;
+    CHECK(cache.FindExact("firefox",L"one",stamp,hit));
+    CHECK(hit.windows.get()==stored.windows.get());
+
+    std::vector<WinFp> second(1); second[0].tabsBlob="second";
+    SessionCacheValue rejected;
+    CHECK(!cache.Put("chrome",L"two",stamp,std::move(second),102,2,rejected));
+    CHECK(!rejected.windows);
+    stored.windows.reset(); hit.windows.reset();
+    CHECK(cache.RetainedBytes()<=bytes);
+}
+
+static void test_session_worker_valid_empty_is_fresh_and_cache_hit_is_shared(){
+    SessionResultSink sink;
+    std::atomic<int> reads(0),parses(0),stamps(0);
+    SessionWorkerOps ops;
+    ops.resolvePath=[](const AppProfile&){ return std::wstring(L"session-file"); };
+    ops.getStamp=[&](const std::wstring&,SessionStamp& stamp){ ++stamps; stamp.size=5; stamp.mtime=9; return true; };
+    ops.readFile=[&](const std::wstring&){ ++reads; FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="valid"; return r; };
+    ops.parse=[&](const AppProfile&,const std::string& bytes,std::vector<WinFp>& output){ ++parses; output.clear(); return bytes=="valid"; };
+    ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
+    SessionWorker worker((HWND)1,ops,16,1024*1024);
+    SessionRequest first;
+    first.requestId=1; first.app="firefox"; first.profile=sessionTestProfile("firefox");
+    first.purpose=SessionPurpose::ManualRestore; first.identityGeneration=7;
+    CHECK(worker.Request(first));
+    std::unique_ptr<SessionResult> fresh=sink.waitFor(1);
+    CHECK(fresh && fresh->status==SessionDataStatus::Fresh && fresh->windows && fresh->windows->empty());
+    CHECK(fresh && fresh->purpose==SessionPurpose::ManualRestore && fresh->identityGeneration==7);
+    SessionStamp expectedStamp; expectedStamp.size=5; expectedStamp.mtime=9;
+    CHECK(fresh && fresh->sourceStampKnown && fresh->sourceStamp==expectedStamp);
+    CHECK(fresh && fresh->dataStamp==expectedStamp && fresh->dataGeneration==1);
+    const std::vector<WinFp>* identity=fresh?fresh->windows.get():nullptr;
+    SessionRequest second=first; second.requestId=2; second.purpose=SessionPurpose::Search;
+    CHECK(worker.Request(second));
+    std::unique_ptr<SessionResult> cached=sink.waitFor(2);
+    CHECK(cached && cached->status==SessionDataStatus::Fresh && cached->windows.get()==identity);
+    CHECK(cached && cached->purpose==SessionPurpose::Search && cached->dataGeneration==1);
+    CHECK(reads.load()==1 && parses.load()==1);
+    worker.Stop();
+    SessionRequest rejected=first; rejected.requestId=3;
+    CHECK(!worker.Request(rejected));
+}
+
+static void test_session_worker_malformed_cold_is_unavailable(){
+    SessionResultSink sink;
+    std::atomic<int> parses(0);
+    SessionWorkerOps ops;
+    ops.resolvePath=[](const AppProfile&){ return std::wstring(L"cold"); };
+    ops.getStamp=[](const std::wstring&,SessionStamp& stamp){ stamp.size=11; stamp.mtime=1; return true; };
+    ops.readFile=[](const std::wstring&){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="malformed"; return r; };
+    ops.parse=[&](const AppProfile&,const std::string&,std::vector<WinFp>& output){ ++parses; output.push_back(WinFp{}); return false; };
+    ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
+    SessionWorker worker((HWND)1,ops);
+    SessionRequest request; request.requestId=20; request.app="firefox"; request.profile=sessionTestProfile("firefox");
+    request.purpose=SessionPurpose::AutoReconcile; request.identityGeneration=2;
+    CHECK(worker.Request(request));
+    std::unique_ptr<SessionResult> result=sink.waitFor(20);
+    SessionStamp current; current.size=11; current.mtime=1;
+    CHECK(result && result->status==SessionDataStatus::Unavailable && !result->windows);
+    CHECK(result && result->sourceStampKnown && result->sourceStamp==current);
+    CHECK(result && result->dataStamp==SessionStamp{} && result->dataGeneration==0);
+    CHECK(parses.load()==1);
+    worker.Stop();
+}
+
+static void test_session_worker_non_ok_reads_never_parse_and_publish_current_stamp(){
+    SessionResultSink sink;
+    std::atomic<int> reads(0),parses(0);
+    const FileReadStatus statuses[]={FileReadStatus::Missing,FileReadStatus::Unavailable,FileReadStatus::TooLarge};
+    SessionWorkerOps ops;
+    ops.resolvePath=[](const AppProfile&){ return std::wstring(L"read-gated"); };
+    ops.getStamp=[](const std::wstring&,SessionStamp& stamp){ stamp.size=23; stamp.mtime=45; return true; };
+    ops.readFile=[&](const std::wstring&){ FileReadResult result; result.status=statuses[reads++]; return result; };
+    ops.parse=[&](const AppProfile&,const std::string&,std::vector<WinFp>&){ ++parses; return true; };
+    ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
+    SessionWorker worker((HWND)1,ops);
+    SessionRequest request; request.app="firefox"; request.profile=sessionTestProfile("firefox");
+    SessionStamp current; current.size=23; current.mtime=45;
+    for(int i=0;i<3;++i){
+        request.requestId=30+i;
+        CHECK(worker.Request(request));
+        std::unique_ptr<SessionResult> result=sink.waitFor(request.requestId);
+        CHECK(result && result->status==SessionDataStatus::Unavailable && !result->windows);
+        CHECK(result && result->path==L"read-gated" && result->sourceStampKnown && result->sourceStamp==current);
+        CHECK(result && result->dataStamp==SessionStamp{} && result->dataGeneration==0);
+    }
+    CHECK(reads.load()==3 && parses.load()==0);
+    worker.Stop();
+}
+
+static void test_session_worker_disappeared_source_is_not_reported_as_current(){
+    SessionResultSink sink;
+    std::atomic<int> resolves(0),stampCalls(0);
+    SessionWorkerOps ops;
+    ops.resolvePath=[&](const AppProfile&){ return ++resolves==1?std::wstring(L"gone"):std::wstring(); };
+    ops.getStamp=[&](const std::wstring& path,SessionStamp& stamp){ ++stampCalls; stamp.size=4; stamp.mtime=5; return path==L"gone"; };
+    ops.readFile=[](const std::wstring&){ FileReadResult result; result.status=FileReadStatus::Missing; return result; };
+    ops.parse=[](const AppProfile&,const std::string&,std::vector<WinFp>&){ return true; };
+    ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
+    SessionWorker worker((HWND)1,ops);
+    SessionRequest request; request.requestId=35; request.app="firefox"; request.profile=sessionTestProfile("firefox");
+    CHECK(worker.Request(request));
+    std::unique_ptr<SessionResult> result=sink.waitFor(35);
+    CHECK(result && result->status==SessionDataStatus::Unavailable);
+    CHECK(result && result->path.empty() && !result->sourceStampKnown && result->sourceStamp==SessionStamp{});
+    CHECK(stampCalls.load()==1);
+    worker.Stop();
+}
+
+static void test_session_worker_stamp_change_uses_exact_path_cached_stale(){
+    SessionResultSink sink;
+    std::atomic<unsigned long long> mtime(1);
+    std::atomic<bool> parseOk(true);
+    SessionWorkerOps ops;
+    ops.resolvePath=[](const AppProfile&){ return std::wstring(L"same-path"); };
+    ops.getStamp=[&](const std::wstring&,SessionStamp& stamp){ stamp.size=9; stamp.mtime=mtime.load(); return true; };
+    ops.readFile=[](const std::wstring&){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="bytes"; return r; };
+    ops.parse=[&](const AppProfile&,const std::string&,std::vector<WinFp>& output){
+        output.clear(); WinFp window; window.activeTitle="cached"; output.push_back(window); return parseOk.load();
+    };
+    ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
+    SessionWorker worker((HWND)1,ops);
+    SessionRequest request; request.requestId=21; request.app="firefox"; request.profile=sessionTestProfile("firefox");
+    request.purpose=SessionPurpose::HeartbeatSave; request.identityGeneration=4;
+    CHECK(worker.Request(request));
+    std::unique_ptr<SessionResult> fresh=sink.waitFor(21);
+    CHECK(fresh && fresh->status==SessionDataStatus::Fresh && fresh->windows->size()==1);
+    const std::vector<WinFp>* identity=fresh?fresh->windows.get():nullptr;
+    uint64_t generation=fresh?fresh->dataGeneration:0;
+
+    mtime=2; parseOk=false; request.requestId=22;
+    CHECK(worker.Request(request));
+    std::unique_ptr<SessionResult> stale=sink.waitFor(22);
+    SessionStamp source; source.size=9; source.mtime=2;
+    SessionStamp data; data.size=9; data.mtime=1;
+    CHECK(stale && stale->status==SessionDataStatus::CachedStale && stale->windows.get()==identity);
+    CHECK(stale && stale->sourceStampKnown && stale->sourceStamp==source);
+    CHECK(stale && stale->dataStamp==data && stale->dataGeneration==generation);
+    worker.Stop();
+}
+
+static void test_session_worker_rotation_during_parse_is_never_fresh(){
+    SessionResultSink sink;
+    std::atomic<int> resolves(0);
+    SessionWorkerOps ops;
+    ops.resolvePath=[&](const AppProfile&){ return ++resolves==1?std::wstring(L"Session_old"):std::wstring(L"Session_new"); };
+    ops.getStamp=[](const std::wstring& path,SessionStamp& stamp){ stamp.size=100; stamp.mtime=path==L"Session_old"?1:2; return true; };
+    ops.readFile=[](const std::wstring&){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="old"; return r; };
+    ops.parse=[](const AppProfile&,const std::string&,std::vector<WinFp>& output){ output.clear(); output.push_back(WinFp{}); return true; };
+    ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
+    SessionWorker worker((HWND)1,ops);
+    SessionRequest request; request.requestId=23; request.app="chrome"; request.profile=sessionTestProfile("chrome",AppProfile::CHROMIUM);
+    request.purpose=SessionPurpose::MetadataProbe; request.identityGeneration=8;
+    CHECK(worker.Request(request));
+    std::unique_ptr<SessionResult> result=sink.waitFor(23);
+    SessionStamp current; current.size=100; current.mtime=2;
+    CHECK(result && result->status==SessionDataStatus::Unavailable && !result->windows);
+    CHECK(result && result->path==L"Session_new" && result->sourceStampKnown && result->sourceStamp==current);
+    CHECK(result && result->dataGeneration==0 && result->dataStamp==SessionStamp{});
+    worker.Stop();
+}
+
+static void test_session_worker_rotation_uses_only_exact_attempted_path_cache(){
+    SessionResultSink sink;
+    std::atomic<int> resolves(0);
+    std::atomic<unsigned long long> oldMtime(1);
+    SessionWorkerOps ops;
+    ops.resolvePath=[&](const AppProfile&){ int call=++resolves; return call<=3?std::wstring(L"Session_old"):std::wstring(L"Session_new"); };
+    ops.getStamp=[&](const std::wstring& path,SessionStamp& stamp){ stamp.size=50; stamp.mtime=path==L"Session_old"?oldMtime.load():3; return true; };
+    ops.readFile=[](const std::wstring&){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="bytes"; return r; };
+    ops.parse=[](const AppProfile&,const std::string&,std::vector<WinFp>& output){ output.clear(); WinFp fp; fp.activeTitle="old-cache"; output.push_back(fp); return true; };
+    ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
+    SessionWorker worker((HWND)1,ops);
+    SessionRequest request; request.requestId=24; request.app="chrome"; request.profile=sessionTestProfile("chrome",AppProfile::CHROMIUM);
+    request.purpose=SessionPurpose::AutoReconcile; request.identityGeneration=9;
+    CHECK(worker.Request(request));
+    std::unique_ptr<SessionResult> fresh=sink.waitFor(24);
+    CHECK(fresh && fresh->status==SessionDataStatus::Fresh);
+    const std::vector<WinFp>* cachedIdentity=fresh?fresh->windows.get():nullptr;
+    uint64_t cachedGeneration=fresh?fresh->dataGeneration:0;
+    oldMtime=2; request.requestId=25;
+    CHECK(worker.Request(request));
+    std::unique_ptr<SessionResult> rotated=sink.waitFor(25);
+    SessionStamp current; current.size=50; current.mtime=3;
+    SessionStamp data; data.size=50; data.mtime=1;
+    CHECK(rotated && rotated->status==SessionDataStatus::CachedStale);
+    CHECK(rotated && rotated->path==L"Session_new" && rotated->sourceStampKnown && rotated->sourceStamp==current);
+    CHECK(rotated && rotated->windows.get()==cachedIdentity && rotated->dataStamp==data && rotated->dataGeneration==cachedGeneration);
+    worker.Stop();
+}
+
+struct BlockingSessionParse {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered=false;
+    bool released=false;
+    bool parse(const AppProfile&,const std::string&,std::vector<WinFp>& output){
+        std::unique_lock<std::mutex> lock(mutex);
+        entered=true; changed.notify_all();
+        changed.wait(lock,[&]{ return released; });
+        output.clear();
+        return true;
+    }
+    bool waitEntered(){
+        std::unique_lock<std::mutex> lock(mutex);
+        return changed.wait_for(lock,std::chrono::seconds(5),[&]{ return entered; });
+    }
+    void release(){ std::lock_guard<std::mutex> lock(mutex); released=true; changed.notify_all(); }
+};
+
+static SessionWorkerOps coalescingWorkerOps(SessionResultSink& sink,BlockingSessionParse& blocker){
+    SessionWorkerOps ops;
+    ops.resolvePath=[](const AppProfile& profile){ return U82W(profile.id)+L"-session"; };
+    ops.getStamp=[](const std::wstring& path,SessionStamp& stamp){ stamp.size=path.size(); stamp.mtime=1; return true; };
+    ops.readFile=[](const std::wstring&){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="valid"; return r; };
+    ops.parse=[&](const AppProfile& profile,const std::string& bytes,std::vector<WinFp>& output){ return blocker.parse(profile,bytes,output); };
+    ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
+    return ops;
+}
+
+static void test_session_worker_ten_rapid_requests_are_active_plus_newest_pending(){
+    SessionResultSink sink; BlockingSessionParse blocker;
+    SessionWorker worker((HWND)1,coalescingWorkerOps(sink,blocker));
+    SessionRequest request; request.app="firefox"; request.profile=sessionTestProfile("firefox");
+    request.identityGeneration=10;
+    SessionPurpose purposes[10]={
+        SessionPurpose::MetadataProbe,SessionPurpose::Search,SessionPurpose::Search,
+        SessionPurpose::AutoReconcile,SessionPurpose::HeartbeatSave,SessionPurpose::ManualSave,
+        SessionPurpose::ManualRestore,SessionPurpose::ManualSave,SessionPurpose::ManualRestore,
+        SessionPurpose::ManualSave
+    };
+    request.requestId=100; request.purpose=purposes[0];
+    CHECK(worker.Request(request)); CHECK(blocker.waitEntered());
+    for(int i=1;i<10;++i){ request.requestId=100+i; request.purpose=purposes[i]; CHECK(worker.Request(request)); }
+    CHECK(worker.OutstandingForApp("firefox")<=2);
+    blocker.release();
+    int fresh=0,superseded=0;
+    for(int i=0;i<10;++i){
+        std::unique_ptr<SessionResult> result=sink.waitFor(100+i);
+        CHECK(result && result->purpose==purposes[i]);
+        if(result && result->status==SessionDataStatus::Fresh) ++fresh;
+        if(result && result->status==SessionDataStatus::Superseded) ++superseded;
+    }
+    CHECK(fresh==2 && superseded==8);
+    CHECK(!sink.wrongMessage.load());
+    worker.Stop();
+}
+
+static void test_session_worker_low_probe_cannot_replace_user_pending(){
+    SessionResultSink sink; BlockingSessionParse blocker;
+    SessionWorker worker((HWND)1,coalescingWorkerOps(sink,blocker));
+    SessionRequest active; active.requestId=200; active.app="firefox"; active.profile=sessionTestProfile("firefox");
+    active.purpose=SessionPurpose::Search;
+    CHECK(worker.Request(active)); CHECK(blocker.waitEntered());
+    SessionRequest manual=active; manual.requestId=201; manual.purpose=SessionPurpose::ManualRestore;
+    SessionRequest probe=active; probe.requestId=202; probe.purpose=SessionPurpose::MetadataProbe;
+    CHECK(worker.Request(manual)); CHECK(worker.Request(probe));
+    std::unique_ptr<SessionResult> dropped=sink.waitFor(202);
+    CHECK(dropped && dropped->status==SessionDataStatus::Superseded && dropped->purpose==SessionPurpose::MetadataProbe);
+    blocker.release();
+    std::unique_ptr<SessionResult> activeResult=sink.waitFor(200);
+    std::unique_ptr<SessionResult> manualResult=sink.waitFor(201);
+    CHECK(activeResult && activeResult->status==SessionDataStatus::Fresh);
+    CHECK(manualResult && manualResult->status==SessionDataStatus::Fresh && manualResult->purpose==SessionPurpose::ManualRestore);
+    worker.Stop();
+}
+
+struct OrderedBlockingSessionParse {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::vector<std::string> order;
+    bool released=false;
+    bool parse(const AppProfile& profile,std::vector<WinFp>& output){
+        std::unique_lock<std::mutex> lock(mutex);
+        order.push_back(profile.id); changed.notify_all();
+        if(order.size()==1) changed.wait(lock,[&]{ return released; });
+        output.clear(); return true;
+    }
+    bool waitFirst(){
+        std::unique_lock<std::mutex> lock(mutex);
+        return changed.wait_for(lock,std::chrono::seconds(5),[&]{ return !order.empty(); });
+    }
+    void release(){ std::lock_guard<std::mutex> lock(mutex); released=true; changed.notify_all(); }
+    std::vector<std::string> snapshot(){ std::lock_guard<std::mutex> lock(mutex); return order; }
+};
+
+static void test_session_worker_cross_app_manual_preempts_pending_metadata(){
+    SessionResultSink sink; OrderedBlockingSessionParse parser;
+    SessionWorkerOps ops;
+    ops.resolvePath=[](const AppProfile& profile){ return U82W(profile.id)+L"-priority"; };
+    ops.getStamp=[](const std::wstring&,SessionStamp& stamp){ stamp.size=1; stamp.mtime=1; return true; };
+    ops.readFile=[](const std::wstring&){ FileReadResult result; result.status=FileReadStatus::Ok; result.bytes="ok"; return result; };
+    ops.parse=[&](const AppProfile& profile,const std::string&,std::vector<WinFp>& output){ return parser.parse(profile,output); };
+    ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
+    SessionWorker worker((HWND)1,ops);
+    SessionRequest active; active.requestId=210; active.app="firefox"; active.profile=sessionTestProfile("firefox");
+    active.purpose=SessionPurpose::MetadataProbe;
+    CHECK(worker.Request(active)); CHECK(parser.waitFirst());
+    SessionRequest probe; probe.requestId=211; probe.app="chrome"; probe.profile=sessionTestProfile("chrome",AppProfile::CHROMIUM);
+    probe.purpose=SessionPurpose::MetadataProbe;
+    SessionRequest manual; manual.requestId=212; manual.app="msedge"; manual.profile=sessionTestProfile("msedge",AppProfile::CHROMIUM);
+    manual.purpose=SessionPurpose::ManualRestore;
+    CHECK(worker.Request(probe)); CHECK(worker.Request(manual));
+    parser.release();
+    CHECK(sink.waitFor(210)!=nullptr); CHECK(sink.waitFor(211)!=nullptr); CHECK(sink.waitFor(212)!=nullptr);
+    std::vector<std::string> order=parser.snapshot();
+    CHECK(order.size()==3);
+    CHECK(order.size()==3 && order[0]=="firefox" && order[1]=="msedge" && order[2]=="chrome");
+    worker.Stop();
+}
+
+static void test_session_worker_rejects_unsupported_app_queue_amplification(){
+    SessionResultSink sink; BlockingSessionParse blocker;
+    SessionWorker worker((HWND)1,coalescingWorkerOps(sink,blocker));
+    SessionRequest active; active.requestId=300; active.app="firefox"; active.profile=sessionTestProfile("firefox");
+    active.purpose=SessionPurpose::MetadataProbe;
+    CHECK(worker.Request(active)); CHECK(blocker.waitEntered());
+    for(int i=0;i<100;++i){
+        SessionRequest unsupported; unsupported.requestId=301+i; unsupported.app="other"+std::to_string(i);
+        unsupported.profile=sessionTestProfile(unsupported.app); unsupported.purpose=SessionPurpose::MetadataProbe;
+        CHECK(!worker.Request(unsupported));
+    }
+    CHECK(worker.PendingCount()<=3 && worker.ActiveCount()==1);
+    blocker.release();
+    CHECK(sink.waitFor(300)!=nullptr);
+    worker.Stop();
+}
+
+static std::unique_ptr<SessionResult> coordinatorResult(uint64_t id,const std::string& app,
+        SessionPurpose purpose,uint64_t generation,SessionDataStatus status){
+    std::unique_ptr<SessionResult> result(new SessionResult());
+    result->requestId=id; result->app=app; result->purpose=purpose;
+    result->identityGeneration=generation; result->status=status;
+    return result;
+}
+
+static void test_session_coordinator_preserves_purpose_and_shared_payload_identity(){
+    SessionRequest captured;
+    SessionCoordinator coordinator([&](const SessionRequest& request){ captured=request; return true; });
+    AppProfile profile=sessionTestProfile("firefox");
+    uint64_t requestId=coordinator.RequestSessionData(profile,41,SessionPurpose::ManualSave);
+    CHECK(requestId!=0 && captured.requestId==requestId && captured.app=="firefox");
+    CHECK(captured.purpose==SessionPurpose::ManualSave && captured.identityGeneration==41);
+    CHECK(SessionProfilesEqual(captured.profile,profile));
+    std::shared_ptr<const std::vector<WinFp> > payload(new std::vector<WinFp>(1));
+    const std::vector<WinFp>* identity=payload.get();
+    std::unique_ptr<SessionResult> result=coordinatorResult(requestId,"firefox",SessionPurpose::ManualSave,41,SessionDataStatus::Fresh);
+    result->windows=payload;
+    CHECK(coordinator.AcceptSessionResult(std::move(result),profile,41));
+    const SessionResult* accepted=coordinator.Latest("firefox");
+    CHECK(accepted && accepted->purpose==SessionPurpose::ManualSave && accepted->windows.get()==identity);
+}
+
+static void test_session_coordinator_rejects_old_generation_profile_purpose_and_request(){
+    SessionCoordinator coordinator([](const SessionRequest&){ return true; });
+    AppProfile profile=sessionTestProfile("chrome",AppProfile::CHROMIUM);
+    uint64_t oldId=coordinator.RequestSessionData(profile,5,SessionPurpose::Search);
+    uint64_t latestId=coordinator.RequestSessionData(profile,5,SessionPurpose::Search);
+    CHECK(!coordinator.AcceptSessionResult(coordinatorResult(oldId,"chrome",SessionPurpose::Search,5,SessionDataStatus::Fresh),profile,5));
+    CHECK(coordinator.AcceptSessionResult(coordinatorResult(latestId,"chrome",SessionPurpose::Search,5,SessionDataStatus::Fresh),profile,5));
+
+    uint64_t generationId=coordinator.RequestSessionData(profile,6,SessionPurpose::AutoReconcile);
+    CHECK(!coordinator.AcceptSessionResult(coordinatorResult(generationId,"chrome",SessionPurpose::AutoReconcile,6,SessionDataStatus::Fresh),profile,7));
+    uint64_t purposeId=coordinator.RequestSessionData(profile,7,SessionPurpose::HeartbeatSave);
+    CHECK(!coordinator.AcceptSessionResult(coordinatorResult(purposeId,"chrome",SessionPurpose::ManualSave,7,SessionDataStatus::Fresh),profile,7));
+    uint64_t profileId=coordinator.RequestSessionData(profile,7,SessionPurpose::ManualRestore);
+    AppProfile changed=profile; changed.userDataDir=L"changed";
+    CHECK(!coordinator.AcceptSessionResult(coordinatorResult(profileId,"chrome",SessionPurpose::ManualRestore,7,SessionDataStatus::Fresh),changed,7));
+}
+
+static void test_session_profile_comparison_covers_every_config_field(){
+    AppProfile original=sessionTestProfile("firefox");
+    CHECK(SessionProfilesEqual(original,original));
+    AppProfile changed=original; changed.id="chrome"; CHECK(!SessionProfilesEqual(original,changed));
+    changed=original; changed.classNames.push_back(L"OtherClass"); CHECK(!SessionProfilesEqual(original,changed));
+    changed=original; changed.exeName=L"other.exe"; CHECK(!SessionProfilesEqual(original,changed));
+    changed=original; changed.titleSuffixes.push_back(L" other"); CHECK(!SessionProfilesEqual(original,changed));
+    changed=original; changed.session=AppProfile::CHROMIUM; CHECK(!SessionProfilesEqual(original,changed));
+    changed=original; changed.userDataDir=L"other-data"; CHECK(!SessionProfilesEqual(original,changed));
+}
+
+static void test_session_coordinator_superseded_only_releases_bookkeeping(){
+    SessionCoordinator coordinator([](const SessionRequest&){ return true; });
+    AppProfile profile=sessionTestProfile("msedge",AppProfile::CHROMIUM);
+    uint64_t id=coordinator.RequestSessionData(profile,9,SessionPurpose::ManualRestore);
+    CHECK(coordinator.PendingCount()==1);
+    CHECK(!coordinator.AcceptSessionResult(coordinatorResult(id,"msedge",SessionPurpose::ManualRestore,9,SessionDataStatus::Superseded),profile,9));
+    CHECK(coordinator.PendingCount()==0 && coordinator.Latest("msedge")==nullptr);
+}
+
+static void test_posted_session_result_is_owned_immediately_on_rejection(){
+    SessionCoordinator coordinator([](const SessionRequest&){ return true; });
+    AppProfile profile=sessionTestProfile("firefox");
+    uint64_t id=coordinator.RequestSessionData(profile,12,SessionPurpose::Search);
+    std::shared_ptr<const std::vector<WinFp> > payload(new std::vector<WinFp>(1));
+    std::unique_ptr<SessionResult> result=coordinatorResult(id,"firefox",SessionPurpose::Search,11,SessionDataStatus::Fresh);
+    result->windows=payload;
+    SessionResult* raw=result.release();
+    CHECK(payload.use_count()==2);
+    CHECK(!AcceptPostedSessionResult(coordinator,(LPARAM)raw,profile,12));
+    CHECK(payload.use_count()==1);
+}
+
+static void test_unavailable_defer_is_once_per_current_source_and_preserves_bytes(){
+    SessionUnavailableDeferBudget budget;
+    SessionResult unavailable;
+    unavailable.app="firefox"; unavailable.path=L"one"; unavailable.status=SessionDataStatus::Unavailable;
+    unavailable.sourceStampKnown=true; unavailable.sourceStamp.size=10; unavailable.sourceStamp.mtime=1;
+    CHECK(budget.ShouldDefer(unavailable)); CHECK(!budget.ShouldDefer(unavailable));
+    unavailable.sourceStamp.mtime=2;
+    CHECK(budget.ShouldDefer(unavailable)); CHECK(!budget.ShouldDefer(unavailable));
+    unavailable.status=SessionDataStatus::Superseded;
+    CHECK(!budget.ShouldDefer(unavailable));
+    const std::string original="serialized-layout-bytes";
+    const std::string proposed="mutated";
+    CHECK(SelectSerializedSessionRecords(SessionDataStatus::Unavailable,original,proposed)==original);
+    CHECK(SelectSerializedSessionRecords(SessionDataStatus::Superseded,original,proposed)==original);
+    CHECK(SelectSerializedSessionRecords(SessionDataStatus::Fresh,original,proposed)==proposed);
+}
+
+static void test_session_data_generation_is_per_app_and_hash_breaks_stamp_ties(){
+    SessionResultSink sink;
+    std::mutex contentMutex;
+    std::string firefoxTitle="A";
+    SessionWorkerOps ops;
+    ops.resolvePath=[](const AppProfile& profile){ return U82W(profile.id)+L"-path"; };
+    ops.getStamp=[](const std::wstring&,SessionStamp& stamp){ stamp.size=7; stamp.mtime=1; return true; };
+    ops.readFile=[](const std::wstring& path){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes=W2U8(path); return r; };
+    ops.parse=[&](const AppProfile& profile,const std::string&,std::vector<WinFp>& output){
+        output.clear(); WinFp fp;
+        { std::lock_guard<std::mutex> lock(contentMutex); fp.activeTitle=profile.id=="firefox"?firefoxTitle:"C"; }
+        output.push_back(fp); return true;
+    };
+    ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
+    SessionWorker worker((HWND)1,ops,1,1024*1024);
+    SessionRequest firefox; firefox.requestId=400; firefox.app="firefox"; firefox.profile=sessionTestProfile("firefox"); firefox.purpose=SessionPurpose::MetadataProbe;
+    SessionRequest chrome; chrome.requestId=401; chrome.app="chrome"; chrome.profile=sessionTestProfile("chrome",AppProfile::CHROMIUM); chrome.purpose=SessionPurpose::AutoReconcile;
+    CHECK(worker.Request(firefox)); std::unique_ptr<SessionResult> ffA=sink.waitFor(400);
+    CHECK(ffA && ffA->dataGeneration==1); ffA.reset();
+    CHECK(worker.Request(chrome)); std::unique_ptr<SessionResult> cr=sink.waitFor(401);
+    CHECK(cr && cr->dataGeneration==1); cr.reset();
+
+    firefox.requestId=402;
+    CHECK(worker.Request(firefox)); std::unique_ptr<SessionResult> ffSame=sink.waitFor(402);
+    CHECK(ffSame && ffSame->dataGeneration==1); ffSame.reset();
+    chrome.requestId=403;
+    CHECK(worker.Request(chrome)); cr=sink.waitFor(403); CHECK(cr && cr->dataGeneration==1); cr.reset();
+
+    { std::lock_guard<std::mutex> lock(contentMutex); firefoxTitle="B"; }
+    firefox.requestId=404;
+    CHECK(worker.Request(firefox)); std::unique_ptr<SessionResult> ffChanged=sink.waitFor(404);
+    CHECK(ffChanged && ffChanged->dataGeneration==2 && ffChanged->windows->at(0).activeTitle=="B");
+    SessionStamp stableSource; stableSource.size=7; stableSource.mtime=1;
+    CHECK(ffChanged && ffChanged->sourceStampKnown && ffChanged->sourceStamp==stableSource && ffChanged->dataStamp==stableSource);
+    const std::vector<WinFp>* changedIdentity=ffChanged?ffChanged->windows.get():nullptr;
+    firefox.requestId=405;
+    CHECK(worker.Request(firefox)); std::unique_ptr<SessionResult> ffHit=sink.waitFor(405);
+    CHECK(ffHit && ffHit->dataGeneration==2 && ffHit->windows.get()==changedIdentity);
+    int refreshWaves=0;
+    uint64_t acceptedGeneration=1;
+    if(ffChanged && ffChanged->dataGeneration!=acceptedGeneration){ ++refreshWaves; acceptedGeneration=ffChanged->dataGeneration; }
+    if(ffHit && ffHit->dataGeneration!=acceptedGeneration) ++refreshWaves;
+    CHECK(refreshWaves==1);
+    worker.Stop();
+}
+
+static void test_session_cache_enforces_sixteen_entry_lru_cap(){
+    SessionCache cache(16,1024*1024);
+    for(int i=0;i<17;++i){
+        std::vector<WinFp> windows(1); windows[0].activeTitle=std::to_string(i);
+        SessionStamp stamp; stamp.size=1; stamp.mtime=(unsigned long long)i;
+        SessionCacheValue stored;
+        CHECK(cache.Put("firefox",L"path"+std::to_wstring(i),stamp,std::move(windows),(uint64_t)i,(uint64_t)i+1,stored));
+        CHECK(cache.EntryCount()<=16);
+        stored.windows.reset();
+    }
+    SessionCacheValue value;
+    SessionStamp first; first.size=1; first.mtime=0;
+    SessionStamp last; last.size=1; last.mtime=16;
+    CHECK(!cache.FindExact("firefox",L"path0",first,value));
+    CHECK(cache.FindExact("firefox",L"path16",last,value));
+    CHECK(cache.EntryCount()==16);
+}
+
+static void test_session_cache_byte_cap_counts_external_ui_payload(){
+    std::vector<WinFp> sample(1); sample[0].tabsBlob=std::string(200,'x');
+    size_t bytes=EstimateSessionPayloadBytes(sample);
+    SessionStamp stamp; stamp.size=1; stamp.mtime=1;
+    SessionCache tooSmall(16,bytes-1);
+    SessionCacheValue rejected;
+    CHECK(!tooSmall.Put("firefox",L"oversized",stamp,std::move(sample),1,1,rejected));
+    CHECK(tooSmall.EntryCount()==0 && tooSmall.RetainedBytes()==0 && !rejected.windows);
+
+    std::vector<WinFp> first(1); first[0].tabsBlob=std::string(200,'a');
+    std::vector<WinFp> second(1); second[0].tabsBlob=std::string(200,'b');
+    CHECK(EstimateSessionPayloadBytes(first)==bytes && EstimateSessionPayloadBytes(second)==bytes);
+    SessionCache exact(16,bytes);
+    SessionCacheValue uiOwned;
+    CHECK(exact.Put("firefox",L"one",stamp,std::move(first),1,1,uiOwned));
+    CHECK(exact.RetainedBytes()==bytes);
+    SessionCacheValue cannotFit;
+    CHECK(!exact.Put("chrome",L"two",stamp,std::move(second),2,1,cannotFit));
+    CHECK(exact.RetainedBytes()==bytes && !cannotFit.windows);
+    uiOwned.windows.reset();
+    CHECK(exact.RetainedBytes()==bytes); // cache still owns the preserved LRU entry
+    CHECK(exact.Put("chrome",L"two",stamp,std::move(second),2,1,cannotFit));
+    CHECK(exact.RetainedBytes()==bytes);
+}
+
+static void test_post_message_failure_deletes_heap_result(){
+    SessionWorkerOps ops;
+    std::atomic<int> posts(0);
+    ops.postMessage=[&](HWND,UINT,WPARAM,LPARAM){ ++posts; return false; };
+    FillMissingSessionWorkerOps(ops);
+    std::shared_ptr<const std::vector<WinFp> > payload(new std::vector<WinFp>(1));
+    std::unique_ptr<SessionResult> result(new SessionResult()); result->windows=payload;
+    CHECK(payload.use_count()==2);
+    CHECK(!PostSessionResultOwned(ops,(HWND)1,std::move(result)));
+    CHECK(posts.load()==1 && payload.use_count()==1);
+}
+
+static void test_session_worker_oversized_payload_is_unavailable(){
+    SessionResultSink sink;
+    SessionWorkerOps ops;
+    ops.resolvePath=[](const AppProfile&){ return std::wstring(L"large"); };
+    ops.getStamp=[](const std::wstring&,SessionStamp& stamp){ stamp.size=5; stamp.mtime=1; return true; };
+    ops.readFile=[](const std::wstring&){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="valid"; return r; };
+    ops.parse=[](const AppProfile&,const std::string&,std::vector<WinFp>& output){ output.clear(); WinFp fp; fp.tabsBlob=std::string(4096,'x'); output.push_back(std::move(fp)); return true; };
+    ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
+    SessionWorker worker((HWND)1,ops,16,128);
+    SessionRequest request; request.requestId=410; request.app="firefox"; request.profile=sessionTestProfile("firefox");
+    CHECK(worker.Request(request));
+    std::unique_ptr<SessionResult> result=sink.waitFor(410);
+    CHECK(result && result->status==SessionDataStatus::Unavailable && !result->windows);
+    CHECK(worker.CacheEntryCount()==0 && worker.RetainedBytes()==0);
+    worker.Stop();
+}
+
+static void test_session_worker_stop_joins_and_suppresses_unposted_completion(){
+    SessionResultSink sink; BlockingSessionParse blocker;
+    std::atomic<int> posts(0);
+    SessionWorkerOps ops=coalescingWorkerOps(sink,blocker);
+    ops.postMessage=[&](HWND,UINT,WPARAM,LPARAM){ ++posts; return false; };
+    SessionWorker worker((HWND)1,ops);
+    SessionRequest request; request.requestId=420; request.app="firefox"; request.profile=sessionTestProfile("firefox");
+    request.purpose=SessionPurpose::ManualSave;
+    CHECK(worker.Request(request)); CHECK(blocker.waitEntered());
+    std::atomic<bool> stopped(false);
+    std::thread stopper([&]{ worker.Stop(); stopped=true; });
+    bool rejecting=false;
+    for(int i=0;i<10000 && !rejecting;++i){ SessionRequest late=request; late.requestId=421; rejecting=!worker.Request(late); if(!rejecting) std::this_thread::yield(); }
+    CHECK(rejecting); CHECK(!stopped.load());
+    int postsWhenStopping=posts.load();
+    blocker.release();
+    stopper.join();
+    CHECK(stopped.load() && posts.load()==postsWhenStopping);
+    CHECK(worker.PendingCount()==0 && worker.ActiveCount()==0 && worker.RetainedBytes()==0);
+    CHECK(!worker.Request(request));
+}
+
+struct BlockingSupersededPoster {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered=false,released=false;
+    bool post(HWND,UINT,WPARAM,LPARAM value){
+        std::unique_ptr<SessionResult> result((SessionResult*)value);
+        if(result && result->requestId==451 && result->status==SessionDataStatus::Superseded){
+            std::unique_lock<std::mutex> lock(mutex);
+            entered=true; changed.notify_all();
+            changed.wait(lock,[&]{ return released; });
+        }
+        return true;
+    }
+    bool waitEntered(){
+        std::unique_lock<std::mutex> lock(mutex);
+        return changed.wait_for(lock,std::chrono::seconds(5),[&]{ return entered; });
+    }
+    void release(){ std::lock_guard<std::mutex> lock(mutex); released=true; changed.notify_all(); }
+};
+
+static void test_session_worker_stop_waits_for_inflight_superseded_post(){
+    SessionResultSink unusedSink; BlockingSessionParse parser; BlockingSupersededPoster poster;
+    SessionWorkerOps ops=coalescingWorkerOps(unusedSink,parser);
+    ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return poster.post(hwnd,message,wp,lp); };
+    SessionWorker worker((HWND)1,ops);
+    SessionRequest active; active.requestId=450; active.app="firefox"; active.profile=sessionTestProfile("firefox");
+    active.purpose=SessionPurpose::MetadataProbe;
+    CHECK(worker.Request(active)); CHECK(parser.waitEntered());
+    SessionRequest queued=active; queued.requestId=451; queued.purpose=SessionPurpose::ManualSave;
+    SessionRequest newest=queued; newest.requestId=452; newest.purpose=SessionPurpose::ManualRestore;
+    CHECK(worker.Request(queued));
+    std::atomic<bool> replacementReturned(false),replacementAccepted(false);
+    std::thread replacer([&]{ replacementAccepted=worker.Request(newest); replacementReturned=true; });
+    CHECK(poster.waitEntered());
+    std::mutex stopMutex; std::condition_variable stopChanged; bool stopped=false;
+    std::thread stopper([&]{ worker.Stop(); { std::lock_guard<std::mutex> lock(stopMutex); stopped=true; } stopChanged.notify_all(); });
+    for(int i=0;i<10000 && worker.PendingCount()!=0;++i) std::this_thread::yield();
+    CHECK(worker.PendingCount()==0);
+    SessionRequest late=active; late.requestId=453;
+    CHECK(!worker.Request(late));
+    parser.release();
+    bool returnedWhilePostBlocked=false;
+    {
+        std::unique_lock<std::mutex> lock(stopMutex);
+        returnedWhilePostBlocked=stopChanged.wait_for(lock,std::chrono::milliseconds(500),[&]{ return stopped; });
+    }
+    CHECK(!returnedWhilePostBlocked);
+    poster.release(); replacer.join(); stopper.join();
+    CHECK(replacementAccepted.load() && replacementReturned.load() && stopped);
+}
+
+struct ReentrantStopState {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered=false,returned=false;
+    SessionWorker* worker=nullptr;
+    std::shared_ptr<BlockingSessionParse> parser;
+    void markEntered(){ std::lock_guard<std::mutex> lock(mutex); entered=true; changed.notify_all(); }
+    void markReturned(){ std::lock_guard<std::mutex> lock(mutex); returned=true; changed.notify_all(); }
+    bool waitEntered(){
+        std::unique_lock<std::mutex> lock(mutex);
+        return changed.wait_for(lock,std::chrono::seconds(5),[&]{ return entered; });
+    }
+    bool waitReturned(){
+        std::unique_lock<std::mutex> lock(mutex);
+        return changed.wait_for(lock,std::chrono::milliseconds(500),[&]{ return returned; });
+    }
+};
+
+static SessionWorkerOps reentrantStopWorkerOps(const std::shared_ptr<ReentrantStopState>& state,
+                                               bool blockParser,bool stopOnlySuperseded){
+    SessionWorkerOps ops;
+    ops.resolvePath=[](const AppProfile&){ return std::wstring(L"reentrant"); };
+    ops.getStamp=[](const std::wstring&,SessionStamp& stamp){ stamp.size=1; stamp.mtime=1; return true; };
+    ops.readFile=[](const std::wstring&){ FileReadResult result; result.status=FileReadStatus::Ok; result.bytes="ok"; return result; };
+    ops.parse=[state,blockParser](const AppProfile& profile,const std::string& bytes,std::vector<WinFp>& output){
+        if(blockParser) return state->parser->parse(profile,bytes,output);
+        output.clear(); return true;
+    };
+    ops.postMessage=[state,stopOnlySuperseded](HWND,UINT,WPARAM,LPARAM value){
+        SessionResult* result=(SessionResult*)value;
+        if(!stopOnlySuperseded || (result && result->status==SessionDataStatus::Superseded)){
+            if(state->parser) state->parser->release();
+            state->markEntered();
+            state->worker->Stop();
+            state->markReturned();
+        }
+        delete result; // ownership transfers only if the callback returns successfully
+        return true;
+    };
+    return ops;
+}
+
+static void test_session_worker_reentrant_requester_poster_stop_completes(){
+    std::shared_ptr<ReentrantStopState> state(new ReentrantStopState());
+    state->parser.reset(new BlockingSessionParse());
+    SessionWorker* worker=new SessionWorker((HWND)1,reentrantStopWorkerOps(state,true,true));
+    state->worker=worker;
+    SessionRequest active; active.requestId=460; active.app="firefox"; active.profile=sessionTestProfile("firefox");
+    active.purpose=SessionPurpose::MetadataProbe;
+    CHECK(worker->Request(active)); CHECK(state->parser->waitEntered());
+    SessionRequest queued=active; queued.requestId=461; queued.purpose=SessionPurpose::ManualSave;
+    SessionRequest newest=queued; newest.requestId=462; newest.purpose=SessionPurpose::ManualRestore;
+    CHECK(worker->Request(queued));
+    std::thread replacer([worker,newest]{ worker->Request(newest); });
+    CHECK(state->waitEntered());
+    bool completed=state->waitReturned();
+    CHECK(completed);
+    if(completed){ replacer.join(); worker->Stop(); delete worker; }
+    else replacer.detach(); // bounded RED: the isolated heap state lives until process exit
+}
+
+static void test_session_worker_reentrant_worker_poster_stop_defers_self_join(){
+    std::shared_ptr<ReentrantStopState> state(new ReentrantStopState());
+    SessionWorker* worker=new SessionWorker((HWND)1,reentrantStopWorkerOps(state,false,false));
+    state->worker=worker;
+    SessionRequest request; request.requestId=470; request.app="firefox"; request.profile=sessionTestProfile("firefox");
+    request.purpose=SessionPurpose::ManualRestore;
+    CHECK(worker->Request(request)); CHECK(state->waitEntered());
+    bool completed=state->waitReturned();
+    CHECK(completed);
+    if(completed){ worker->Stop(); delete worker; }
+    // On RED the worker has exited after the caught self-join exception; keep it isolated.
+}
+
+static void test_worker_retained_budget_includes_posted_ui_ownership(){
+    SessionResultSink sink;
+    SessionWorkerOps ops;
+    ops.resolvePath=[](const AppProfile&){ return std::wstring(L"owned"); };
+    ops.getStamp=[](const std::wstring&,SessionStamp& stamp){ stamp.size=5; stamp.mtime=1; return true; };
+    ops.readFile=[](const std::wstring&){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="valid"; return r; };
+    ops.parse=[](const AppProfile&,const std::string&,std::vector<WinFp>& output){ output.clear(); output.push_back(WinFp{}); return true; };
+    ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
+    SessionWorker worker((HWND)1,ops);
+    SessionRequest request; request.requestId=430; request.app="firefox"; request.profile=sessionTestProfile("firefox");
+    CHECK(worker.Request(request));
+    std::unique_ptr<SessionResult> accepted=sink.waitFor(430);
+    CHECK(accepted && accepted->windows && worker.RetainedBytes()>0);
+    worker.Stop();
+    CHECK(worker.RetainedBytes()>0);
+    accepted.reset();
+    CHECK(worker.RetainedBytes()==0);
+}
+
+static void test_failed_cache_replacement_preserves_exact_stale_payload(){
+    SessionResultSink sink;
+    std::atomic<unsigned long long> mtime(1);
+    std::atomic<char> title('A');
+    std::vector<WinFp> sizing(1); sizing[0].activeTitle=std::string(200,'A');
+    size_t onePayload=EstimateSessionPayloadBytes(sizing);
+    SessionWorkerOps ops;
+    ops.resolvePath=[](const AppProfile&){ return std::wstring(L"budgeted"); };
+    ops.getStamp=[&](const std::wstring&,SessionStamp& stamp){ stamp.size=5; stamp.mtime=mtime.load(); return true; };
+    ops.readFile=[](const std::wstring&){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="valid"; return r; };
+    ops.parse=[&](const AppProfile&,const std::string&,std::vector<WinFp>& output){ output.clear(); WinFp fp; fp.activeTitle=std::string(200,title.load()); output.push_back(std::move(fp)); return true; };
+    ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
+    SessionWorker worker((HWND)1,ops,16,onePayload);
+    SessionRequest request; request.requestId=440; request.app="firefox"; request.profile=sessionTestProfile("firefox");
+    CHECK(worker.Request(request));
+    std::unique_ptr<SessionResult> oldUi=sink.waitFor(440);
+    CHECK(oldUi && oldUi->status==SessionDataStatus::Fresh);
+    const std::vector<WinFp>* oldIdentity=oldUi?oldUi->windows.get():nullptr;
+    mtime=2; title='B'; request.requestId=441;
+    CHECK(worker.Request(request));
+    std::unique_ptr<SessionResult> stale=sink.waitFor(441);
+    SessionStamp data; data.size=5; data.mtime=1;
+    SessionStamp source; source.size=5; source.mtime=2;
+    CHECK(stale && stale->status==SessionDataStatus::CachedStale && stale->windows.get()==oldIdentity);
+    CHECK(stale && stale->dataStamp==data && stale->sourceStampKnown && stale->sourceStamp==source);
+    CHECK(worker.CacheEntryCount()==1 && worker.RetainedBytes()==onePayload);
+    worker.Stop();
+}
+
+static void test_session_cache_put_is_strongly_transactional_at_every_fault_step(){
+    const SessionCachePutStep steps[]={
+        SessionCachePutStep::PayloadStorage,
+        SessionCachePutStep::PayloadControl,
+        SessionCachePutStep::KeyCopy,
+        SessionCachePutStep::PathCopy,
+        SessionCachePutStep::StampCopy,
+        SessionCachePutStep::OutputCopy,
+        SessionCachePutStep::ContainerReserve,
+        SessionCachePutStep::DuplicateReplacement,
+        SessionCachePutStep::ContainerInsert,
+        SessionCachePutStep::OrderPublish
+    };
+    for(size_t stepIndex=0;stepIndex<sizeof(steps)/sizeof(steps[0]);++stepIndex){
+        bool enabled=false;
+        SessionCacheOps ops;
+        ops.beforePutStep=[&](SessionCachePutStep step){
+            if(enabled && step==steps[stepIndex]){
+                if((stepIndex&1)==0) throw std::bad_alloc();
+                throw std::length_error("session cache injected fault");
+            }
+        };
+        SessionCache cache(2,1024*1024,ops);
+        SessionStamp stampA; stampA.size=1; stampA.mtime=1;
+        SessionStamp stampB; stampB.size=2; stampB.mtime=2;
+        SessionStamp stampC; stampC.size=3; stampC.mtime=3;
+        std::vector<WinFp> first(1); first[0].activeTitle="A";
+        std::vector<WinFp> second(1); second[0].activeTitle="B";
+        SessionCacheValue storedA,storedB;
+        CHECK(cache.Put("firefox",L"A",stampA,std::move(first),11,1,storedA));
+        CHECK(cache.Put("firefox",L"B",stampB,std::move(second),22,2,storedB));
+        const std::vector<WinFp>* identityA=storedA.windows.get();
+        const std::vector<WinFp>* identityB=storedB.windows.get();
+        SessionCacheValue touch;
+        CHECK(cache.FindExact("firefox",L"A",stampA,touch)); // B is the LRU victim
+        touch.windows.reset();
+        const size_t entriesBefore=cache.EntryCount(),bytesBefore=cache.RetainedBytes();
+
+        const bool duplicate=steps[stepIndex]==SessionCachePutStep::DuplicateReplacement;
+        std::vector<WinFp> candidate(1); candidate[0].activeTitle=duplicate?"A2":"C";
+        SessionCacheValue failed;
+        enabled=true;
+        CHECK(!cache.Put("firefox",duplicate?L"A":L"C",duplicate?stampA:stampC,
+                         std::move(candidate),33,3,failed));
+        enabled=false;
+        CHECK(!failed.windows && cache.EntryCount()==entriesBefore && cache.RetainedBytes()==bytesBefore);
+        SessionCacheValue afterB,afterA;
+        CHECK(cache.FindExact("firefox",L"B",stampB,afterB));
+        CHECK(afterB.windows.get()==identityB && afterB.windows->at(0).activeTitle=="B");
+        CHECK(cache.FindExact("firefox",L"A",stampA,afterA));
+        CHECK(afterA.windows.get()==identityA && afterA.windows->at(0).activeTitle=="A");
+
+        std::vector<WinFp> retry(1); retry[0].activeTitle=duplicate?"A2":"C";
+        SessionCacheValue inserted;
+        CHECK(cache.Put("firefox",duplicate?L"A":L"C",duplicate?stampA:stampC,
+                        std::move(retry),33,3,inserted));
+        CHECK(inserted.windows && inserted.windows.get()!=identityA && inserted.windows.get()!=identityB);
+        if(!duplicate){
+            SessionCacheValue evicted;
+            CHECK(!cache.FindExact("firefox",L"B",stampB,evicted));
+            CHECK(cache.FindExact("firefox",L"A",stampA,evicted) && evicted.windows.get()==identityA);
+        }
+    }
+}
 
 // ---- failure-atomic layout-store tests ----
 
@@ -3684,6 +4931,58 @@ int main(){
     test_strict_counts_parsing();
     test_snss_parse();
     test_snss_garbage();
+    test_snss_truncated_frame_returns_no_partial_windows();
+    test_mozlz4_rejects_huge_declared_output();
+    test_session_stamp_detects_change();
+    test_firefox_json_rejects_trailing_and_excessive_depth();
+    test_firefox_json_rejects_malformed_unicode_numbers_and_controls();
+    test_firefox_json_depth_node_and_string_budget_boundaries();
+    test_browser_parser_default_limits_are_exact();
+    test_snss_rejects_zero_trailing_and_malformed_known_commands();
+    test_snss_unique_id_and_command_cap_boundaries();
+    test_snss_window_and_tab_maps_have_independent_exact_caps();
+    test_snss_navigation_duplicate_and_search_budget_boundaries();
+    test_snss_per_window_and_global_text_caps_are_exact();
+    test_mozlz4_exact_decode_and_limit_boundaries();
+    test_mozlz4_rejects_malformed_blocks_transactionally();
+    test_lz4_match_offset_and_extension_arithmetic_edges();
+    test_get_session_stamp_accepts_exact_cap_and_rejects_over();
+    test_firefox_profile_ini_default_release_fallback();
+    test_firefox_json_valid_empty_is_distinct_from_failure();
+    test_firefox_selected_index_rejects_int_min_without_overflow();
+    test_chromium_resolver_tracks_rotation_and_breaks_stamp_ties();
+    test_already_posted_session_results_are_drained_and_freed();
+    test_session_status_and_acceptance_policy_contract();
+    test_session_cache_shares_payload_and_rejects_oversize();
+    test_session_worker_valid_empty_is_fresh_and_cache_hit_is_shared();
+    test_session_worker_malformed_cold_is_unavailable();
+    test_session_worker_non_ok_reads_never_parse_and_publish_current_stamp();
+    test_session_worker_disappeared_source_is_not_reported_as_current();
+    test_session_worker_stamp_change_uses_exact_path_cached_stale();
+    test_session_worker_rotation_during_parse_is_never_fresh();
+    test_session_worker_rotation_uses_only_exact_attempted_path_cache();
+    test_session_worker_ten_rapid_requests_are_active_plus_newest_pending();
+    test_session_worker_low_probe_cannot_replace_user_pending();
+    test_session_worker_cross_app_manual_preempts_pending_metadata();
+    test_session_worker_rejects_unsupported_app_queue_amplification();
+    test_session_coordinator_preserves_purpose_and_shared_payload_identity();
+    test_session_coordinator_rejects_old_generation_profile_purpose_and_request();
+    test_session_profile_comparison_covers_every_config_field();
+    test_session_coordinator_superseded_only_releases_bookkeeping();
+    test_posted_session_result_is_owned_immediately_on_rejection();
+    test_unavailable_defer_is_once_per_current_source_and_preserves_bytes();
+    test_session_data_generation_is_per_app_and_hash_breaks_stamp_ties();
+    test_session_cache_enforces_sixteen_entry_lru_cap();
+    test_session_cache_byte_cap_counts_external_ui_payload();
+    test_post_message_failure_deletes_heap_result();
+    test_session_worker_oversized_payload_is_unavailable();
+    test_session_worker_stop_joins_and_suppresses_unposted_completion();
+    test_session_worker_stop_waits_for_inflight_superseded_post();
+    test_session_worker_reentrant_requester_poster_stop_completes();
+    test_session_worker_reentrant_worker_poster_stop_defers_self_join();
+    test_worker_retained_budget_includes_posted_ui_ownership();
+    test_failed_cache_replacement_preserves_exact_stale_payload();
+    test_session_cache_put_is_strongly_transactional_at_every_fault_step();
     test_layout_serializes_v4_header();
     test_layout_roundtrip_v4();
     test_layout_parse_v2();
