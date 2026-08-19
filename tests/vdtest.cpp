@@ -1157,6 +1157,21 @@ static bool ResizeRawFile(const std::wstring& path, unsigned long long size){
     return ok;
 }
 
+static bool SetRawFileMtime(const std::wstring& path,unsigned long long mtime){
+    HANDLE file=CreateFileW(path.c_str(),FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(file==INVALID_HANDLE_VALUE) return false;
+    ULARGE_INTEGER combined{};
+    combined.QuadPart=mtime;
+    FILETIME value{};
+    value.dwLowDateTime=combined.LowPart;
+    value.dwHighDateTime=combined.HighPart;
+    bool ok=SetFileTime(file,nullptr,nullptr,&value)!=0;
+    if(!CloseHandle(file)) ok=false;
+    return ok;
+}
+
 static bool RawFileExists(const std::wstring& path){
     DWORD attributes=GetFileAttributesW(path.c_str());
     return attributes!=INVALID_FILE_ATTRIBUTES && !(attributes&FILE_ATTRIBUTE_DIRECTORY);
@@ -1196,9 +1211,21 @@ static void test_bounded_read_exact_limit_and_preallocation_rejection(){
     LayoutTempDir temp;
     std::wstring exact=temp.file(L"exact.bin"), oversized=temp.file(L"oversized.bin");
     CHECK(ResizeRawFile(exact,MAX_LAYOUT_FILE_BYTES));
-    FileReadResult atLimit=ReadFileBytesBounded(exact,MAX_LAYOUT_FILE_BYTES);
+    LayoutFsOps exactOps;
+    auto exactRead=exactOps.readFile;
+    std::vector<DWORD> requestedSizes;
+    exactOps.readFile=[&](HANDLE handle,void* buffer,DWORD requested,DWORD& read)->BOOL{
+        requestedSizes.push_back(requested);
+        return exactRead(handle,buffer,requested,read);
+    };
+    FileReadResult atLimit=ReadFileBytesBounded(exact,MAX_LAYOUT_FILE_BYTES,exactOps);
     CHECK(atLimit.status==FileReadStatus::Ok);
     CHECK(atLimit.bytes.size()==(size_t)MAX_LAYOUT_FILE_BYTES);
+    CHECK(requestedSizes.size()==257);
+    CHECK((std::count)(requestedSizes.begin(),requestedSizes.end(),64*1024)==256);
+    CHECK(!requestedSizes.empty() && requestedSizes.back()==1);
+    CHECK((std::all_of)(requestedSizes.begin(),requestedSizes.end(),
+        [](DWORD requested){ return requested<=64*1024; }));
 
     CHECK(ResizeRawFile(oversized,MAX_LAYOUT_FILE_BYTES+1));
     LayoutFsOps ops;
@@ -1267,6 +1294,19 @@ static void test_bounded_read_failures_are_transactional_and_status_bearing(){
     FileReadResult noMtime=ReadFileBytesBounded(path,1024,mtimeOps);
     CHECK(noMtime.status==FileReadStatus::Unavailable);
     CHECK(noMtime.bytes.empty());
+
+    LayoutFsOps changedMtimeOps;
+    auto realMtime=changedMtimeOps.getMtime;
+    int mtimeCalls=0;
+    changedMtimeOps.getMtime=[&](HANDLE handle,unsigned long long& mtime)->BOOL{
+        BOOL ok=realMtime(handle,mtime);
+        if(ok && ++mtimeCalls>=2) ++mtime;
+        return ok;
+    };
+    FileReadResult changedMtime=ReadFileBytesBounded(path,1024,changedMtimeOps);
+    CHECK(mtimeCalls>=2);
+    CHECK(changedMtime.status==FileReadStatus::Unavailable);
+    CHECK(changedMtime.bytes.empty());
 
     LayoutFsOps sizeOps;
     sizeOps.getSize=[](HANDLE,unsigned long long&)->BOOL{
@@ -1436,6 +1476,52 @@ static void test_transient_primary_open_blocks_backup_recovery(){
     CHECK(DiagnosticCopies(primary).empty());
 }
 
+static void test_oversized_primary_blocks_all_recovery_without_mutation(){
+    LayoutTempDir temp;
+    std::wstring primary=temp.file(L"layout.txt"), rollback=primary+L".rollback", bak=primary+L".bak";
+    const std::string rollbackBytes=ValidLayoutBytes("oversize-rollback"),
+        backupBytes=ValidLayoutBytes("oversize-backup");
+    CHECK(ResizeRawFile(primary,MAX_LAYOUT_FILE_BYTES+1));
+    CHECK(WriteRawFile(rollback,rollbackBytes)); CHECK(WriteRawFile(bak,backupBytes));
+    LayoutFsOps ops;
+    auto realOpen=ops.openFile;
+    int recoveryOpens=0;
+    ops.openFile=[&](const std::wstring& opened,DWORD access,DWORD share,
+            DWORD creation,DWORD flags)->HANDLE{
+        if(opened==rollback || opened==bak) ++recoveryOpens;
+        return realOpen(opened,access,share,creation,flags);
+    };
+    LayoutLoadResult loaded=LoadLayoutWithBackupLocked(primary,1700000000,ops);
+    CHECK(loaded.status==LayoutLoadStatus::Unavailable && !loaded.writesAllowed && !loaded.usable());
+    CHECK(recoveryOpens==0);
+    CHECK(ReadRawFile(rollback)==rollbackBytes && ReadRawFile(bak)==backupBytes);
+    CHECK(DiagnosticCopies(primary).empty() && DiagnosticCopies(rollback).empty() && DiagnosticCopies(bak).empty());
+}
+
+static void test_missing_primary_uses_rollback_priority_then_backup_fallback(){
+    {
+        LayoutTempDir temp;
+        std::wstring primary=temp.file(L"layout.txt"), rollback=primary+L".rollback", bak=primary+L".bak";
+        const std::string rollbackBytes=ValidLayoutBytes("plain-rollback"),
+            backupBytes=ValidLayoutBytes("plain-older-backup");
+        CHECK(WriteRawFile(rollback,rollbackBytes)); CHECK(WriteRawFile(bak,backupBytes));
+        LayoutLoadResult loaded=LoadLayoutWithBackupLocked(primary,1700000000);
+        CHECK(loaded.status==LayoutLoadStatus::Recovered && loaded.writesAllowed && loaded.usable());
+        CHECK(loaded.revision.sourcePath==rollback && LoadedDesktopName(loaded)=="plain-rollback");
+        CHECK(ReadRawFile(rollback)==rollbackBytes && ReadRawFile(bak)==backupBytes);
+    }
+    {
+        LayoutTempDir temp;
+        std::wstring primary=temp.file(L"layout.txt"), bak=primary+L".bak";
+        const std::string backupBytes=ValidLayoutBytes("plain-backup");
+        CHECK(WriteRawFile(bak,backupBytes));
+        LayoutLoadResult loaded=LoadLayoutWithBackupLocked(primary,1700000000);
+        CHECK(loaded.status==LayoutLoadStatus::Recovered && loaded.writesAllowed && loaded.usable());
+        CHECK(loaded.revision.sourcePath==bak && LoadedDesktopName(loaded)=="plain-backup");
+        CHECK(ReadRawFile(bak)==backupBytes);
+    }
+}
+
 static void test_transient_and_corrupt_recovery_states(){
     {
         LayoutTempDir temp;
@@ -1499,20 +1585,58 @@ static void test_diagnostic_copy_failure_and_readback_mismatch_block_writes(){
     {
         LayoutTempDir temp;
         std::wstring primary=temp.file(L"layout.txt"), bak=primary+L".bak";
-        CHECK(WriteRawFile(primary,"corrupt primary"));
+        const std::string corrupt="corrupt primary";
+        std::string sameLengthMismatch=corrupt;
+        sameLengthMismatch[0]='C';
+        CHECK(WriteRawFile(primary,corrupt));
         CHECK(WriteRawFile(bak,ValidLayoutBytes("backup")));
         LayoutFsOps ops;
         auto realCopy=ops.copyFile;
         ops.copyFile=[&](const std::wstring& from,const std::wstring& to,BOOL failIfExists)->BOOL{
             BOOL copied=realCopy(from,to,failIfExists);
-            if(copied && to.find(L".corrupt.")!=std::wstring::npos) WriteRawFile(to,"mismatch");
+            if(copied && to.find(L".corrupt.")!=std::wstring::npos)
+                WriteRawFile(to,sameLengthMismatch);
             return copied;
         };
         LayoutLoadResult loaded=LoadLayoutWithBackupLocked(primary,1700000000,ops);
         CHECK(loaded.status==LayoutLoadStatus::Unavailable && !loaded.writesAllowed);
         CHECK(!loaded.error.empty());
-        CHECK(ReadRawFile(primary)=="corrupt primary" && ReadRawFile(bak)==ValidLayoutBytes("backup"));
+        CHECK(ReadRawFile(primary)==corrupt && ReadRawFile(bak)==ValidLayoutBytes("backup"));
         CHECK(DiagnosticCopies(primary).size()==1);
+    }
+
+    for(int failRead=0;failRead<2;++failRead){
+        LayoutTempDir temp;
+        std::wstring primary=temp.file(L"layout.txt"), bak=primary+L".bak";
+        const std::string corrupt=failRead ? "corrupt readback read" : "corrupt readback open";
+        const std::string recovery=ValidLayoutBytes("diagnostic-readback-recovery");
+        CHECK(WriteRawFile(primary,corrupt)); CHECK(WriteRawFile(bak,recovery));
+        LayoutFsOps ops;
+        auto realOpen=ops.openFile;
+        auto realRead=ops.readFile;
+        HANDLE diagnosticHandle=INVALID_HANDLE_VALUE;
+        bool injected=false;
+        ops.openFile=[&](const std::wstring& opened,DWORD access,DWORD share,
+                DWORD creation,DWORD flags)->HANDLE{
+            if(opened.find(L".corrupt.")!=std::wstring::npos && creation==OPEN_EXISTING){
+                if(!failRead){ injected=true; SetLastError(ERROR_SHARING_VIOLATION); return INVALID_HANDLE_VALUE; }
+                diagnosticHandle=realOpen(opened,access,share,creation,flags);
+                return diagnosticHandle;
+            }
+            return realOpen(opened,access,share,creation,flags);
+        };
+        ops.readFile=[&](HANDLE handle,void* buffer,DWORD requested,DWORD& read)->BOOL{
+            if(failRead && handle==diagnosticHandle && !injected){
+                injected=true; read=0; SetLastError(ERROR_READ_FAULT); return FALSE;
+            }
+            return realRead(handle,buffer,requested,read);
+        };
+        LayoutLoadResult loaded=LoadLayoutWithBackupLocked(primary,1700000000,ops);
+        CHECK(injected && loaded.status==LayoutLoadStatus::Unavailable && !loaded.writesAllowed);
+        CHECK(!loaded.usable() && !loaded.error.empty());
+        CHECK(ReadRawFile(primary)==corrupt && ReadRawFile(bak)==recovery);
+        std::vector<std::wstring> diagnostics=DiagnosticCopies(primary);
+        CHECK(diagnostics.size()==1 && ReadRawFile(diagnostics.front())==corrupt);
     }
 }
 
@@ -2090,6 +2214,144 @@ static void test_loader_never_accepts_stale_bak_beside_authoritative_promotion_m
     CHECK(ReadRawFile(bak)==intended && ReadRawFile(promote)==intended);
 }
 
+static void test_valid_primary_reconciles_authoritative_promotion_marker(){
+    {
+        LayoutTempDir temp;
+        std::wstring primary=temp.file(L"layout.txt"), rollback=primary+L".rollback",
+            bak=primary+L".bak", promote=bak+L".previous.promote";
+        const std::string current=ValidLayoutBytes("valid-primary"),
+            prior=ValidLayoutBytes("prior-from-rollback"), stale=ValidLayoutBytes("stale-backup");
+        CHECK(WriteRawFile(primary,current)); CHECK(WriteRawFile(rollback,prior));
+        CHECK(WriteRawFile(bak,stale)); CHECK(WriteRawFile(promote,prior));
+        LayoutLoadResult loaded=LoadLayoutWithBackupLocked(primary,1700000000);
+        CHECK(loaded.status==LayoutLoadStatus::Valid && loaded.writesAllowed && loaded.usable());
+        CHECK(loaded.revision.sourcePath==primary && LoadedDesktopName(loaded)=="valid-primary");
+        CHECK(ReadRawFile(primary)==current && ReadRawFile(bak)==prior);
+        CHECK(!RawFileExists(rollback) && !RawFileExists(promote));
+    }
+    {
+        LayoutTempDir temp;
+        std::wstring primary=temp.file(L"layout.txt"), bak=primary+L".bak",
+            promote=bak+L".previous.promote";
+        const std::string current=ValidLayoutBytes("exact-primary"), prior=ValidLayoutBytes("exact-backup");
+        CHECK(WriteRawFile(primary,current)); CHECK(WriteRawFile(bak,prior));
+        CHECK(WriteRawFile(promote,prior));
+        LayoutLoadResult loaded=LoadLayoutWithBackupLocked(primary,1700000000);
+        CHECK(loaded.status==LayoutLoadStatus::Valid && loaded.writesAllowed);
+        CHECK(loaded.revision.sourcePath==primary && LoadedDesktopName(loaded)=="exact-primary");
+        CHECK(ReadRawFile(bak)==prior && !RawFileExists(promote));
+    }
+    {
+        LayoutTempDir temp;
+        std::wstring primary=temp.file(L"layout.txt"), bak=primary+L".bak",
+            promote=bak+L".previous.promote";
+        const std::string current=ValidLayoutBytes("missing-backup-primary"),
+            prior=ValidLayoutBytes("marker-repair");
+        CHECK(WriteRawFile(primary,current)); CHECK(WriteRawFile(promote,prior));
+        LayoutLoadResult loaded=LoadLayoutWithBackupLocked(primary,1700000000);
+        CHECK(loaded.status==LayoutLoadStatus::Valid && loaded.writesAllowed);
+        CHECK(loaded.revision.sourcePath==primary && LoadedDesktopName(loaded)=="missing-backup-primary");
+        CHECK(ReadRawFile(bak)==prior && !RawFileExists(promote));
+    }
+}
+
+static void test_valid_primary_marker_faults_fail_closed_then_converge(){
+    {
+        LayoutTempDir temp;
+        std::wstring primary=temp.file(L"layout.txt"), bak=primary+L".bak",
+            promote=bak+L".previous.promote";
+        const std::string current=ValidLayoutBytes("corrupt-marker-primary"), corrupt="not a layout";
+        CHECK(WriteRawFile(primary,current)); CHECK(WriteRawFile(promote,corrupt));
+        LayoutLoadResult loaded=LoadLayoutWithBackupLocked(primary,1700000000);
+        CHECK(loaded.status==LayoutLoadStatus::Unavailable && !loaded.writesAllowed && !loaded.usable());
+        CHECK(ReadRawFile(primary)==current && ReadRawFile(promote)==corrupt && !RawFileExists(bak));
+    }
+    {
+        LayoutTempDir temp;
+        std::wstring primary=temp.file(L"layout.txt"), bak=primary+L".bak",
+            promote=bak+L".previous.promote";
+        const std::string current=ValidLayoutBytes("transient-marker-primary"),
+            prior=ValidLayoutBytes("transient-marker-prior");
+        CHECK(WriteRawFile(primary,current)); CHECK(WriteRawFile(promote,prior));
+        LayoutFsOps ops;
+        auto realOpen=ops.openFile;
+        ops.openFile=[&](const std::wstring& opened,DWORD access,DWORD share,
+                DWORD creation,DWORD flags)->HANDLE{
+            if(opened==promote){ SetLastError(ERROR_SHARING_VIOLATION); return INVALID_HANDLE_VALUE; }
+            return realOpen(opened,access,share,creation,flags);
+        };
+        LayoutLoadResult blocked=LoadLayoutWithBackupLocked(primary,1700000000,ops);
+        CHECK(blocked.status==LayoutLoadStatus::Unavailable && !blocked.writesAllowed);
+        CHECK(ReadRawFile(primary)==current && ReadRawFile(promote)==prior && !RawFileExists(bak));
+        LayoutLoadResult retry=LoadLayoutWithBackupLocked(primary,1700000000);
+        CHECK(retry.status==LayoutLoadStatus::Valid && retry.writesAllowed);
+        CHECK(ReadRawFile(primary)==current && ReadRawFile(bak)==prior && !RawFileExists(promote));
+    }
+    {
+        LayoutTempDir temp;
+        std::wstring primary=temp.file(L"layout.txt"), bak=primary+L".bak",
+            promote=bak+L".previous.promote";
+        const std::string current=ValidLayoutBytes("repair-fault-primary"),
+            prior=ValidLayoutBytes("repair-fault-prior"), stale=ValidLayoutBytes("repair-fault-stale");
+        CHECK(WriteRawFile(primary,current)); CHECK(WriteRawFile(bak,stale));
+        CHECK(WriteRawFile(promote,prior));
+        LayoutFsOps ops;
+        auto realCopy=ops.copyFile;
+        bool injected=false;
+        ops.copyFile=[&](const std::wstring& from,const std::wstring& to,BOOL failIfExists)->BOOL{
+            if(from==promote && to==bak && !injected){
+                injected=true; SetLastError(ERROR_ACCESS_DENIED); return FALSE;
+            }
+            return realCopy(from,to,failIfExists);
+        };
+        LayoutLoadResult blocked=LoadLayoutWithBackupLocked(primary,1700000000,ops);
+        CHECK(injected && blocked.status==LayoutLoadStatus::Unavailable && !blocked.writesAllowed);
+        CHECK(ReadRawFile(primary)==current && ReadRawFile(bak)==stale && ReadRawFile(promote)==prior);
+        LayoutLoadResult retry=LoadLayoutWithBackupLocked(primary,1700000000);
+        CHECK(retry.status==LayoutLoadStatus::Valid && retry.writesAllowed);
+        CHECK(retry.revision.sourcePath==primary && ReadRawFile(bak)==prior && !RawFileExists(promote));
+    }
+}
+
+static void test_valid_primary_retries_cleanup_after_trigger_delete_false_effect(){
+    for(int deletePromotionMarker=0;deletePromotionMarker<2;++deletePromotionMarker){
+        LayoutTempDir temp;
+        std::wstring primary=temp.file(L"layout.txt"), bak=primary+L".bak",
+            previous=bak+L".previous", promote=previous+L".promote",
+            promoteStage=promote+L".stage";
+        const std::string current=ValidLayoutBytes(deletePromotionMarker ?
+                "marker-delete-current" : "stage-delete-current"),
+            prior=ValidLayoutBytes(deletePromotionMarker ?
+                "marker-delete-prior" : "stage-delete-prior"),
+            staged=ValidLayoutBytes("staged-old-backup"), poison="non-authoritative stage";
+        CHECK(WriteRawFile(primary,current)); CHECK(WriteRawFile(bak,prior));
+        CHECK(WriteRawFile(previous,staged));
+        const std::wstring& trigger=deletePromotionMarker ? promote : promoteStage;
+        CHECK(WriteRawFile(trigger,deletePromotionMarker ? prior : poison));
+        LayoutFsOps ops;
+        auto realDelete=ops.deleteFile;
+        bool injected=false;
+        ops.deleteFile=[&](const std::wstring& deleted)->BOOL{
+            if(deleted==trigger && !injected){
+                CHECK(realDelete(deleted)!=0); injected=true;
+                SetLastError(ERROR_ACCESS_DENIED); return FALSE;
+            }
+            return realDelete(deleted);
+        };
+        LayoutLoadResult first=LoadLayoutWithBackupLocked(primary,1700000000,ops);
+        CHECK(injected && first.status==LayoutLoadStatus::Unavailable && !first.writesAllowed);
+        CHECK(!RawFileExists(trigger) && RawFileExists(previous));
+        CHECK(ReadRawFile(primary)==current && ReadRawFile(bak)==prior);
+
+        LayoutLoadResult retry=LoadLayoutWithBackupLocked(primary,1700000000);
+        CHECK(retry.status==LayoutLoadStatus::Valid && retry.writesAllowed && retry.usable());
+        CHECK(retry.revision.sourcePath==primary && LoadedDesktopName(retry)==
+            (deletePromotionMarker ? "marker-delete-current" : "stage-delete-current"));
+        CHECK(ReadRawFile(primary)==current && ReadRawFile(bak)==prior);
+        CHECK(!RawFileExists(previous) && !RawFileExists(promote) && !RawFileExists(promoteStage));
+    }
+}
+
 static void test_first_publish_tmp_recovers_on_restart_after_move_failure(){
     LayoutTempDir temp;
     std::wstring primary=temp.file(L"layout.txt"), tempPath=primary+L".tmp";
@@ -2213,6 +2475,83 @@ static void test_idempotent_retry_cleans_orphan_prior_backup_stage(){
     CHECK(error.empty());
     CHECK(ReadRawFile(primary)==current && ReadRawFile(bak)==oldBackup);
     CHECK(!RawFileExists(previous) && !RawFileExists(stage));
+}
+
+static void test_orphan_promotion_stage_is_non_authoritative_and_converges(){
+    for(int withPrevious=0;withPrevious<2;++withPrevious){
+        for(int changedRequest=0;changedRequest<2;++changedRequest){
+            LayoutTempDir temp;
+            std::wstring primary=temp.file(L"layout.txt"), bak=primary+L".bak",
+                previous=bak+L".previous", promoteStage=previous+L".promote.stage";
+            const std::string current=ValidLayoutBytes("orphan-current"),
+                prior=ValidLayoutBytes("orphan-prior"), changed=ValidLayoutBytes("orphan-changed"),
+                poison=ValidLayoutBytes("uncommitted-stage-poison");
+            CHECK(WriteRawFile(primary,current)); CHECK(WriteRawFile(bak,prior));
+            if(withPrevious) CHECK(WriteRawFile(previous,prior));
+            CHECK(WriteRawFile(promoteStage,poison));
+            const std::string& requested=changedRequest ? changed : current;
+            std::string error;
+            CHECK(AtomicWriteText(primary,requested,&error));
+            CHECK(error.empty() && ReadRawFile(primary)==requested);
+            CHECK(ReadRawFile(bak)==(changedRequest ? current : prior));
+            CHECK(!RawFileExists(promoteStage) && !RawFileExists(previous));
+        }
+    }
+
+    {
+        LayoutTempDir temp;
+        std::wstring primary=temp.file(L"layout.txt"), bak=primary+L".bak",
+            previous=bak+L".previous", promoteStage=previous+L".promote.stage";
+        const std::string current=ValidLayoutBytes("delete-effect-current"),
+            prior=ValidLayoutBytes("delete-effect-prior"), changed=ValidLayoutBytes("delete-effect-next"),
+            poison=ValidLayoutBytes("delete-effect-stage");
+        CHECK(WriteRawFile(primary,current)); CHECK(WriteRawFile(bak,prior));
+        CHECK(WriteRawFile(previous,prior)); CHECK(WriteRawFile(promoteStage,poison));
+        LayoutFsOps ops;
+        auto realDelete=ops.deleteFile;
+        bool injected=false;
+        ops.deleteFile=[&](const std::wstring& deleted)->BOOL{
+            if(deleted==promoteStage && !injected){
+                CHECK(realDelete(deleted)!=0); injected=true;
+                SetLastError(ERROR_ACCESS_DENIED); return FALSE;
+            }
+            return realDelete(deleted);
+        };
+        std::string error;
+        CHECK(!AtomicWriteText(primary,changed,&error,false,ops));
+        CHECK(injected && !error.empty() && !RawFileExists(promoteStage));
+        CHECK(ReadRawFile(primary)==current && ReadRawFile(bak)==prior && ReadRawFile(previous)==prior);
+        CHECK(AtomicWriteText(primary,changed,&error));
+        CHECK(error.empty() && ReadRawFile(primary)==changed && ReadRawFile(bak)==current);
+        CHECK(!RawFileExists(previous));
+    }
+
+    {
+        LayoutTempDir temp;
+        std::wstring primary=temp.file(L"layout.txt"), bak=primary+L".bak",
+            previous=bak+L".previous", promoteStage=previous+L".promote.stage";
+        const std::string current=ValidLayoutBytes("transient-current"),
+            prior=ValidLayoutBytes("transient-prior"), poison=ValidLayoutBytes("transient-stage");
+        CHECK(WriteRawFile(primary,current)); CHECK(WriteRawFile(bak,prior));
+        CHECK(WriteRawFile(promoteStage,poison));
+        LayoutFsOps ops;
+        auto realOpen=ops.openFile;
+        int backupOpens=0;
+        ops.openFile=[&](const std::wstring& opened,DWORD access,DWORD share,
+                DWORD creation,DWORD flags)->HANDLE{
+            if(opened==bak && ++backupOpens==2){
+                SetLastError(ERROR_SHARING_VIOLATION); return INVALID_HANDLE_VALUE;
+            }
+            return realOpen(opened,access,share,creation,flags);
+        };
+        std::string error;
+        CHECK(!AtomicWriteText(primary,current,&error,false,ops));
+        CHECK(!error.empty() && RawFileExists(promoteStage));
+        CHECK(ReadRawFile(primary)==current && ReadRawFile(bak)==prior);
+        CHECK(AtomicWriteText(primary,current,&error));
+        CHECK(error.empty() && !RawFileExists(promoteStage));
+        CHECK(ReadRawFile(primary)==current && ReadRawFile(bak)==prior);
+    }
 }
 
 static void test_staged_backup_restore_mismatch_never_discards_intended_bytes_on_retry(){
@@ -2455,6 +2794,91 @@ static void test_recovery_write_preserves_known_good_backup_and_reports_cleanup_
     }
 }
 
+static void test_preserve_retry_without_named_recovery_converges(){
+    for(int changedRetry=0;changedRetry<2;++changedRetry){
+        LayoutTempDir temp;
+        std::wstring primary=temp.file(L"layout.txt"), displaced=primary+L".displaced",
+            bak=primary+L".bak", rollback=primary+L".rollback";
+        const std::string old=ValidLayoutBytes("old"), first=ValidLayoutBytes("first"),
+            changed=ValidLayoutBytes("changed");
+        CHECK(WriteRawFile(primary,old));
+        LayoutFsOps ops;
+        auto realDelete=ops.deleteFile;
+        ops.deleteFile=[&](const std::wstring& deleted)->BOOL{
+            if(deleted==displaced){ SetLastError(ERROR_ACCESS_DENIED); return FALSE; }
+            return realDelete(deleted);
+        };
+        std::string error;
+        CHECK(!AtomicWriteText(primary,first,&error,true,ops));
+        CHECK(!error.empty() && ReadRawFile(primary)==first && ReadRawFile(displaced)==old);
+        CHECK(!RawFileExists(bak) && !RawFileExists(rollback));
+        const std::string& requested=changedRetry ? changed : first;
+        CHECK(AtomicWriteText(primary,requested,&error,true));
+        CHECK(error.empty() && ReadRawFile(primary)==requested && !RawFileExists(displaced));
+        if(changedRetry) CHECK(ReadRawFile(bak)==old);
+        else CHECK(!RawFileExists(bak));
+    }
+
+    LayoutTempDir temp;
+    std::wstring primary=temp.file(L"layout.txt"), displaced=primary+L".displaced",
+        bak=primary+L".bak", rollback=primary+L".rollback", committed=primary+L".tmp";
+    const std::string old=ValidLayoutBytes("old-no-primary"), first=ValidLayoutBytes("first-no-primary"),
+        changed=ValidLayoutBytes("changed-no-primary");
+    CHECK(WriteRawFile(primary,old));
+    LayoutFsOps ops;
+    ops.replaceFile=[&](const std::wstring& replaced,const std::wstring&,
+            const std::wstring& backupName,DWORD)->BOOL{
+        CHECK(MoveFileExW(replaced.c_str(),backupName.c_str(),
+            MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0);
+        SetLastError(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2);
+        return FALSE;
+    };
+    std::string error;
+    CHECK(!AtomicWriteText(primary,first,&error,true,ops));
+    CHECK(!error.empty() && !RawFileExists(primary) && ReadRawFile(displaced)==old);
+    CHECK(ReadRawFile(committed)==first && !RawFileExists(bak) && !RawFileExists(rollback));
+    CHECK(AtomicWriteText(primary,changed,&error,true));
+    CHECK(error.empty() && ReadRawFile(primary)==changed && ReadRawFile(bak)==old);
+    CHECK(!RawFileExists(displaced) && !RawFileExists(committed));
+
+    {
+        LayoutTempDir direct;
+        std::wstring missingPrimary=direct.file(L"layout.txt"),
+            onlyDisplaced=missingPrimary+L".displaced", onlyBak=missingPrimary+L".bak";
+        const std::string prior=ValidLayoutBytes("displaced-only-prior"),
+            requested=ValidLayoutBytes("displaced-only-new");
+        CHECK(WriteRawFile(onlyDisplaced,prior));
+        CHECK(AtomicWriteText(missingPrimary,requested,&error,true));
+        CHECK(error.empty() && ReadRawFile(missingPrimary)==requested && ReadRawFile(onlyBak)==prior);
+        CHECK(!RawFileExists(onlyDisplaced));
+    }
+
+    for(int afterEffect=0;afterEffect<2;++afterEffect){
+        LayoutTempDir interrupted;
+        std::wstring retryPrimary=interrupted.file(L"layout.txt"),
+            retryDisplaced=retryPrimary+L".displaced", retryBak=retryPrimary+L".bak";
+        const std::string published=ValidLayoutBytes("published-before-retry"),
+            prior=ValidLayoutBytes("prior-before-retry"), next=ValidLayoutBytes("next-retry");
+        CHECK(WriteRawFile(retryPrimary,published)); CHECK(WriteRawFile(retryDisplaced,prior));
+        LayoutFsOps moveOps;
+        auto realMove=moveOps.moveFile;
+        bool injected=false;
+        moveOps.moveFile=[&](const std::wstring& from,const std::wstring& to,DWORD flags)->BOOL{
+            if(from==retryDisplaced && to==retryBak && !injected){
+                if(afterEffect) CHECK(realMove(from,to,flags)!=0);
+                injected=true; SetLastError(ERROR_UNABLE_TO_MOVE_REPLACEMENT); return FALSE;
+            }
+            return realMove(from,to,flags);
+        };
+        CHECK(!AtomicWriteText(retryPrimary,next,&error,true,moveOps));
+        CHECK(injected && !error.empty() && ReadRawFile(retryPrimary)==published);
+        CHECK(afterEffect ? ReadRawFile(retryBak)==prior : ReadRawFile(retryDisplaced)==prior);
+        CHECK(AtomicWriteText(retryPrimary,next,&error,true));
+        CHECK(error.empty() && ReadRawFile(retryPrimary)==next && ReadRawFile(retryBak)==prior);
+        CHECK(!RawFileExists(retryDisplaced));
+    }
+}
+
 static void test_same_revision_compares_every_field(){
     LayoutRevision base;
     base.sourcePath=L"a"; base.exists=true; base.size=12; base.mtime=34; base.contentHash=56;
@@ -2478,14 +2902,30 @@ static bool WriteIfCanonicalRevisionUnchanged(const std::wstring& primary,const 
 static void test_two_actor_stale_save_is_rejected_without_overwrite(){
     LayoutTempDir temp;
     std::wstring primary=temp.file(L"layout.txt");
-    std::string first=ValidLayoutBytes("A-base"), fromB=ValidLayoutBytes("B"), staleA=ValidLayoutBytes("A-stale"), error;
+    std::string first=ValidLayoutBytes("AAAA"), fromB=ValidLayoutBytes("BBBB"),
+        staleA=ValidLayoutBytes("CCCC"), error;
+    CHECK(first.size()==fromB.size() && first.size()==staleA.size());
     CHECK(AtomicWriteText(primary,first,&error));
     LayoutLoadResult actorA=LoadLayoutWithBackup(primary,1700000000);
     CHECK(actorA.status==LayoutLoadStatus::Valid);
+    LayoutRevision directA=ReadLayoutRevisionLocked(primary);
+    CHECK(actorA.revision.sourcePath==primary && directA.sourcePath==primary);
+    CHECK(actorA.revision.exists && directA.exists);
+    CHECK(actorA.revision.size==first.size() && directA.size==first.size());
+    CHECK(actorA.revision.mtime==directA.mtime && actorA.revision.mtime!=0);
+    CHECK(actorA.revision.contentHash==directA.contentHash && actorA.revision.contentHash!=0);
     {
         ScopedLayoutLock actorB(1000); CHECK(actorB.acquired());
         CHECK(actorB.acquired() && AtomicWriteText(primary,fromB,&error));
     }
+    CHECK(SetRawFileMtime(primary,actorA.revision.mtime));
+    LayoutRevision directB=ReadLayoutRevisionLocked(primary);
+    CHECK(directB.sourcePath==actorA.revision.sourcePath);
+    CHECK(directB.exists==actorA.revision.exists);
+    CHECK(directB.size==actorA.revision.size);
+    CHECK(directB.mtime==actorA.revision.mtime);
+    CHECK(directB.contentHash!=actorA.revision.contentHash);
+    CHECK(!SameRevision(directB,actorA.revision));
     CHECK(!WriteIfCanonicalRevisionUnchanged(primary,actorA.revision,staleA));
     CHECK(ReadRawFile(primary)==fromB);
 }
@@ -2499,11 +2939,22 @@ static void test_two_actor_recovered_source_stale_save_is_rejected(){
     CHECK(WriteRawFile(bak,base));
     LayoutLoadResult actorA=LoadLayoutWithBackup(primary,1700000000);
     CHECK(actorA.status==LayoutLoadStatus::Recovered && actorA.revision.sourcePath==bak);
+    LayoutRevision directRecovery=ReadLayoutRevisionLocked(bak);
+    CHECK(actorA.revision.sourcePath==directRecovery.sourcePath);
+    CHECK(actorA.revision.exists==directRecovery.exists && actorA.revision.exists);
+    CHECK(actorA.revision.size==directRecovery.size && actorA.revision.size==base.size());
+    CHECK(actorA.revision.mtime==directRecovery.mtime && actorA.revision.mtime!=0);
+    CHECK(actorA.revision.contentHash==directRecovery.contentHash && actorA.revision.contentHash!=0);
     {
         ScopedLayoutLock actorB(1000); CHECK(actorB.acquired());
         CHECK(actorB.acquired() && AtomicWriteText(primary,fromB,&error,true));
     }
     CHECK(ReadRawFile(bak)==base);
+    LayoutRevision canonicalAfterB=ReadLayoutRevisionLocked(primary);
+    CHECK(canonicalAfterB.sourcePath==primary && canonicalAfterB.exists);
+    CHECK(canonicalAfterB.size==fromB.size() && canonicalAfterB.mtime!=0 &&
+        canonicalAfterB.contentHash!=0);
+    CHECK(!SameRevision(actorA.revision,canonicalAfterB));
     CHECK(!WriteIfCanonicalRevisionUnchanged(primary,actorA.revision,staleA,true));
     CHECK(ReadRawFile(primary)==fromB);
 
@@ -2692,6 +3143,8 @@ int main(){
     test_layout_recovery_uses_bak_and_preserves_all_corruption();
     test_two_corrupt_streams_require_verified_diagnostics();
     test_transient_primary_open_blocks_backup_recovery();
+    test_oversized_primary_blocks_all_recovery_without_mutation();
+    test_missing_primary_uses_rollback_priority_then_backup_fallback();
     test_transient_and_corrupt_recovery_states();
     test_diagnostic_copy_failure_and_readback_mismatch_block_writes();
     test_second_diagnostic_copy_failure_and_collision_never_lose_evidence();
@@ -2713,15 +3166,20 @@ int main(){
     test_transient_promoted_backup_read_is_retained_and_loads_before_retry();
     test_loader_recovers_valid_authoritative_internal_marker();
     test_loader_never_accepts_stale_bak_beside_authoritative_promotion_marker();
+    test_valid_primary_reconciles_authoritative_promotion_marker();
+    test_valid_primary_marker_faults_fail_closed_then_converge();
+    test_valid_primary_retries_cleanup_after_trigger_delete_false_effect();
     test_first_publish_tmp_recovers_on_restart_after_move_failure();
     test_partial_valid_prefix_is_never_treated_as_committed_first_publish();
     test_temporary_commit_move_failure_converges_before_and_after_effect();
     test_idempotent_retry_cleans_orphan_prior_backup_stage();
+    test_orphan_promotion_stage_is_non_authoritative_and_converges();
     test_staged_backup_restore_mismatch_never_discards_intended_bytes_on_retry();
     test_partial_effect_replace_failure_remains_recoverable();
     test_first_write_preserves_existing_recovery_artifacts();
     test_failed_rollback_promotion_stays_recoverable_before_older_bak();
     test_recovery_write_preserves_known_good_backup_and_reports_cleanup_failure();
+    test_preserve_retry_without_named_recovery_converges();
     test_same_revision_compares_every_field();
     test_two_actor_stale_save_is_rejected_without_overwrite();
     test_two_actor_recovered_source_stale_save_is_rejected();

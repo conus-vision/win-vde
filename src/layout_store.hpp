@@ -346,7 +346,7 @@ inline bool ResolveWriteTempArtifacts(const std::wstring& primary,OptionalBytes&
 
 inline bool ResolveDisplacedForRecovery(const std::wstring& primary,const std::wstring& displaced,
         const std::string& currentPrimary,const std::string& requested,
-        const OptionalBytes& preservedBackup,const OptionalBytes& preservedRollback,
+        OptionalBytes& preservedBackup,OptionalBytes& preservedRollback,
         const LayoutFsOps& ops,bool& requestAlreadyPublished,std::string* errorOut){
     requestAlreadyPublished=false;
     OptionalBytes staleDisplaced;
@@ -354,20 +354,36 @@ inline bool ResolveDisplacedForRecovery(const std::wstring& primary,const std::w
     if(!CaptureOptional(displaced,ops,staleDisplaced,&error))
         return SetFailure(errorOut,"cannot inspect prior displaced artifact: "+error);
     if(!staleDisplaced.exists) return true;
-    if(!preservedBackup.exists && !preservedRollback.exists)
-        return SetFailure(errorOut,"cannot resolve displaced artifact without a preserved recovery stream");
     if(!VerifyExactFile(primary,currentPrimary,ops,&error) ||
+       !VerifyCaptured(staleDisplaced,ops,&error) ||
        !VerifyCaptured(preservedBackup,ops,&error) ||
        !VerifyCaptured(preservedRollback,ops,&error))
         return SetFailure(errorOut,"cannot verify survivors before displaced cleanup: "+error);
-    if(!ops.deleteFile(displaced))
-        return SetFailure(errorOut,Win32Failure("DeleteFileW prior displaced cleanup failed",
-            LastErrorOr(ERROR_ACCESS_DENIED)));
-    PathState afterDelete=QueryPath(displaced,ops,&error);
-    if(afterDelete==PathState::Unavailable)
-        return SetFailure(errorOut,"cannot verify displaced cleanup: "+error);
-    if(afterDelete!=PathState::Missing)
-        return SetFailure(errorOut,"DeleteFileW reported success but displaced artifact remains");
+
+    // A preserve-mode ReplaceFile backup is itself the captured prior stream.
+    // If no named recovery survived and another payload is requested, first
+    // make that stream canonical at .bak before consuming .displaced.
+    if(currentPrimary!=requested && !preservedBackup.exists && !preservedRollback.exists){
+        if(!ops.moveFile(displaced,preservedBackup.path,MOVEFILE_WRITE_THROUGH))
+            return SetFailure(errorOut,Win32Failure(
+                "MoveFileExW displaced-to-backup recovery failed",
+                LastErrorOr(ERROR_UNABLE_TO_MOVE_REPLACEMENT)));
+        if(!VerifyExactFile(preservedBackup.path,staleDisplaced.bytes,ops,&error))
+            return SetFailure(errorOut,"displaced-to-backup recovery verification failed: "+error);
+        PathState displacedState=QueryPath(displaced,ops,&error);
+        if(displacedState==PathState::Unavailable)
+            return SetFailure(errorOut,"cannot verify displaced-to-backup consumption: "+error);
+        if(displacedState!=PathState::Missing)
+            return SetFailure(errorOut,
+                "MoveFileExW reported success but displaced artifact remains");
+        if(!VerifyExactFile(primary,currentPrimary,ops,&error))
+            return SetFailure(errorOut,
+                "primary changed during displaced-to-backup recovery: "+error);
+        preservedBackup.exists=true;
+        preservedBackup.bytes=staleDisplaced.bytes;
+        return true;
+    }
+    if(!DeleteArtifactChecked(displaced,"prior displaced artifact",ops,errorOut)) return false;
     if(!VerifyExactFile(primary,currentPrimary,ops,&error) ||
        !VerifyCaptured(preservedBackup,ops,&error) ||
        !VerifyCaptured(preservedRollback,ops,&error))
@@ -377,19 +393,36 @@ inline bool ResolveDisplacedForRecovery(const std::wstring& primary,const std::w
 }
 
 inline bool ResolveDisplacedWithoutPrimary(const std::wstring& displaced,
-        const OptionalBytes& preservedBackup,const OptionalBytes& preservedRollback,
-        const LayoutFsOps& ops,bool& cleanupPending,std::string* errorOut){
-    cleanupPending=false;
+        OptionalBytes& preservedBackup,OptionalBytes& preservedRollback,
+        const LayoutFsOps& ops,OptionalBytes& cleanupPending,std::string* errorOut){
+    cleanupPending=OptionalBytes();
+    cleanupPending.path=displaced;
     OptionalBytes staleDisplaced;
     std::string error;
     if(!CaptureOptional(displaced,ops,staleDisplaced,&error))
         return SetFailure(errorOut,"cannot inspect displaced artifact beside missing primary: "+error);
     if(!staleDisplaced.exists) return true;
-    if(!preservedBackup.exists && !preservedRollback.exists)
-        return SetFailure(errorOut,"cannot resolve displaced artifact without a preserved recovery stream");
-    if(!VerifyCaptured(preservedBackup,ops,&error) || !VerifyCaptured(preservedRollback,ops,&error))
+    if(!VerifyCaptured(staleDisplaced,ops,&error) ||
+       !VerifyCaptured(preservedBackup,ops,&error) || !VerifyCaptured(preservedRollback,ops,&error))
         return SetFailure(errorOut,"cannot verify recovery beside displaced artifact: "+error);
-    cleanupPending=true;
+    if(!preservedBackup.exists && !preservedRollback.exists){
+        if(!ops.moveFile(displaced,preservedBackup.path,MOVEFILE_WRITE_THROUGH))
+            return SetFailure(errorOut,Win32Failure(
+                "MoveFileExW displaced-only recovery failed",
+                LastErrorOr(ERROR_UNABLE_TO_MOVE_REPLACEMENT)));
+        if(!VerifyExactFile(preservedBackup.path,staleDisplaced.bytes,ops,&error))
+            return SetFailure(errorOut,"displaced-only recovery verification failed: "+error);
+        PathState displacedState=QueryPath(displaced,ops,&error);
+        if(displacedState==PathState::Unavailable)
+            return SetFailure(errorOut,"cannot verify displaced-only consumption: "+error);
+        if(displacedState!=PathState::Missing)
+            return SetFailure(errorOut,
+                "MoveFileExW reported success but displaced-only artifact remains");
+        preservedBackup.exists=true;
+        preservedBackup.bytes=staleDisplaced.bytes;
+        return true;
+    }
+    cleanupPending=staleDisplaced;
     return true;
 }
 
@@ -449,8 +482,23 @@ inline bool ResolveStaleBakPrevious(const OptionalBytes& currentPrimary,
                 promotionCopy.exists=true;
                 promotionCopy.bytes=currentRollback.bytes;
             } else {
-                return SetFailure(errorOut,
-                    "orphan rollback-promotion stage has no authoritative rollback");
+                // The .promote.stage name is deliberately non-authoritative:
+                // CopyFile may have returned FALSE after leaving arbitrary
+                // bytes there.  Once canonical survivors are exact it can be
+                // discarded without interpreting its contents as intent.
+                if(!currentPrimary.exists && !currentBackup.exists)
+                    return SetFailure(errorOut,
+                        "cannot discard rollback-promotion stage without a canonical stream");
+                if(!VerifyCaptured(currentPrimary,ops,&error) ||
+                   !VerifyCaptured(currentBackup,ops,&error))
+                    return SetFailure(errorOut,
+                        "cannot verify canonical state before rollback-promotion stage cleanup: "+error);
+                if(!deleteChecked(promoteStage,"orphan rollback-promotion stage")) return false;
+                if(!VerifyCaptured(currentPrimary,ops,&error) ||
+                   !VerifyCaptured(currentBackup,ops,&error))
+                    return SetFailure(errorOut,
+                        "canonical state changed during rollback-promotion stage cleanup: "+error);
+                promotionStageCopy.exists=false;
             }
         }
         if(promotionCopy.exists){
@@ -521,7 +569,18 @@ inline bool ResolveStaleBakPrevious(const OptionalBytes& currentPrimary,
             promotionCopy.exists=true;
             promotionCopy.bytes=currentRollback.bytes;
         } else {
-            return SetFailure(errorOut,"orphan rollback-promotion stage has no authoritative rollback");
+            if(!VerifyCaptured(currentPrimary,ops,&error) ||
+               !VerifyCaptured(currentBackup,ops,&error) ||
+               !VerifyCaptured(staged,ops,&error))
+                return SetFailure(errorOut,
+                    "cannot verify canonical state before rollback-promotion stage cleanup: "+error);
+            if(!deleteChecked(promoteStage,"orphan rollback-promotion stage")) return false;
+            if(!VerifyCaptured(currentPrimary,ops,&error) ||
+               !VerifyCaptured(currentBackup,ops,&error) ||
+               !VerifyCaptured(staged,ops,&error))
+                return SetFailure(errorOut,
+                    "canonical state changed during rollback-promotion stage cleanup: "+error);
+            promotionStageCopy.exists=false;
         }
     }
 
@@ -1017,7 +1076,8 @@ inline bool AtomicWriteText(const std::wstring& path,const std::string& data,std
     OptionalBytes currentPrimary;
     currentPrimary.path=path;
     OptionalBytes preservedBackup, preservedRollback;
-    bool requestAlreadyPublished=false,displacedCleanupPending=false;
+    bool requestAlreadyPublished=false;
+    OptionalBytes displacedCleanupPending;
     if(primaryState==PathState::File){
         LayoutRevision ignored;
         if(!ReadExactBytes(path,ops,priorPrimary,&ignored,&queryError))
@@ -1125,16 +1185,15 @@ inline bool AtomicWriteText(const std::wstring& path,const std::string& data,std
         if(!VerifyCaptured(preservedBackup,ops,&queryError) ||
            !VerifyCaptured(preservedRollback,ops,&queryError))
             return SetFailure(errorOut,queryError);
-        if(displacedCleanupPending){
-            if(!ops.deleteFile(displaced))
-                return SetFailure(errorOut,Win32Failure(
-                    "DeleteFileW displaced cleanup after first publish failed",
-                    LastErrorOr(ERROR_ACCESS_DENIED)));
-            PathState displacedState=QueryPath(displaced,ops,&queryError);
-            if(displacedState==PathState::Unavailable)
-                return SetFailure(errorOut,"cannot verify displaced cleanup after first publish: "+queryError);
-            if(displacedState!=PathState::Missing)
-                return SetFailure(errorOut,"DeleteFileW reported success but displaced artifact remains");
+        if(displacedCleanupPending.exists){
+            if(!VerifyExactFile(path,data,ops,&queryError) ||
+               !VerifyCaptured(displacedCleanupPending,ops,&queryError) ||
+               !VerifyCaptured(preservedBackup,ops,&queryError) ||
+               !VerifyCaptured(preservedRollback,ops,&queryError))
+                return SetFailure(errorOut,
+                    "survivor verification failed before displaced cleanup: "+queryError);
+            if(!DeleteArtifactChecked(displaced,"displaced artifact after first publish",ops,errorOut))
+                return false;
             if(!VerifyExactFile(path,data,ops,&queryError) ||
                !VerifyCaptured(preservedBackup,ops,&queryError) ||
                !VerifyCaptured(preservedRollback,ops,&queryError))
@@ -1212,14 +1271,57 @@ inline LayoutLoadResult LoadLayoutWithBackupLocked(const std::wstring& path,Unix
         const LayoutFsOps& ops){
     using namespace layout_store_detail;
     LayoutCandidate primary=ReadCandidate(path,nowUtc,ops);
-    if(primary.state==CandidateState::Valid) return ValidLoad(primary,LayoutLoadStatus::Valid);
+    const std::wstring promotionPath=path+L".bak.previous.promote";
+    const std::wstring promotionStagePath=promotionPath+L".stage";
+    const std::wstring previousBackupPath=path+L".bak.previous";
+    if(primary.state==CandidateState::Valid){
+        // A committed promotion marker represents an unfinished transaction,
+        // even though the new primary is already parse-valid.  Settle it
+        // before advertising a writable Valid state so the prior generation
+        // cannot remain stranded at rollback/marker paths.
+        LayoutCandidate pendingPromotion=ReadCandidate(promotionPath,nowUtc,ops);
+        if(pendingPromotion.state==CandidateState::Unavailable)
+            return UnavailableLoad(promotionPath,
+                "rollback-promotion marker unavailable: "+pendingPromotion.error);
+        if(pendingPromotion.state==CandidateState::Corrupt)
+            return UnavailableLoad(promotionPath,
+                "authoritative rollback-promotion marker is corrupt: "+pendingPromotion.error);
+        std::string artifactError;
+        bool hasResolverArtifact=pendingPromotion.state==CandidateState::Valid;
+        std::vector<std::wstring> resolverArtifacts;
+        resolverArtifacts.push_back(promotionStagePath);
+        resolverArtifacts.push_back(previousBackupPath);
+        resolverArtifacts.push_back(previousBackupPath+L".restore");
+        resolverArtifacts.push_back(previousBackupPath+L".stage");
+        for(const std::wstring& artifact:resolverArtifacts){
+            PathState state=QueryPath(artifact,ops,&artifactError);
+            if(state==PathState::Unavailable)
+                return UnavailableLoad(artifact,
+                    "layout transaction artifact unavailable: "+artifactError);
+            if(state==PathState::File) hasResolverArtifact=true;
+        }
+        if(hasResolverArtifact){
+            OptionalBytes currentPrimary;
+            currentPrimary.path=path;
+            currentPrimary.exists=true;
+            currentPrimary.bytes=primary.bytes;
+            if(!ResolveStaleBakPrevious(currentPrimary,path+L".rollback",path+L".bak",
+                    previousBackupPath,ops,&artifactError))
+                return UnavailableLoad(path,"cannot reconcile layout transaction artifacts: "+artifactError);
+            LayoutCandidate settled=ReadCandidate(path,nowUtc,ops);
+            if(settled.state!=CandidateState::Valid || settled.bytes!=primary.bytes)
+                return UnavailableLoad(path,
+                    "primary layout changed while transaction artifacts were reconciled");
+            return ValidLoad(settled,LayoutLoadStatus::Valid);
+        }
+        return ValidLoad(primary,LayoutLoadStatus::Valid);
+    }
     if(primary.state==CandidateState::Unavailable)
         return UnavailableLoad(path,"primary layout unavailable: "+primary.error);
 
     std::vector<const LayoutCandidate*> corrupt;
     if(primary.state==CandidateState::Corrupt) corrupt.push_back(&primary);
 
-    const std::wstring promotionPath=path+L".bak.previous.promote";
     LayoutCandidate promotion=ReadCandidate(promotionPath,nowUtc,ops);
     if(promotion.state==CandidateState::Unavailable)
         return UnavailableLoad(promotionPath,"rollback-promotion marker unavailable: "+promotion.error);
