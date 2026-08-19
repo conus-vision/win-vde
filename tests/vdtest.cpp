@@ -1756,6 +1756,141 @@ static void test_diagnostic_reuse_never_overwrites_changed_corrupt_backup(){
     CHECK(ReadRawFile(backup+L".corrupt.1700000000.1")==changedCorrupt);
 }
 
+static void test_diagnostic_preservation_revalidates_primary_before_backup_recovery(){
+    LayoutTempDir temp;
+    std::wstring primary=temp.file(L"layout.txt"), backup=primary+L".bak",
+        diagnostic=primary+L".corrupt.1700000000.0";
+    const std::string captured="captured corrupt primary",
+        changed="changed corrupt primary", recovery=ValidLayoutBytes("backup recovery");
+    CHECK(WriteRawFile(primary,captured));
+    CHECK(WriteRawFile(backup,recovery));
+    CHECK(WriteRawFile(diagnostic,captured));
+
+    LayoutFsOps ops;
+    auto realCopy=ops.copyFile;
+    bool injected=false;
+    ops.copyFile=[&](const std::wstring& from,const std::wstring& to,BOOL failIfExists)->BOOL{
+        if(from==primary && to==diagnostic && failIfExists && !injected){
+            injected=true;
+            CHECK(WriteRawFile(primary,changed));
+            SetLastError(ERROR_FILE_EXISTS);
+            return FALSE;
+        }
+        return realCopy(from,to,failIfExists);
+    };
+
+    LayoutLoadResult blocked=LoadLayoutWithBackupLocked(primary,1700000000,ops);
+    CHECK(injected && blocked.status==LayoutLoadStatus::Unavailable && !blocked.writesAllowed);
+    CHECK(ReadRawFile(primary)==changed && ReadRawFile(backup)==recovery);
+    CHECK(ReadRawFile(diagnostic)==captured && DiagnosticCopies(primary).size()==1);
+
+    LayoutLoadResult retry=LoadLayoutWithBackupLocked(primary,1700000000);
+    CHECK(retry.status==LayoutLoadStatus::Recovered && retry.writesAllowed && retry.usable());
+    CHECK(retry.revision.sourcePath==backup && ReadRawFile(primary)==changed);
+    CHECK(DiagnosticCopies(primary).size()==2);
+    CHECK(ReadRawFile(primary+L".corrupt.1700000000.1")==changed);
+    LayoutLoadResult stable=LoadLayoutWithBackupLocked(primary,1700000000);
+    CHECK(stable.status==LayoutLoadStatus::Recovered && DiagnosticCopies(primary).size()==2);
+}
+
+static void test_diagnostic_preservation_revalidates_primary_before_displaced_recovery(){
+    LayoutTempDir temp;
+    std::wstring primary=temp.file(L"layout.txt"), displaced=primary+L".displaced",
+        backup=primary+L".bak", diagnostic=primary+L".corrupt.1700000000.0";
+    const std::string captured="captured corrupt beside displaced",
+        changed="changed corrupt beside displaced", recovery=ValidLayoutBytes("displaced recovery");
+    CHECK(WriteRawFile(primary,captured));
+    CHECK(WriteRawFile(displaced,recovery));
+    CHECK(WriteRawFile(diagnostic,captured));
+
+    LayoutFsOps ops;
+    auto realCopy=ops.copyFile;
+    bool injected=false;
+    ops.copyFile=[&](const std::wstring& from,const std::wstring& to,BOOL failIfExists)->BOOL{
+        if(from==primary && to==diagnostic && failIfExists && !injected){
+            injected=true;
+            CHECK(WriteRawFile(primary,changed));
+            SetLastError(ERROR_FILE_EXISTS);
+            return FALSE;
+        }
+        return realCopy(from,to,failIfExists);
+    };
+
+    LayoutLoadResult blocked=LoadLayoutWithBackupLocked(primary,1700000000,ops);
+    CHECK(injected && blocked.status==LayoutLoadStatus::Unavailable && !blocked.writesAllowed);
+    CHECK(ReadRawFile(primary)==changed && ReadRawFile(displaced)==recovery);
+    CHECK(!RawFileExists(backup) && DiagnosticCopies(primary).size()==1);
+
+    LayoutLoadResult retry=LoadLayoutWithBackupLocked(primary,1700000000);
+    CHECK(retry.status==LayoutLoadStatus::Recovered && retry.writesAllowed && retry.usable());
+    CHECK(retry.revision.sourcePath==backup && ReadRawFile(backup)==recovery);
+    CHECK(!RawFileExists(displaced) && ReadRawFile(primary)==changed);
+    CHECK(DiagnosticCopies(primary).size()==2);
+    LayoutLoadResult stable=LoadLayoutWithBackupLocked(primary,1700000000);
+    CHECK(stable.status==LayoutLoadStatus::Recovered && DiagnosticCopies(primary).size()==2);
+}
+
+static void test_fresh_diagnostic_copy_revalidates_primary_before_recovery(){
+    for(int copyReturnsFalse=0;copyReturnsFalse<2;++copyReturnsFalse){
+        LayoutTempDir temp;
+        std::wstring primary=temp.file(L"layout.txt"), backup=primary+L".bak",
+            diagnostic=primary+L".corrupt.1700000000.0";
+        const std::string captured="fresh-copy captured primary",
+            changed="fresh-copy changed primary", recovery=ValidLayoutBytes("fresh-copy backup");
+        CHECK(WriteRawFile(primary,captured)); CHECK(WriteRawFile(backup,recovery));
+        LayoutFsOps ops;
+        auto realCopy=ops.copyFile;
+        bool injected=false;
+        ops.copyFile=[&](const std::wstring& from,const std::wstring& to,BOOL failIfExists)->BOOL{
+            if(from==primary && to==diagnostic && failIfExists && !injected){
+                CHECK(realCopy(from,to,failIfExists)!=0);
+                CHECK(WriteRawFile(primary,changed));
+                injected=true;
+                if(copyReturnsFalse){ SetLastError(ERROR_WRITE_FAULT); return FALSE; }
+                return TRUE;
+            }
+            return realCopy(from,to,failIfExists);
+        };
+
+        LayoutLoadResult blocked=LoadLayoutWithBackupLocked(primary,1700000000,ops);
+        CHECK(injected && blocked.status==LayoutLoadStatus::Unavailable && !blocked.writesAllowed);
+        CHECK(ReadRawFile(primary)==changed && ReadRawFile(backup)==recovery);
+        CHECK(ReadRawFile(diagnostic)==captured && DiagnosticCopies(primary).size()==1);
+        LayoutLoadResult retry=LoadLayoutWithBackupLocked(primary,1700000000);
+        CHECK(retry.status==LayoutLoadStatus::Recovered && retry.revision.sourcePath==backup);
+        CHECK(DiagnosticCopies(primary).size()==2);
+        CHECK(ReadRawFile(primary+L".corrupt.1700000000.1")==changed);
+    }
+}
+
+static void test_diagnostic_source_reverify_transient_failure_retries_without_growth(){
+    LayoutTempDir temp;
+    std::wstring primary=temp.file(L"layout.txt"), backup=primary+L".bak",
+        diagnostic=primary+L".corrupt.1700000000.0";
+    const std::string corrupt="transient reverify corrupt",
+        recovery=ValidLayoutBytes("transient reverify backup");
+    CHECK(WriteRawFile(primary,corrupt)); CHECK(WriteRawFile(backup,recovery));
+    LayoutFsOps ops;
+    auto realOpen=ops.openFile;
+    int primaryOpens=0;
+    bool injected=false;
+    ops.openFile=[&](const std::wstring& opened,DWORD access,DWORD share,
+            DWORD creation,DWORD flags)->HANDLE{
+        if(opened==primary && ++primaryOpens==2){
+            injected=true; SetLastError(ERROR_SHARING_VIOLATION); return INVALID_HANDLE_VALUE;
+        }
+        return realOpen(opened,access,share,creation,flags);
+    };
+
+    LayoutLoadResult blocked=LoadLayoutWithBackupLocked(primary,1700000000,ops);
+    CHECK(injected && blocked.status==LayoutLoadStatus::Unavailable && !blocked.writesAllowed);
+    CHECK(ReadRawFile(primary)==corrupt && ReadRawFile(backup)==recovery);
+    CHECK(ReadRawFile(diagnostic)==corrupt && DiagnosticCopies(primary).size()==1);
+    LayoutLoadResult retry=LoadLayoutWithBackupLocked(primary,1700000000);
+    CHECK(retry.status==LayoutLoadStatus::Recovered && retry.revision.sourcePath==backup);
+    CHECK(DiagnosticCopies(primary).size()==1);
+}
+
 static void test_atomic_write_first_and_two_successful_writes(){
     LayoutTempDir temp;
     std::wstring primary=temp.file(L"layout.txt");
@@ -3625,6 +3760,10 @@ int main(){
     test_second_diagnostic_copy_failure_and_collision_never_lose_evidence();
     test_diagnostic_reuse_never_deletes_changed_corrupt_temp();
     test_diagnostic_reuse_never_overwrites_changed_corrupt_backup();
+    test_diagnostic_preservation_revalidates_primary_before_backup_recovery();
+    test_diagnostic_preservation_revalidates_primary_before_displaced_recovery();
+    test_fresh_diagnostic_copy_revalidates_primary_before_recovery();
+    test_diagnostic_source_reverify_transient_failure_retries_without_growth();
     test_atomic_write_first_and_two_successful_writes();
     test_atomic_write_rejects_oversize_without_touching_destination();
     test_atomic_write_faults_keep_old_or_recovery_bytes();

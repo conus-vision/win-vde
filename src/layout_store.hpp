@@ -943,8 +943,13 @@ inline bool PreserveCorruptCandidate(const LayoutCandidate& candidate,UnixSecond
                 if(ReadExactBytes(diagnostic,ops,existing,&existingRevision,&readError) &&
                    existingRevision.size==candidate.revision.size &&
                    existingRevision.contentHash==candidate.revision.contentHash &&
-                   existing==candidate.bytes)
+                   existing==candidate.bytes){
+                    std::string sourceError;
+                    if(!VerifyExactFile(candidate.path,candidate.bytes,ops,&sourceError))
+                        return SetFailure(errorOut,
+                            "corrupt source changed after diagnostic reuse: "+sourceError);
                     return true;
+                }
                 continue;
             }
             return SetFailure(errorOut,Win32Failure("CopyFileW diagnostic preservation failed",error));
@@ -957,6 +962,10 @@ inline bool PreserveCorruptCandidate(const LayoutCandidate& candidate,UnixSecond
         if(copiedRevision.size!=candidate.revision.size ||
            copiedRevision.contentHash!=candidate.revision.contentHash || copied!=candidate.bytes)
             return SetFailure(errorOut,"diagnostic copy readback mismatch");
+        std::string sourceError;
+        if(!VerifyExactFile(candidate.path,candidate.bytes,ops,&sourceError))
+            return SetFailure(errorOut,
+                "corrupt source changed after diagnostic preservation: "+sourceError);
         return true;
     }
     return SetFailure(errorOut,"could not allocate a collision-free diagnostic filename");
