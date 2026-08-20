@@ -84,6 +84,7 @@ static bool g_appFirefox = true, g_appChrome = true, g_appEdge = true;  // ка�
 #define TIMER_HEARTBEAT 4
 #define TIMER_AUTO_FLUSH 5
 #define TIMER_PICKER_TRANSITION 6
+#define TIMER_PICKER_SEARCH_RETRY 7
 #define WM_PICKER_TRANSITION (WM_APP + 16)
 #define WM_PICKER_SEARCH_RETRY (WM_APP + 17)
 #define WM_MOVE_CANCEL_RETRY (WM_APP + 14)
@@ -1772,10 +1773,17 @@ static void SchedulePickerTabSearchRetry(
     if(!g_main || !PickerTabSearchRetryPostNeeded(
             g_pickerTabSearchCache,g_picker.modelGeneration,
             g_picker.searchText)) return;
-    if(PostMessageW(g_main,WM_PICKER_SEARCH_RETRY,0,0))
+    if(PostMessageW(g_main,WM_PICKER_SEARCH_RETRY,0,0)){
+        KillTimer(g_main,TIMER_PICKER_SEARCH_RETRY);
         MarkPickerTabSearchRetryPosted(
             g_pickerTabSearchCache,g_picker.modelGeneration,
             g_picker.searchText);
+        return;
+    }
+    if(MarkPickerTabSearchRetryDeliveryFailed(
+            g_pickerTabSearchCache,g_picker.modelGeneration,
+            g_picker.searchText))
+        SetTimer(g_main,TIMER_PICKER_SEARCH_RETRY,1,nullptr);
 }
 
 static uint64_t RequestSessionWork(AsyncOperationOwner owner,uint64_t operationId,
@@ -5025,6 +5033,7 @@ struct Tile { GUID guid; std::string guidKey; std::wstring name; std::wstring di
 static std::vector<Tile> g_tiles;
 static PickerEffect g_pickerScheduledEffect;
 static bool g_pickerEffectScheduled=false;
+static uint64_t g_pickerEffectNotBeforeMs=0;
 static PickerKickState g_pickerObservationKick;
 static bool g_pickerTerminalizationPending=false;
 static bool g_pickerPumpActive=false;
@@ -5053,11 +5062,13 @@ static bool QuiesceRuntime(HWND messageWindow) noexcept {
         KillTimer(messageWindow,TIMER_HEARTBEAT);
         KillTimer(messageWindow,TIMER_AUTO_FLUSH);
         KillTimer(messageWindow,TIMER_PICKER_TRANSITION);
+        KillTimer(messageWindow,TIMER_PICKER_SEARCH_RETRY);
         g_flushTimerArmed=false;
         g_flushTimerDueMs=0;
         g_heartbeatTimerArmed=false;
         g_moveCancellationRetry.clear();
         g_pickerEffectScheduled=false;
+        g_pickerEffectNotBeforeMs=0;
         g_pickerObservationKick.pending=false;
         g_pickerTerminalizationPending=false;
         g_pickerShutdownDrain=false;
@@ -5733,24 +5744,52 @@ static bool RefreshPickerPaintCache() noexcept {
 
 struct PickerLightweightSnapshot {
     GUID currentDesktop={0};
+    PickerReadValidity currentValidity=PickerReadValidity::Unavailable;
+    PickerForegroundObservation foregroundObservation=
+        PickerForegroundObservation::Unavailable;
     WindowIdentityKey foreground;
+    PickerIdentityValidity activeIdentity=PickerIdentityValidity::Unknown;
     std::wstring cachedTitle;
     bool popupVisible=false;
 };
 
 static bool RefreshPickerHighlightsLightweight() noexcept {
     PickerLightweightSnapshot adopted;
-    bool adoptedForeground=false;
+    PickerLightweightActiveUpdate activeUpdate=
+        PickerLightweightActiveUpdate::Preserved;
     const bool refreshed=RunPickerLightweightRefresh(
         g_picker,
         [](){
             PickerLightweightSnapshot snapshot;
             snapshot.currentDesktop=CurrentDesktopGuid();
+            if(!GuidIsZero(snapshot.currentDesktop))
+                snapshot.currentValidity=PickerReadValidity::Valid;
             snapshot.popupVisible=g_main && IsWindowVisible(g_main)!=FALSE;
+            if(SameIdentity(
+                    g_picker.activeWindow,g_picker.activeWindow)){
+                switch(RecaptureGenericWindowIdentity(
+                        g_picker.activeWindow)){
+                case WindowIdentityRecapture::Match:
+                    snapshot.activeIdentity=PickerIdentityValidity::Match;
+                    break;
+                case WindowIdentityRecapture::Lost:
+                    snapshot.activeIdentity=PickerIdentityValidity::Lost;
+                    break;
+                case WindowIdentityRecapture::Indeterminate:
+                    snapshot.activeIdentity=
+                        PickerIdentityValidity::Indeterminate;
+                    break;
+                }
+            }
             const HWND foreground=GetForegroundWindow();
-            if(foreground && foreground!=g_main){
+            if(foreground==g_main){
+                snapshot.foregroundObservation=
+                    PickerForegroundObservation::Popup;
+            } else if(foreground){
                 snapshot.foreground=CapturePickerWindowIdentity(foreground);
                 if(SameIdentity(snapshot.foreground,snapshot.foreground)){
+                    snapshot.foregroundObservation=
+                        PickerForegroundObservation::ValidExternal;
                     for(const Tile& tile : g_tiles){
                         for(const WinItem& item : tile.windows){
                             if(SameIdentity(
@@ -5760,26 +5799,30 @@ static bool RefreshPickerHighlightsLightweight() noexcept {
                             }
                         }
                     }
+                } else {
+                    snapshot.foregroundObservation=
+                        PickerForegroundObservation::UnusableExternal;
                 }
             }
             return snapshot;
         },
         [&](const PickerLightweightSnapshot& snapshot,PickerState& staged){
-            if(!GuidIsZero(snapshot.currentDesktop))
-                staged.currentDesktop=snapshot.currentDesktop;
             adopted=snapshot;
-            if(AdoptPickerIdleActiveIdentity(
-                    staged,snapshot.foreground,
-                    reinterpret_cast<uintptr_t>(g_main),
-                    reinterpret_cast<uintptr_t>(g_main),
-                    snapshot.popupVisible))
-                adoptedForeground=true;
+            activeUpdate=ApplyPickerLightweightHighlightSnapshot(
+                staged,snapshot.currentValidity,snapshot.currentDesktop,
+                snapshot.foregroundObservation,snapshot.foreground,
+                snapshot.activeIdentity,
+                reinterpret_cast<uintptr_t>(g_main),
+                reinterpret_cast<uintptr_t>(g_main),snapshot.popupVisible);
             return true;
         });
     if(!refreshed) return false;
-    if(adoptedForeground){
+    if(activeUpdate==PickerLightweightActiveUpdate::Adopted){
         g_target=reinterpret_cast<HWND>(adopted.foreground.hwnd);
         g_targetTitle.swap(adopted.cachedTitle);
+    } else if(activeUpdate==PickerLightweightActiveUpdate::Cleared){
+        g_target=nullptr;
+        g_targetTitle.clear();
     }
     const bool cacheReady=RefreshPickerPaintCache();
     if(g_main) InvalidateRect(g_main,nullptr,FALSE);
@@ -6319,14 +6362,43 @@ static PickerObservation ExecutePickerEffect(
 
 static void PumpPickerTransitionWork() noexcept;
 
+static void StagePickerScheduledEffect(
+        const PickerEffect& effect) noexcept {
+    g_pickerScheduledEffect=effect;
+    g_pickerEffectScheduled=true;
+    g_pickerEffectNotBeforeMs=PickerEffectRequiresSettlingDelay(effect.kind)
+        ? PickerSettlingNotBeforeMs(
+            MonotonicNowMs(),MOVE_VERIFY_INTERVAL_MS)
+        : 0;
+}
+
 static bool DeferPickerTransitionWork(bool delayed) noexcept {
     if(!g_main) return false;
     if(g_pickerShutdownDrain) return false;
-    if(delayed && SetTimer(
-            g_main,TIMER_PICKER_TRANSITION,
-            MOVE_VERIFY_INTERVAL_MS,nullptr)) return true;
-    if(PostMessageW(g_main,WM_PICKER_TRANSITION,0,0)) return true;
-    return SetTimer(g_main,TIMER_PICKER_TRANSITION,1,nullptr)!=0;
+    if(delayed){
+        const uint64_t remaining=PickerSettlingDelayRemainingMs(
+            MonotonicNowMs(),g_pickerEffectNotBeforeMs);
+        if(remaining!=0){
+            const UINT wait=static_cast<UINT>((std::min)(
+                remaining,static_cast<uint64_t>(UINT_MAX)));
+            if(SetTimer(g_main,TIMER_PICKER_TRANSITION,
+                        wait?wait:1,nullptr)){
+                g_pickerDurableKickPending=false;
+                return true;
+            }
+            g_pickerDurableKickPending=true;
+            return true;
+        }
+    }
+    if(PostMessageW(g_main,WM_PICKER_TRANSITION,0,0)){
+        g_pickerDurableKickPending=false;
+        return true;
+    }
+    if(SetTimer(g_main,TIMER_PICKER_TRANSITION,1,nullptr)){
+        g_pickerDurableKickPending=false;
+        return true;
+    }
+    return false;
 }
 
 static void QueuePickerEffect(const PickerEffect& effect) noexcept {
@@ -6345,11 +6417,8 @@ static void QueuePickerEffect(const PickerEffect& effect) noexcept {
         g_pickerTerminalizationPending=true;
         return;
     }
-    g_pickerScheduledEffect=effect;
-    g_pickerEffectScheduled=true;
-    const bool delayed=effect.kind==PickerEffectKind::ReadTarget ||
-        effect.kind==PickerEffectKind::ReadPopup ||
-        effect.kind==PickerEffectKind::ReadCurrent;
+    StagePickerScheduledEffect(effect);
+    const bool delayed=PickerEffectRequiresSettlingDelay(effect.kind);
     if(!DeferPickerTransitionWork(delayed) && !g_pickerPumpActive)
         PumpPickerTransitionWork();
 }
@@ -6383,7 +6452,10 @@ static bool FinalizePickerRuntimeTransition() noexcept {
     else
         resumeTabSearch=ConsumePickerTabSearchRetryPostWhenIdle(
             g_pickerTabSearchCache,false,g_picker.modelGeneration,
-            g_picker.searchText);
+            g_picker.searchText) ||
+            ConsumePickerTabSearchRetryDeliveryWhenIdle(
+                g_pickerTabSearchCache,false,g_picker.modelGeneration,
+                g_picker.searchText);
     g_pickerTerminalizationPending=false;
     g_pickerDurableKickPending=false;
     KillTimer(g_main,TIMER_PICKER_TRANSITION);
@@ -6403,6 +6475,7 @@ static void PumpPickerTransitionWork() noexcept {
     g_pickerDurableKickPending=false;
     bool terminalRetryNoProgress=false;
     bool terminalRetryDeferred=false;
+    bool effectDeferredUntilDue=false;
     if(g_main) KillTimer(g_main,TIMER_PICKER_TRANSITION);
     for(unsigned budget=0;budget<256;++budget){
         if(g_pickerObservationKick.pending){
@@ -6412,12 +6485,13 @@ static void PumpPickerTransitionWork() noexcept {
             const PickerEffect next=
                 AdvancePickerTransition(g_picker,observation);
             if(next.kind!=PickerEffectKind::None){
-                g_pickerScheduledEffect=next;
-                g_pickerEffectScheduled=true;
-                if(DeferPickerTransitionWork(
-                        next.kind==PickerEffectKind::ReadTarget ||
-                        next.kind==PickerEffectKind::ReadPopup ||
-                        next.kind==PickerEffectKind::ReadCurrent)) break;
+                StagePickerScheduledEffect(next);
+                const bool delayed=
+                    PickerEffectRequiresSettlingDelay(next.kind);
+                if(DeferPickerTransitionWork(delayed)){
+                    effectDeferredUntilDue=delayed;
+                    break;
+                }
                 continue;
             }
             if(g_picker.transition.terminalAcknowledged){
@@ -6427,10 +6501,37 @@ static void PumpPickerTransitionWork() noexcept {
             continue;
         }
         if(g_pickerEffectScheduled){
+            if(!g_pickerShutdownDrain &&
+               PickerEffectRequiresSettlingDelay(
+                   g_pickerScheduledEffect.kind) &&
+               PickerSettlingDelayRemainingMs(
+                   MonotonicNowMs(),g_pickerEffectNotBeforeMs)!=0){
+                effectDeferredUntilDue=DeferPickerTransitionWork(true);
+                break;
+            }
+            const PickerEffectExecutionRoute executionRoute=
+                RoutePickerEffectExecution(
+                    g_pickerScheduledEffect.kind,g_pickerShutdownDrain);
+            if(executionRoute==
+                    PickerEffectExecutionRoute::DeferUntilDue){
+                effectDeferredUntilDue=true;
+                break;
+            }
             const PickerEffect effect=g_pickerScheduledEffect;
             g_pickerScheduledEffect=PickerEffect{};
             g_pickerEffectScheduled=false;
-            const PickerObservation observation=ExecutePickerEffect(effect);
+            g_pickerEffectNotBeforeMs=0;
+            PickerObservation observation;
+            if(executionRoute==
+                    PickerEffectExecutionRoute::AcknowledgeWithoutUi){
+                observation.generation=effect.generation;
+                observation.effectKind=effect.kind;
+                observation.effectSerial=effect.effectSerial;
+                observation.event=PickerEvent::EffectCompleted;
+                observation.apiAccepted=true;
+            } else {
+                observation=ExecutePickerEffect(effect);
+            }
             const bool posted=!g_pickerShutdownDrain && PostMessageW(
                 g_main,WM_PICKER_TRANSITION,0,0)!=FALSE;
             const bool timer=posted || g_pickerShutdownDrain ? false :
@@ -6458,7 +6559,10 @@ static void PumpPickerTransitionWork() noexcept {
     g_pickerPumpActive=false;
     if((g_pickerEffectScheduled || g_pickerObservationKick.pending ||
         g_pickerTerminalizationPending)){
-        if(terminalRetryNoProgress){
+        if(!PickerPumpImmediateKickAllowed(effectDeferredUntilDue)){
+            // The settling timer (or its durable retry flag) exclusively owns
+            // delivery; shutdown restores that ownership after its bounded pump.
+        } else if(terminalRetryNoProgress){
             if(DecidePickerTerminalNoProgressRoute(
                     g_pickerShutdownDrain,terminalRetryDeferred)==
                     PickerTerminalNoProgressRoute::DurableExternalKick)
@@ -6475,6 +6579,7 @@ static void RequestPickerCancellation() noexcept {
     const bool unissued=DiscardPickerUnissuedEffectForCancel(
         g_pickerScheduledEffect,g_pickerEffectScheduled,
         g_picker.transition);
+    if(unissued) g_pickerEffectNotBeforeMs=0;
     PickerObservation cancel;
     cancel.event=PickerEvent::CancelRequested;
     cancel.generation=g_picker.transition.generation;
@@ -6489,6 +6594,15 @@ static bool DrainPickerForShutdown() noexcept {
         g_picker,[](){ RequestPickerCancellation(); },
         [](){ PumpPickerTransitionWork(); });
     g_pickerShutdownDrain=false;
+    if(!drained && (g_pickerEffectScheduled ||
+       g_pickerObservationKick.pending || g_pickerTerminalizationPending)){
+        const bool delayed=g_pickerEffectScheduled &&
+            PickerEffectRequiresSettlingDelay(g_pickerScheduledEffect.kind);
+        const bool deferred=DeferPickerTransitionWork(delayed);
+        g_pickerDurableKickPending=
+            PickerDurableKickRequiredAfterDefer(
+                deferred,g_pickerDurableKickPending);
+    }
     return drained;
 }
 
@@ -7484,6 +7598,13 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
        !g_pickerShutdownDrain && msg!=WM_PICKER_TRANSITION &&
        g_runtimeQuiescence.acceptsDispatch())
         PumpPickerTransitionWork();
+    if(msg!=WM_TIMER && msg!=WM_PICKER_SEARCH_RETRY &&
+       !g_pickerShutdownDrain && !g_picker.controlledTransition() &&
+       g_runtimeQuiescence.acceptsDispatch() &&
+       PickerTabSearchRetryDeliveryKickNeeded(
+           g_pickerTabSearchCache,g_picker.modelGeneration,
+           g_picker.searchText))
+        SchedulePickerTabSearchRetry();
     switch(msg){
     case WM_HOTKEY: ShowPicker(CapturePickerTarget()); return 0;
     case WM_CLOSE:
@@ -7677,12 +7798,29 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         return 0;
     case WM_TIMER:
         if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
+        if(wp==TIMER_PICKER_SEARCH_RETRY){
+            KillTimer(hwnd,TIMER_PICKER_SEARCH_RETRY);
+            if(ConsumePickerTabSearchRetryDeliveryWhenIdle(
+                    g_pickerTabSearchCache,g_picker.controlledTransition(),
+                    g_picker.modelGeneration,g_picker.searchText))
+                EnsureTabSearch();
+            return 0;
+        }
         if(wp==TIMER_PICKER_TRANSITION){
             if(g_picker.controlledTransition() || g_pickerEffectScheduled ||
                g_pickerObservationKick.pending ||
                g_pickerTerminalizationPending){
                 PumpPickerTransitionWork();
             } else {
+                if(PickerTabSearchRetryDeliveryKickNeeded(
+                        g_pickerTabSearchCache,g_picker.modelGeneration,
+                        g_picker.searchText)){
+                    SchedulePickerTabSearchRetry();
+                    if(PickerTabSearchRetryDeliveryKickNeeded(
+                            g_pickerTabSearchCache,
+                            g_picker.modelGeneration,g_picker.searchText))
+                        return 0;
+                }
                 KillTimer(hwnd,TIMER_PICKER_TRANSITION);
                 RefreshPickerHighlightsLightweight();
                 ArmPickerIdleRefresh();

@@ -402,6 +402,53 @@ enum class PickerEffectKind {
     ShowAndFocus, Hide, ReportFailure
 };
 
+enum class PickerEffectExecutionRoute {
+    Execute, DeferUntilDue, AcknowledgeWithoutUi
+};
+
+inline bool PickerEffectRequiresSettlingDelay(
+        PickerEffectKind kind) noexcept {
+    return kind==PickerEffectKind::ReadTarget ||
+           kind==PickerEffectKind::ReadPopup ||
+           kind==PickerEffectKind::ReadCurrent;
+}
+
+inline uint64_t PickerSettlingNotBeforeMs(
+        uint64_t nowMs,uint64_t delayMs) noexcept {
+    return nowMs>(std::numeric_limits<uint64_t>::max)()-delayMs
+        ? (std::numeric_limits<uint64_t>::max)() : nowMs+delayMs;
+}
+
+inline uint64_t PickerSettlingDelayRemainingMs(
+        uint64_t nowMs,uint64_t notBeforeMs) noexcept {
+    return nowMs<notBeforeMs ? notBeforeMs-nowMs : 0;
+}
+
+inline bool PickerPumpImmediateKickAllowed(
+        bool effectDeferredUntilDue) noexcept {
+    return !effectDeferredUntilDue;
+}
+
+inline bool PickerDurableKickRequiredAfterDefer(
+        bool deferAccepted,bool durableKickPublished) noexcept {
+    return !deferAccepted || durableKickPublished;
+}
+
+inline PickerEffectExecutionRoute RoutePickerEffectExecution(
+        PickerEffectKind kind,bool shutdownDrain) noexcept {
+    if(!shutdownDrain) return PickerEffectExecutionRoute::Execute;
+    if(PickerEffectRequiresSettlingDelay(kind))
+        return PickerEffectExecutionRoute::DeferUntilDue;
+    switch(kind){
+    case PickerEffectKind::Refresh:
+    case PickerEffectKind::ShowAndFocus:
+    case PickerEffectKind::ReportFailure:
+        return PickerEffectExecutionRoute::AcknowledgeWithoutUi;
+    default:
+        return PickerEffectExecutionRoute::Execute;
+    }
+}
+
 enum class PickerReadValidity { Unknown, Valid, Unavailable };
 enum class PickerIdentityValidity { Unknown, Match, Lost, Indeterminate };
 enum class PopupSaveStatus { NotTracked, Saved, Failed };
@@ -476,9 +523,11 @@ struct PickerTransition {
     bool targetMayHaveMoved=false;
     bool popupMayHaveMoved=false;
     bool switchMayHaveChanged=false;
+    bool rollbackVerificationRequired=false;
     bool targetUnresolvedBeforeIssue=false;
     bool popupUnresolvedBeforeIssue=false;
     bool switchUnresolvedBeforeIssue=false;
+    bool postSwitchPopupRepair=false;
     bool cancelRequested=false;
     bool dismissed=false;
     bool failed=false;
@@ -529,12 +578,15 @@ struct PickerTransition {
         std::swap(targetMayHaveMoved,other.targetMayHaveMoved);
         std::swap(popupMayHaveMoved,other.popupMayHaveMoved);
         std::swap(switchMayHaveChanged,other.switchMayHaveChanged);
+        std::swap(rollbackVerificationRequired,
+                  other.rollbackVerificationRequired);
         std::swap(targetUnresolvedBeforeIssue,
                   other.targetUnresolvedBeforeIssue);
         std::swap(popupUnresolvedBeforeIssue,
                   other.popupUnresolvedBeforeIssue);
         std::swap(switchUnresolvedBeforeIssue,
                   other.switchUnresolvedBeforeIssue);
+        std::swap(postSwitchPopupRepair,other.postSwitchPopupRepair);
         std::swap(cancelRequested,other.cancelRequested);
         std::swap(dismissed,other.dismissed);
         std::swap(failed,other.failed);
@@ -1302,6 +1354,39 @@ inline bool AdoptPickerIdleActiveIdentity(
     return true;
 }
 
+enum class PickerForegroundObservation {
+    Unavailable, Popup, ValidExternal, UnusableExternal
+};
+
+enum class PickerLightweightActiveUpdate { Preserved, Adopted, Cleared };
+
+inline PickerLightweightActiveUpdate ApplyPickerLightweightHighlightSnapshot(
+        PickerState& state,PickerReadValidity currentValidity,
+        const GUID& currentDesktop,
+        PickerForegroundObservation foreground,
+        const WindowIdentityKey& foregroundIdentity,
+        PickerIdentityValidity activeIdentity,
+        uintptr_t popupHwnd,uintptr_t mainHwnd,
+        bool popupVisible) noexcept {
+    if(state.controlledTransition())
+        return PickerLightweightActiveUpdate::Preserved;
+    state.currentDesktop=
+        currentValidity==PickerReadValidity::Valid &&
+        !GuidIsZero(currentDesktop) ? currentDesktop : GUID{};
+    if(!popupVisible)
+        return PickerLightweightActiveUpdate::Preserved;
+    if(foreground==PickerForegroundObservation::ValidExternal &&
+       AdoptPickerIdleActiveIdentity(
+           state,foregroundIdentity,popupHwnd,mainHwnd,popupVisible))
+        return PickerLightweightActiveUpdate::Adopted;
+    if(foreground==PickerForegroundObservation::UnusableExternal ||
+       activeIdentity==PickerIdentityValidity::Lost){
+        state.activeWindow=WindowIdentityKey{};
+        return PickerLightweightActiveUpdate::Cleared;
+    }
+    return PickerLightweightActiveUpdate::Preserved;
+}
+
 struct PickerTabSearchCacheState {
     uint64_t attemptId=0;
     uint64_t modelGeneration=0;
@@ -1311,6 +1396,7 @@ struct PickerTabSearchCacheState {
     bool retryNeeded=false;
     bool routeFreed=false;
     bool retryPosted=false;
+    bool retryDeliveryPending=false;
     unsigned retryAttempts=0;
     unsigned blockedAppMask=0;
     bool blockedOnAnyRoute=false;
@@ -1373,6 +1459,7 @@ inline bool BeginPickerTabSearchAttempt(
         cache.retryNeeded=false;
         cache.routeFreed=false;
         cache.retryPosted=false;
+        cache.retryDeliveryPending=false;
         cache.blockedAppMask=0;
         cache.blockedOnAnyRoute=false;
         if(retrying) ++cache.retryAttempts;
@@ -1411,6 +1498,7 @@ inline bool CompletePickerTabSearchAttempt(
     if(cache.ready){
         cache.routeFreed=false;
         cache.retryPosted=false;
+        cache.retryDeliveryPending=false;
         cache.blockedAppMask=0;
         cache.blockedOnAnyRoute=false;
     }
@@ -1440,6 +1528,36 @@ inline bool MarkPickerTabSearchRetryPosted(
     if(!PickerTabSearchRetryPostNeeded(
             cache,modelGeneration,normalizedQuery)) return false;
     cache.retryPosted=true;
+    cache.retryDeliveryPending=false;
+    return true;
+}
+
+inline bool MarkPickerTabSearchRetryDeliveryFailed(
+        PickerTabSearchCacheState& cache,uint64_t modelGeneration,
+        const std::wstring& normalizedQuery) noexcept {
+    if(!PickerTabSearchRetryPostNeeded(
+            cache,modelGeneration,normalizedQuery)) return false;
+    cache.retryDeliveryPending=true;
+    return true;
+}
+
+inline bool PickerTabSearchRetryDeliveryKickNeeded(
+        const PickerTabSearchCacheState& cache,uint64_t modelGeneration,
+        const std::wstring& normalizedQuery) noexcept {
+    return cache.retryDeliveryPending &&
+           PickerTabSearchRetryPostNeeded(
+               cache,modelGeneration,normalizedQuery);
+}
+
+inline bool ConsumePickerTabSearchRetryDeliveryWhenIdle(
+        PickerTabSearchCacheState& cache,bool controlledTransition,
+        uint64_t modelGeneration,
+        const std::wstring& normalizedQuery) noexcept {
+    if(controlledTransition ||
+       !PickerTabSearchRetryDeliveryKickNeeded(
+           cache,modelGeneration,normalizedQuery)) return false;
+    cache.retryDeliveryPending=false;
+    cache.routeFreed=false;
     return true;
 }
 
@@ -1449,6 +1567,7 @@ inline bool ConsumePickerTabSearchRetryPost(
     if(!cache.retryPosted || !PickerTabSearchKeyMatches(
             cache,modelGeneration,normalizedQuery)) return false;
     cache.retryPosted=false;
+    cache.retryDeliveryPending=false;
     cache.routeFreed=false;
     return true;
 }
@@ -1471,6 +1590,7 @@ inline void InvalidatePickerTabSearchCache(
     cache.retryNeeded=false;
     cache.routeFreed=false;
     cache.retryPosted=false;
+    cache.retryDeliveryPending=false;
     cache.retryAttempts=0;
     cache.blockedAppMask=0;
     cache.blockedOnAnyRoute=false;
@@ -1713,6 +1833,10 @@ inline PickerEffect PickerContinueRollbackAfterPopup(
         PickerState& state) noexcept {
     if(state.transition.switchMayHaveChanged)
         return PickerIssueSwitch(state,true);
+    if(state.transition.rollbackVerificationRequired){
+        state.transition.phase=PickerPhase::OriginVerify;
+        return EmitPickerEffect(state,PickerEffectKind::ReadCurrent);
+    }
     return PickerStartRefresh(state);
 }
 
@@ -1720,6 +1844,10 @@ inline PickerEffect PickerContinueRollbackAfterTarget(
         PickerState& state) noexcept {
     if(state.transition.popupMayHaveMoved)
         return PickerIssuePopup(state,true);
+    if(state.transition.rollbackVerificationRequired){
+        state.transition.phase=PickerPhase::RollbackPopupVerify;
+        return EmitPickerEffect(state,PickerEffectKind::ReadPopup);
+    }
     return PickerContinueRollbackAfterPopup(state);
 }
 
@@ -1728,11 +1856,21 @@ inline PickerEffect PickerBeginRollback(PickerState& state,
     PickerTransition& transition=state.transition;
     transition.failed=true;
     PickerAppendDiagnostic(transition,diagnostic);
+    transition.rollbackVerificationRequired=
+        transition.rollbackVerificationRequired ||
+        transition.targetMayHaveMoved || transition.popupMayHaveMoved ||
+        transition.switchMayHaveChanged;
+    if(!transition.rollbackVerificationRequired)
+        return PickerStartRefresh(state);
     if(transition.targetMayHaveMoved && !transition.targetIdentityUnusable)
         return PickerIssueTarget(state,true);
     if(transition.targetMayHaveMoved && transition.targetIdentityUnusable)
         PickerAppendDiagnostic(
             transition,L"The target identity cannot be safely rolled back.");
+    if(!transition.targetIdentityUnusable){
+        transition.phase=PickerPhase::RollbackTargetVerify;
+        return EmitPickerEffect(state,PickerEffectKind::ReadTarget);
+    }
     return PickerContinueRollbackAfterTarget(state);
 }
 
@@ -1751,22 +1889,25 @@ inline PickerEffect PickerResumeAfterHide(PickerState& state) noexcept {
         return PickerNoEffect();
     case PickerPhase::RollbackTargetIssue:
     case PickerPhase::RollbackTargetVerify:
-        if(transition.targetMayHaveMoved &&
-           !transition.targetIdentityUnusable){
+        if(!transition.targetIdentityUnusable &&
+           (transition.targetMayHaveMoved ||
+            transition.rollbackVerificationRequired)){
             transition.phase=PickerPhase::RollbackTargetVerify;
             return EmitPickerEffect(state,PickerEffectKind::ReadTarget);
         }
         return PickerContinueRollbackAfterTarget(state);
     case PickerPhase::RollbackPopupIssue:
     case PickerPhase::RollbackPopupVerify:
-        if(transition.popupMayHaveMoved){
+        if(transition.popupMayHaveMoved ||
+           transition.rollbackVerificationRequired){
             transition.phase=PickerPhase::RollbackPopupVerify;
             return EmitPickerEffect(state,PickerEffectKind::ReadPopup);
         }
         return PickerContinueRollbackAfterPopup(state);
     case PickerPhase::RollbackSwitchIssue:
     case PickerPhase::OriginVerify:
-        if(transition.switchMayHaveChanged){
+        if(transition.switchMayHaveChanged ||
+           transition.rollbackVerificationRequired){
             transition.phase=PickerPhase::OriginVerify;
             return EmitPickerEffect(state,PickerEffectKind::ReadCurrent);
         }
@@ -1825,9 +1966,11 @@ inline PickerEffect AdvancePickerTransition(
         transition.targetMayHaveMoved=false;
         transition.popupMayHaveMoved=false;
         transition.switchMayHaveChanged=false;
+        transition.rollbackVerificationRequired=false;
         transition.targetUnresolvedBeforeIssue=false;
         transition.popupUnresolvedBeforeIssue=false;
         transition.switchUnresolvedBeforeIssue=false;
+        transition.postSwitchPopupRepair=false;
         transition.observedTargetDesktop=transition.targetOrigin;
         transition.observedPopupDesktop=transition.popupOrigin;
         transition.observedCurrentDesktop=transition.currentOrigin;
@@ -1889,6 +2032,8 @@ inline PickerEffect AdvancePickerTransition(
     case PickerPhase::TargetIssue:
         if(acknowledged==PickerEffectKind::MoveTarget &&
            observation.event==PickerEvent::ApiCompleted){
+            if(observation.apiInvoked)
+                transition.rollbackVerificationRequired=true;
             if(!observation.apiInvoked ||
                !PickerIdentityMatches(observation.identity)){
                 if(!observation.apiInvoked)
@@ -1947,6 +2092,8 @@ inline PickerEffect AdvancePickerTransition(
     case PickerPhase::PopupIssue:
         if(acknowledged==PickerEffectKind::MovePopup &&
            observation.event==PickerEvent::ApiCompleted){
+            if(observation.apiInvoked)
+                transition.rollbackVerificationRequired=true;
             if(!observation.apiInvoked){
                 transition.popupMayHaveMoved=
                     transition.popupUnresolvedBeforeIssue;
@@ -1965,6 +2112,15 @@ inline PickerEffect AdvancePickerTransition(
             transition.observedPopupDesktop=observation.actualPopupDesktop;
             if(PickerReadMatches(observation.popupRead,
                     observation.actualPopupDesktop,transition.destination)){
+                if(transition.postSwitchPopupRepair){
+                    transition.postSwitchPopupRepair=false;
+                    transition.observedCurrentValidity=
+                        PickerReadValidity::Unknown;
+                    transition.observedCurrentDesktop=GUID{};
+                    transition.phase=PickerPhase::DestinationVerify;
+                    return EmitPickerEffect(
+                        state,PickerEffectKind::ReadCurrent);
+                }
                 transition.phase=PickerPhase::IdentityVerifyBeforeSwitch;
                 return EmitPickerEffect(state,PickerEffectKind::ValidateTarget);
             }
@@ -2010,6 +2166,8 @@ inline PickerEffect AdvancePickerTransition(
     case PickerPhase::SwitchIssue:
         if(acknowledged==PickerEffectKind::SwitchDesktop &&
            observation.event==PickerEvent::ApiCompleted){
+            if(observation.apiInvoked)
+                transition.rollbackVerificationRequired=true;
             if(!observation.apiInvoked ||
                !PickerIdentityMatches(observation.identity)){
                 transition.switchMayHaveChanged=
@@ -2060,6 +2218,10 @@ inline PickerEffect AdvancePickerTransition(
                 observation.popupRead,observation.actualPopupDesktop,
                 transition.currentOrigin);
             if(transition.forwardPopupAttempts<4){
+                transition.postSwitchPopupRepair=true;
+                transition.observedCurrentValidity=
+                    PickerReadValidity::Unknown;
+                transition.observedCurrentDesktop=GUID{};
                 transition.phase=PickerPhase::IdentityVerifyBeforePopup;
                 return EmitPickerEffect(state,PickerEffectKind::ValidateTarget);
             }
