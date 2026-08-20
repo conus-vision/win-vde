@@ -801,6 +801,24 @@ static std::string CountingRecordIdGenerator(){
     return DeterministicRecordId(MAX_LAYOUT_RECORDS+100+call);
 }
 
+static size_t& CountingReconcileMatcherCalls(){
+    static size_t calls=0;
+    return calls;
+}
+
+static void ResetCountingReconcileMatcher(){
+    CountingReconcileMatcherCalls()=0;
+}
+
+static std::vector<LayoutMatch> CountingReconcileMatcher(
+        const std::vector<LayoutWin>& saved,
+        const std::vector<LayoutWin>& live,
+        double acceptScore,
+        bool* tooComplex){
+    ++CountingReconcileMatcherCalls();
+    return MatchOneToOne(saved,live,acceptScore,tooComplex);
+}
+
 static bool SameLayoutWinFields(const LayoutWin& left, const LayoutWin& right){
     return left.recordId==right.recordId && left.app==right.app &&
         left.deskIndex==right.deskIndex && GuidEq(left.desktop,right.desktop) &&
@@ -1387,6 +1405,149 @@ static void test_reconcile_window_caps_defer_before_generation(){
     CHECK(liveOverflow.newRecords.empty());
     CHECK(liveOverflow.missingSavedIndices.empty());
     CHECK(CountingRecordIdGeneratorCalls()==0);
+    ResetCountingRecordIdGenerator();
+}
+
+static void test_reconcile_malformed_reserved_id_defers_before_work(){
+    const UnixSeconds now=2000001650;
+    LayoutWin saved=ReconcileTestRecord(
+        DeterministicRecordId(17000),"chrome","Saved","same.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-10);
+    LayoutWin live=MatchRecord("chrome","Saved","same.example",1,{{"same.example",1}});
+    live.deskIndex=1;
+    live.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+
+    ResetCountingRecordIdGenerator();
+    ResetCountingReconcileMatcher();
+    ReconcilePlan plan=PlanAppReconcile(
+        {saved},{live},"chrome",now,{"not-a-guid"},ReconcileFreshness::Fresh,
+        CountingRecordIdGenerator,CountingReconcileMatcher);
+
+    CHECK(plan.app=="chrome" && plan.nowUtc==now &&
+        plan.freshness==ReconcileFreshness::Fresh);
+    CHECK(plan.deferred);
+    CHECK(plan.matches.empty());
+    CHECK(plan.restores.empty());
+    CHECK(plan.newRecords.empty());
+    CHECK(plan.missingSavedIndices.empty());
+    CHECK(CountingReconcileMatcherCalls()==0);
+    CHECK(CountingRecordIdGeneratorCalls()==0);
+    ResetCountingReconcileMatcher();
+    ResetCountingRecordIdGenerator();
+}
+
+static void test_reconcile_reserved_id_cap_is_fail_closed_at_boundary(){
+    const UnixSeconds now=2000001675;
+    LayoutWin live=MatchRecord("chrome","New","new.example",1,{{"new.example",1}});
+    live.deskIndex=1;
+    live.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+    std::set<std::string> oversized;
+    for(size_t i=0;i<MAX_LAYOUT_RECORDS+1;++i)
+        oversized.insert(DeterministicRecordId(18000+i));
+
+    ResetCountingRecordIdGenerator();
+    ResetCountingReconcileMatcher();
+    ReconcilePlan rejected=PlanAppReconcile(
+        {},{live},"chrome",now,oversized,ReconcileFreshness::Fresh,
+        CountingRecordIdGenerator,CountingReconcileMatcher);
+    CHECK(rejected.app=="chrome" && rejected.nowUtc==now &&
+        rejected.freshness==ReconcileFreshness::Fresh);
+    CHECK(rejected.deferred);
+    CHECK(rejected.matches.empty());
+    CHECK(rejected.restores.empty());
+    CHECK(rejected.newRecords.empty());
+    CHECK(rejected.missingSavedIndices.empty());
+    CHECK(CountingReconcileMatcherCalls()==0);
+    CHECK(CountingRecordIdGeneratorCalls()==0);
+
+    LayoutWin bound=ReconcileTestRecord(
+        "{ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAC}","chrome","Same","same.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-10);
+    LayoutWin duplicate=MatchRecord("chrome","Same","same.example",1,{{"same.example",1}});
+    duplicate.deskIndex=2;
+    duplicate.desktop=G(L"{231A0000-0000-0000-0000-000000000003}");
+    std::set<std::string> exact={"abcdefab-cdef-abcd-efab-cdefabcdefac"};
+    for(size_t i=0;i<MAX_LAYOUT_RECORDS-1;++i)
+        exact.insert(DeterministicRecordId(23000+i));
+    CHECK(exact.size()==MAX_LAYOUT_RECORDS);
+
+    ResetCountingRecordIdGenerator();
+    ResetCountingReconcileMatcher();
+    ReconcilePlan accepted=PlanAppReconcile(
+        {bound},{duplicate},"chrome",now,exact,ReconcileFreshness::Fresh,
+        CountingRecordIdGenerator,CountingReconcileMatcher);
+    CHECK(!accepted.deferred);
+    CHECK(accepted.matches.empty());
+    CHECK(accepted.restores.empty());
+    CHECK(accepted.missingSavedIndices.empty());
+    CHECK(accepted.newRecords.size()==1 && accepted.newRecords[0].liveIndex==0);
+    CHECK(CountingReconcileMatcherCalls()==1);
+    CHECK(CountingRecordIdGeneratorCalls()==1);
+    ResetCountingReconcileMatcher();
+    ResetCountingRecordIdGenerator();
+}
+
+static void test_reconcile_guaranteed_capacity_defers_before_matcher(){
+    const UnixSeconds now=2000001685;
+    const size_t chromeSavedCount=64;
+    std::vector<LayoutWin> existing;
+    existing.reserve(MAX_LAYOUT_RECORDS);
+    for(size_t i=0;i<MAX_LAYOUT_RECORDS;++i){
+        const bool chrome=i>=MAX_LAYOUT_RECORDS-chromeSavedCount;
+        LayoutWin record=ReconcileTestRecord(
+            DeterministicRecordId(28000+i),chrome ? "chrome" : "firefox",
+            chrome ? "Chrome" : "Firefox",chrome ? "same.example" : "ff.example",0,
+            G(L"{231A0000-0000-0000-0000-000000000001}"),now-10);
+        existing.push_back(record);
+    }
+    LayoutWin liveChrome=MatchRecord(
+        "chrome","Chrome","same.example",1,{{"same.example",1}});
+    liveChrome.deskIndex=0;
+    liveChrome.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    std::vector<LayoutWin> overflowLive(chromeSavedCount+1,liveChrome);
+
+    ResetCountingRecordIdGenerator();
+    ResetCountingReconcileMatcher();
+    ReconcilePlan overflow=PlanAppReconcile(
+        existing,overflowLive,"chrome",now,{},ReconcileFreshness::Fresh,
+        CountingRecordIdGenerator,CountingReconcileMatcher);
+    CHECK(overflow.app=="chrome" && overflow.nowUtc==now &&
+        overflow.freshness==ReconcileFreshness::Fresh);
+    CHECK(overflow.deferred);
+    CHECK(overflow.matches.empty());
+    CHECK(overflow.restores.empty());
+    CHECK(overflow.newRecords.empty());
+    CHECK(overflow.missingSavedIndices.empty());
+    CHECK(CountingReconcileMatcherCalls()==0);
+    CHECK(CountingRecordIdGeneratorCalls()==0);
+
+    std::vector<LayoutWin> exactLive(chromeSavedCount,liveChrome);
+    ResetCountingRecordIdGenerator();
+    ResetCountingReconcileMatcher();
+    ReconcilePlan exact=PlanAppReconcile(
+        existing,exactLive,"chrome",now,{},ReconcileFreshness::Fresh,
+        CountingRecordIdGenerator,CountingReconcileMatcher);
+    CHECK(!exact.deferred);
+    CHECK(exact.matches.size()==chromeSavedCount);
+    CHECK(exact.restores.empty());
+    CHECK(exact.newRecords.empty());
+    CHECK(exact.missingSavedIndices.empty());
+    CHECK(CountingReconcileMatcherCalls()==1);
+    CHECK(CountingRecordIdGeneratorCalls()==0);
+
+    ResetCountingRecordIdGenerator();
+    ResetCountingReconcileMatcher();
+    ReconcilePlan noMatcher=PlanAppReconcile(
+        {},{liveChrome},"chrome",now,{},ReconcileFreshness::Fresh,
+        CountingRecordIdGenerator,nullptr);
+    CHECK(noMatcher.deferred);
+    CHECK(noMatcher.matches.empty());
+    CHECK(noMatcher.restores.empty());
+    CHECK(noMatcher.newRecords.empty());
+    CHECK(noMatcher.missingSavedIndices.empty());
+    CHECK(CountingReconcileMatcherCalls()==0);
+    CHECK(CountingRecordIdGeneratorCalls()==0);
+    ResetCountingReconcileMatcher();
     ResetCountingRecordIdGenerator();
 }
 
@@ -7594,6 +7755,9 @@ int main(){
     test_reconcile_null_generator_defers_transactionally();
     test_reconcile_match_preflight_too_complex_defers_cleanly();
     test_reconcile_window_caps_defer_before_generation();
+    test_reconcile_malformed_reserved_id_defers_before_work();
+    test_reconcile_reserved_id_cap_is_fail_closed_at_boundary();
+    test_reconcile_guaranteed_capacity_defers_before_matcher();
     test_reconcile_unsupported_app_defers_without_generation();
     test_commit_reconcile_rejects_out_of_range_mixed_plan_atomically();
     test_commit_reconcile_rejects_malformed_restore_sets_atomically();

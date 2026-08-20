@@ -37,6 +37,12 @@ struct ReconcilePlan {
     std::vector<size_t> missingSavedIndices;
 };
 
+using ReconcileMatcher = std::vector<LayoutMatch> (*)(
+    const std::vector<LayoutWin>&,
+    const std::vector<LayoutWin>&,
+    double,
+    bool*);
+
 inline ReconcilePlan PlanAppReconcile(
         const std::vector<LayoutWin>& existing,
         const std::vector<LayoutWin>& live,
@@ -44,7 +50,8 @@ inline ReconcilePlan PlanAppReconcile(
         UnixSeconds nowUtc,
         const std::set<std::string>& reservedRecordIds={},
         ReconcileFreshness freshness=ReconcileFreshness::Fresh,
-        RecordIdGenerator idGenerator=NewRecordId){
+        RecordIdGenerator idGenerator=NewRecordId,
+        ReconcileMatcher matcher=MatchOneToOne){
     ReconcilePlan plan;
     plan.app=app;
     plan.nowUtc=nowUtc;
@@ -60,7 +67,8 @@ inline ReconcilePlan PlanAppReconcile(
     if(!IsSupportedLayoutApp(app) || nowUtc<=0 ||
             (freshness!=ReconcileFreshness::Fresh &&
              freshness!=ReconcileFreshness::CachedStale) ||
-            existing.size()>MAX_LAYOUT_RECORDS || live.size()>MAX_LAYOUT_RECORDS)
+            existing.size()>MAX_LAYOUT_RECORDS || live.size()>MAX_LAYOUT_RECORDS ||
+            reservedRecordIds.size()>MAX_LAYOUT_RECORDS || !matcher)
         return deferredPlan();
 
     std::set<std::string> occupiedRecordIds;
@@ -78,7 +86,7 @@ inline ReconcilePlan PlanAppReconcile(
     for(const std::string& recordId : reservedRecordIds){
         GUID id{};
         std::string canonicalId;
-        if(!ParseNonzeroLayoutGuid(recordId,id,&canonicalId)) continue;
+        if(!ParseNonzeroLayoutGuid(recordId,id,&canonicalId)) return deferredPlan();
         occupiedRecordIds.insert(canonicalId);
         reservedRecordIdKeys.insert(canonicalId);
     }
@@ -95,8 +103,21 @@ inline ReconcilePlan PlanAppReconcile(
         originalIndices.push_back(i);
     }
 
+    size_t retainedExisting=0;
+    for(const LayoutWin& record : existing)
+        if(!IsExpired(record,nowUtc)) ++retainedExisting;
+    size_t liveAppCount=0;
+    for(const LayoutWin& record : live)
+        if(record.app==app) ++liveAppCount;
+    const size_t unavoidableNew=
+        liveAppCount>eligible.size() ? liveAppCount-eligible.size() : 0;
+    if(freshness==ReconcileFreshness::Fresh &&
+            (retainedExisting>MAX_LAYOUT_RECORDS ||
+             unavoidableNew>MAX_LAYOUT_RECORDS-retainedExisting))
+        return deferredPlan();
+
     bool tooComplex=false;
-    std::vector<LayoutMatch> assigned=MatchOneToOne(eligible,live,0.55,&tooComplex);
+    std::vector<LayoutMatch> assigned=matcher(eligible,live,0.55,&tooComplex);
     if(tooComplex) return deferredPlan();
 
     std::vector<bool> matchedSaved(existing.size(),false);
@@ -117,9 +138,6 @@ inline ReconcilePlan PlanAppReconcile(
     }
 
     if(freshness==ReconcileFreshness::Fresh){
-        size_t retainedExisting=0;
-        for(const LayoutWin& record : existing)
-            if(!IsExpired(record,nowUtc)) ++retainedExisting;
         size_t newRecordCount=0;
         for(size_t i=0;i<live.size();++i)
             if(live[i].app==app && !matchedLive[i]) ++newRecordCount;
