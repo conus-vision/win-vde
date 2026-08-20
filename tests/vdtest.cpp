@@ -3,6 +3,7 @@
 #define UNICODE
 #define _UNICODE
 #include "session_worker.hpp" // must be self-contained at first include
+#include "move_queue.hpp"
 #include "str_util.hpp"
 #include "layout.hpp"
 #include "layout_store.hpp"
@@ -16,8 +17,10 @@
 #include <deque>
 #include <memory>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -82,6 +85,393 @@ static void test_strict_counts_parsing(){
 }
 
 static GUID G(const wchar_t* s){ GUID g{}; StringToGuid(s, g); return g; }
+
+static MoveJob MJ(MoveOwner owner, uint64_t operationId,
+                  uint64_t jobId, const char* runtimeKey){
+    MoveJob job;
+    job.token={owner,operationId,jobId,0};
+    job.runtimeKey=runtimeKey;
+    job.recordId="record-"+std::to_string(jobId);
+    job.destination=G(L"{231A0000-0000-0000-0000-000000000001}");
+    return job;
+}
+
+static void check_move_result(const MoveResult& result,MoveTerminal terminal,
+                              const MoveJob& job,int attempts){
+    CHECK(result.completed);
+    CHECK(result.terminal==terminal);
+    CHECK(result.attempts==attempts);
+    CHECK(result.token.owner==job.token.owner);
+    CHECK(result.token.operationId==job.token.operationId);
+    CHECK(result.token.jobId==job.token.jobId);
+    CHECK(result.token.itemIndex==job.token.itemIndex);
+    CHECK(result.runtimeKey==job.runtimeKey);
+    CHECK(result.recordId==job.recordId);
+}
+
+static void check_empty_move_result(const MoveResult& result){
+    CHECK(!result.completed);
+    CHECK(result.terminal==MoveTerminal::None);
+    CHECK(result.attempts==0);
+    CHECK(result.token.owner==MoveOwner::AutoReconcile);
+    CHECK(result.token.operationId==0);
+    CHECK(result.token.jobId==0);
+    CHECK(result.token.itemIndex==0);
+    CHECK(result.runtimeKey.empty());
+    CHECK(result.recordId.empty());
+}
+
+static_assert(std::is_same<decltype(std::declval<MoveQueue&>().front()),
+                           const MoveJob*>::value,
+              "MoveQueue::front must expose read-only state");
+
+static void test_move_queue_alternates_issue_verify_and_succeeds(){
+    MoveQueue queue;
+    CHECK(queue.empty());
+    CHECK(queue.front()==nullptr);
+    CHECK(queue.nextAction()==MoveAction::None);
+    check_empty_move_result(queue.onIssued(MoveAttemptOutcome::Accepted));
+    check_empty_move_result(queue.onVerified(MoveAttemptOutcome::OnDestination));
+    check_empty_move_result(queue.cancelJob(77));
+
+    MoveJob job=MJ(MoveOwner::Picker,101,1001,"picker-runtime");
+    job.token.itemIndex=7;
+    job.recordId="{00000000-0000-0000-0000-000000001001}";
+    CHECK(queue.enqueue(job));
+    CHECK(!queue.empty());
+    CHECK(queue.front()!=nullptr && queue.front()->token.jobId==1001);
+    CHECK(queue.nextAction()==MoveAction::Issue);
+
+    MoveResult issued=queue.onIssued(MoveAttemptOutcome::Accepted);
+    CHECK(!issued.completed);
+    CHECK(issued.terminal==MoveTerminal::None);
+    CHECK(issued.attempts==1);
+    CHECK(issued.token.owner==MoveOwner::Picker);
+    CHECK(issued.token.operationId==101);
+    CHECK(issued.token.jobId==1001);
+    CHECK(issued.token.itemIndex==7);
+    CHECK(issued.runtimeKey==job.runtimeKey);
+    CHECK(issued.recordId==job.recordId);
+    CHECK(queue.front()!=nullptr && queue.front()->attempts==1);
+    CHECK(queue.front()!=nullptr && queue.front()->waitingForVerify);
+    CHECK(queue.nextAction()==MoveAction::Verify);
+
+    MoveResult verified=queue.onVerified(MoveAttemptOutcome::OnDestination);
+    check_move_result(verified,MoveTerminal::Succeeded,job,1);
+    CHECK(queue.empty());
+    CHECK(queue.front()==nullptr);
+    CHECK(queue.nextAction()==MoveAction::None);
+}
+
+static void test_move_queue_enqueue_validates_identity_state_and_copies_guid(){
+    MoveQueue queue;
+    MoveJob valid=MJ(MoveOwner::AutoReconcile,111,1101,"");
+    valid.recordId.clear();
+    GUID expectedDestination=valid.destination;
+    CHECK(queue.enqueue(valid));
+    valid.token.operationId=999;
+    valid.token.jobId=999;
+    valid.destination=GUID{};
+    CHECK(queue.front()!=nullptr && queue.front()->token.operationId==111);
+    CHECK(queue.front()!=nullptr && queue.front()->token.jobId==1101);
+    CHECK(queue.front()!=nullptr && GuidEq(queue.front()->destination,expectedDestination));
+    CHECK(queue.front()!=nullptr && queue.front()->runtimeKey.empty());
+    CHECK(queue.front()!=nullptr && queue.front()->recordId.empty());
+
+    MoveJob zeroOperation=MJ(MoveOwner::ManualTray,0,1102,"runtime");
+    MoveJob zeroJob=MJ(MoveOwner::ManualTray,112,0,"runtime");
+    MoveJob invalidOwner=MJ(static_cast<MoveOwner>(-1),112,1102,"runtime");
+    MoveJob zeroDestination=MJ(MoveOwner::ManualTray,112,1102,"runtime");
+    zeroDestination.destination=GUID{};
+    MoveJob attempted=MJ(MoveOwner::ManualTray,112,1102,"runtime");
+    attempted.attempts=1;
+    MoveJob waiting=MJ(MoveOwner::ManualTray,112,1102,"runtime");
+    waiting.waitingForVerify=true;
+    MoveJob duplicateId=MJ(MoveOwner::Picker,999,1101,"different-runtime");
+    CHECK(!queue.enqueue(zeroOperation));
+    CHECK(!queue.enqueue(zeroJob));
+    CHECK(!queue.enqueue(invalidOwner));
+    CHECK(!queue.enqueue(zeroDestination));
+    CHECK(!queue.enqueue(attempted));
+    CHECK(!queue.enqueue(waiting));
+    CHECK(!queue.enqueue(duplicateId));
+    CHECK(queue.front()!=nullptr && queue.front()->token.jobId==1101);
+
+    MoveResult cancelled=queue.cancelJob(1101);
+    CHECK(cancelled.completed && cancelled.terminal==MoveTerminal::Cancelled);
+    CHECK(queue.enqueue(duplicateId)); // uniqueness is required among live jobs
+    CHECK(queue.front()!=nullptr && queue.front()->token.jobId==1101);
+}
+
+static void test_move_queue_capacity_is_exact_and_rejection_is_transactional(){
+    MoveQueue queue;
+    bool acceptedAll=true;
+    for(size_t i=0;i+1<MAX_MOVE_QUEUE_JOBS;++i){
+        MoveJob job=MJ(MoveOwner::AutoReconcile,151,1501+i,"");
+        job.recordId.clear();
+        if(!queue.enqueue(job)) acceptedAll=false;
+    }
+    CHECK(acceptedAll);
+    CHECK(!queue.empty());
+    CHECK(queue.front()!=nullptr && queue.front()->token.jobId==1501);
+
+    MoveJob invalid=MJ(MoveOwner::AutoReconcile,0,999999,"invalid");
+    MoveJob duplicate=MJ(MoveOwner::Picker,999,1501,"duplicate");
+    CHECK(!queue.enqueue(invalid));
+    CHECK(!queue.enqueue(duplicate));
+    MoveJob exact=MJ(MoveOwner::AutoReconcile,151,
+                     1501+MAX_MOVE_QUEUE_JOBS-1,"");
+    exact.recordId.clear();
+    CHECK(queue.enqueue(exact));
+
+    MoveJob overflow=MJ(
+        MoveOwner::ManualTray,152,1501+MAX_MOVE_QUEUE_JOBS,"overflow");
+    CHECK(!queue.enqueue(overflow));
+    CHECK(queue.front()!=nullptr && queue.front()->token.jobId==1501);
+    MoveResult removed=queue.cancelJob(1501);
+    CHECK(removed.completed && removed.terminal==MoveTerminal::Cancelled);
+    CHECK(queue.front()!=nullptr && queue.front()->token.jobId==1502);
+    CHECK(queue.enqueue(overflow));
+}
+
+static void test_move_queue_phase_guards_and_issue_outcomes(){
+    MoveQueue queue;
+    MoveJob job=MJ(MoveOwner::AutoReconcile,121,1201,"phase-runtime");
+    CHECK(queue.enqueue(job));
+    CHECK(queue.nextAction()==MoveAction::Issue);
+    CHECK(queue.nextAction()==MoveAction::Issue);
+    check_empty_move_result(queue.onVerified(MoveAttemptOutcome::OnDestination));
+    CHECK(queue.front()!=nullptr && queue.front()->attempts==0);
+    CHECK(queue.nextAction()==MoveAction::Issue);
+
+    MoveResult issued=queue.onIssued(MoveAttemptOutcome::TransientFailure);
+    CHECK(!issued.completed && issued.attempts==1);
+    CHECK(queue.nextAction()==MoveAction::Verify);
+    CHECK(queue.nextAction()==MoveAction::Verify);
+    check_empty_move_result(queue.onIssued(MoveAttemptOutcome::Accepted));
+    CHECK(queue.front()!=nullptr && queue.front()->attempts==1);
+    CHECK(queue.front()!=nullptr && queue.front()->waitingForVerify);
+    CHECK(queue.nextAction()==MoveAction::Verify);
+
+    MoveResult retry=queue.onVerified(MoveAttemptOutcome::TransientFailure);
+    CHECK(!retry.completed && retry.attempts==1);
+    CHECK(queue.nextAction()==MoveAction::Issue);
+    MoveResult alreadyThere=queue.onIssued(MoveAttemptOutcome::OnDestination);
+    check_move_result(alreadyThere,MoveTerminal::Succeeded,job,2);
+    CHECK(queue.empty());
+}
+
+static void test_move_queue_four_transient_issues_still_receive_four_verifies(){
+    MoveQueue queue;
+    MoveJob job=MJ(MoveOwner::AutoReconcile,131,1301,"ambiguous-issue");
+    CHECK(queue.enqueue(job));
+    for(int attempt=1;attempt<=4;++attempt){
+        CHECK(queue.nextAction()==MoveAction::Issue);
+        MoveResult issued=queue.onIssued(MoveAttemptOutcome::TransientFailure);
+        CHECK(!issued.completed && issued.attempts==attempt);
+        CHECK(queue.nextAction()==MoveAction::Verify);
+        MoveResult verified=queue.onVerified(MoveAttemptOutcome::TransientFailure);
+        if(attempt<4){
+            CHECK(!verified.completed && verified.attempts==attempt);
+            CHECK(queue.nextAction()==MoveAction::Issue);
+        }else{
+            check_move_result(verified,MoveTerminal::Exhausted,job,4);
+        }
+    }
+    CHECK(queue.empty());
+}
+
+static void test_move_queue_invalid_outcomes_fail_closed(){
+    MoveQueue queue;
+    MoveJob invalidIssue=MJ(MoveOwner::AutoReconcile,141,1401,"invalid-issue");
+    MoveJob acceptedVerify=MJ(MoveOwner::ManualTray,142,1402,"accepted-verify");
+    MoveJob invalidVerify=MJ(MoveOwner::Picker,143,1403,"invalid-verify");
+    CHECK(queue.enqueue(invalidIssue));
+    CHECK(queue.enqueue(acceptedVerify));
+    CHECK(queue.enqueue(invalidVerify));
+
+    MoveResult first=queue.onIssued(static_cast<MoveAttemptOutcome>(-1));
+    check_move_result(first,MoveTerminal::PermanentFailure,invalidIssue,1);
+    CHECK(!queue.onIssued(MoveAttemptOutcome::Accepted).completed);
+    MoveResult second=queue.onVerified(MoveAttemptOutcome::Accepted);
+    check_move_result(second,MoveTerminal::PermanentFailure,acceptedVerify,1);
+    CHECK(!queue.onIssued(MoveAttemptOutcome::Accepted).completed);
+    MoveResult third=queue.onVerified(static_cast<MoveAttemptOutcome>(99));
+    check_move_result(third,MoveTerminal::PermanentFailure,invalidVerify,1);
+    CHECK(queue.empty());
+}
+
+static void test_move_queue_four_transient_cycles_exhaust_and_unblock_next(){
+    MoveQueue queue;
+    MoveJob failed=MJ(MoveOwner::AutoReconcile,201,2001,"failed-runtime");
+    failed.token.itemIndex=3;
+    MoveJob next=MJ(MoveOwner::AutoReconcile,201,2002,"healthy-runtime");
+    CHECK(queue.enqueue(failed));
+    CHECK(queue.enqueue(next));
+
+    for(int attempt=1;attempt<=4;++attempt){
+        CHECK(queue.nextAction()==MoveAction::Issue);
+        MoveResult issued=queue.onIssued(MoveAttemptOutcome::Accepted);
+        CHECK(!issued.completed && issued.attempts==attempt);
+        CHECK(queue.nextAction()==MoveAction::Verify);
+        MoveResult verified=queue.onVerified(MoveAttemptOutcome::TransientFailure);
+        if(attempt<4){
+            CHECK(!verified.completed && verified.attempts==attempt);
+            CHECK(queue.nextAction()==MoveAction::Issue);
+        }else{
+            check_move_result(verified,MoveTerminal::Exhausted,failed,4);
+        }
+    }
+
+    CHECK(!queue.empty());
+    CHECK(queue.front()!=nullptr && queue.front()->token.jobId==next.token.jobId);
+    CHECK(queue.nextAction()==MoveAction::Issue);
+    MoveResult nextIssued=queue.onIssued(MoveAttemptOutcome::Accepted);
+    CHECK(!nextIssued.completed && nextIssued.attempts==1);
+    MoveResult nextVerified=queue.onVerified(MoveAttemptOutcome::OnDestination);
+    check_move_result(nextVerified,MoveTerminal::Succeeded,next,1);
+    CHECK(queue.empty());
+}
+
+static void test_move_queue_permanent_failure_finishes_and_unblocks_next(){
+    MoveQueue queue;
+    MoveJob invalidDestination=MJ(MoveOwner::ManualTray,301,3001,"bad-destination");
+    MoveJob invalidIdentity=MJ(MoveOwner::Picker,302,3002,"bad-identity");
+    MoveJob healthy=MJ(MoveOwner::AutoReconcile,303,3003,"healthy");
+    CHECK(queue.enqueue(invalidDestination));
+    CHECK(queue.enqueue(invalidIdentity));
+    CHECK(queue.enqueue(healthy));
+
+    MoveResult first=queue.onIssued(MoveAttemptOutcome::PermanentFailure);
+    check_move_result(first,MoveTerminal::PermanentFailure,invalidDestination,1);
+    CHECK(queue.front()!=nullptr && queue.front()->token.jobId==invalidIdentity.token.jobId);
+    CHECK(!queue.onIssued(MoveAttemptOutcome::Accepted).completed);
+    MoveResult second=queue.onVerified(MoveAttemptOutcome::PermanentFailure);
+    check_move_result(second,MoveTerminal::PermanentFailure,invalidIdentity,1);
+    CHECK(queue.front()!=nullptr && queue.front()->token.jobId==healthy.token.jobId);
+
+    CHECK(!queue.onIssued(MoveAttemptOutcome::Accepted).completed);
+    MoveResult third=queue.onVerified(MoveAttemptOutcome::OnDestination);
+    check_move_result(third,MoveTerminal::Succeeded,healthy,1);
+    CHECK(queue.empty());
+}
+
+static void test_move_queue_cancel_job_is_identity_safe_during_verify(){
+    MoveQueue queue;
+    MoveJob automatic=MJ(MoveOwner::AutoReconcile,401,4001,"shared-runtime");
+    MoveJob manual=MJ(MoveOwner::ManualTray,402,4002,"shared-runtime");
+    CHECK(queue.enqueue(automatic));
+    CHECK(queue.enqueue(manual));
+    CHECK(!queue.onIssued(MoveAttemptOutcome::Accepted).completed);
+    CHECK(queue.nextAction()==MoveAction::Verify);
+
+    MoveResult cancelled=queue.cancelJob(automatic.token.jobId);
+    check_move_result(cancelled,MoveTerminal::Cancelled,automatic,1);
+    CHECK(queue.front()!=nullptr && queue.front()->token.jobId==manual.token.jobId);
+    CHECK(queue.front()!=nullptr && queue.front()->attempts==0);
+    CHECK(queue.nextAction()==MoveAction::Issue);
+
+    MoveResult duplicate=queue.cancelJob(automatic.token.jobId);
+    CHECK(!duplicate.completed && duplicate.terminal==MoveTerminal::None);
+    MoveResult manualCancelled=queue.cancelJob(manual.token.jobId);
+    check_move_result(manualCancelled,MoveTerminal::Cancelled,manual,0);
+    CHECK(queue.empty());
+}
+
+static void test_move_queue_cancel_operation_is_owner_scoped_and_fifo(){
+    MoveQueue queue;
+    MoveJob autoCurrent=MJ(MoveOwner::AutoReconcile,501,5001,"same-runtime");
+    MoveJob manualSameOperation=MJ(MoveOwner::ManualTray,501,5002,"same-runtime");
+    MoveJob autoLater=MJ(MoveOwner::AutoReconcile,501,5003,"another-runtime");
+    MoveJob autoOtherOperation=MJ(MoveOwner::AutoReconcile,502,5004,"same-runtime");
+    MoveJob pickerSameOperation=MJ(MoveOwner::Picker,501,5005,"same-runtime");
+    CHECK(queue.enqueue(autoCurrent));
+    CHECK(queue.enqueue(manualSameOperation));
+    CHECK(queue.enqueue(autoLater));
+    CHECK(queue.enqueue(autoOtherOperation));
+    CHECK(queue.enqueue(pickerSameOperation));
+    CHECK(!queue.onIssued(MoveAttemptOutcome::Accepted).completed);
+    CHECK(queue.nextAction()==MoveAction::Verify);
+
+    std::vector<MoveResult> cancelled=queue.cancelOperation(MoveOwner::AutoReconcile,501);
+    CHECK(cancelled.size()==2);
+    if(cancelled.size()==2){
+        check_move_result(cancelled[0],MoveTerminal::Cancelled,autoCurrent,1);
+        check_move_result(cancelled[1],MoveTerminal::Cancelled,autoLater,0);
+    }
+    CHECK(queue.front()!=nullptr && queue.front()->token.jobId==manualSameOperation.token.jobId);
+    CHECK(queue.cancelOperation(MoveOwner::AutoReconcile,501).empty());
+
+    MoveResult manual=queue.cancelJob(manualSameOperation.token.jobId);
+    check_move_result(manual,MoveTerminal::Cancelled,manualSameOperation,0);
+    CHECK(queue.front()!=nullptr && queue.front()->token.jobId==autoOtherOperation.token.jobId);
+    MoveResult other=queue.cancelJob(autoOtherOperation.token.jobId);
+    check_move_result(other,MoveTerminal::Cancelled,autoOtherOperation,0);
+    CHECK(queue.front()!=nullptr && queue.front()->token.jobId==pickerSameOperation.token.jobId);
+    MoveResult picker=queue.cancelJob(pickerSameOperation.token.jobId);
+    check_move_result(picker,MoveTerminal::Cancelled,pickerSameOperation,0);
+    CHECK(queue.empty());
+}
+
+struct FakeMoveOperationKey {
+    MoveOwner owner=MoveOwner::AutoReconcile;
+    uint64_t operationId=0;
+    bool operator<(const FakeMoveOperationKey& other) const {
+        if(owner!=other.owner) return static_cast<int>(owner)<static_cast<int>(other.owner);
+        return operationId<other.operationId;
+    }
+};
+
+struct FakeMoveOperationState {
+    size_t outstanding=0;
+    size_t delivered=0;
+    std::set<uint64_t> liveJobIds;
+};
+
+struct FakeMoveOwnerDispatcher {
+    std::map<FakeMoveOperationKey,FakeMoveOperationState> operations;
+    bool dispatch(const MoveResult& result){
+        if(!result.completed) return false;
+        FakeMoveOperationKey key{result.token.owner,result.token.operationId};
+        auto operation=operations.find(key);
+        if(operation==operations.end()) return false;
+        if(operation->second.liveJobIds.erase(result.token.jobId)!=1) return false;
+        if(operation->second.outstanding==0) return false;
+        --operation->second.outstanding;
+        ++operation->second.delivered;
+        return true;
+    }
+};
+
+static void test_move_queue_duplicate_owner_delivery_is_harmless(){
+    MoveQueue queue;
+    MoveJob automatic=MJ(MoveOwner::AutoReconcile,601,6001,"shared-runtime");
+    MoveJob manual=MJ(MoveOwner::ManualTray,601,6002,"shared-runtime");
+    CHECK(queue.enqueue(automatic));
+    CHECK(queue.enqueue(manual));
+
+    FakeMoveOwnerDispatcher dispatcher;
+    FakeMoveOperationKey automaticKey{MoveOwner::AutoReconcile,601};
+    FakeMoveOperationKey manualKey{MoveOwner::ManualTray,601};
+    dispatcher.operations[automaticKey].outstanding=1;
+    dispatcher.operations[automaticKey].liveJobIds.insert(automatic.token.jobId);
+    dispatcher.operations[manualKey].outstanding=1;
+    dispatcher.operations[manualKey].liveJobIds.insert(manual.token.jobId);
+
+    MoveResult cancelled=queue.cancelJob(automatic.token.jobId);
+    CHECK(dispatcher.dispatch(cancelled));
+    CHECK(!dispatcher.dispatch(cancelled));
+    CHECK(dispatcher.operations[automaticKey].outstanding==0);
+    CHECK(dispatcher.operations[automaticKey].delivered==1);
+    CHECK(dispatcher.operations[manualKey].outstanding==1);
+    CHECK(dispatcher.operations[manualKey].delivered==0);
+    CHECK(dispatcher.operations[manualKey].liveJobIds.count(manual.token.jobId)==1);
+
+    MoveResult manualCancelled=queue.cancelJob(manual.token.jobId);
+    CHECK(dispatcher.dispatch(manualCancelled));
+    CHECK(dispatcher.operations[manualKey].outstanding==0);
+    CHECK(dispatcher.operations[manualKey].delivered==1);
+}
 
 static void test_layout_serializes_v4_header(){
     CHECK(SerializeLayout({}, {}).find("# VDE snapshot v4\n") == 0);
@@ -7915,6 +8305,17 @@ int main(){
     test_strict_integer_parsing();
     test_strict_base64_parsing();
     test_strict_counts_parsing();
+    test_move_queue_alternates_issue_verify_and_succeeds();
+    test_move_queue_enqueue_validates_identity_state_and_copies_guid();
+    test_move_queue_capacity_is_exact_and_rejection_is_transactional();
+    test_move_queue_phase_guards_and_issue_outcomes();
+    test_move_queue_four_transient_issues_still_receive_four_verifies();
+    test_move_queue_invalid_outcomes_fail_closed();
+    test_move_queue_four_transient_cycles_exhaust_and_unblock_next();
+    test_move_queue_permanent_failure_finishes_and_unblocks_next();
+    test_move_queue_cancel_job_is_identity_safe_during_verify();
+    test_move_queue_cancel_operation_is_owner_scoped_and_fifo();
+    test_move_queue_duplicate_owner_delivery_is_harmless();
     test_snss_parse();
     test_snss_garbage();
     test_snss_truncated_frame_returns_no_partial_windows();
