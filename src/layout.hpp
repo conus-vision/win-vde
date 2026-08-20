@@ -24,7 +24,6 @@ inline std::map<std::string,int> StrToCounts(const std::string& s){ std::map<std
 // ---- Layout v4 records ----
 using UnixSeconds = long long;
 static const UnixSeconds WINDOW_RETENTION_SECONDS = 30LL * 24 * 60 * 60;
-static const int MISSING_RUNS_MAX = 3; // transitional legacy constant
 static const std::size_t MAX_LAYOUT_RECORDS = 4096;
 static const std::size_t MAX_MATCH_CANDIDATES = 8192;
 static const std::size_t MAX_MATCH_FLOW_WORK = 1000000;
@@ -35,8 +34,15 @@ struct LayoutWin {
     std::string activeTitle, activeDomain; int tabCount=0;
     std::map<std::string,int> counts;
     UnixSeconds lastSeenUtc=0, missingSinceUtc=0;
-    int missingRuns=0; // transitional legacy field; ignored by v4 serialization
 };
+
+inline int ResolveSavedDesktop(const LayoutWin& saved,
+                               const std::vector<DeskRec>& currentDesktops){
+    if(GuidIsZero(saved.desktop)) return -1;
+    for(const DeskRec& desktop : currentDesktops)
+        if(GuidEq(saved.desktop, desktop.guid)) return desktop.index;
+    return -1;
+}
 
 struct LayoutMatch {
     size_t savedIndex=0;
@@ -57,6 +63,44 @@ inline void MarkSeen(LayoutWin& window, UnixSeconds nowUtc){
 inline void MarkMissing(LayoutWin& window, UnixSeconds nowUtc){
     if(window.missingSinceUtc==0)
         window.missingSinceUtc=window.lastSeenUtc>0 ? window.lastSeenUtc : nowUtc;
+}
+
+struct ExpiredLayoutPartition {
+    std::vector<LayoutWin> retained;
+    std::vector<LayoutWin> expired;
+};
+
+template<typename AppendRecord>
+inline bool PartitionExpiredLayoutRecords(
+        const std::vector<LayoutWin>& input,UnixSeconds nowUtc,
+        ExpiredLayoutPartition& output,AppendRecord&& appendRecord){
+    if(input.size()>MAX_LAYOUT_RECORDS) return false;
+    try {
+        size_t expiredCount=0;
+        for(const LayoutWin& record : input)
+            if(IsExpired(record,nowUtc)) ++expiredCount;
+        ExpiredLayoutPartition built;
+        built.expired.reserve(expiredCount);
+        built.retained.reserve(input.size()-expiredCount);
+        for(const LayoutWin& record : input){
+            std::vector<LayoutWin>& destination=IsExpired(record,nowUtc)
+                ? built.expired : built.retained;
+            if(!appendRecord(destination,record)) return false;
+        }
+        output=std::move(built);
+        return true;
+    } catch(...) { return false; }
+}
+
+inline bool PartitionExpiredLayoutRecords(
+        const std::vector<LayoutWin>& input,UnixSeconds nowUtc,
+        ExpiredLayoutPartition& output){
+    return PartitionExpiredLayoutRecords(
+        input,nowUtc,output,
+        [](std::vector<LayoutWin>& destination,const LayoutWin& record){
+            destination.push_back(record);
+            return true;
+        });
 }
 
 inline std::vector<LayoutWin> PruneExpired(const std::vector<LayoutWin>& input, UnixSeconds nowUtc){
@@ -580,41 +624,25 @@ inline std::string NewRecordId(){
 }
 
 using RecordIdGenerator = std::string (*)();
-inline bool PrepareTransitionalV4Records(std::vector<LayoutWin>& records, UnixSeconds nowUtc,
-        std::string* errorOut=nullptr, RecordIdGenerator idGenerator=NewRecordId){
-    std::vector<LayoutWin> prepared = records;
+inline bool ValidateV4Records(const std::vector<LayoutWin>& records,
+        std::string* errorOut=nullptr){
     std::set<std::string> recordIds;
     auto fail = [&](const std::string& message)->bool {
         if(errorOut) *errorOut = message;
         return false;
     };
-    for(auto& record : prepared){
+    for(const auto& record : records){
         if(!IsSupportedLayoutApp(record.app)) return fail("window record has an unsupported app");
         if(GuidIsZero(record.desktop)) return fail("window record has a zero desktop GUID");
         if(HasLayoutFieldBreak(record.activeDomain)) return fail("window record domain contains a field delimiter");
         if(record.tabCount<0) return fail("window record has a negative tab count");
         if(!AreLayoutCountsSerializable(record.counts)) return fail("window record has invalid domain counts");
-        if(record.lastSeenUtc<0) return fail("window record has a negative last-seen time");
+        if(record.lastSeenUtc<=0) return fail("window record has a nonpositive last-seen time");
         if(record.missingSinceUtc<0) return fail("window record has a negative missing-since time");
-        if(record.missingRuns<0) return fail("window record has a negative legacy missing-run count");
-        if(record.recordId.empty()){
-            if(!idGenerator) return fail("record ID generator is unavailable");
-            record.recordId = idGenerator();
-            if(record.recordId.empty()) return fail("failed to generate record ID");
-        }
         GUID id{}; std::string idKey;
         if(!ParseNonzeroLayoutGuid(record.recordId,id,&idKey)) return fail("window record has an invalid record ID");
         if(!recordIds.insert(idKey).second) return fail("window records contain a duplicate record ID");
-        if(record.lastSeenUtc==0){
-            if(nowUtc<=0) return fail("cannot initialize last-seen time from a nonpositive clock");
-            record.lastSeenUtc = nowUtc;
-        }
-        if(record.missingRuns>0 && record.missingSinceUtc==0){
-            if(nowUtc<=0) return fail("cannot initialize missing-since time from a nonpositive clock");
-            record.missingSinceUtc = nowUtc;
-        }
     }
-    records.swap(prepared);
     if(errorOut) errorOut->clear();
     return true;
 }
@@ -764,8 +792,7 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
 }
 
 inline bool BuildCheckedLayoutSnapshot(const std::vector<DeskRec>& desks, std::vector<LayoutWin>& wins,
-        UnixSeconds nowUtc, std::string& textOut, std::string* errorOut=nullptr,
-        RecordIdGenerator idGenerator=NewRecordId){
+        UnixSeconds nowUtc, std::string& textOut, std::string* errorOut=nullptr){
     auto fail = [&](const std::string& message)->bool {
         if(errorOut) *errorOut=message;
         return false;
@@ -773,75 +800,11 @@ inline bool BuildCheckedLayoutSnapshot(const std::vector<DeskRec>& desks, std::v
     if(desks.size()>MAX_LAYOUT_RECORDS || wins.size()>MAX_LAYOUT_RECORDS-desks.size())
         return fail("snapshot record limit exceeded");
     for(const auto& desk : desks) if(GuidIsZero(desk.guid)) return fail("desktop record has a zero GUID");
-    std::vector<LayoutWin> prepared=wins;
-    std::string prepareError;
-    if(!PrepareTransitionalV4Records(prepared,nowUtc,&prepareError,idGenerator)) return fail(prepareError);
-    std::string serialized=SerializeLayout(desks,prepared);
-    wins.swap(prepared);
+    std::string validationError;
+    if(!ValidateV4Records(wins,&validationError)) return fail(validationError);
+    std::string serialized=SerializeLayout(desks,wins);
     textOut.swap(serialized);
     if(errorOut) errorOut->clear();
+    (void)nowUtc;
     return true;
-}
-
-// ---- Cross-restart identity + merge/grace ----
-// Key that re-identifies a window across a restart (HWND is ephemeral):
-// domain multiset when available (robust — session restore recreates tabs),
-// else the active-window title (generic apps without tab data).
-inline std::string FingerprintKey(const std::string& app, const std::map<std::string,int>& counts, const std::string& activeTitle){
-    std::string k = app + "|";
-    if(!counts.empty()){ bool f=true; for(const auto& kv:counts){ if(!f)k+=","; f=false; k+=kv.first+":"+std::to_string(kv.second);} }
-    else k += "t:" + activeTitle;
-    return k;
-}
-
-// Merge currently-present windows into the existing auto layout WITHOUT deleting
-// absent windows (anti-wipe). Present windows: desk updated, missingRuns reset to 0.
-inline std::vector<LayoutWin> MergeAutoLayout(const std::vector<LayoutWin>& existing, const std::vector<LayoutWin>& present){
-    std::vector<LayoutWin> out = existing;
-    std::map<std::string,int> idx;
-    for(size_t i=0;i<out.size();++i) idx[FingerprintKey(out[i].app,out[i].counts,out[i].activeTitle)] = (int)i;
-    for(const auto& p : present){
-        std::string key = FingerprintKey(p.app,p.counts,p.activeTitle);
-        auto it = idx.find(key);
-        if(it!=idx.end()){
-            LayoutWin& e = out[it->second];
-            e.deskIndex=p.deskIndex; e.desktop=p.desktop; e.activeTitle=p.activeTitle;
-            e.activeDomain=p.activeDomain; e.tabCount=p.tabCount; e.counts=p.counts; e.missingRuns=0;
-        } else { LayoutWin n=p; n.missingRuns=0; idx[key]=(int)out.size(); out.push_back(n); }
-    }
-    return out;
-}
-
-inline bool BuildAutoLayoutSnapshot(const std::string* existingBytes, const std::vector<DeskRec>& currentDesks,
-        const std::vector<LayoutWin>& present, UnixSeconds nowUtc, std::string& textOut,
-        std::string* errorOut=nullptr, RecordIdGenerator idGenerator=NewRecordId){
-    auto fail = [&](const std::string& message)->bool {
-        if(errorOut) *errorOut=message;
-        return false;
-    };
-    std::vector<LayoutWin> existing;
-    if(existingBytes){
-        std::vector<DeskRec> ignoredDesks;
-        std::string parseError;
-        if(!ParseLayout(*existingBytes,ignoredDesks,existing,nowUtc,&parseError,nullptr,idGenerator))
-            return fail("invalid existing auto snapshot: "+parseError);
-    }
-    std::vector<LayoutWin> merged=MergeAutoLayout(existing,present);
-    return BuildCheckedLayoutSnapshot(currentDesks,merged,nowUtc,textOut,errorOut,idGenerator);
-}
-
-// Age the auto layout by one utility run. For apps observed this run: seen
-// windows reset to 0, unseen windows increment and are dropped at maxMissing.
-// Records for apps NOT observed this run are left untouched.
-inline std::vector<LayoutWin> ReconcileGrace(const std::vector<LayoutWin>& records,
-        const std::set<std::string>& seenKeys, const std::set<std::string>& observedApps, int maxMissing){
-    std::vector<LayoutWin> out;
-    for(const auto& r : records){
-        if(!observedApps.count(r.app)){ out.push_back(r); continue; }
-        LayoutWin w = r;
-        std::string key = FingerprintKey(w.app,w.counts,w.activeTitle);
-        if(seenKeys.count(key)) w.missingRuns = 0; else w.missingRuns += 1;
-        if(w.missingRuns < maxMissing) out.push_back(w);
-    }
-    return out;
 }

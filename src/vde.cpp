@@ -41,13 +41,20 @@
 #include <map>
 #include <set>
 #include <algorithm>
+#include <memory>
+#include <limits>
+#include <deque>
 
 #include "str_util.hpp"   // W2U8/U82W, GUID helpers, b64, GetWindowsBuild, hostOf, etld1
 #include "layout.hpp"     // DeskRec + v4 layout serialization/migration logic
-#include "lifecycle.hpp"  // LcState/LcAction, LcOnStartup/LcOnTick/LcOnExit
+#include "layout_store.hpp"
+#include "lifecycle.hpp"
+#include "move_queue.hpp"
+#include "window_identity.hpp"
+#include "reconcile_worker.hpp"
 #include "session.hpp"    // bounded browser-session decoding primitives
 #include "appprofile.hpp" // AppProfile, BuiltinProfiles
-#include "session_worker.hpp" // bounded browser-session ownership and transitional helpers
+#include "session_worker.hpp"
 #include <dwmapi.h>
 #pragma comment(lib, "dwmapi.lib")
 
@@ -73,10 +80,15 @@ static const bool SWITCH_AFTER_MOVE = false;    // переключаться н
 
 #define IDI_APPICON 101    // должен совпадать с ID в vde.rc
 #define TIMER_MONITOR 1
-#define TIMER_STARTUP 2
+#define TIMER_MOVE_VERIFY 3
+#define TIMER_HEARTBEAT 4
+#define TIMER_AUTO_FLUSH 5
+#define WM_MOVE_CANCEL_RETRY (WM_APP + 14)
 #define MONITOR_INTERVAL_MS 5000
-#define STARTUP_SETTLE_MS 2500
-#define LAUNCH_SETTLE_TICKS 4          // 4 * 5000ms = ~20s launch stabilization
+#define MOVE_VERIFY_INTERVAL_MS 150
+#define AUTO_FLUSH_INTERVAL_MS 500
+#define CONFLICT_RECHECK_INTERVAL_MS (60U * 1000U)
+#define HEARTBEAT_INTERVAL_MS (6U * 60U * 60U * 1000U)
 #define IDC_HOTKEY 1001
 #define IDC_AUTOFIX 1002
 #define IDC_AUTOSTART 1003
@@ -89,10 +101,166 @@ static const bool SWITCH_AFTER_MOVE = false;    // переключаться н
 #define IDC_HELP_TEXT 1104
 static const wchar_t* APP_VERSION = L"1.0.0";
 
-// ---- lifecycle monitor state (this run) ----
-static LcState g_lc;
-static std::set<std::string> g_seenKeys;      // window fingerprints seen at least once this run
-static std::set<std::string> g_observedApps;  // apps observed at least once this run
+static HWND g_main=nullptr;
+static void Balloon(const std::wstring& text);
+
+struct RuntimeRecordBinding {
+    std::string app;
+    std::string recordId;
+    WindowIdentityKey identity;
+    uint64_t causalGeneration=0;
+};
+
+struct MoveRuntimeBinding {
+    FastWin window;
+    GUID destination={0};
+    RestoreBudgetKey budgetKey;
+    bool hasBudgetKey=false;
+    bool issueAwaitingVerify=false;
+    bool retireAfterVerify=false;
+    bool cancelRequested=false;
+    IdentityRecaptureRetryBudget identityRecaptureBudget;
+    IssuedMoveRetirementTracker retirement;
+};
+
+struct ReservedAutoIdentity {
+    MoveToken token;
+    WindowIdentityKey identity;
+    std::string app;
+    std::string recordId;
+    GUID originDesktop={0};
+    LayoutWin provisionalOriginRecord;
+    bool hasProvisionalOriginRecord=false;
+};
+
+enum class AsyncOperationOwner {
+    AutoReconcile, ManualSave, ManualRestore, Search, MetadataProbe
+};
+
+struct SessionRoute {
+    AsyncOperationOwner owner=AsyncOperationOwner::AutoReconcile;
+    uint64_t operationId=0;
+    std::string app;
+    SessionPurpose purpose=SessionPurpose::MetadataProbe;
+    uint64_t identityGeneration=0;
+    uint64_t contentGeneration=0;
+    uint64_t deadlineMs=0;
+};
+
+struct AutoRestoreOperation {
+    uint64_t operationId=0;
+    std::string app;
+    uint64_t lifecycleGeneration=0;
+    uint64_t identityGeneration=0;
+    uint64_t contentGeneration=0;
+    uint64_t windowSetSignature=0;
+    uint64_t layoutSignature=0;
+    uint64_t sourceSignature=0;
+    uint64_t sessionRequestId=0;
+    uint64_t sessionDataGeneration=0;
+    ReconcileFreshness freshness=ReconcileFreshness::Fresh;
+    bool reconcilePending=false;
+    ReconcileWorkMode reconcileMode=ReconcileWorkMode::Plan;
+    std::vector<FastWin> reconcileFast;
+    std::unique_ptr<ReconcileResult> reconcile;
+    MoveTerminalOutcomes successfulLive;
+    std::set<uint64_t> liveJobIds;
+    size_t outstanding=0;
+    bool hadExhausted=false;
+    bool hadFailure=false;
+    bool cancellationPending=false;
+};
+
+struct PickerMoveOperation {
+    uint64_t operationId=0;
+    std::set<uint64_t> liveJobIds;
+    bool completionReported=false;
+};
+
+struct SearchOperation {
+    uint64_t operationId=0;
+    size_t outstanding=0;
+    std::map<std::string,AppFastSnapshot> snapshots;
+    std::set<std::string> waitingReconcileApps;
+};
+
+struct MetadataProbeOperation {
+    uint64_t operationId=0;
+    std::string app;
+    uint64_t identityGeneration=0;
+    uint64_t contentGeneration=0;
+};
+
+struct ManualSaveOperation {
+    uint64_t operationId=0;
+    OperationAppProfiles profiles;
+    std::map<std::string,AppFastSnapshot> snapshots;
+    std::vector<DeskRec> desktops;
+    std::map<std::string,std::vector<LayoutWin> > preparedLive;
+    std::set<std::string> waitingReconcileApps;
+    size_t outstanding=0;
+    bool failed=false;
+    bool completionReported=false;
+};
+
+struct ManualMoveOperation {
+    uint64_t operationId=0;
+    OperationAppProfiles profiles;
+    std::map<std::string,AppFastSnapshot> snapshots;
+    std::vector<DeskRec> currentDesktops;
+    std::vector<LayoutWin> saved;
+    std::set<std::string> waitingSessionApps;
+    std::set<std::string> waitingReconcileApps;
+    std::set<uint64_t> liveJobIds;
+    size_t outstanding=0;
+    size_t succeeded=0;
+    size_t failed=0;
+    size_t already=0;
+    bool completionReported=false;
+    bool cancellationPending=false;
+};
+
+static std::vector<LayoutWin> g_autoRecords;
+static std::vector<DeskRec> g_autoDesktops;
+static std::map<std::string,LcState> g_lifecycleByApp;
+static std::map<std::string,RuntimeRecordBinding> g_recordByRuntime;
+static std::map<std::string,std::string> g_pendingRecordByRuntime;
+static std::map<std::string,std::string> g_provisionalRecordByRuntime;
+static std::map<std::string,ReservedAutoIdentity> g_reservedAutoIdentities;
+static std::map<uint64_t,MoveRuntimeBinding> g_moveRuntime;
+static std::map<uint64_t,SessionRoute> g_sessionRoutes;
+static std::map<uint64_t,AutoRestoreOperation> g_pendingAutoOperations;
+static std::map<uint64_t,PickerMoveOperation> g_pickerOperations;
+static std::map<uint64_t,SearchOperation> g_searchOperations;
+static std::map<uint64_t,MetadataProbeOperation> g_metadataProbeOperations;
+static std::map<uint64_t,ManualSaveOperation> g_manualSaveOperations;
+static std::map<uint64_t,ManualMoveOperation> g_manualMoveOperations;
+static std::map<std::string,uint64_t> g_lastFreshSessionSignature;
+static MoveQueue g_moveQueue;
+static RestoreBudgets g_restoreBudgets;
+static CheckpointController g_checkpointController;
+static AsyncSessionRouteGate g_sessionRouteGate;
+static AsyncReconcileDeadlineGate g_reconcileDeadlines;
+static DirtyFlushController g_dirtyFlush;
+static AutoLoadRetryState g_autoLoadRetry;
+static bool g_autoDirty=false;
+static bool g_autoLoaded=false;
+static bool g_autoWritesAllowed=false;
+static bool g_preserveBackupOnNextWrite=false;
+static bool g_flushTimerArmed=false;
+static uint64_t g_flushTimerDueMs=0;
+static bool g_heartbeatTimerArmed=false;
+static bool g_moveCancellationPending=false;
+static unsigned g_moveCancellationPostRetries=0;
+static LayoutRevision g_autoRevision;
+static std::map<std::string,RecordDelta> g_dirtyRecordDeltas;
+static std::map<std::string,ValidatedRecordTouch> g_validatedTouches;
+static std::set<std::string> g_deferredConflictRecordIds;
+static uint64_t g_nextSessionRequestId=0;
+static uint64_t g_nextOperationId=0;
+static uint64_t g_nextMoveJobId=0;
+static std::unique_ptr<SessionWorker> g_sessionWorker;
+static std::unique_ptr<ReconcileWorker> g_reconcileWorker;
 
 // ============================ PER-BUILD IIDs (24H2/25H2) ======================
 static const GUID kCLSID_ImmersiveShell =
@@ -150,8 +318,8 @@ static std::wstring DesktopNameFromRegistry(const GUID& g) {
     return res;
 }
 
-// Browser-session decoders live in session.hpp. The synchronous callers below
-// are explicitly transitional until Task 8 atomically cuts the UI over.
+// Browser-session decoding is owned by SessionWorker in GUI mode; CLI mode uses
+// the same bounded reader directly because it has no window-message loop.
 // ============================== services ======================================
 static IServiceProvider*               g_shell  = nullptr;
 static IVirtualDesktopManagerInternal* g_vdmi   = nullptr;
@@ -164,11 +332,17 @@ static bool InitServices(){
     CoCreateInstance(CLSID_VirtualDesktopManager,nullptr,CLSCTX_INPROC_SERVER,IID_IVirtualDesktopManager,(void**)&g_vdmDoc);
     return true;
 }
-static void ReleaseServices(){ if(g_vdmDoc)g_vdmDoc->Release(); if(g_avc)g_avc->Release(); if(g_vdmi)g_vdmi->Release(); if(g_shell)g_shell->Release(); }
+static void ReleaseServices(){
+    if(g_vdmDoc){ g_vdmDoc->Release(); g_vdmDoc=nullptr; }
+    if(g_avc){ g_avc->Release(); g_avc=nullptr; }
+    if(g_vdmi){ g_vdmi->Release(); g_vdmi=nullptr; }
+    if(g_shell){ g_shell->Release(); g_shell=nullptr; }
+}
 // After a Windows update the undocumented vtable/IIDs can shift: QueryService may
 // still succeed but calls return garbage. Verify a couple of calls make sense.
 static bool SanityCheckServices(){
-    if(!g_vdmi) return false;
+    if(!DesktopServicesReady(g_vdmi!=nullptr,g_avc!=nullptr,g_vdmDoc!=nullptr))
+        return false;
     UINT n=0; if(FAILED(g_vdmi->GetCount(&n))) return false;
     if(n<1 || n>64) return false;
     IVirtualDesktop* d=nullptr; if(FAILED(g_vdmi->GetCurrentDesktop(&d))||!d) return false;
@@ -195,124 +369,246 @@ static IVirtualDesktop* GetDesktopByGuid(const GUID& t){ IObjectArray* a=nullptr
     for(UINT i=0;i<n;++i){ IVirtualDesktop* d=nullptr; if(SUCCEEDED(a->GetAt(i,kIID_IVirtualDesktop,(void**)&d))&&d){ GUID g={0};d->GetID(&g); if(IsEqualGUID(g,t)){r=d;break;} d->Release(); } } a->Release(); return r; }
 static int GetDesktopIndexByGuid(const GUID& t){ IObjectArray* a=nullptr; if(FAILED(g_vdmi->GetDesktops(&a))||!a)return -1; UINT n=0;a->GetCount(&n); int idx=-1;
     for(UINT i=0;i<n;++i){ IVirtualDesktop* d=nullptr; if(SUCCEEDED(a->GetAt(i,kIID_IVirtualDesktop,(void**)&d))&&d){ GUID g={0};d->GetID(&g); if(IsEqualGUID(g,t)){idx=(int)i;d->Release();break;} d->Release(); } } a->Release(); return idx; }
-static bool VerifyOnDesktop(HWND hwnd, const GUID& dest, int tries=4){
-    if(!g_vdmDoc)return true;
-    for(int i=0;i<tries;++i){ GUID cur={0}; if(SUCCEEDED(g_vdmDoc->GetWindowDesktopId(hwnd,&cur))&&GuidEq(cur,dest))return true; Sleep(150); }
-    return false;
-}
-static bool MoveWindowToDesktop(HWND hwnd, IVirtualDesktop* pDest, const GUID& destGuid){
-    DWORD pid=0; GetWindowThreadProcessId(hwnd,&pid);
-    if(pid==GetCurrentProcessId()&&g_vdmDoc){ if(SUCCEEDED(g_vdmDoc->MoveWindowToDesktop(hwnd,destGuid)))return VerifyOnDesktop(hwnd,destGuid); }
-    IApplicationView* view=nullptr; if(FAILED(g_avc->GetViewForHwnd(hwnd,&view))||!view)return false;
-    HRESULT hr=g_vdmi->MoveViewToDesktop(view,pDest); view->Release();
-    if(FAILED(hr))return false;
-    return VerifyOnDesktop(hwnd,destGuid);
-}
 
 // ============================ Firefox windows =================================
-static std::wstring ProcessImageName(DWORD pid){ HANDLE h=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid); if(!h)return L""; wchar_t b[MAX_PATH]; DWORD sz=MAX_PATH; std::wstring r; if(QueryFullProcessImageNameW(h,0,b,&sz))r.assign(b,sz); CloseHandle(h); return r; }
-static bool EndsWithI(const std::wstring& s, const std::wstring& suf){ if(s.size()<suf.size())return false; return CompareStringOrdinal(s.c_str()+(s.size()-suf.size()),(int)suf.size(),suf.c_str(),(int)suf.size(),TRUE)==CSTR_EQUAL; }
 static std::wstring StripSuffixes(std::wstring t, const std::vector<std::wstring>& sfx){
     for(auto& s:sfx){ size_t l=s.size(); if(t.size()>=l&&_wcsicmp(t.c_str()+(t.size()-l),s.c_str())==0){ t.resize(t.size()-l); return t; } }
     return t;
 }
-struct LiveWin { HWND hwnd; std::wstring rawTitle; GUID desktop; };
-struct EnumCtx { std::vector<LiveWin>* out; const AppProfile* prof; };
-static BOOL CALLBACK EnumAppCb(HWND hwnd, LPARAM lp){
-    auto* ctx=(EnumCtx*)lp; wchar_t cls[64]={0};
-    if(GetClassNameW(hwnd,cls,64)<=0)return TRUE;
-    bool clsOk=false; for(auto& c:ctx->prof->classNames) if(c==cls){clsOk=true;break;} if(!clsOk)return TRUE;
-    if(!(GetWindowLongPtrW(hwnd,GWL_STYLE)&WS_VISIBLE))return TRUE;
-    int len=GetWindowTextLengthW(hwnd); if(len<=0)return TRUE;
-    DWORD pid=0; GetWindowThreadProcessId(hwnd,&pid);
-    std::wstring img=ProcessImageName(pid); if(!img.empty()&&!EndsWithI(img,ctx->prof->exeName))return TRUE;
-    std::wstring title(len+1,0); GetWindowTextW(hwnd,&title[0],len+1); title.resize(wcslen(title.c_str()));
-    LiveWin w; w.hwnd=hwnd; w.rawTitle=title; w.desktop=GUID{0}; ctx->out->push_back(w);
-    return TRUE;
-}
-static std::vector<LiveWin> EnumAppWindows(const AppProfile& prof){
-    std::vector<LiveWin> v; EnumCtx ctx{&v,&prof}; EnumWindows(EnumAppCb,(LPARAM)&ctx);
-    if(g_vdmDoc)for(auto&w:v)g_vdmDoc->GetWindowDesktopId(w.hwnd,&w.desktop); return v;
-}
 
-// TRANSITIONAL (removed by Task 8): the legacy monitor remains synchronous,
-// but all discovery, bounded I/O, stamps, decompression, and parsing delegate
-// to the worker-owned primitives. Nothing is published across a rotation.
-static std::vector<WinFp> ReadSessionForTransitional(const AppProfile& profile,
-                                                      std::wstring* usedPathOut=nullptr){
-    std::wstring before=ResolveBrowserSessionPath(profile);
-    SessionStamp beforeStamp;
-    if(before.empty() || !GetSessionStamp(before,beforeStamp)) return {};
-    SessionFileReadResult read=ReadBrowserSessionFileBounded(before,MAX_BROWSER_SESSION_BYTES);
-    if(read.status!=FileReadStatus::Ok || !read.readStampKnown || read.readStamp!=beforeStamp) return {};
-    std::vector<WinFp> parsed;
-    if(!ParseBrowserSessionData(profile,read.bytes,parsed)) return {};
-    std::wstring after=ResolveBrowserSessionPath(profile);
-    SessionStamp afterStamp;
-    if(after!=before || !GetSessionStamp(after,afterStamp) ||
-       beforeStamp!=read.readStamp || read.readStamp!=afterStamp) return {};
-    if(usedPathOut) *usedPathOut=after;
-    return parsed;
-}
-
-// ============================ fingerprint / scoring ===========================
-struct Fp {
-    std::string app;
-    HWND hwnd=nullptr; GUID desktop={0}; int deskIndex=-1;
-    std::string activeTitle, activeDomain; std::map<std::string,int> counts; int tabCount=0;
-    bool hasDomains() const { return !counts.empty(); }
+class UniqueWinHandle {
+public:
+    UniqueWinHandle()=default;
+    explicit UniqueWinHandle(HANDLE handle):handle_(handle){}
+    ~UniqueWinHandle(){ reset(); }
+    UniqueWinHandle(const UniqueWinHandle&)=delete;
+    UniqueWinHandle& operator=(const UniqueWinHandle&)=delete;
+    UniqueWinHandle(UniqueWinHandle&& other) noexcept :handle_(other.release()){}
+    UniqueWinHandle& operator=(UniqueWinHandle&& other) noexcept {
+        if(this!=&other) reset(other.release());
+        return *this;
+    }
+    HANDLE get() const { return handle_; }
+    explicit operator bool() const { return handle_ && handle_!=INVALID_HANDLE_VALUE; }
+    HANDLE release(){ HANDLE value=handle_; handle_=nullptr; return value; }
+    void reset(HANDLE value=nullptr){
+        if(handle_ && handle_!=INVALID_HANDLE_VALUE) CloseHandle(handle_);
+        handle_=value;
+    }
+private:
+    HANDLE handle_=nullptr;
 };
-static std::vector<AppProfile> ActiveProfiles(){ return BuiltinProfiles(g_appFirefox,g_appChrome,g_appEdge); }
-static std::vector<WinFp> ReadSessionFor(const AppProfile& prof){
-    return prof.session==AppProfile::NONE?std::vector<WinFp>():ReadSessionForTransitional(prof);
-}
-static std::vector<Fp> BuildLiveFingerprintsFor(const AppProfile& prof, int* boundCount=nullptr){
-    std::vector<LiveWin> live=EnumAppWindows(prof);
-    std::vector<WinFp> ss=ReadSessionFor(prof);
-    std::vector<bool> used(ss.size(),false); int bound=0; std::vector<Fp> out;
-    for(auto& w:live){
-        std::string sTitle=W2U8(StripSuffixes(w.rawTitle,prof.titleSuffixes));
-        Fp fp; fp.app=prof.id; fp.hwnd=w.hwnd; fp.desktop=w.desktop; fp.activeTitle=sTitle;
-        int bi=-1; for(size_t i=0;i<ss.size();++i) if(!used[i]&&ss[i].activeTitle==sTitle){bi=(int)i;break;}   // bind by active-tab title
-        if(bi>=0){ used[bi]=true; bound++; fp.counts=ss[bi].counts; fp.activeDomain=ss[bi].activeDomain; fp.tabCount=ss[bi].tabCount; if(!ss[bi].activeTitle.empty())fp.activeTitle=ss[bi].activeTitle; }
-        out.push_back(std::move(fp));
+
+template<class T>
+class ScopedComPtr {
+public:
+    ScopedComPtr()=default;
+    explicit ScopedComPtr(T* value):value_(value){}
+    ~ScopedComPtr(){ reset(); }
+    ScopedComPtr(const ScopedComPtr&)=delete;
+    ScopedComPtr& operator=(const ScopedComPtr&)=delete;
+    ScopedComPtr(ScopedComPtr&& other) noexcept :value_(other.release()){}
+    ScopedComPtr& operator=(ScopedComPtr&& other) noexcept {
+        if(this!=&other) reset(other.release());
+        return *this;
     }
-    if(boundCount)*boundCount=bound;
-    return out;
-}
-static bool AnyAppPresent(){ for(auto& prof:ActiveProfiles()) if(!EnumAppWindows(prof).empty()) return true; return false; }
-// HWND -> lowercased text of ALL tabs (titles + domains) for each browser window; used to search across all tabs, not just the active one.
-static std::map<HWND,std::wstring> BuildTabBlobs(){
-    std::map<HWND,std::wstring> out;
-    for(auto& prof:ActiveProfiles()){
-        if(prof.session==AppProfile::NONE) continue;
-        auto live=EnumAppWindows(prof); auto ss=ReadSessionFor(prof);
-        std::vector<bool> used(ss.size(),false);
-        for(auto& w:live){
-            std::string sTitle=W2U8(StripSuffixes(w.rawTitle,prof.titleSuffixes));
-            int bi=-1; for(size_t i=0;i<ss.size();++i) if(!used[i]&&ss[i].activeTitle==sTitle){ bi=(int)i; break; }
-            if(bi>=0){ used[bi]=true; std::wstring blob=U82W(ss[bi].tabsBlob); if(!blob.empty())CharLowerW(&blob[0]); out[w.hwnd]=std::move(blob); }
-        }
+    T* get() const { return value_; }
+    T* operator->() const { return value_; }
+    explicit operator bool() const { return value_!=nullptr; }
+    T* release(){ T* value=value_; value_=nullptr; return value; }
+    void reset(T* value=nullptr){ if(value_) value_->Release(); value_=value; }
+private:
+    T* value_=nullptr;
+};
+
+struct ProcessSnapshot {
+    std::wstring image;
+    uint64_t started=0;
+};
+
+static ProcessSnapshot ReadProcessSnapshot(DWORD pid){
+    ProcessSnapshot value;
+    std::vector<wchar_t> path;
+    try { path.resize(32768,L'\0'); }
+    catch(...) { return value; }
+    UniqueWinHandle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid));
+    if(!process) return value;
+    DWORD pathSize=static_cast<DWORD>(path.size());
+    if(QueryFullProcessImageNameW(process.get(),0,path.data(),&pathSize))
+        value.image.assign(path.data(),pathSize);
+    FILETIME created{},exited{},kernel{},user{};
+    if(GetProcessTimes(process.get(),&created,&exited,&kernel,&user)){
+        ULARGE_INTEGER ticks{};
+        ticks.LowPart=created.dwLowDateTime;
+        ticks.HighPart=created.dwHighDateTime;
+        value.started=ticks.QuadPart;
     }
-    return out;
-}
-static double Score(const Fp& s, const Fp& l){
-    if(s.hasDomains()&&l.hasDomains()){
-        double dot=0,na=0,nb=0;
-        for(auto& kv:s.counts){ na+=double(kv.second)*kv.second; auto it=l.counts.find(kv.first); if(it!=l.counts.end())dot+=double(kv.second)*it->second; }
-        for(auto& kv:l.counts) nb+=double(kv.second)*kv.second;
-        double C=(na&&nb)?dot/(std::sqrt(na)*std::sqrt(nb)):0;
-        int inter=0; std::set<std::string> uni; for(auto& kv:s.counts)uni.insert(kv.first);
-        for(auto& kv:l.counts){ if(s.counts.count(kv.first))inter++; uni.insert(kv.first); }
-        double J=uni.empty()?0:double(inter)/uni.size();
-        double act=(s.activeTitle==l.activeTitle&&!s.activeTitle.empty())?1.0:((!s.activeDomain.empty()&&s.activeDomain==l.activeDomain)?0.5:0.0);
-        int mx=std::max(std::max(s.tabCount,l.tabCount),1);
-        double tab=1.0-std::min(1.0,std::abs(s.tabCount-l.tabCount)/double(mx));
-        return 0.40*C+0.25*J+0.20*act+0.15*tab;
-    }
-    return (!s.activeTitle.empty()&&s.activeTitle==l.activeTitle)?1.0:0.0;
+    return value;
 }
 
+static std::vector<AppProfile> ActiveProfiles(){
+    return BuiltinProfiles(g_appFirefox,g_appChrome,g_appEdge);
+}
+
+static uint64_t ProfileConfigSignature(const AppProfile& profile){
+    SnapshotSignatureBuilder signature;
+    signature.addString(profile.id).addWideString(profile.exeName)
+             .addUnsigned(static_cast<uint64_t>(profile.session))
+             .addWideString(profile.userDataDir);
+    for(const std::wstring& value : profile.classNames)
+        signature.addWideString(value);
+    for(const std::wstring& value : profile.titleSuffixes)
+        signature.addWideString(value);
+    return signature.value();
+}
+
+struct FastEnumContext {
+    const std::vector<AppProfile>* profiles=nullptr;
+    std::map<std::string,AppFastSnapshot>* snapshots=nullptr;
+    std::map<DWORD,ProcessSnapshot> processes;
+    bool allocationFailure=false;
+};
+
+static void MarkClassProfilesIncomplete(FastEnumContext& context,
+                                        const wchar_t* className){
+    for(const AppProfile& profile : *context.profiles)
+        if(std::find(profile.classNames.begin(),profile.classNames.end(),className)!=
+           profile.classNames.end())
+            (*context.snapshots)[profile.id].enumerationComplete=false;
+}
+
+static BOOL CALLBACK EnumFastWindow(HWND hwnd,LPARAM parameter){
+    FastEnumContext& context=*reinterpret_cast<FastEnumContext*>(parameter);
+    try {
+        if(!(GetWindowLongPtrW(hwnd,GWL_STYLE)&WS_VISIBLE)) return TRUE;
+        wchar_t className[64]={0};
+        if(GetClassNameW(hwnd,className,64)<=0) return TRUE;
+        bool trackedClass=false;
+        for(const AppProfile& profile : *context.profiles)
+            if(std::find(profile.classNames.begin(),profile.classNames.end(),className)!=
+               profile.classNames.end()){
+                trackedClass=true;
+                break;
+            }
+        if(!trackedClass) return TRUE;
+
+        DWORD pid=0;
+        if(!GetWindowThreadProcessId(hwnd,&pid) || pid==0){
+            MarkClassProfilesIncomplete(context,className);
+            return TRUE;
+        }
+        auto process=context.processes.find(pid);
+        if(process==context.processes.end())
+            process=context.processes.emplace(pid,ReadProcessSnapshot(pid)).first;
+        if(process->second.image.empty() || process->second.started==0){
+            MarkClassProfilesIncomplete(context,className);
+            return TRUE;
+        }
+        const AppProfile* profile=ClassifyBrowserCandidate(
+            className,process->second.image,*context.profiles);
+        if(!profile) return TRUE;
+
+        int titleLength=GetWindowTextLengthW(hwnd);
+        std::wstring title;
+        if(titleLength>0){
+            title.resize(static_cast<size_t>(titleLength)+1,L'\0');
+            int copied=GetWindowTextW(hwnd,&title[0],titleLength+1);
+            if(copied<=0){
+                (*context.snapshots)[profile->id].enumerationComplete=false;
+                return TRUE;
+            }
+            title.resize(static_cast<size_t>(copied));
+        }
+        FastWin window;
+        window.app=profile->id;
+        window.hwnd=hwnd;
+        window.pid=pid;
+        window.processStart=process->second.started;
+        window.title=title;
+        HRESULT desktopResult=g_vdmDoc
+            ? g_vdmDoc->GetWindowDesktopId(hwnd,&window.desktop)
+            : E_NOINTERFACE;
+        if(FAILED(desktopResult) || GuidIsZero(window.desktop))
+            (*context.snapshots)[profile->id].desktopLookupsComplete=false;
+        (*context.snapshots)[profile->id].windows.push_back(std::move(window));
+        return TRUE;
+    } catch(...) {
+        context.allocationFailure=true;
+        for(auto& entry : *context.snapshots)
+            entry.second.enumerationComplete=false;
+        return FALSE;
+    }
+}
+
+static std::map<std::string,AppFastSnapshot> CollectFastSnapshots(
+        const std::vector<AppProfile>& profiles){
+    static SnapshotVersionTracker versions;
+    std::map<std::string,AppFastSnapshot> result;
+    for(const AppProfile& profile : profiles) result[profile.id];
+    FastEnumContext context;
+    context.profiles=&profiles;
+    context.snapshots=&result;
+    if(!EnumWindows(EnumFastWindow,reinterpret_cast<LPARAM>(&context)) ||
+       context.allocationFailure)
+        for(auto& entry : result) entry.second.enumerationComplete=false;
+    for(const AppProfile& profile : profiles)
+        FinalizeFastSnapshot(profile.id,ProfileConfigSignature(profile),
+                             versions,result[profile.id]);
+    return result;
+}
+
+static std::map<std::string,AppFastSnapshot> CollectFastSnapshots(){
+    return CollectFastSnapshots(ActiveProfiles());
+}
+
+static WindowIdentityRecapture RecaptureGenericWindowIdentity(
+        const WindowIdentityKey& expected) noexcept {
+    if(expected.hwnd==0 || expected.pid==0 || expected.processStart==0)
+        return WindowIdentityRecapture::Lost;
+    HWND hwnd=reinterpret_cast<HWND>(expected.hwnd);
+    if(!IsWindow(hwnd)) return WindowIdentityRecapture::Lost;
+    DWORD pid=0;
+    if(!GetWindowThreadProcessId(hwnd,&pid))
+        return WindowIdentityRecapture::Indeterminate;
+    if(pid!=expected.pid) return WindowIdentityRecapture::Lost;
+    UniqueWinHandle process(OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid));
+    if(!process) return WindowIdentityRecapture::Indeterminate;
+    FILETIME created{},exited{},kernel{},user{};
+    if(!GetProcessTimes(process.get(),&created,&exited,&kernel,&user))
+        return WindowIdentityRecapture::Indeterminate;
+    ULARGE_INTEGER ticks{};
+    ticks.LowPart=created.dwLowDateTime;
+    ticks.HighPart=created.dwHighDateTime;
+    return ticks.QuadPart==expected.processStart
+        ? WindowIdentityRecapture::Match : WindowIdentityRecapture::Lost;
+}
+
+static bool CaptureGenericWindowIdentity(const WindowIdentityKey& expected,
+                                          ProcessSnapshot* processOut=nullptr){
+    if(RecaptureGenericWindowIdentity(expected)!=WindowIdentityRecapture::Match)
+        return false;
+    if(!processOut) return true;
+    ProcessSnapshot process=ReadProcessSnapshot(expected.pid);
+    if(process.started==0 || process.started!=expected.processStart) return false;
+    *processOut=std::move(process);
+    return true;
+}
+
+static bool IsTrackedBrowserWindow(const WindowIdentityKey& expected,
+                                   std::string* appOut){
+    ProcessSnapshot process;
+    if(!CaptureGenericWindowIdentity(expected,&process)) return false;
+    HWND hwnd=reinterpret_cast<HWND>(expected.hwnd);
+    wchar_t className[64]={0};
+    if(GetClassNameW(hwnd,className,64)<=0) return false;
+    std::vector<AppProfile> profiles=ActiveProfiles();
+    const AppProfile* profile=ClassifyBrowserCandidate(
+        className,process.image,profiles);
+    if(!profile) return false;
+    if(appOut) *appOut=profile->id;
+    return true;
+}
 // ============================ snapshot storage ================================
 static UnixSeconds UtcNowSeconds(){
     FILETIME ft{}; GetSystemTimeAsFileTime(&ft);
@@ -321,138 +617,3140 @@ static UnixSeconds UtcNowSeconds(){
     if(ticks.QuadPart<WINDOWS_TO_UNIX_EPOCH)return 0;
     return (UnixSeconds)((ticks.QuadPart-WINDOWS_TO_UNIX_EPOCH)/10000000ULL);
 }
+static uint64_t MonotonicNowMs(){ return static_cast<uint64_t>(GetTickCount64()); }
+static uint64_t TakeNonzeroId(uint64_t& counter){
+    if(counter==(std::numeric_limits<uint64_t>::max)()) counter=0;
+    ++counter;
+    return counter;
+}
 static std::wstring DataDir(){
     wchar_t base[MAX_PATH]={0}; GetEnvironmentVariableW(L"LOCALAPPDATA",base,MAX_PATH);
     std::wstring dir=std::wstring(base)+L"\\VirtualDesktopsExtention"; CreateDirectoryW(dir.c_str(),nullptr); return dir;
 }
 static std::wstring LayoutPath(bool manual){ return DataDir()+(manual?L"\\layout-manual.txt":L"\\layout-auto.txt"); }
-static void MigrateLegacyLayout(){
-    std::wstring legacy=DataDir()+L"\\layout.txt", autoP=LayoutPath(false);
-    if(FileExists(legacy) && !FileExists(autoP)) MoveFileW(legacy.c_str(), autoP.c_str());
-}
-static bool WriteTextFile(const std::wstring& path, const std::string& text){
-    HANDLE f=CreateFileW(path.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
-    if(f==INVALID_HANDLE_VALUE)return false; DWORD wr=0; BOOL ok=WriteFile(f,text.data(),(DWORD)text.size(),&wr,nullptr); CloseHandle(f); return ok&&wr==text.size();
+static void ReportStorageError(const std::wstring& message);
+static bool MigrateLegacyLayout(){
+    LegacyLayoutMigrationResult migration=MigrateLegacyLayout(
+        DataDir()+L"\\layout.txt",LayoutPath(false),UtcNowSeconds());
+    if(!migration.succeeded())
+        ReportStorageError(L"Legacy layout migration could not be completed; the original file was preserved and startup will retry.");
+    return migration.succeeded();
 }
 static bool CurrentDesktops(std::vector<DeskRec>& desksOut, std::string* errorOut=nullptr){
     auto fail=[&](const std::string& message)->bool{ if(errorOut)*errorOut=message; return false; };
     if(!g_vdmi)return fail("virtual desktop manager is unavailable");
     UINT count=0; if(FAILED(g_vdmi->GetCount(&count)))return fail("failed to get virtual desktop count");
+    if(count==0 || count>MAX_LAYOUT_RECORDS)return fail("invalid virtual desktop count");
     std::vector<DeskRec> desks;
+    try { desks.reserve(count); }
+    catch(...) { return fail("out of memory collecting virtual desktops"); }
     for(UINT i=0;i<count;++i){
-        IVirtualDesktop* d=GetDesktopByIndex(i); if(!d)return fail("failed to get virtual desktop");
-        GUID g={0}; HRESULT idHr=d->GetID(&g);
-        if(FAILED(idHr)||GuidIsZero(g)){ d->Release(); return fail("failed to get virtual desktop GUID"); }
-        DeskRec dr; dr.index=(int)i; dr.guid=g; dr.name=DesktopNameFromRegistry(g); desks.push_back(dr); d->Release();
+        ScopedComPtr<IVirtualDesktop> desktop(GetDesktopByIndex(i));
+        if(!desktop)return fail("failed to get virtual desktop");
+        GUID g={0}; HRESULT idHr=desktop->GetID(&g);
+        if(FAILED(idHr)||GuidIsZero(g)) return fail("failed to get virtual desktop GUID");
+        try {
+            DeskRec record; record.index=(int)i; record.guid=g;
+            record.name=DesktopNameFromRegistry(g); desks.push_back(std::move(record));
+        } catch(...) { return fail("out of memory collecting virtual desktops"); }
     }
     desksOut.swap(desks); if(errorOut)errorOut->clear(); return true;
 }
-// Currently-open windows (Phase 1: Firefox) as LayoutWin with desktop assigned.
-// Accumulates each window's FingerprintKey into `seen` and app into `apps` (for grace bookkeeping).
-static std::vector<LayoutWin> CollectPresentWindows(std::set<std::string>* seen, std::set<std::string>* apps){
-    std::vector<LayoutWin> out;
-    for(auto& prof:ActiveProfiles()) for(auto& f:BuildLiveFingerprintsFor(prof)){
-        if(GuidIsZero(f.desktop))continue;
-        LayoutWin w; w.app=f.app; w.deskIndex=GetDesktopIndexByGuid(f.desktop);
-        w.desktop=f.desktop; w.activeTitle=f.activeTitle; w.activeDomain=f.activeDomain; w.tabCount=f.tabCount; w.counts=f.counts; w.missingRuns=0;
-        out.push_back(w);
-        if(seen) seen->insert(FingerprintKey(w.app,w.counts,w.activeTitle));
-        if(apps) apps->insert(w.app);
-    }
-    return out;
+
+static void ReportStorageError(const std::wstring& message){
+    const uint64_t now=MonotonicNowMs();
+    std::string key;
+    try { key=W2U8(message); }
+    catch(...) { key="storage-error"; }
+    if(g_dirtyFlush.shouldReportError(key,now) && g_main) Balloon(message);
 }
 
-// ============================ save / restore cores ============================
-// Возвращают краткую сводку (UTF-8) для трей-балуна; CLI печатает её и детали.
-static Fp SavedToFp(const LayoutWin& w){
-    Fp f; f.desktop=w.desktop; f.deskIndex=w.deskIndex; f.activeTitle=w.activeTitle;
-    f.activeDomain=w.activeDomain; f.counts=w.counts; f.tabCount=w.tabCount; return f;
-}
-// Manual save: full snapshot of currently-open windows → layout-manual.txt (no grace).
-static std::string RunSaveManual(){
-    if(g_degraded) return "Virtual-desktop features are unavailable on this Windows build.";
-    auto present=CollectPresentWindows(nullptr,nullptr);
-    if(present.empty()) return "No browser windows found. Nothing to save.";
-    std::vector<DeskRec> desks; std::string prepareError, snapshot;
-    if(!CurrentDesktops(desks,&prepareError)) return "Failed to collect desktops: "+prepareError;
-    if(!BuildCheckedLayoutSnapshot(desks,present,UtcNowSeconds(),snapshot,&prepareError)) return "Failed to prepare manual layout: "+prepareError;
-    if(!WriteTextFile(LayoutPath(true), snapshot)) return "Failed to write manual layout.";
-    char b[160]; sprintf_s(b,"Saved layout: %d window(s).",(int)present.size()); return b;
-}
-// Auto save: merge present windows into layout-auto.txt. Never touches the file when
-// no windows are open (anti-wipe). Absent windows are kept (grace, aged only on exit).
-static std::string RunSaveAuto(std::set<std::string>* seen, std::set<std::string>* apps){
-    if(g_degraded) return "";
-    UnixSeconds nowUtc=UtcNowSeconds();
-    auto present=CollectPresentWindows(seen,apps);
-    if(present.empty()) return "";
-    std::vector<DeskRec> desks; std::string prepareError, snapshot;
-    if(!CurrentDesktops(desks,&prepareError)) return "Failed to collect desktops: "+prepareError;
-    std::string existingBytes; bool haveExisting=ReadFileBytes(LayoutPath(false),existingBytes);
-    if(!BuildAutoLayoutSnapshot(haveExisting?&existingBytes:nullptr,desks,present,nowUtc,snapshot,&prepareError))
-        return "Failed to prepare auto layout: "+prepareError;
-    WriteTextFile(LayoutPath(false), snapshot);
-    return "auto-saved";
-}
-static std::string RunRestore(bool manual, std::vector<std::string>* linesOut=nullptr, int* movedOut=nullptr){
-    if(g_degraded) return "Virtual-desktop features are unavailable on this Windows build.";
-    std::vector<DeskRec> savedDesks; std::vector<LayoutWin> saved;
-    { std::string t; if(!ReadFileBytes(LayoutPath(manual),t) || !ParseLayout(t,savedDesks,saved,UtcNowSeconds()) || saved.empty())
-        return manual?"No saved layout. Use 'Save windows layout' first.":"No auto layout yet."; }
-    std::vector<Fp> live; for(auto& prof:ActiveProfiles()){ auto l=BuildLiveFingerprintsFor(prof); for(auto& x:l) live.push_back(std::move(x)); }
-    if(live.empty())return "No browser windows to restore.";
-    UINT count=0; g_vdmi->GetCount(&count);
-    const double T_FLOOR=0.35,T_ACCEPT=0.55;
-    struct Pair{ double sc; int si,li; }; std::vector<Pair> pairs;
-    for(int i=0;i<(int)saved.size();++i){ Fp S=SavedToFp(saved[i]);
-        for(int j=0;j<(int)live.size();++j){ if(saved[i].app!=live[j].app)continue; double sc=Score(S,live[j]); if(sc>=T_FLOOR)pairs.push_back({sc,i,j}); } }   // only match same app
-    std::sort(pairs.begin(),pairs.end(),[](const Pair&a,const Pair&b){return a.sc>b.sc;});
-    std::vector<int> usedS(saved.size(),0),usedL(live.size(),0),assignL2S(live.size(),-1); int matched=0;
-    for(auto& p:pairs) if(!usedS[p.si]&&!usedL[p.li]&&p.sc>=T_ACCEPT){ usedS[p.si]=usedL[p.li]=1; assignL2S[p.li]=p.si; matched++; }
-    int already=0,failed=0,realMoved=0;
-    for(int li=0;li<(int)live.size();++li){ Fp& L=live[li];
-        if(assignL2S[li]<0){ if(linesOut)linesOut->push_back("[no match] "+L.activeTitle); continue; }
-        const LayoutWin& S=saved[assignL2S[li]];
-        IVirtualDesktop* dest=nullptr; GUID destGuid={0};
-        if(GetDesktopIndexByGuid(S.desktop)>=0){ dest=GetDesktopByGuid(S.desktop); destGuid=S.desktop; }
-        else if(S.deskIndex>=0&&(UINT)S.deskIndex<count){ dest=GetDesktopByIndex((UINT)S.deskIndex); if(dest)dest->GetID(&destGuid); }
-        if(!dest){ if(linesOut)linesOut->push_back("[no target] "+L.activeTitle); failed++; continue; }
-        if(!GuidIsZero(L.desktop)&&GuidEq(L.desktop,destGuid)){ if(linesOut)linesOut->push_back("[already there] "+L.activeTitle); dest->Release(); already++; continue; }
-        bool ok=MoveWindowToDesktop(L.hwnd,dest,destGuid); dest->Release();
-        if(ok){ realMoved++; if(linesOut)linesOut->push_back("[moved] "+L.activeTitle); }
-        else  { failed++; if(linesOut)linesOut->push_back("[FAILED] "+L.activeTitle); }
+static void ScheduleAutoFlush(UINT delayMs=AUTO_FLUSH_INTERVAL_MS){
+    if(!g_main || !g_autoDirty || !g_dirtyFlush.dirty() || !g_autoLoaded ||
+       !g_autoWritesAllowed || !g_autoFix || g_degraded) return;
+    const uint64_t now=MonotonicNowMs();
+    const uint64_t requestedDue=now>(std::numeric_limits<uint64_t>::max)()-delayMs
+        ? (std::numeric_limits<uint64_t>::max)() : now+delayMs;
+    if(g_flushTimerArmed && g_flushTimerDueMs!=0 &&
+       g_flushTimerDueMs<=requestedDue) return;
+    if(SetTimer(g_main,TIMER_AUTO_FLUSH,delayMs,nullptr)){
+        g_flushTimerArmed=true;
+        g_flushTimerDueMs=requestedDue;
+        return;
     }
-    if(movedOut)*movedOut=realMoved;                        // real moves only (excludes "already in place")
-    char b[200];
-    if(matched==0)                     sprintf_s(b,"Restore: no matching windows (%d open, %d saved).",(int)live.size(),(int)saved.size());
-    else if(realMoved==0 && failed==0) sprintf_s(b,"Restore: nothing to move - all %d matched window(s) already in place.",matched);
-    else if(failed==0)                 sprintf_s(b,"Restore: moved %d, %d already in place (%d/%d matched).",realMoved,already,matched,(int)live.size());
-    else                               sprintf_s(b,"Restore: moved %d, %d already in place, %d failed (%d/%d matched).",realMoved,already,failed,matched,(int)live.size());
-    return b;
+    g_flushTimerArmed=false;
+    g_flushTimerDueMs=0;
+    ReportStorageError(L"Automatic layout flush timer could not be started; final checkpoints remain enabled.");
 }
 
+static void MarkAutoDirty(bool schedule=true){
+    g_autoDirty=true;
+    g_dirtyFlush.markDirty(MonotonicNowMs());
+    if(schedule) ScheduleAutoFlush();
+}
+
+static void QueueRecordDelta(RecordDeltaKind kind,const LayoutWin* before,
+                             const LayoutWin& desired,bool erase,
+                             UnixSeconds changedUtc,uint64_t causalGeneration);
+
+static bool LoadAutoLayout(){
+    const UnixSeconds nowUtc=UtcNowSeconds();
+    LayoutLoadResult loaded=LoadLayoutWithBackup(LayoutPath(false),nowUtc);
+    if(loaded.status==LayoutLoadStatus::Unavailable){
+        g_autoWritesAllowed=false;
+        ReportStorageError(L"The saved layout is temporarily unavailable; automatic changes are paused and will retry.");
+        return false;
+    }
+
+    std::vector<DeskRec> desktops;
+    std::vector<LayoutWin> records;
+    std::vector<LayoutWin> expiredRecords;
+    if(loaded.status==LayoutLoadStatus::Valid ||
+       loaded.status==LayoutLoadStatus::Recovered){
+        ExpiredLayoutPartition partition;
+        if(!PartitionExpiredLayoutRecords(loaded.wins,nowUtc,partition)){
+            g_autoWritesAllowed=false;
+            ReportStorageError(L"The saved layout could not be prepared in memory; automatic changes are paused and will retry.");
+            return false;
+        }
+        try { desktops=loaded.desks; }
+        catch(...) {
+            g_autoWritesAllowed=false;
+            ReportStorageError(L"The desktop snapshot could not be prepared in memory; automatic changes are paused and will retry.");
+            return false;
+        }
+        records.swap(partition.retained);
+        expiredRecords.swap(partition.expired);
+    }
+    g_autoDesktops.swap(desktops);
+    g_autoRecords.swap(records);
+    g_autoLoaded=true;
+    g_autoWritesAllowed=loaded.writesAllowed;
+    g_autoRevision=loaded.revision;
+    g_preserveBackupOnNextWrite=loaded.status==LayoutLoadStatus::Recovered;
+    g_autoDirty=loaded.status==LayoutLoadStatus::Recovered ||
+                loaded.status==LayoutLoadStatus::CorruptPreserved ||
+                ((loaded.status==LayoutLoadStatus::Valid) && loaded.sourceVersion<4);
+    g_dirtyRecordDeltas.clear();
+    g_validatedTouches.clear();
+    g_deferredConflictRecordIds.clear();
+    g_dirtyFlush.clearDirty();
+    if(g_autoDirty) g_dirtyFlush.markDirty(MonotonicNowMs());
+    if(!expiredRecords.empty()){
+        const uint64_t generation=TakeNonzeroId(g_nextOperationId);
+        for(const LayoutWin& expired : expiredRecords)
+            QueueRecordDelta(RecordDeltaKind::ExpireDelete,&expired,expired,
+                             true,nowUtc,generation);
+    }
+    if(loaded.status==LayoutLoadStatus::Recovered)
+        ReportStorageError(L"The primary layout was invalid; VDE restored the valid backup.");
+    else if(loaded.status==LayoutLoadStatus::CorruptPreserved)
+        ReportStorageError(L"Invalid layout copies were preserved for diagnostics; VDE started with an empty layout.");
+    if(g_autoDirty) ScheduleAutoFlush();
+    return true;
+}
+
+static std::map<std::string,uint64_t> CurrentCausalGenerations(){
+    std::map<std::string,uint64_t> generations;
+    for(const auto& entry : g_recordByRuntime){
+        const RuntimeRecordBinding& binding=entry.second;
+        auto found=generations.find(binding.recordId);
+        if(found==generations.end() || found->second<binding.causalGeneration)
+            generations[binding.recordId]=binding.causalGeneration;
+    }
+    return generations;
+}
+
+static const LayoutWin* FindAutoRecord(const std::string& recordId){
+    for(const LayoutWin& record : g_autoRecords)
+        if(record.recordId==recordId) return &record;
+    return nullptr;
+}
+
+static void QueueRecordDelta(RecordDeltaKind kind,const LayoutWin* before,
+                             const LayoutWin& desired,bool erase,
+                             UnixSeconds changedUtc,uint64_t causalGeneration){
+    RecordDelta next;
+    next.kind=kind;
+    next.erase=erase;
+    next.record=desired;
+    next.baseRevision=g_autoRevision;
+    next.baseRecordPresent=before!=nullptr;
+    if(before) next.baseRecord=*before;
+    next.changedUtc=changedUtc;
+    next.causalGeneration=causalGeneration;
+    auto found=g_dirtyRecordDeltas.find(desired.recordId);
+    if(found==g_dirtyRecordDeltas.end()) g_dirtyRecordDeltas[desired.recordId]=next;
+    else found->second=ChainRecordDelta(found->second,next);
+    g_deferredConflictRecordIds.erase(desired.recordId);
+    g_dirtyFlush.setConflict(!g_deferredConflictRecordIds.empty(),
+                             MonotonicNowMs());
+    MarkAutoDirty();
+}
+
+static bool PersistAutoLayout(){
+    if(!g_autoLoaded || !g_autoWritesAllowed){ g_autoDirty=true; return false; }
+    ScopedLayoutLock lock;
+    if(!lock.acquired()){ g_autoDirty=true; return false; }
+    const std::wstring path=LayoutPath(false);
+    LayoutRevision current=ReadLayoutRevisionLocked(path);
+    if(SameRevision(current,g_autoRevision) &&
+       !g_deferredConflictRecordIds.empty()){
+        g_autoDirty=true;
+        g_dirtyFlush.setConflict(true,MonotonicNowMs());
+        return false;
+    }
+
+    if(!SameRevision(current,g_autoRevision)){
+        LayoutLoadResult latest=LoadLayoutWithBackupLocked(path,UtcNowSeconds());
+        if(!latest.usable()){
+            g_autoDirty=true;
+            return false;
+        }
+        g_preserveBackupOnNextWrite=PreserveExistingBackupForPublish(
+            g_preserveBackupOnNextWrite,latest.status);
+        const std::map<std::string,uint64_t> causal=CurrentCausalGenerations();
+        std::map<std::string,RecordDelta> validDeltas;
+        std::set<std::string> nextConflicts;
+        for(const auto& entry : g_dirtyRecordDeltas){
+            const RecordDelta& delta=entry.second;
+            if(delta.kind==RecordDeltaKind::ExplicitUpsert ||
+               delta.kind==RecordDeltaKind::ExpireDelete ||
+               delta.kind==RecordDeltaKind::MissingMark){
+                validDeltas.insert(entry);
+                continue;
+            }
+            auto generation=causal.find(entry.first);
+            if(generation!=causal.end() && generation->second==delta.causalGeneration)
+                validDeltas.insert(entry);
+            else
+                nextConflicts.insert(entry.first);
+        }
+        RebaseResult rebased=RebaseRecordDeltas(
+            latest.wins,latest.revision,validDeltas,UtcNowSeconds());
+        nextConflicts.insert(
+            rebased.deferredConflictRecordIds.begin(),
+            rebased.deferredConflictRecordIds.end());
+        TouchRebaseResult touched=ReapplyValidatedTouches(
+            rebased.records,g_validatedTouches,causal);
+        nextConflicts.insert(
+            touched.deferredRecordIds.begin(),touched.deferredRecordIds.end());
+        g_autoRecords.swap(touched.records);
+        g_autoDesktops.swap(latest.desks);
+        std::swap(g_autoRevision,latest.revision);
+        g_deferredConflictRecordIds.swap(nextConflicts);
+        if(!g_deferredConflictRecordIds.empty()){
+            g_autoDirty=true;
+            g_dirtyFlush.setConflict(true,MonotonicNowMs());
+            return false;
+        }
+    }
+
+    std::vector<DeskRec> desktops;
+    std::string error,text;
+    if(!CurrentDesktops(desktops,&error)){
+        g_autoDirty=true;
+        ReportStorageError(L"Could not collect virtual desktops; automatic layout remains pending.");
+        return false;
+    }
+    std::vector<LayoutWin> checkedRecords=g_autoRecords;
+    if(!BuildCheckedLayoutSnapshot(
+            desktops,checkedRecords,UtcNowSeconds(),text,&error)){
+        g_autoDirty=true;
+        ReportStorageError(L"Automatic layout validation failed; the previous copy was kept.");
+        return false;
+    }
+    if(!AtomicWriteText(path,text,&error,g_preserveBackupOnNextWrite)){
+        g_autoDirty=true;
+        ReportStorageError(L"Could not save the automatic layout; the previous copy was kept.");
+        return false;
+    }
+    LayoutRevision published=ReadLayoutRevisionLocked(path);
+    if(!published.exists){
+        g_autoDirty=true;
+        return false;
+    }
+    g_autoRecords.swap(checkedRecords);
+    g_autoDesktops.swap(desktops);
+    g_autoRevision=published;
+    g_preserveBackupOnNextWrite=false;
+    g_dirtyRecordDeltas.clear();
+    g_validatedTouches.clear();
+    g_deferredConflictRecordIds.clear();
+    g_autoDirty=false;
+    return true;
+}
+
+static bool FlushAutoLayout(bool force){
+    const uint64_t now=MonotonicNowMs();
+    g_dirtyFlush.setConflict(!g_deferredConflictRecordIds.empty(),now);
+    const DirtyFlushResult result=g_dirtyFlush.flush(
+        now,force,[](){ return PersistAutoLayout(); });
+    if(result==DirtyFlushResult::Succeeded ||
+       result==DirtyFlushResult::NotDirty ||
+       result==DirtyFlushResult::Cleared){
+        g_autoDirty=g_dirtyFlush.dirty();
+        if(g_autoDirty) ScheduleAutoFlush();
+        return !g_autoDirty;
+    }
+    if(result==DirtyFlushResult::SucceededDirtyAgain){
+        g_autoDirty=true;
+        ScheduleAutoFlush();
+        return false;
+    }
+    if(result==DirtyFlushResult::Failed){
+        g_autoDirty=true;
+        ScheduleAutoFlush(g_dirtyFlush.conflicted()
+            ? CONFLICT_RECHECK_INTERVAL_MS : 5000);
+        return false;
+    }
+    if(result==DirtyFlushResult::Deferred){
+        const uint64_t due=g_dirtyFlush.dueAtMs();
+        UINT delay=AUTO_FLUSH_INTERVAL_MS;
+        if(due>now){
+            const uint64_t remaining=due-now;
+            delay=static_cast<UINT>((std::min<uint64_t>)(
+                remaining,(std::numeric_limits<UINT>::max)()));
+            if(delay==0) delay=1;
+        }
+        ScheduleAutoFlush(delay);
+    } else if(result==DirtyFlushResult::ConflictSuppressed){
+        ScheduleAutoFlush(CONFLICT_RECHECK_INTERVAL_MS);
+    }
+    return false;
+}
+
+static const AppProfile* FindActiveProfile(const std::string& app,
+                                           std::vector<AppProfile>& storage){
+    storage=ActiveProfiles();
+    for(const AppProfile& profile : storage)
+        if(profile.id==app) return &profile;
+    return nullptr;
+}
+
+static int SnapshotDesktopIndex(const GUID& guid){
+    for(const DeskRec& desktop : g_autoDesktops)
+        if(GuidEq(desktop.guid,guid)) return desktop.index;
+    return -1;
+}
+
+static uint64_t SessionSourceSignature(const SessionResult& result){
+    SnapshotSignatureBuilder signature;
+    signature.addWideString(result.path)
+        .addUnsigned(result.sourceStampKnown ? 1 : 0);
+    if(result.sourceStampKnown){
+        signature.addUnsigned(result.sourceStamp.size)
+            .addUnsigned(result.sourceStamp.mtime)
+            .addUnsigned(result.sourceStamp.changeTime)
+            .addUnsigned(result.sourceStamp.fileIdHigh)
+            .addUnsigned(result.sourceStamp.fileIdLow)
+            .addUnsigned(result.sourceStamp.volumeSerial);
+    }
+    return signature.value();
+}
+
+// CLI commands have no message loop; they may run the same bounded preparation
+// synchronously. GUI paths always queue it through ReconcileWorker.
+static ReconcileRequest MakeCliLiveRequest(
+        const AppProfile& profile,const AppFastSnapshot& snapshot,
+        const std::shared_ptr<const std::vector<WinFp> >& sessionWindows,
+        const std::vector<DeskRec>& desktops){
+    ReconcileRequest request;
+    request.app=profile.id;
+    request.buildLiveFromInputs=true;
+    request.fastWindows=snapshot.windows;
+    request.sessionWindows=sessionWindows;
+    request.desktops=desktops;
+    request.titleSuffixes=profile.titleSuffixes;
+    return request;
+}
+
+static void ConfigureWorkerLiveBuild(
+        ReconcileRequest& request,ReconcileWorkMode mode,
+        const AppProfile& profile,const AppFastSnapshot& snapshot,
+        const std::shared_ptr<const std::vector<WinFp> >& sessionWindows,
+        const std::vector<DeskRec>& desktops){
+    request.workMode=mode;
+    request.buildLiveFromInputs=true;
+    request.fastWindows=snapshot.windows;
+    request.sessionWindows=sessionWindows;
+    request.desktops=desktops;
+    request.titleSuffixes=profile.titleSuffixes;
+}
+
+static bool SameRecordSemantic(const LayoutWin& left,const LayoutWin& right){
+    return left.recordId==right.recordId && left.app==right.app &&
+        left.deskIndex==right.deskIndex && GuidEq(left.desktop,right.desktop) &&
+        left.activeTitle==right.activeTitle &&
+        left.activeDomain==right.activeDomain && left.tabCount==right.tabCount &&
+        left.counts==right.counts &&
+        left.missingSinceUtc==right.missingSinceUtc;
+}
+
+static void RememberValidatedTouch(const LayoutWin& record,
+                                   uint64_t causalGeneration){
+    ValidatedRecordTouch touch;
+    touch.recordId=record.recordId;
+    touch.lastSeenUtc=record.lastSeenUtc;
+    touch.causalGeneration=causalGeneration;
+    auto found=g_validatedTouches.find(touch.recordId);
+    if(found==g_validatedTouches.end() ||
+       found->second.lastSeenUtc<touch.lastSeenUtc)
+        g_validatedTouches[touch.recordId]=touch;
+}
+
+static bool UpsertAutoRecord(const LayoutWin& desired,RecordDeltaKind kind,
+                             UnixSeconds changedUtc,uint64_t causalGeneration){
+    for(LayoutWin& current : g_autoRecords){
+        if(current.recordId!=desired.recordId) continue;
+        const LayoutWin before=current;
+        current=desired;
+        RememberValidatedTouch(current,causalGeneration);
+        if(!SameRecordSemantic(before,current))
+            QueueRecordDelta(kind,&before,current,false,changedUtc,causalGeneration);
+        return true;
+    }
+    if(g_autoRecords.size()>=MAX_LAYOUT_RECORDS) return false;
+    QueueRecordDelta(kind,nullptr,desired,false,changedUtc,causalGeneration);
+    g_autoRecords.push_back(desired);
+    RememberValidatedTouch(desired,causalGeneration);
+    return true;
+}
+
+static bool EraseAutoRecord(const LayoutWin& previous,RecordDeltaKind kind,
+                            UnixSeconds changedUtc,uint64_t causalGeneration){
+    for(size_t index=0;index<g_autoRecords.size();++index){
+        if(g_autoRecords[index].recordId!=previous.recordId) continue;
+        const LayoutWin before=g_autoRecords[index];
+        QueueRecordDelta(kind,&before,before,true,changedUtc,causalGeneration);
+        g_autoRecords.erase(g_autoRecords.begin()+static_cast<std::ptrdiff_t>(index));
+        g_validatedTouches.erase(previous.recordId);
+        return true;
+    }
+    return false;
+}
+
+static void MarkAppMissingFromLastSeen(const std::string& app,UnixSeconds nowUtc,
+                                       uint64_t causalGeneration){
+    if(causalGeneration==0) return;
+    for(size_t index=g_autoRecords.size();index>0;--index){
+        LayoutWin before=g_autoRecords[index-1];
+        if(before.app!=app) continue;
+        LayoutWin after=before;
+        MarkMissing(after,nowUtc);
+        if(IsExpired(after,nowUtc)){
+            EraseAutoRecord(before,RecordDeltaKind::ExpireDelete,nowUtc,
+                            causalGeneration);
+        } else if(!SameRecordSemantic(before,after)){
+            QueueRecordDelta(RecordDeltaKind::MissingMark,&before,after,false,
+                             nowUtc,causalGeneration);
+            g_autoRecords[index-1]=after;
+        }
+    }
+}
+
+static void PruneStaleRuntimeState(
+        const std::map<std::string,AppFastSnapshot>& snapshots){
+    std::map<std::string,WindowIdentityKey> live;
+    std::set<std::string> completeApps;
+    bool allComplete=!snapshots.empty();
+    try {
+        for(const auto& app : snapshots){
+            if(!app.second.enumerationComplete){ allComplete=false; continue; }
+            completeApps.insert(app.first);
+            for(const FastWin& window : app.second.windows)
+                live[RuntimeKey(window)]=IdentityOf(window);
+        }
+    } catch(...) { return; }
+    auto reserved=[](const std::string& runtime){
+        return g_reservedAutoIdentities.count(runtime)!=0;
+    };
+    for(auto it=g_recordByRuntime.begin();it!=g_recordByRuntime.end();){
+        if(completeApps.count(it->second.app)==0 || reserved(it->first)){
+            ++it; continue;
+        }
+        auto found=live.find(it->first);
+        if(found==live.end() || !SameIdentity(found->second,it->second.identity)){
+            g_pendingRecordByRuntime.erase(it->first);
+            it=g_recordByRuntime.erase(it);
+        } else ++it;
+    }
+    auto staleStateKey=[&](const std::string& runtime,
+                           const std::string& recordId){
+        if(live.count(runtime)!=0 || reserved(runtime)) return false;
+        const LayoutWin* record=FindAutoRecord(recordId);
+        if(record) return completeApps.count(record->app)!=0;
+        return allComplete;
+    };
+    for(auto it=g_pendingRecordByRuntime.begin();
+        it!=g_pendingRecordByRuntime.end();){
+        if(staleStateKey(it->first,it->second))
+            it=g_pendingRecordByRuntime.erase(it);
+        else ++it;
+    }
+    for(auto it=g_provisionalRecordByRuntime.begin();
+        it!=g_provisionalRecordByRuntime.end();){
+        if(staleStateKey(it->first,it->second))
+            it=g_provisionalRecordByRuntime.erase(it);
+        else ++it;
+    }
+    if(allComplete){
+        std::set<std::string> liveAndReserved;
+        try {
+            for(const auto& item : live) liveAndReserved.insert(item.first);
+            for(const auto& item : g_reservedAutoIdentities)
+                liveAndReserved.insert(item.first);
+            g_restoreBudgets.pruneToLiveIdentities(liveAndReserved);
+        } catch(...) {}
+    }
+}
+
+static std::set<std::string> UpdateBoundRecords(
+        const std::string& app,const AppFastSnapshot& snapshot,
+        const std::vector<LayoutWin>& live,ReconcileFreshness freshness,
+        UnixSeconds nowUtc){
+    std::set<std::string> reserved;
+    for(size_t index=0;index<snapshot.windows.size() && index<live.size();++index){
+        const FastWin& fast=snapshot.windows[index];
+        const std::string runtime=RuntimeKey(fast);
+        auto binding=g_recordByRuntime.find(runtime);
+        if(binding==g_recordByRuntime.end() || binding->second.app!=app ||
+           !SameIdentity(binding->second.identity,IdentityOf(fast))) continue;
+        const LayoutWin* existing=FindAutoRecord(binding->second.recordId);
+        if(!existing){ g_recordByRuntime.erase(binding); continue; }
+        LayoutWin desired=*existing;
+        if(!GuidIsZero(fast.desktop)){
+            desired.desktop=fast.desktop;
+            desired.deskIndex=live[index].deskIndex;
+        }
+        if(freshness==ReconcileFreshness::Fresh){
+            desired.activeTitle=live[index].activeTitle;
+            desired.activeDomain=live[index].activeDomain;
+            desired.tabCount=live[index].tabCount;
+            desired.counts=live[index].counts;
+        }
+        MarkSeen(desired,nowUtc);
+        binding->second.causalGeneration=snapshot.generation;
+        UpsertAutoRecord(desired,RecordDeltaKind::ValidatedRuntimeUpsert,
+                         nowUtc,snapshot.generation);
+        reserved.insert(desired.recordId);
+        g_pendingRecordByRuntime.erase(runtime);
+    }
+    return reserved;
+}
+
+static bool SaveObservedApp(const std::string& app,
+                            const AppFastSnapshot& snapshot,
+                            UnixSeconds nowUtc,bool& needsReconcile){
+    needsReconcile=false;
+    if(!FastSnapshotCanPersistAll(snapshot) || snapshot.generation==0 ||
+       nowUtc<=0) return false;
+
+    std::vector<DeskRec> desktops;
+    std::string desktopError;
+    if(!CurrentDesktops(desktops,&desktopError)) return false;
+
+    std::vector<BoundSaveObservation> observations;
+    try {
+        observations.reserve(snapshot.windows.size());
+        for(const FastWin& fast : snapshot.windows){
+            BoundSaveObservation observed;
+            observed.window=fast;
+            observed.causalGeneration=snapshot.generation;
+            for(const DeskRec& desktop : desktops)
+                if(GuidEq(desktop.guid,fast.desktop)){
+                    observed.deskIndex=desktop.index;
+                    break;
+                }
+            const std::string runtime=RuntimeKey(fast);
+            auto binding=g_recordByRuntime.find(runtime);
+            auto reservation=g_reservedAutoIdentities.find(runtime);
+            const bool reserved=reservation!=g_reservedAutoIdentities.end() &&
+                SameIdentity(reservation->second.identity,IdentityOf(fast));
+            if(!reserved && binding!=g_recordByRuntime.end() &&
+               binding->second.app==app &&
+               SameIdentity(binding->second.identity,IdentityOf(fast))){
+                observed.hasBinding=true;
+                observed.expectedIdentity=binding->second.identity;
+                observed.recordId=binding->second.recordId;
+            }
+            observations.push_back(std::move(observed));
+        }
+    } catch(...) { return false; }
+
+    SaveObservedAppResult saved=ApplyObservedBoundRecords(
+        g_autoRecords,app,observations,true,nowUtc);
+    if(!saved.valid) return false;
+
+    bool semanticChanged=false;
+    try {
+        std::map<std::string,RecordDelta> nextDeltas=g_dirtyRecordDeltas;
+        std::map<std::string,ValidatedRecordTouch> nextTouches=
+            g_validatedTouches;
+        std::set<std::string> nextConflicts=g_deferredConflictRecordIds;
+        for(const BoundSaveUpdate& update : saved.updates){
+            ValidatedRecordTouch touch;
+            touch.recordId=update.after.recordId;
+            touch.lastSeenUtc=update.after.lastSeenUtc;
+            touch.causalGeneration=update.causalGeneration;
+            auto priorTouch=nextTouches.find(touch.recordId);
+            if(priorTouch==nextTouches.end() ||
+               priorTouch->second.lastSeenUtc<touch.lastSeenUtc)
+                nextTouches[touch.recordId]=touch;
+            if(!update.semanticChanged) continue;
+            semanticChanged=true;
+            RecordDelta next;
+            next.kind=RecordDeltaKind::ValidatedRuntimeUpsert;
+            next.record=update.after;
+            next.baseRevision=g_autoRevision;
+            next.baseRecordPresent=true;
+            next.baseRecord=update.before;
+            next.changedUtc=nowUtc;
+            next.causalGeneration=update.causalGeneration;
+            auto prior=nextDeltas.find(update.after.recordId);
+            if(prior==nextDeltas.end())
+                nextDeltas[update.after.recordId]=next;
+            else prior->second=ChainRecordDelta(prior->second,next);
+            nextConflicts.erase(update.after.recordId);
+        }
+        g_autoRecords.swap(saved.records);
+        g_autoDesktops.swap(desktops);
+        g_dirtyRecordDeltas.swap(nextDeltas);
+        g_validatedTouches.swap(nextTouches);
+        g_deferredConflictRecordIds.swap(nextConflicts);
+    } catch(...) { return false; }
+
+    for(const BoundSaveObservation& observed : observations){
+        if(!observed.hasBinding) continue;
+        auto binding=g_recordByRuntime.find(RuntimeKey(observed.window));
+        if(binding!=g_recordByRuntime.end() &&
+           SameIdentity(binding->second.identity,IdentityOf(observed.window))){
+            binding->second.causalGeneration=snapshot.generation;
+            g_pendingRecordByRuntime.erase(RuntimeKey(observed.window));
+        }
+    }
+    needsReconcile=saved.needsReconcile;
+    g_dirtyFlush.setConflict(!g_deferredConflictRecordIds.empty(),
+                             MonotonicNowMs());
+    if(semanticChanged) MarkAutoDirty();
+    return true;
+}
+
+static bool SessionPurposeForOwner(AsyncOperationOwner owner,
+                                   SessionPurpose& purpose){
+    switch(owner){
+    case AsyncOperationOwner::AutoReconcile:
+        purpose=SessionPurpose::AutoReconcile; return true;
+    case AsyncOperationOwner::ManualSave:
+        purpose=SessionPurpose::ManualSave; return true;
+    case AsyncOperationOwner::ManualRestore:
+        purpose=SessionPurpose::ManualRestore; return true;
+    case AsyncOperationOwner::Search:
+        purpose=SessionPurpose::Search; return true;
+    case AsyncOperationOwner::MetadataProbe:
+        purpose=SessionPurpose::MetadataProbe; return true;
+    }
+    return false;
+}
+
+static bool SessionOwnerForPurpose(SessionPurpose purpose,
+                                   AsyncOperationOwner& owner){
+    switch(purpose){
+    case SessionPurpose::AutoReconcile:
+        owner=AsyncOperationOwner::AutoReconcile; return true;
+    case SessionPurpose::ManualSave:
+        owner=AsyncOperationOwner::ManualSave; return true;
+    case SessionPurpose::ManualRestore:
+        owner=AsyncOperationOwner::ManualRestore; return true;
+    case SessionPurpose::Search:
+        owner=AsyncOperationOwner::Search; return true;
+    case SessionPurpose::MetadataProbe:
+        owner=AsyncOperationOwner::MetadataProbe; return true;
+    case SessionPurpose::HeartbeatSave:
+        return false;
+    }
+    return false;
+}
+
+static void CancelAutoOperation(uint64_t operationId,bool rearm);
+static void CancelManualSaveOperation(uint64_t operationId);
+static void CancelManualMoveOperation(uint64_t operationId);
+static void FinishManualSave(uint64_t operationId);
+static void FinishManualMove(uint64_t operationId);
+static void RetireSessionRoutesForOperation(AsyncOperationOwner owner,
+                                            uint64_t operationId);
+static void RetireAsyncSessionOperation(const SessionRoute& route,
+                                        AsyncRetirementReason reason);
+static void ProcessSessionRetirements(
+    const std::vector<AsyncSessionRetirement>& retired);
+static void RetireReconcileOperation(uint64_t operationId);
+static void CancelExpiredReconcileOperations(uint64_t nowMs);
+
+static uint64_t RequestSessionWork(AsyncOperationOwner owner,uint64_t operationId,
+        const AppProfile& profile,const AppFastSnapshot& snapshot,
+        SessionPurpose purpose){
+    SessionPurpose ownerPurpose=SessionPurpose::MetadataProbe;
+    if(!g_sessionWorker || !g_main || operationId==0 ||
+       snapshot.identityGeneration==0 ||
+       !SessionPurposeForOwner(owner,ownerPurpose) || ownerPurpose!=purpose)
+        return 0;
+    const uint64_t requestId=TakeNonzeroId(g_nextSessionRequestId);
+    SessionRequest request;
+    request.requestId=requestId;
+    request.app=profile.id;
+    request.profile=profile;
+    request.purpose=purpose;
+    request.identityGeneration=snapshot.identityGeneration;
+    SessionRoute route;
+    route.owner=owner;
+    route.operationId=operationId;
+    route.app=profile.id;
+    route.purpose=purpose;
+    route.identityGeneration=snapshot.identityGeneration;
+    route.contentGeneration=snapshot.generation;
+    const uint64_t now=MonotonicNowMs();
+    const uint64_t lifetime=AsyncSessionRouteGate::maxLifetimeMs();
+    route.deadlineMs=now>(std::numeric_limits<uint64_t>::max)()-lifetime
+        ? (std::numeric_limits<uint64_t>::max)() : now+lifetime;
+
+    AsyncSessionRoute gated;
+    gated.requestId=requestId;
+    gated.operationId=operationId;
+    gated.app=profile.id;
+    gated.purpose=purpose;
+    gated.identityGeneration=snapshot.identityGeneration;
+    gated.deadlineMs=route.deadlineMs;
+    std::vector<AsyncSessionRetirement> retired;
+    if(g_sessionRouteGate.submit(gated,now,retired)!=
+       AsyncRouteAdmission::Accepted) return 0;
+    ProcessSessionRetirements(retired);
+
+    try {
+        if(!g_sessionRoutes.emplace(requestId,route).second){
+            std::vector<AsyncSessionRetirement> ignored;
+            g_sessionRouteGate.retire(requestId,operationId,
+                snapshot.identityGeneration,AsyncRetirementReason::Cancelled,
+                ignored);
+            return 0;
+        }
+    } catch(...) {
+        std::vector<AsyncSessionRetirement> ignored;
+        g_sessionRouteGate.retire(requestId,operationId,
+            snapshot.identityGeneration,AsyncRetirementReason::Cancelled,
+            ignored);
+        return 0;
+    }
+    if(!SetTimer(g_main,TIMER_MONITOR,MONITOR_INTERVAL_MS,nullptr)){
+        std::vector<AsyncSessionRetirement> ignored;
+        g_sessionRouteGate.retire(requestId,operationId,
+            snapshot.identityGeneration,AsyncRetirementReason::Failed,ignored);
+        g_sessionRoutes.erase(requestId);
+        return 0;
+    }
+    bool requested=false;
+    try { requested=g_sessionWorker->Request(request); }
+    catch(...) { requested=false; }
+    if(!requested){
+        std::vector<AsyncSessionRetirement> ignored;
+        g_sessionRouteGate.retire(requestId,operationId,
+            snapshot.identityGeneration,AsyncRetirementReason::Failed,ignored);
+        g_sessionRoutes.erase(requestId);
+        return 0;
+    }
+    return requestId;
+}
+
+static bool RequestReconcileWork(const ReconcileRequest& request){
+    if(!g_reconcileWorker || !g_main || request.operationId==0) return false;
+    if(!SetTimer(g_main,TIMER_MONITOR,MONITOR_INTERVAL_MS,nullptr)) return false;
+    if(!g_reconcileDeadlines.begin(
+            request.operationId,MonotonicNowMs())) return false;
+    bool accepted=false;
+    try { accepted=g_reconcileWorker->Request(request); }
+    catch(...) { accepted=false; }
+    if(!accepted) g_reconcileDeadlines.complete(request.operationId);
+    return accepted;
+}
+
+static void DispatchMoveResult(const MoveResult& result);
+static void DispatchMoveResult(const MoveResult& result,
+                               bool consumeCheckpointWhileProtected);
+static void AdvanceMoveQueue();
+static void FinishAutoOperation(uint64_t operationId);
+static void FinishManualMove(uint64_t operationId);
+static bool ExecuteCheckpoint(CheckpointReason reason);
+
+static bool TryCancelQueuedMove(uint64_t jobId,MoveResult& result) noexcept {
+    try {
+        result=g_moveQueue.cancelJob(jobId);
+        return result.completed;
+    } catch(...) {
+        result=MoveResult();
+        return false;
+    }
+}
+
+static void RefreshMoveCancellationPending() noexcept {
+    g_moveCancellationPending=false;
+    for(const auto& runtime : g_moveRuntime)
+        if(runtime.second.cancelRequested){
+            g_moveCancellationPending=true;
+            break;
+        }
+    if(!g_moveCancellationPending) g_moveCancellationPostRetries=0;
+}
+
+static bool ScheduleMoveCancellationRetry(){
+    if(!g_moveCancellationPending || !g_main) return !g_moveCancellationPending;
+    if(SetTimer(g_main,TIMER_MOVE_VERIFY,MOVE_VERIFY_INTERVAL_MS,nullptr)){
+        g_moveCancellationPostRetries=0;
+        return true;
+    }
+    static const unsigned kMaxPostRetries=8;
+    if(g_moveCancellationPostRetries<kMaxPostRetries &&
+       PostMessageW(g_main,WM_MOVE_CANCEL_RETRY,0,0)){
+        ++g_moveCancellationPostRetries;
+        return true;
+    }
+    return false;
+}
+
+static bool MoveCancellationAwaitsTerminal(uint64_t jobId) noexcept {
+    try {
+        auto runtime=g_moveRuntime.find(jobId);
+        if(runtime==g_moveRuntime.end()) return false;
+        return MoveCancellationDispositionFor(
+            runtime->second.issueAwaitingVerify,
+            RecaptureGenericWindowIdentity(IdentityOf(runtime->second.window)))==
+            MoveCancellationDisposition::AwaitTerminalAcknowledgement;
+    } catch(...) { return false; }
+}
+
+static bool MarkMoveForTerminalRetirement(uint64_t jobId) noexcept {
+    if(!MoveCancellationAwaitsTerminal(jobId)) return false;
+    auto runtime=g_moveRuntime.find(jobId);
+    if(runtime==g_moveRuntime.end()) return false;
+    runtime->second.retireAfterVerify=true;
+    return true;
+}
+
+static bool CancelMoveJobOrDefer(uint64_t jobId){
+    if(MarkMoveForTerminalRetirement(jobId)) return true;
+    auto runtime=g_moveRuntime.find(jobId);
+    if(runtime!=g_moveRuntime.end()) runtime->second.cancelRequested=true;
+    MoveResult cancelled;
+    try { cancelled=g_moveQueue.cancelJob(jobId); }
+    catch(...) {
+        RefreshMoveCancellationPending();
+        if(!ScheduleMoveCancellationRetry())
+            ReportStorageError(L"A cancelled window move is still protected and will be retried when move scheduling becomes available.");
+        return false;
+    }
+    if(cancelled.completed){
+        try { DispatchMoveResult(cancelled); }
+        catch(...) {}
+    } else {
+        RefreshMoveCancellationPending();
+        if(!ScheduleMoveCancellationRetry())
+            ReportStorageError(L"A cancelled window move remains protected because its queue entry could not be retired.");
+        return false;
+    }
+    RefreshMoveCancellationPending();
+    return cancelled.completed;
+}
+
+static void CancelAutoOperation(uint64_t operationId,bool rearm){
+    g_reconcileDeadlines.cancel(operationId);
+    auto found=g_pendingAutoOperations.find(operationId);
+    if(found==g_pendingAutoOperations.end()) return;
+    if(found->second.cancellationPending){
+        RefreshMoveCancellationPending();
+        ScheduleMoveCancellationRetry();
+        return;
+    }
+    const uint64_t lifecycleGeneration=found->second.lifecycleGeneration;
+    auto state=g_lifecycleByApp.find(found->second.app);
+    uint64_t jobIds[MAX_LAYOUT_RECORDS]={0};
+    size_t jobCount=0;
+    for(uint64_t jobId : found->second.liveJobIds)
+        if(jobCount<MAX_LAYOUT_RECORDS) jobIds[jobCount++]=jobId;
+    PublishMoveCancellationIntent(found->second.cancellationPending,
+        jobIds,jobCount,[&](uint64_t jobId) noexcept {
+            if(MarkMoveForTerminalRetirement(jobId)) return;
+            auto runtime=g_moveRuntime.find(jobId);
+            if(runtime!=g_moveRuntime.end()) runtime->second.cancelRequested=true;
+        });
+    RefreshMoveCancellationPending();
+    found->second.reconcile.reset();
+    found->second.reconcileFast.clear();
+    RetireSessionRoutesForOperation(
+        AsyncOperationOwner::AutoReconcile,operationId);
+    if(state!=g_lifecycleByApp.end())
+        LcCancelRestore(state->second,lifecycleGeneration,MonotonicNowMs(),rearm);
+    for(size_t index=0;index<jobCount;++index)
+        CancelMoveJobOrDefer(jobIds[index]);
+    found=g_pendingAutoOperations.find(operationId);
+    if(found!=g_pendingAutoOperations.end() && found->second.liveJobIds.empty())
+        g_pendingAutoOperations.erase(found);
+}
+
+static void CancelExpiredSessionRoutes(uint64_t nowMs){
+    std::vector<AsyncSessionRetirement> retired;
+    g_sessionRouteGate.expire(nowMs,retired);
+    ProcessSessionRetirements(retired);
+}
+
+static bool BeginAutoRestore(const AppProfile& profile,
+                             const AppFastSnapshot& snapshot,
+                             uint64_t lifecycleGeneration){
+    AutoRestoreOperation operation;
+    operation.operationId=TakeNonzeroId(g_nextOperationId);
+    operation.app=profile.id;
+    operation.lifecycleGeneration=lifecycleGeneration;
+    operation.identityGeneration=snapshot.identityGeneration;
+    operation.contentGeneration=snapshot.generation;
+    operation.windowSetSignature=snapshot.windowSetSignature;
+    operation.layoutSignature=snapshot.layoutSignature;
+    uint64_t operationId=operation.operationId;
+    try {
+        if(!g_pendingAutoOperations.emplace(operationId,std::move(operation)).second)
+            return false;
+    } catch(...) { return false; }
+    uint64_t requestId=RequestSessionWork(
+        AsyncOperationOwner::AutoReconcile,operationId,profile,snapshot,
+        SessionPurpose::AutoReconcile);
+    if(requestId==0){
+        g_pendingAutoOperations.erase(operationId);
+        return false;
+    }
+    g_pendingAutoOperations[operationId].sessionRequestId=requestId;
+    return true;
+}
+
+static bool BeginMetadataProbe(const AppProfile& profile,
+                               const AppFastSnapshot& snapshot){
+    if(snapshot.windows.empty() || !FastSnapshotCanObserve(snapshot) ||
+       snapshot.identityGeneration==0 || snapshot.generation==0) return false;
+    for(const auto& route : g_sessionRoutes)
+        if(route.second.app==profile.id) return false;
+    for(const auto& operation : g_metadataProbeOperations)
+        if(operation.second.app==profile.id) return false;
+    MetadataProbeOperation operation;
+    operation.operationId=TakeNonzeroId(g_nextOperationId);
+    operation.app=profile.id;
+    operation.identityGeneration=snapshot.identityGeneration;
+    operation.contentGeneration=snapshot.generation;
+    const uint64_t operationId=operation.operationId;
+    try {
+        if(!g_metadataProbeOperations.emplace(operationId,operation).second)
+            return false;
+    } catch(...) { return false; }
+    if(RequestSessionWork(AsyncOperationOwner::MetadataProbe,operationId,
+                          profile,snapshot,SessionPurpose::MetadataProbe)==0){
+        g_metadataProbeOperations.erase(operationId);
+        return false;
+    }
+    return true;
+}
+
+static void ObserveFastSnapshots(
+        const std::map<std::string,AppFastSnapshot>& snapshots){
+    const uint64_t nowMs=MonotonicNowMs();
+    const UnixSeconds nowUtc=UtcNowSeconds();
+    CancelExpiredSessionRoutes(nowMs);
+    PruneStaleRuntimeState(snapshots);
+    std::vector<AppProfile> profiles=ActiveProfiles();
+    for(const AppProfile& profile : profiles){
+        auto found=snapshots.find(profile.id);
+        if(found==snapshots.end() || !FastSnapshotCanObserve(found->second)) continue;
+        const AppFastSnapshot& snapshot=found->second;
+        LcState& state=g_lifecycleByApp[profile.id];
+        uint64_t sessionSignature=g_lastFreshSessionSignature[profile.id];
+        LcDecision decision=LcObserve(state,!snapshot.windows.empty(),
+            snapshot.windowSetSignature,snapshot.settleSignature,
+            snapshot.layoutSignature,sessionSignature,nowMs);
+        if(decision.action==LcAction::MarkMissingFromLastSeen){
+            MarkAppMissingFromLastSeen(
+                profile.id,nowUtc,snapshot.generation);
+        } else if(decision.action==LcAction::BeginRestore){
+            if(!FastSnapshotCanPersistAll(snapshot) ||
+               !BeginAutoRestore(profile,snapshot,decision.generation))
+                LcCancelRestore(state,decision.generation,nowMs,true);
+        } else if(decision.action==LcAction::SaveLayout){
+            bool needsReconcile=true;
+            if(SaveObservedApp(profile.id,snapshot,nowUtc,needsReconcile) &&
+               !needsReconcile){
+                LcExplicitSaveCompleted(state,decision.generation,
+                    snapshot.layoutSignature,sessionSignature,nowMs);
+            } else {
+                LcExplicitSaveNeedsReconcile(state,decision.generation,
+                    snapshot.layoutSignature,sessionSignature,nowMs);
+            }
+        }
+        if(!state.restorePending && !state.restoreInFlight &&
+           !state.saveInFlight)
+            BeginMetadataProbe(profile,snapshot);
+    }
+}
+
+static HRESULT IssueWindowMove(const MoveRuntimeBinding& binding,
+                               WindowIdentityRecapture& identity){
+    identity=WindowIdentityRecapture::Match;
+    const HWND hwnd=binding.window.hwnd;
+    const GUID& destinationGuid=binding.destination;
+    if(GuidIsZero(destinationGuid) || !g_vdmi || !g_avc) return E_INVALIDARG;
+    ScopedComPtr<IVirtualDesktop> destination(GetDesktopByGuid(destinationGuid));
+    if(!destination) return E_INVALIDARG;
+    identity=RecaptureGenericWindowIdentity(IdentityOf(binding.window));
+    if(identity!=WindowIdentityRecapture::Match)
+        return identity==WindowIdentityRecapture::Lost ? E_ABORT : E_PENDING;
+    HRESULT issued=E_FAIL;
+    try {
+        issued=[&]()->HRESULT{
+            if(binding.window.pid==GetCurrentProcessId()){
+                if(!g_vdmDoc) return E_NOINTERFACE;
+                return g_vdmDoc->MoveWindowToDesktop(hwnd,destinationGuid);
+            }
+            IApplicationView* rawView=nullptr;
+            HRESULT result=g_avc->GetViewForHwnd(hwnd,&rawView);
+            ScopedComPtr<IApplicationView> view(rawView);
+            if(FAILED(result)) return result;
+            if(!view) return E_FAIL;
+            return g_vdmi->MoveViewToDesktop(view.get(),destination.get());
+        }();
+    } catch(...) { issued=E_FAIL; }
+    return issued;
+}
+
+static bool RetryableMoveHresult(HRESULT result){
+    return result==E_FAIL || result==E_PENDING || result==RPC_E_CALL_REJECTED ||
+           result==HRESULT_FROM_WIN32(ERROR_BUSY) ||
+           result==HRESULT_FROM_WIN32(ERROR_RETRY) ||
+           result==HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+}
+
+static MoveAttemptOutcome ReadMoveDestination(const MoveRuntimeBinding& binding,
+                                              WindowIdentityRecapture& identity){
+    identity=WindowIdentityRecapture::Match;
+    if(GetDesktopIndexByGuid(binding.destination)<0)
+        return MoveAttemptOutcome::PermanentFailure;
+    if(!g_vdmDoc) return MoveAttemptOutcome::PermanentFailure;
+    GUID current={0};
+    identity=RecaptureGenericWindowIdentity(IdentityOf(binding.window));
+    if(identity!=WindowIdentityRecapture::Match)
+        return MoveAttemptOutcome::TransientFailure;
+    HRESULT result=E_FAIL;
+    try { result=g_vdmDoc->GetWindowDesktopId(binding.window.hwnd,&current); }
+    catch(...) { result=E_FAIL; }
+    if(SUCCEEDED(result) && !GuidIsZero(current))
+        return GuidEq(current,binding.destination)
+            ? MoveAttemptOutcome::OnDestination
+            : MoveAttemptOutcome::TransientFailure;
+    return RetryableMoveHresult(result)
+        ? MoveAttemptOutcome::TransientFailure
+        : MoveAttemptOutcome::PermanentFailure;
+}
+
+static bool CancelNextMoveAfterArmFailure(){
+    const MoveJob* front=g_moveQueue.front();
+    if(!front){ RefreshMoveCancellationPending(); return true; }
+    const uint64_t jobId=front->token.jobId;
+    auto runtime=g_moveRuntime.find(jobId);
+    if(runtime!=g_moveRuntime.end() && !runtime->second.cancelRequested)
+        return false;
+    MoveResult cancelled;
+    if(!TryCancelQueuedMove(jobId,cancelled)){
+        RefreshMoveCancellationPending();
+        return false;
+    }
+    try { DispatchMoveResult(cancelled); }
+    catch(...) {
+        // DispatchMoveResult settles runtime/reservation ownership before an
+        // owner callback is allowed to escape.
+    }
+    RefreshMoveCancellationPending();
+    return g_moveQueue.empty();
+}
+
+static bool ArmMoveTimer(){
+    if(g_moveQueue.empty()) return true;
+    try {
+        if(g_main && SetTimer(g_main,TIMER_MOVE_VERIFY,
+                MOVE_VERIFY_INTERVAL_MS,nullptr)!=0) return true;
+    } catch(...) {}
+
+    // No timer means no queued job may Issue.  Mark every retained runtime
+    // first, cancel at most one synchronously, then rearm/post bounded retry
+    // work so allocation failure preserves coherent guarded ownership.
+    for(auto& runtime : g_moveRuntime) runtime.second.cancelRequested=true;
+    RefreshMoveCancellationPending();
+    const MoveArmFailureCleanup cleanup=RecoverMoveArmFailure(
+        [](){ return CancelNextMoveAfterArmFailure(); },
+        [](){ return ScheduleMoveCancellationRetry(); });
+    if(cleanup==MoveArmFailureCleanup::Completed)
+        ReportStorageError(L"Window-move verification could not be started; queued moves were cancelled safely.");
+    else if(cleanup==MoveArmFailureCleanup::Rearmed)
+        ReportStorageError(L"Window-move verification could not be started; queued moves are being cancelled safely.");
+    else
+        ReportStorageError(L"Window-move verification could not be started; queued moves remain protected and cancellation will retry on the next move request.");
+    return false;
+}
+
+static bool HandleIndeterminateMoveIdentity(
+        uint64_t jobId,MoveRuntimeBinding& runtime,
+        WindowIdentityRecapture recapture){
+    const IdentityRecaptureRetryAction action=
+        runtime.identityRecaptureBudget.observe(recapture);
+    if(recapture!=WindowIdentityRecapture::Indeterminate) return false;
+    if(action==IdentityRecaptureRetryAction::Retry) return true;
+    runtime.cancelRequested=true;
+    MoveResult cancelled;
+    if(TryCancelQueuedMove(jobId,cancelled)){
+        try { DispatchMoveResult(cancelled); } catch(...) {}
+    }
+    RefreshMoveCancellationPending();
+    return true;
+}
+
+static void AdvanceMoveQueue(){
+    const MoveJob* front=g_moveQueue.front();
+    if(!front){
+        if(g_main) KillTimer(g_main,TIMER_MOVE_VERIFY);
+        return;
+    }
+    const uint64_t jobId=front->token.jobId;
+    auto runtime=g_moveRuntime.find(jobId);
+    if(runtime==g_moveRuntime.end()){
+        MoveResult cancelled;
+        if(TryCancelQueuedMove(jobId,cancelled)) DispatchMoveResult(cancelled);
+        return;
+    }
+    if(runtime->second.cancelRequested){
+        MoveResult cancelled;
+        if(TryCancelQueuedMove(jobId,cancelled)){
+            try { DispatchMoveResult(cancelled); }
+            catch(...) {}
+        }
+        RefreshMoveCancellationPending();
+        if(g_moveQueue.empty() && g_main) KillTimer(g_main,TIMER_MOVE_VERIFY);
+        return;
+    }
+    MoveResult result;
+    if(g_moveQueue.nextAction()==MoveAction::Issue){
+        WindowIdentityRecapture identity=WindowIdentityRecapture::Match;
+        MoveAttemptOutcome current=ReadMoveDestination(
+            runtime->second,identity);
+        if(HandleIndeterminateMoveIdentity(jobId,runtime->second,identity)) return;
+        if(identity==WindowIdentityRecapture::Lost){
+            TryCancelQueuedMove(jobId,result);
+        } else if(current==MoveAttemptOutcome::OnDestination ||
+           current==MoveAttemptOutcome::PermanentFailure){
+            result=g_moveQueue.onIssued(current);
+        } else {
+            HRESULT issued=IssueWindowMove(runtime->second,identity);
+            if(HandleIndeterminateMoveIdentity(
+                    jobId,runtime->second,identity)) return;
+            if(identity==WindowIdentityRecapture::Lost)
+                TryCancelQueuedMove(jobId,result);
+            else {
+                runtime->second.identityRecaptureBudget.reset();
+                MoveAttemptOutcome outcome=SUCCEEDED(issued)
+                    ? MoveAttemptOutcome::Accepted
+                    : (RetryableMoveHresult(issued)
+                        ? MoveAttemptOutcome::TransientFailure
+                        : MoveAttemptOutcome::PermanentFailure);
+                result=g_moveQueue.onIssued(outcome);
+            }
+        }
+        if(!result.completed && g_moveQueue.nextAction()==MoveAction::Verify)
+            runtime->second.issueAwaitingVerify=true;
+    } else if(g_moveQueue.nextAction()==MoveAction::Verify){
+        WindowIdentityRecapture identity=WindowIdentityRecapture::Match;
+        MoveAttemptOutcome verified=ReadMoveDestination(
+            runtime->second,identity);
+        if(HandleIndeterminateMoveIdentity(jobId,runtime->second,identity)) return;
+        if(identity==WindowIdentityRecapture::Match)
+            runtime->second.identityRecaptureBudget.reset();
+        if(runtime->second.retireAfterVerify){
+            const IssuedMoveRetirementAction retirement=
+                runtime->second.retirement.observe(
+                    identity!=WindowIdentityRecapture::Lost,verified);
+            if(retirement==IssuedMoveRetirementAction::WaitForReadback) return;
+            const bool protectCheckpoint=retirement==
+                IssuedMoveRetirementAction::ConsumeProtectedCheckpointAndCancel;
+            if(!protectCheckpoint){
+                runtime->second.issueAwaitingVerify=false;
+            }
+            if(!TryCancelQueuedMove(jobId,result)) return;
+            if(result.completed)
+                DispatchMoveResult(result,protectCheckpoint);
+            if(g_moveQueue.empty() && g_main)
+                KillTimer(g_main,TIMER_MOVE_VERIFY);
+            return;
+        }
+        runtime->second.issueAwaitingVerify=false;
+        if(identity==WindowIdentityRecapture::Lost)
+            TryCancelQueuedMove(jobId,result);
+        else result=g_moveQueue.onVerified(verified);
+    }
+    if(result.completed) DispatchMoveResult(result);
+    if(g_moveQueue.empty() && g_main) KillTimer(g_main,TIMER_MOVE_VERIFY);
+}
+
+static bool ReleaseMoveReservation(const MoveResult& result){
+    auto reserved=g_reservedAutoIdentities.find(result.runtimeKey);
+    if(reserved!=g_reservedAutoIdentities.end() &&
+       SameMoveToken(reserved->second.token,result.token)){
+        g_reservedAutoIdentities.erase(reserved);
+        return true;
+    }
+    return false;
+}
+
+static bool ConsumeCheckpointAndReleaseMoveReservation(
+        const MoveResult& result){
+    auto reserved=g_reservedAutoIdentities.find(result.runtimeKey);
+    if(reserved==g_reservedAutoIdentities.end() ||
+       !SameMoveToken(reserved->second.token,result.token)) return false;
+    const bool lastReservation=g_reservedAutoIdentities.size()==1;
+    g_checkpointController.acknowledgeReservationBeforeRelease(
+        true,lastReservation,g_autoFix && !g_degraded,g_autoLoaded,
+        [](CheckpointReason reason){ return ExecuteCheckpoint(reason); });
+    // The checkpoint callback must observe the guard.  Re-find afterward so
+    // cleanup stays safe even if injected code altered the reservation map.
+    reserved=g_reservedAutoIdentities.find(result.runtimeKey);
+    if(reserved!=g_reservedAutoIdentities.end() &&
+       SameMoveToken(reserved->second.token,result.token)){
+        g_reservedAutoIdentities.erase(reserved);
+        return true;
+    }
+    return false;
+}
+
+static void FinishAutoOperation(uint64_t operationId){
+    auto found=g_pendingAutoOperations.find(operationId);
+    if(found!=g_pendingAutoOperations.end() &&
+       found->second.cancellationPending){
+        if(found->second.liveJobIds.empty())
+            g_pendingAutoOperations.erase(found);
+        return;
+    }
+    if(found==g_pendingAutoOperations.end() || found->second.outstanding!=0) return;
+    AutoRestoreOperation& operation=found->second;
+    g_reconcileDeadlines.cancel(operationId);
+    auto lifecycle=g_lifecycleByApp.find(operation.app);
+    RunTerminalCompletionOrFail([&](){
+        if(!operation.reconcile){
+            if(lifecycle!=g_lifecycleByApp.end())
+                LcCancelRestore(lifecycle->second,operation.lifecycleGeneration,
+                                MonotonicNowMs(),true);
+            return;
+        }
+        const ReconcileResult& result=*operation.reconcile;
+        if(result.plan.deferred){
+            if(lifecycle!=g_lifecycleByApp.end())
+                LcRestoreCompleted(lifecycle->second,operation.lifecycleGeneration,
+                    LcRestoreOutcome::Deferred,operation.layoutSignature,
+                    operation.sourceSignature,MonotonicNowMs());
+            return;
+        }
+
+        std::set<size_t> successfulLiveIndices;
+        for(size_t index=0;index<operation.successfulLive.size();++index)
+            if(operation.successfulLive.succeeded(index))
+                successfulLiveIndices.insert(index);
+        const UnixSeconds nowUtc=UtcNowSeconds();
+        std::vector<LayoutWin> committed=CommitAppReconcile(
+            result.saved,result.live,result.plan,
+            successfulLiveIndices,result.plan.nowUtc);
+    std::map<std::string,LayoutWin> baseById,committedById;
+    for(const LayoutWin& record : result.saved)
+        if(record.app==operation.app) baseById[record.recordId]=record;
+    for(const LayoutWin& record : committed)
+        if(record.app==operation.app) committedById[record.recordId]=record;
+
+    for(const auto& entry : baseById){
+        if(committedById.count(entry.first)!=0) continue;
+        const LayoutWin* current=FindAutoRecord(entry.first);
+        if(current && SameRecordForDelta(*current,entry.second))
+            EraseAutoRecord(*current,RecordDeltaKind::ExpireDelete,
+                            nowUtc,operation.contentGeneration);
+    }
+    for(const auto& entry : committedById){
+        auto base=baseById.find(entry.first);
+        if(base!=baseById.end() &&
+           SameRecordForDelta(base->second,entry.second)) continue;
+        RecordDeltaKind kind=RecordDeltaKind::ValidatedRuntimeUpsert;
+        if(base!=baseById.end() && base->second.missingSinceUtc==0 &&
+           entry.second.missingSinceUtc!=0)
+            kind=RecordDeltaKind::MissingMark;
+        UpsertAutoRecord(entry.second,kind,nowUtc,operation.contentGeneration);
+    }
+
+    std::set<size_t> restoreIndices;
+    for(const RestoreRequest& restore : result.plan.restores)
+        restoreIndices.insert(restore.liveIndex);
+    for(const LayoutMatch& match : result.plan.matches){
+        if(match.savedIndex>=result.saved.size() ||
+           match.liveIndex>=operation.reconcileFast.size()) continue;
+        const FastWin& fast=operation.reconcileFast[match.liveIndex];
+        const std::string runtime=RuntimeKey(fast);
+        const bool required=restoreIndices.count(match.liveIndex)!=0;
+        const bool succeeded=!required ||
+            operation.successfulLive.succeeded(match.liveIndex);
+        if(succeeded){
+            RuntimeRecordBinding binding;
+            binding.app=operation.app;
+            binding.recordId=result.saved[match.savedIndex].recordId;
+            binding.identity=IdentityOf(fast);
+            binding.causalGeneration=operation.contentGeneration;
+            g_recordByRuntime[runtime]=binding;
+            g_pendingRecordByRuntime.erase(runtime);
+        } else {
+            g_pendingRecordByRuntime[runtime]=
+                result.saved[match.savedIndex].recordId;
+        }
+    }
+    for(const NewRecordRequest& created : result.plan.newRecords){
+        if(created.liveIndex>=operation.reconcileFast.size()) continue;
+        const FastWin& fast=operation.reconcileFast[created.liveIndex];
+        RuntimeRecordBinding binding;
+        binding.app=operation.app;
+        binding.recordId=created.recordId;
+        binding.identity=IdentityOf(fast);
+        binding.causalGeneration=operation.contentGeneration;
+        g_recordByRuntime[RuntimeKey(fast)]=binding;
+        g_pendingRecordByRuntime.erase(RuntimeKey(fast));
+    }
+
+        if(operation.hadFailure)
+            ReportStorageError(L"Some browser windows could not be restored automatically; their saved destinations were retained.");
+        if(lifecycle!=g_lifecycleByApp.end())
+            LcRestoreCompleted(lifecycle->second,operation.lifecycleGeneration,
+                AutoRestoreCompletionOutcome(
+                    operation.hadExhausted,operation.hadFailure),
+                operation.layoutSignature,operation.sourceSignature,MonotonicNowMs());
+    },[&]() noexcept {
+        if(lifecycle==g_lifecycleByApp.end()) return;
+        try {
+            LcRestoreCompleted(lifecycle->second,operation.lifecycleGeneration,
+                LcRestoreOutcome::Exhausted,operation.layoutSignature,
+                operation.sourceSignature,MonotonicNowMs());
+        } catch(...) {
+            try {
+                LcCancelRestore(lifecycle->second,operation.lifecycleGeneration,
+                                MonotonicNowMs(),true);
+            } catch(...) {}
+        }
+    });
+    g_pendingAutoOperations.erase(found);
+}
+
+static void DispatchMoveOwnerResult(const MoveResult& result,bool hadRuntime,
+                                    MoveRuntimeBinding& runtime){
+    if(result.token.owner==MoveOwner::AutoReconcile){
+        auto operation=g_pendingAutoOperations.find(result.token.operationId);
+        if(operation==g_pendingAutoOperations.end() ||
+           operation->second.liveJobIds.erase(result.token.jobId)==0) return;
+        if(operation->second.outstanding>0) --operation->second.outstanding;
+        if(operation->second.cancellationPending){
+            if(operation->second.liveJobIds.empty())
+                g_pendingAutoOperations.erase(operation);
+            return;
+        }
+        if(result.terminal==MoveTerminal::Succeeded){
+            if(!operation->second.successfulLive.markSucceeded(
+                    result.token.itemIndex)) operation->second.hadFailure=true;
+            if(hadRuntime && runtime.hasBudgetKey)
+                g_restoreBudgets.clearExact(runtime.budgetKey);
+        } else if(result.terminal==MoveTerminal::Exhausted){
+            operation->second.hadExhausted=true;
+            operation->second.hadFailure=true;
+            if(hadRuntime && runtime.hasBudgetKey &&
+               !g_restoreBudgets.markExhaustedPrepared(
+                    std::move(runtime.budgetKey)))
+                operation->second.hadFailure=true;
+        } else if(result.terminal!=MoveTerminal::Cancelled){
+            operation->second.hadFailure=true;
+        }
+        FinishAutoOperation(result.token.operationId);
+        return;
+    }
+
+    if(result.token.owner==MoveOwner::ManualTray){
+        auto operation=g_manualMoveOperations.find(result.token.operationId);
+        if(operation==g_manualMoveOperations.end() ||
+           operation->second.liveJobIds.erase(result.token.jobId)==0) return;
+        if(operation->second.outstanding>0) --operation->second.outstanding;
+        if(operation->second.cancellationPending){
+            if(operation->second.liveJobIds.empty())
+                g_manualMoveOperations.erase(operation);
+            return;
+        }
+        if(result.terminal==MoveTerminal::Succeeded) ++operation->second.succeeded;
+        else ++operation->second.failed;
+        FinishManualMove(result.token.operationId);
+        return;
+    }
+
+    if(result.token.owner==MoveOwner::Picker){
+        auto operation=g_pickerOperations.find(result.token.operationId);
+        if(operation==g_pickerOperations.end() ||
+           operation->second.liveJobIds.erase(result.token.jobId)==0) return;
+        if(operation->second.liveJobIds.empty()){
+            const bool report=!operation->second.completionReported &&
+                result.terminal!=MoveTerminal::Succeeded;
+            g_pickerOperations.erase(operation);
+            if(report) Balloon(L"The window could not be moved to that desktop.");
+        }
+    }
+}
+
+static void FinalizeMoveReservation(const MoveResult& result,
+                                    bool consumeCheckpointWhileProtected){
+    if(consumeCheckpointWhileProtected){
+        ConsumeCheckpointAndReleaseMoveReservation(result);
+        return;
+    }
+    const bool reservationReleased=ReleaseMoveReservation(result);
+    try {
+        g_checkpointController.reservationTerminated(
+            reservationReleased,!g_reservedAutoIdentities.empty(),
+            g_autoFix && !g_degraded,g_autoLoaded,
+            [](CheckpointReason reason){ return ExecuteCheckpoint(reason); });
+    } catch(...) {
+        // Reservation ownership is already settled.  Checkpoint persistence
+        // retains its own dirty/retry state and must not unwind WndProc.
+    }
+}
+
+static void DispatchMoveResult(const MoveResult& result,
+                               bool consumeCheckpointWhileProtected){
+    if(!result.completed || result.token.jobId==0) return;
+    static_assert(std::is_nothrow_move_assignable<MoveRuntimeBinding>::value,
+        "terminal dispatch must extract runtime ownership without allocation");
+    MoveRuntimeBinding runtime;
+    bool hadRuntime=false;
+    auto runtimeFound=g_moveRuntime.find(result.token.jobId);
+    if(runtimeFound!=g_moveRuntime.end()){
+        runtime=std::move(runtimeFound->second);
+        hadRuntime=true;
+        g_moveRuntime.erase(runtimeFound);
+    }
+    const bool protect=consumeCheckpointWhileProtected ||
+        result.terminal!=MoveTerminal::Succeeded;
+    try {
+        DispatchMoveOwnerResult(result,hadRuntime,runtime);
+    } catch(...) {
+        FinalizeMoveReservation(result,protect);
+        throw;
+    }
+    FinalizeMoveReservation(result,protect);
+}
+
+static void DispatchMoveResult(const MoveResult& result){
+    DispatchMoveResult(result,false);
+}
+
+static void CompleteAutoDeferred(uint64_t operationId,uint64_t sourceSignature){
+    auto found=g_pendingAutoOperations.find(operationId);
+    if(found==g_pendingAutoOperations.end()) return;
+    const std::string app=found->second.app;
+    const uint64_t generation=found->second.lifecycleGeneration;
+    const uint64_t layoutSignature=found->second.layoutSignature;
+    g_pendingAutoOperations.erase(found);
+    g_reconcileDeadlines.cancel(operationId);
+    auto lifecycle=g_lifecycleByApp.find(app);
+    if(lifecycle!=g_lifecycleByApp.end())
+        LcRestoreCompleted(lifecycle->second,generation,
+            LcRestoreOutcome::Deferred,layoutSignature,sourceSignature,
+            MonotonicNowMs());
+}
+
+static void HandleAutoSessionResult(const SessionRoute& route,
+                                    const SessionResult& result){
+    auto operation=g_pendingAutoOperations.find(route.operationId);
+    if(operation==g_pendingAutoOperations.end() ||
+       operation->second.sessionRequestId!=result.requestId) return;
+    if(result.status==SessionDataStatus::Superseded){
+        CancelAutoOperation(route.operationId,true);
+        return;
+    }
+    const uint64_t sourceSignature=SessionSourceSignature(result);
+    if(result.status==SessionDataStatus::Unavailable){
+        CompleteAutoDeferred(route.operationId,sourceSignature);
+        return;
+    }
+    if(!SessionDataUsable(result.status) || !result.windows ||
+       result.dataGeneration==0){
+        CancelAutoOperation(route.operationId,true);
+        return;
+    }
+
+    std::vector<AppProfile> profiles;
+    const AppProfile* profile=FindActiveProfile(route.app,profiles);
+    std::map<std::string,AppFastSnapshot> snapshots=CollectFastSnapshots();
+    auto current=snapshots.find(route.app);
+    if(!profile || current==snapshots.end() ||
+       !FastSnapshotCanObserve(current->second) ||
+       !FastSnapshotCanPersistAll(current->second) ||
+       current->second.identityGeneration!=result.identityGeneration){
+        CancelAutoOperation(route.operationId,true);
+        return;
+    }
+
+    std::vector<DeskRec> currentDesktops;
+    std::string desktopError;
+    if(!CurrentDesktops(currentDesktops,&desktopError)){
+        CancelAutoOperation(route.operationId,true);
+        return;
+    }
+    g_autoDesktops.swap(currentDesktops);
+    const ReconcileFreshness freshness=
+        result.status==SessionDataStatus::Fresh
+            ? ReconcileFreshness::Fresh : ReconcileFreshness::CachedStale;
+    operation=g_pendingAutoOperations.find(route.operationId);
+    if(operation==g_pendingAutoOperations.end()) return;
+    operation->second.identityGeneration=current->second.identityGeneration;
+    operation->second.contentGeneration=current->second.generation;
+    operation->second.windowSetSignature=current->second.windowSetSignature;
+    operation->second.layoutSignature=current->second.layoutSignature;
+    operation->second.sourceSignature=sourceSignature;
+    operation->second.sessionDataGeneration=result.dataGeneration;
+    operation->second.freshness=freshness;
+    if(result.status==SessionDataStatus::Fresh){
+        g_lastFreshSessionSignature[route.app]=sourceSignature;
+    }
+
+    ReconcileRequest request;
+    request.operationId=route.operationId;
+    request.app=route.app;
+    request.identityGeneration=current->second.identityGeneration;
+    request.contentGeneration=current->second.generation;
+    request.sessionRequestId=result.requestId;
+    request.sessionDataGeneration=result.dataGeneration;
+    request.nowUtc=UtcNowSeconds();
+    request.freshness=freshness;
+    try { ConfigureWorkerLiveBuild(request,ReconcileWorkMode::PrepareLiveOnly,
+                                   *profile,current->second,result.windows,
+                                   g_autoDesktops); }
+    catch(...) { CancelAutoOperation(route.operationId,true); return; }
+    operation->second.reconcilePending=true;
+    operation->second.reconcileMode=ReconcileWorkMode::PrepareLiveOnly;
+    if(!RequestReconcileWork(request)){
+        operation->second.reconcilePending=false;
+        CancelAutoOperation(route.operationId,true);
+    }
+}
+
+static void HandleSearchSessionResult(const SessionRoute& route,
+                                      const SessionResult& result);
+static void HandleManualSaveSessionResult(const SessionRoute& route,
+                                          const SessionResult& result);
+static void HandleManualRestoreSessionResult(const SessionRoute& route,
+                                              const SessionResult& result);
+static void HandleMetadataProbeSessionResult(const SessionRoute& route,
+                                             const SessionResult& result){
+    auto operation=g_metadataProbeOperations.find(route.operationId);
+    if(operation==g_metadataProbeOperations.end() ||
+       operation->second.app!=route.app) return;
+    const MetadataProbeOperation expected=operation->second;
+    g_metadataProbeOperations.erase(operation);
+    if(result.status!=SessionDataStatus::Fresh || !result.windows ||
+       result.dataGeneration==0 || !result.sourceStampKnown) return;
+    std::map<std::string,AppFastSnapshot> snapshots=CollectFastSnapshots();
+    auto current=snapshots.find(route.app);
+    if(current==snapshots.end() || !FastSnapshotCanObserve(current->second) ||
+       current->second.identityGeneration!=expected.identityGeneration ||
+       current->second.generation!=expected.contentGeneration ||
+       route.identityGeneration!=expected.identityGeneration ||
+       route.contentGeneration!=expected.contentGeneration) return;
+    const uint64_t sourceSignature=SessionSourceSignature(result);
+    if(g_lastFreshSessionSignature[route.app]!=sourceSignature)
+        g_lastFreshSessionSignature[route.app]=sourceSignature;
+}
+
+static void HandleSessionResult(std::unique_ptr<SessionResult> result){
+    if(!result) return;
+    auto route=g_sessionRoutes.find(result->requestId);
+    if(route==g_sessionRoutes.end()) return;
+    SessionRoute expected=route->second;
+    std::vector<AsyncSessionRetirement> retired;
+    const AsyncRetirementReason reason=
+        result->status==SessionDataStatus::Superseded
+            ? AsyncRetirementReason::Superseded
+            : AsyncRetirementReason::Completed;
+    if(!g_sessionRouteGate.retire(result->requestId,expected.operationId,
+            expected.identityGeneration,reason,retired)){
+        g_sessionRoutes.erase(route);
+        RetireAsyncSessionOperation(expected,AsyncRetirementReason::Failed);
+        return;
+    }
+    g_sessionRoutes.erase(route);
+    if(result->app!=expected.app || result->purpose!=expected.purpose ||
+       result->identityGeneration!=expected.identityGeneration){
+        RetireAsyncSessionOperation(expected,AsyncRetirementReason::Failed);
+        return;
+    }
+    try {
+        if(expected.owner==AsyncOperationOwner::AutoReconcile)
+            HandleAutoSessionResult(expected,*result);
+        else if(expected.owner==AsyncOperationOwner::Search)
+            HandleSearchSessionResult(expected,*result);
+        else if(expected.owner==AsyncOperationOwner::ManualSave)
+            HandleManualSaveSessionResult(expected,*result);
+        else if(expected.owner==AsyncOperationOwner::ManualRestore)
+            HandleManualRestoreSessionResult(expected,*result);
+        else if(expected.owner==AsyncOperationOwner::MetadataProbe)
+            HandleMetadataProbeSessionResult(expected,*result);
+    } catch(...) {
+        RetireAsyncSessionOperation(expected,AsyncRetirementReason::Failed);
+    }
+}
+
+static bool QueueAutoMove(AutoRestoreOperation& operation,
+                          const ReconcileResult& result,
+                          const RestoreRequest& restore){
+    if(restore.savedIndex>=result.saved.size() ||
+       restore.liveIndex>=operation.reconcileFast.size()) return false;
+    const FastWin& fast=operation.reconcileFast[restore.liveIndex];
+    const std::string runtimeKey=RuntimeKey(fast);
+    const LayoutWin& saved=result.saved[restore.savedIndex];
+    g_pendingRecordByRuntime[runtimeKey]=saved.recordId;
+    if(g_reservedAutoIdentities.count(runtimeKey)) return false;
+    if(GetDesktopIndexByGuid(restore.destination)<0) return false;
+
+    RestoreBudgetKey budget;
+    budget.recordId=saved.recordId;
+    budget.fullRuntimeIdentity=runtimeKey;
+    budget.destinationGuid=W2U8(GuidToString(restore.destination));
+    if(!g_restoreBudgets.mayAttempt(budget)){
+        operation.hadExhausted=true;
+        return false;
+    }
+    if(!g_restoreBudgets.prepareTerminalInsert()) return false;
+    MoveJob job;
+    job.token.owner=MoveOwner::AutoReconcile;
+    job.token.operationId=operation.operationId;
+    job.token.jobId=TakeNonzeroId(g_nextMoveJobId);
+    job.token.itemIndex=restore.liveIndex;
+    job.runtimeKey=runtimeKey;
+    job.recordId=saved.recordId;
+    job.destination=restore.destination;
+    MoveRuntimeBinding runtime;
+    runtime.window=fast;
+    runtime.destination=restore.destination;
+    runtime.budgetKey=std::move(budget);
+    runtime.hasBudgetKey=true;
+    ReservedAutoIdentity reservation;
+    reservation.token=job.token;
+    reservation.identity=IdentityOf(fast);
+    reservation.app=fast.app;
+    reservation.recordId=saved.recordId;
+    reservation.originDesktop=fast.desktop;
+    bool insertedRuntime=false,insertedReservation=false;
+    bool insertedLiveJob=false,incrementedOutstanding=false;
+    const bool published=RunFailureAtomicMoveSetup([&](){
+        if(!g_moveRuntime.emplace(job.token.jobId,runtime).second) return false;
+        insertedRuntime=true;
+        if(!g_reservedAutoIdentities.emplace(runtimeKey,reservation).second)
+            return false;
+        insertedReservation=true;
+        if(!operation.liveJobIds.insert(job.token.jobId).second) return false;
+        insertedLiveJob=true;
+        ++operation.outstanding;
+        incrementedOutstanding=true;
+        // Queue publication is deliberately last: no fallible owner update is
+        // allowed to leave an enqueued job requiring an allocating cancel.
+        return g_moveQueue.enqueue(job);
+    },[&](){
+        if(incrementedOutstanding && operation.outstanding>0)
+            --operation.outstanding;
+        if(insertedLiveJob) operation.liveJobIds.erase(job.token.jobId);
+        if(insertedReservation){
+            auto current=g_reservedAutoIdentities.find(runtimeKey);
+            if(current!=g_reservedAutoIdentities.end() &&
+               SameMoveToken(current->second.token,job.token))
+                g_reservedAutoIdentities.erase(current);
+        }
+        if(insertedRuntime) g_moveRuntime.erase(job.token.jobId);
+    });
+    return published;
+}
+
+static void HandleManualReconcileResult(std::unique_ptr<ReconcileResult> result);
+static void HandleManualSavePreparedResult(std::unique_ptr<ReconcileResult> result);
+static void HandleSearchReconcileResult(std::unique_ptr<ReconcileResult> result);
+
+static void HandleReconcileResult(std::unique_ptr<ReconcileResult> result){
+    if(!result) return;
+    auto operation=g_pendingAutoOperations.find(result->operationId);
+    if(operation==g_pendingAutoOperations.end()){
+        if(g_manualSaveOperations.count(result->operationId)){
+            HandleManualSavePreparedResult(std::move(result));
+            return;
+        }
+        if(g_searchOperations.count(result->operationId)){
+            HandleSearchReconcileResult(std::move(result));
+            return;
+        }
+        HandleManualReconcileResult(std::move(result));
+        return;
+    }
+    const uint64_t operationId=result->operationId;
+    if(operation->second.cancellationPending) return;
+    if(!operation->second.reconcilePending ||
+       operation->second.reconcileMode!=result->workMode) return;
+    operation->second.reconcilePending=false;
+    g_reconcileDeadlines.complete(operationId);
+    if(result->status!=ReconcileResultStatus::Completed ||
+       result->app!=operation->second.app ||
+       result->identityGeneration!=operation->second.identityGeneration ||
+       result->contentGeneration!=operation->second.contentGeneration ||
+       result->sessionRequestId!=operation->second.sessionRequestId ||
+       result->sessionDataGeneration!=operation->second.sessionDataGeneration){
+        CancelAutoOperation(operationId,true);
+        return;
+    }
+    std::map<std::string,AppFastSnapshot> snapshots=CollectFastSnapshots();
+    auto current=snapshots.find(result->app);
+    if(current==snapshots.end() || !FastSnapshotCanPersistAll(current->second) ||
+       current->second.identityGeneration!=result->identityGeneration ||
+       current->second.generation!=result->contentGeneration){
+        CancelAutoOperation(operationId,true);
+        return;
+    }
+    if(result->workMode==ReconcileWorkMode::PrepareLiveOnly){
+        if(!result->buildLiveFromInputs ||
+           result->fastWindows.size()!=result->live.size()){
+            CancelAutoOperation(operationId,true);
+            return;
+        }
+        AppFastSnapshot prepared=current->second;
+        prepared.windows=result->fastWindows;
+        std::set<std::string> reserved=UpdateBoundRecords(
+            result->app,prepared,result->live,result->freshness,result->nowUtc);
+        for(const auto& entry : g_reservedAutoIdentities)
+            if(entry.second.app==result->app && !entry.second.recordId.empty())
+                reserved.insert(entry.second.recordId);
+
+        std::vector<LayoutWin> unboundLive;
+        std::vector<FastWin> unboundFast;
+        try {
+            for(size_t index=0;index<result->fastWindows.size();++index){
+                const FastWin& fast=result->fastWindows[index];
+                auto bound=g_recordByRuntime.find(RuntimeKey(fast));
+                if(bound!=g_recordByRuntime.end() &&
+                   SameIdentity(bound->second.identity,IdentityOf(fast))) continue;
+                unboundFast.push_back(fast);
+                unboundLive.push_back(result->live[index]);
+            }
+        } catch(...) {
+            CancelAutoOperation(operationId,true);
+            return;
+        }
+        operation=g_pendingAutoOperations.find(operationId);
+        if(operation==g_pendingAutoOperations.end()) return;
+        ReconcileRequest plan;
+        plan.operationId=operationId;
+        plan.app=result->app;
+        plan.identityGeneration=result->identityGeneration;
+        plan.contentGeneration=result->contentGeneration;
+        plan.sessionRequestId=result->sessionRequestId;
+        plan.sessionDataGeneration=result->sessionDataGeneration;
+        plan.nowUtc=result->nowUtc;
+        plan.freshness=result->freshness;
+        try {
+            operation->second.reconcileFast=unboundFast;
+            plan.saved=g_autoRecords;
+            plan.live.swap(unboundLive);
+            plan.reservedRecordIds.swap(reserved);
+        } catch(...) {
+            CancelAutoOperation(operationId,true);
+            return;
+        }
+        operation->second.reconcilePending=true;
+        operation->second.reconcileMode=ReconcileWorkMode::Plan;
+        if(!RequestReconcileWork(plan)){
+            operation->second.reconcilePending=false;
+            CancelAutoOperation(operationId,true);
+        }
+        return;
+    }
+    if(result->workMode!=ReconcileWorkMode::Plan || result->buildLiveFromInputs){
+        CancelAutoOperation(operationId,true);
+        return;
+    }
+    if(result->plan.deferred){
+        const bool tooComplex=result->plan.tooComplex;
+        operation->second.reconcile=std::move(result);
+        if(tooComplex)
+            ReportStorageError(L"Window reconciliation was deferred because the candidate set is too complex.");
+        FinishAutoOperation(operationId);
+        return;
+    }
+
+    if(!operation->second.successfulLive.initialize(
+            operation->second.reconcileFast.size())){
+        CancelAutoOperation(operationId,true);
+        return;
+    }
+    operation->second.reconcile=std::move(result);
+    ReconcileResult& accepted=*operation->second.reconcile;
+    for(const RestoreRequest& restore : accepted.plan.restores){
+        if(restore.liveIndex>=operation->second.reconcileFast.size()){
+            operation->second.hadFailure=true;
+            continue;
+        }
+        const FastWin& fast=operation->second.reconcileFast[restore.liveIndex];
+        if(GuidEq(fast.desktop,restore.destination)){
+            if(!operation->second.successfulLive.markSucceeded(restore.liveIndex))
+                operation->second.hadFailure=true;
+            continue;
+        }
+        if(!QueueAutoMove(operation->second,accepted,restore))
+            operation->second.hadFailure=true;
+    }
+    if(operation->second.outstanding==0) FinishAutoOperation(operationId);
+    else ArmMoveTimer();
+}
+
+static std::vector<FinalAppObservation> BuildFinalObservations(
+        const std::map<std::string,AppFastSnapshot>& snapshots,
+        UnixSeconds nowUtc){
+    std::vector<FinalAppObservation> observations;
+    const std::vector<AppProfile> allProfiles=BuiltinProfiles(true,true,true);
+    observations.reserve(allProfiles.size());
+    for(const AppProfile& profile : allProfiles){
+        FinalAppObservation app;
+        app.app=profile.id;
+        auto snapshot=snapshots.find(profile.id);
+        if(snapshot==snapshots.end()){
+            app.quality=FinalProfileQuality::Disabled;
+            observations.push_back(std::move(app));
+            continue;
+        }
+        if(!snapshot->second.enumerationComplete){
+            app.quality=FinalProfileQuality::Incomplete;
+            observations.push_back(std::move(app));
+            continue;
+        }
+        app.quality=FinalProfileQuality::Complete;
+        for(size_t index=0;index<snapshot->second.windows.size();++index){
+            const FastWin& fast=snapshot->second.windows[index];
+            const std::string runtime=RuntimeKey(fast);
+            FinalWindowObservation window;
+            window.observed.app=profile.id;
+            window.observed.desktop=fast.desktop;
+            window.observed.deskIndex=SnapshotDesktopIndex(fast.desktop);
+            window.observed.activeTitle=W2U8(
+                StripSuffixes(fast.title,profile.titleSuffixes));
+            window.desktopValid=!GuidIsZero(fast.desktop);
+            window.fingerprintFresh=false;
+            auto bound=g_recordByRuntime.find(runtime);
+            if(bound!=g_recordByRuntime.end() &&
+               SameIdentity(bound->second.identity,IdentityOf(fast)))
+                window.boundRecordId=bound->second.recordId;
+            auto pending=g_pendingRecordByRuntime.find(runtime);
+            if(pending!=g_pendingRecordByRuntime.end())
+                window.pendingRecordId=pending->second;
+            auto provisional=g_provisionalRecordByRuntime.find(runtime);
+            if(provisional==g_provisionalRecordByRuntime.end()){
+                std::string id=NewRecordId();
+                GUID parsed{};
+                if(ParseNonzeroLayoutGuid(id,parsed)){
+                    g_provisionalRecordByRuntime[runtime]=id;
+                    window.provisionalRecordId=id;
+                }
+            } else window.provisionalRecordId=provisional->second;
+            window.allowTitleFallback=window.pendingRecordId.empty() &&
+                window.boundRecordId.empty();
+            auto reservation=g_reservedAutoIdentities.find(runtime);
+            if(reservation!=g_reservedAutoIdentities.end() &&
+               SameIdentity(reservation->second.identity,IdentityOf(fast))){
+                window.reserved=true;
+                if(window.boundRecordId.empty())
+                    window.boundRecordId=reservation->second.recordId;
+                window.hasProvisionalOriginRecord=
+                    reservation->second.hasProvisionalOriginRecord;
+                window.provisionalOriginRecord=
+                    reservation->second.provisionalOriginRecord;
+            }
+            app.windows.push_back(std::move(window));
+        }
+        observations.push_back(std::move(app));
+    }
+    (void)nowUtc;
+    return observations;
+}
+
+static bool CommitFinalSnapshots(
+        const std::map<std::string,AppFastSnapshot>& snapshots){
+    const UnixSeconds nowUtc=UtcNowSeconds();
+    const uint64_t checkpointGeneration=TakeNonzeroId(g_nextOperationId);
+    PruneStaleRuntimeState(snapshots);
+    std::vector<FinalAppObservation> observations;
+    try { observations=BuildFinalObservations(snapshots,nowUtc); }
+    catch(...) { return false; }
+    FinalSnapshotResult finalResult=
+        CommitFinalSnapshotRecords(g_autoRecords,observations,nowUtc);
+    if(!finalResult.valid) return false;
+
+    const std::vector<LayoutWin> beforeRecords=g_autoRecords;
+    std::map<std::string,LayoutWin> beforeById,afterById;
+    for(const LayoutWin& record : beforeRecords) beforeById[record.recordId]=record;
+    for(const LayoutWin& record : finalResult.records) afterById[record.recordId]=record;
+    for(const auto& entry : beforeById){
+        if(afterById.count(entry.first)!=0) continue;
+        QueueRecordDelta(RecordDeltaKind::ExpireDelete,&entry.second,
+                         entry.second,true,nowUtc,checkpointGeneration);
+    }
+    for(const auto& entry : afterById){
+        auto before=beforeById.find(entry.first);
+        if(before==beforeById.end()){
+            QueueRecordDelta(RecordDeltaKind::ExplicitUpsert,nullptr,
+                             entry.second,false,nowUtc,checkpointGeneration);
+        } else if(!SameRecordSemantic(before->second,entry.second)){
+            const RecordDeltaKind kind=
+                before->second.missingSinceUtc==0 &&
+                entry.second.missingSinceUtc!=0
+                    ? RecordDeltaKind::MissingMark
+                    : RecordDeltaKind::ExplicitUpsert;
+            QueueRecordDelta(kind,&before->second,entry.second,false,nowUtc,
+                             checkpointGeneration);
+        }
+    }
+    g_autoRecords=finalResult.records;
+    for(const auto& entry : g_recordByRuntime){
+        const LayoutWin* record=FindAutoRecord(entry.second.recordId);
+        if(record) RememberValidatedTouch(*record,entry.second.causalGeneration);
+    }
+    for(const auto& provisional : g_provisionalRecordByRuntime){
+        const LayoutWin* record=FindAutoRecord(provisional.second);
+        if(!record) continue;
+        auto observationsByApp=snapshots.find(record->app);
+        if(observationsByApp==snapshots.end()) continue;
+        for(const FastWin& fast : observationsByApp->second.windows)
+            if(RuntimeKey(fast)==provisional.first){
+                RuntimeRecordBinding binding;
+                binding.app=record->app;
+                binding.recordId=record->recordId;
+                binding.identity=IdentityOf(fast);
+                binding.causalGeneration=observationsByApp->second.generation;
+                g_recordByRuntime[provisional.first]=binding;
+                break;
+            }
+    }
+    MarkAutoDirty(false);
+    return true;
+}
+
+static bool ExecuteCheckpoint(CheckpointReason){
+    if(!g_autoFix || g_degraded || !g_autoLoaded || !g_autoWritesAllowed)
+        return !g_autoFix || g_degraded;
+    std::map<std::string,AppFastSnapshot> snapshots=CollectFastSnapshots();
+    if(!CommitFinalSnapshots(snapshots)) return false;
+    return FlushAutoLayout(true);
+}
+
+static bool CheckpointAutoLayout(CheckpointReason reason){
+    return g_checkpointController.dispatch(reason,g_autoFix && !g_degraded,
+        g_autoLoaded,!g_reservedAutoIdentities.empty(),
+        [](CheckpointReason current){ return ExecuteCheckpoint(current); });
+}
+
+static void FinalizeAutoLayout(){
+    CheckpointAutoLayout(CheckpointReason::Finalize);
+}
+
+static bool TryLoadAutoLayoutAndInitialize(){
+    if(!MigrateLegacyLayout() || !LoadAutoLayout()) return false;
+    g_autoLoadRetry.succeeded();
+    g_lifecycleByApp.clear();
+    ObserveFastSnapshots(CollectFastSnapshots());
+    if(SetTimer(g_main,TIMER_HEARTBEAT,HEARTBEAT_INTERVAL_MS,nullptr))
+        g_heartbeatTimerArmed=true;
+    else
+        ReportStorageError(L"Automatic heartbeat timer could not be started; final checkpoints remain enabled.");
+    return true;
+}
+
+static void ResetAutoRuntimeState(){
+    std::vector<uint64_t> operations;
+    operations.reserve(g_pendingAutoOperations.size());
+    for(const auto& entry : g_pendingAutoOperations)
+        operations.push_back(entry.first);
+    for(uint64_t operationId : operations) CancelAutoOperation(operationId,false);
+    operations.clear();
+    for(const auto& entry : g_metadataProbeOperations)
+        operations.push_back(entry.first);
+    for(uint64_t operationId : operations)
+        RetireSessionRoutesForOperation(
+            AsyncOperationOwner::MetadataProbe,operationId);
+    g_metadataProbeOperations.clear();
+    for(;;){
+        auto route=std::find_if(g_sessionRoutes.begin(),g_sessionRoutes.end(),
+            [](const std::pair<const uint64_t,SessionRoute>& item){
+                return item.second.owner==AsyncOperationOwner::AutoReconcile;
+            });
+        if(route==g_sessionRoutes.end()) break;
+        RetireSessionRoutesForOperation(
+            AsyncOperationOwner::AutoReconcile,route->second.operationId);
+    }
+    g_recordByRuntime.clear();
+    g_pendingRecordByRuntime.clear();
+    g_provisionalRecordByRuntime.clear();
+    g_lifecycleByApp.clear();
+    g_lastFreshSessionSignature.clear();
+    g_dirtyRecordDeltas.clear();
+    g_validatedTouches.clear();
+    g_deferredConflictRecordIds.clear();
+    g_autoDirty=false;
+    g_dirtyFlush.clearDirty();
+    g_flushTimerArmed=false;
+    g_flushTimerDueMs=0;
+    g_autoLoaded=false;
+    g_autoWritesAllowed=false;
+    g_autoLoadRetry.reset();
+}
+
+static bool SameDesktopSnapshot(const std::vector<DeskRec>& left,
+                                const std::vector<DeskRec>& right){
+    if(left.size()!=right.size()) return false;
+    for(size_t index=0;index<left.size();++index)
+        if(left[index].index!=right[index].index ||
+           !GuidEq(left[index].guid,right[index].guid)) return false;
+    return true;
+}
+
+struct ReservationHandoff {
+    std::string runtimeKey;
+    ReservedAutoIdentity installed;
+    ReservedAutoIdentity displaced;
+    MoveResult rollbackResult;
+    bool hadDisplaced=false;
+    bool active=false;
+};
+
+static void SwapLayoutWinNoThrow(LayoutWin& left,LayoutWin& right) noexcept {
+    left.recordId.swap(right.recordId);
+    left.app.swap(right.app);
+    std::swap(left.deskIndex,right.deskIndex);
+    const GUID desktop=left.desktop;
+    left.desktop=right.desktop;
+    right.desktop=desktop;
+    left.activeTitle.swap(right.activeTitle);
+    left.activeDomain.swap(right.activeDomain);
+    std::swap(left.tabCount,right.tabCount);
+    left.counts.swap(right.counts);
+    std::swap(left.lastSeenUtc,right.lastSeenUtc);
+    std::swap(left.missingSinceUtc,right.missingSinceUtc);
+}
+
+static void SwapReservedAutoIdentityNoThrow(
+        ReservedAutoIdentity& left,ReservedAutoIdentity& right) noexcept {
+    const MoveToken token=left.token;
+    left.token=right.token;
+    right.token=token;
+    const WindowIdentityKey identity=left.identity;
+    left.identity=right.identity;
+    right.identity=identity;
+    left.app.swap(right.app);
+    left.recordId.swap(right.recordId);
+    const GUID origin=left.originDesktop;
+    left.originDesktop=right.originDesktop;
+    right.originDesktop=origin;
+    SwapLayoutWinNoThrow(
+        left.provisionalOriginRecord,right.provisionalOriginRecord);
+    std::swap(left.hasProvisionalOriginRecord,
+              right.hasProvisionalOriginRecord);
+}
+
+static bool BeginReservationHandoff(
+        const std::string& runtimeKey,
+        const ReservedAutoIdentity& replacement,
+        ReservationHandoff& handoff){
+    try {
+        ReservationHandoff next;
+        next.runtimeKey=runtimeKey;
+        auto prior=g_reservedAutoIdentities.find(runtimeKey);
+        ReservedAutoIdentity installed=replacement;
+        if(prior!=g_reservedAutoIdentities.end() &&
+           SameIdentity(prior->second.identity,replacement.identity)){
+            if(!prior->second.recordId.empty())
+                installed.recordId=prior->second.recordId;
+            if(!GuidIsZero(prior->second.originDesktop))
+                installed.originDesktop=prior->second.originDesktop;
+            if(prior->second.hasProvisionalOriginRecord){
+                installed.provisionalOriginRecord=
+                    prior->second.provisionalOriginRecord;
+                installed.hasProvisionalOriginRecord=true;
+            }
+            if(installed.app.empty()) installed.app=prior->second.app;
+        }
+        next.installed=installed;
+        if(!PrepareCancelledMoveResult(next.installed.token,runtimeKey,
+                                       next.installed.recordId,
+                                       next.rollbackResult)) return false;
+        if(prior==g_reservedAutoIdentities.end()){
+            next.active=true;
+            handoff=next;
+            if(!g_reservedAutoIdentities.emplace(runtimeKey,installed).second)
+                return false;
+            return true;
+        }
+        next.displaced=prior->second;
+        MoveResult displacedFallback;
+        if(!PrepareCancelledMoveResult(next.displaced.token,runtimeKey,
+                                       next.displaced.recordId,
+                                       displacedFallback)) return false;
+        next.hadDisplaced=true;
+        next.active=true;
+        handoff=next;
+        SwapReservedAutoIdentityNoThrow(prior->second,installed);
+        // The successor guard is visible before the old queue entry is
+        // physically cancelled.  The old exact-token terminal therefore
+        // cannot erase protection even if its COM Issue may still land.
+        MoveResult removed;
+        try {
+            removed=g_moveQueue.cancelJob(next.displaced.token.jobId);
+        } catch(...) {
+            // cancelJob is transactional.  Restore the old token without a
+            // reservation-free interval if its allocation failed.
+            SwapReservedAutoIdentityNoThrow(prior->second,installed);
+            handoff.active=false;
+            return false;
+        }
+        if(!removed.completed) removed=std::move(displacedFallback);
+        DispatchMoveResult(removed);
+        return true;
+    } catch(...) { return false; }
+}
+
+static void RollbackReservationHandoff(ReservationHandoff& handoff){
+    if(!handoff.active) return;
+    auto current=g_reservedAutoIdentities.find(handoff.runtimeKey);
+    if(current==g_reservedAutoIdentities.end() ||
+       !SameMoveToken(current->second.token,handoff.installed.token)){
+        handoff.active=false;
+        return;
+    }
+    // The displaced job was already retired.  Its stable origin protection
+    // was inherited by the installed token, so consume any deferred
+    // heartbeat while that successor guard is still visible, then erase it.
+    ConsumeCheckpointAndReleaseMoveReservation(handoff.rollbackResult);
+    handoff.active=false;
+}
+
+static void RetireSessionRoutesForOperation(AsyncOperationOwner owner,
+                                             uint64_t operationId){
+    SessionPurpose purpose=SessionPurpose::MetadataProbe;
+    if(SessionPurposeForOwner(owner,purpose)){
+        std::vector<AsyncSessionRetirement> ignored;
+        g_sessionRouteGate.cancelOperation(purpose,operationId,ignored);
+    }
+    for(auto route=g_sessionRoutes.begin();route!=g_sessionRoutes.end();)
+        if(route->second.owner==owner && route->second.operationId==operationId)
+            route=g_sessionRoutes.erase(route);
+        else ++route;
+}
+
+static void FinishManualSave(uint64_t operationId){
+    auto found=g_manualSaveOperations.find(operationId);
+    if(found==g_manualSaveOperations.end() || found->second.outstanding!=0) return;
+    ManualSaveOperation operation=std::move(found->second);
+    g_manualSaveOperations.erase(found);
+    g_reconcileDeadlines.cancel(operationId);
+    if(operation.completionReported) return;
+    auto fail=[&](const wchar_t* message){ Balloon(message); };
+    if(operation.failed){
+        fail(L"Manual layout was not saved because the snapshot changed or browser data was incomplete. Retry.");
+        return;
+    }
+    std::map<std::string,AppFastSnapshot> current=
+        CollectFastSnapshots(operation.profiles.all());
+    std::vector<DeskRec> currentDesktops;
+    std::string error;
+    if(!CurrentDesktops(currentDesktops,&error) ||
+       !SameDesktopSnapshot(currentDesktops,operation.desktops)){
+        fail(L"Manual layout was not saved because the desktop set changed. Retry.");
+        return;
+    }
+    std::vector<LayoutWin> records;
+    std::set<std::string> ids;
+    for(const AppProfile& profile : operation.profiles.all()){
+        auto captured=operation.snapshots.find(profile.id);
+        auto now=current.find(profile.id);
+        if(captured==operation.snapshots.end() || now==current.end() ||
+           captured->second.identityGeneration!=now->second.identityGeneration ||
+           captured->second.generation!=now->second.generation ||
+           !FastSnapshotCanPersistAll(now->second)){
+            fail(L"Manual layout was not saved because the window snapshot changed. Retry.");
+            return;
+        }
+        if(captured->second.windows.empty()) continue;
+        auto prepared=operation.preparedLive.find(profile.id);
+        if(prepared==operation.preparedLive.end()){
+            fail(L"Manual layout was not saved because fresh browser data was unavailable.");
+            return;
+        }
+        for(LayoutWin record : prepared->second){
+            record.recordId=NewRecordId();
+            GUID id{};
+            std::string canonical;
+            if(GuidIsZero(record.desktop) ||
+               !ParseNonzeroLayoutGuid(record.recordId,id,&canonical) ||
+               !ids.insert(canonical).second){
+                fail(L"Manual layout could not allocate stable record identities.");
+                return;
+            }
+            record.recordId=canonical;
+            MarkSeen(record,UtcNowSeconds());
+            record.missingSinceUtc=0;
+            records.push_back(std::move(record));
+        }
+    }
+    if(records.empty()){
+        fail(L"No browser windows found. Nothing was saved.");
+        return;
+    }
+    std::string bytes;
+    std::vector<LayoutWin> checked=records;
+    if(!BuildCheckedLayoutSnapshot(
+            currentDesktops,checked,UtcNowSeconds(),bytes,&error)){
+        fail(L"Manual layout validation failed; the previous checkpoint was kept.");
+        return;
+    }
+    ScopedLayoutLock lock;
+    if(!lock.acquired()){
+        fail(L"Manual layout storage is busy; the previous checkpoint was kept.");
+        return;
+    }
+    LayoutLoadResult prior=LoadLayoutWithBackupLocked(
+        LayoutPath(true),UtcNowSeconds());
+    if(prior.status==LayoutLoadStatus::Unavailable ||
+       !AtomicWriteText(LayoutPath(true),bytes,&error,
+                        prior.status==LayoutLoadStatus::Recovered)){
+        fail(L"Manual layout write failed; the previous checkpoint was kept.");
+        return;
+    }
+    wchar_t message[160]={0};
+    swprintf_s(message,L"Saved manual layout: %u window(s).",
+               static_cast<unsigned>(records.size()));
+    Balloon(message);
+}
+
+static void CancelManualSaveOperation(uint64_t operationId){
+    g_reconcileDeadlines.cancel(operationId);
+    RetireSessionRoutesForOperation(AsyncOperationOwner::ManualSave,operationId);
+    g_manualSaveOperations.erase(operationId);
+}
+
+static void StartManualSave(){
+    if(g_degraded || !g_sessionWorker){
+        Balloon(L"Virtual-desktop or browser-session services are unavailable.");
+        return;
+    }
+    std::vector<uint64_t> old;
+    for(const auto& entry : g_manualSaveOperations) old.push_back(entry.first);
+    for(uint64_t id : old) CancelManualSaveOperation(id);
+    ManualSaveOperation operation;
+    operation.operationId=TakeNonzeroId(g_nextOperationId);
+    operation.profiles=OperationAppProfiles(ActiveProfiles());
+    operation.snapshots=CollectFastSnapshots(operation.profiles.all());
+    std::string error;
+    if(!CurrentDesktops(operation.desktops,&error)){
+        Balloon(L"Manual layout was not saved because desktops could not be collected.");
+        return;
+    }
+    bool any=false;
+    for(const auto& entry : operation.snapshots){
+        if(!FastSnapshotCanPersistAll(entry.second)){
+            Balloon(L"Manual layout was not saved because enumeration or desktop lookup was incomplete.");
+            return;
+        }
+        any=any || !entry.second.windows.empty();
+    }
+    if(!any){ Balloon(L"No browser windows found. Nothing was saved."); return; }
+    const uint64_t operationId=operation.operationId;
+    try {
+        if(!g_manualSaveOperations.emplace(operationId,operation).second) return;
+    } catch(...) { Balloon(L"Manual save could not be started."); return; }
+    bool failed=false;
+    for(const AppProfile& profile : operation.profiles.all()){
+        const AppFastSnapshot& snapshot=operation.snapshots[profile.id];
+        if(snapshot.windows.empty()) continue;
+        uint64_t request=RequestSessionWork(
+            AsyncOperationOwner::ManualSave,operationId,profile,snapshot,
+            SessionPurpose::ManualSave);
+        if(!request){ failed=true; break; }
+        ++g_manualSaveOperations[operationId].outstanding;
+    }
+    if(failed){
+        RetireSessionRoutesForOperation(AsyncOperationOwner::ManualSave,operationId);
+        g_manualSaveOperations[operationId].failed=true;
+        g_manualSaveOperations[operationId].outstanding=0;
+    }
+    FinishManualSave(operationId);
+}
+
+static void HandleManualSaveSessionResult(const SessionRoute& route,
+                                           const SessionResult& result){
+    auto operation=g_manualSaveOperations.find(route.operationId);
+    if(operation==g_manualSaveOperations.end()) return;
+    bool accepted=result.status==SessionDataStatus::Fresh && result.windows &&
+        result.dataGeneration!=0;
+    std::map<std::string,AppFastSnapshot> current=
+        CollectFastSnapshots(operation->second.profiles.all());
+    auto captured=operation->second.snapshots.find(route.app);
+    auto now=current.find(route.app);
+    accepted=accepted && captured!=operation->second.snapshots.end() &&
+        now!=current.end() && FastSnapshotCanPersistAll(now->second) &&
+        captured->second.identityGeneration==now->second.identityGeneration &&
+        captured->second.generation==now->second.generation &&
+        route.contentGeneration==now->second.generation;
+    if(accepted){
+        const AppProfile* profile=operation->second.profiles.find(route.app);
+        ReconcileRequest request;
+        request.operationId=route.operationId;
+        request.app=route.app;
+        request.identityGeneration=now->second.identityGeneration;
+        request.contentGeneration=now->second.generation;
+        request.sessionRequestId=result.requestId;
+        request.sessionDataGeneration=result.dataGeneration;
+        request.nowUtc=UtcNowSeconds();
+        request.freshness=ReconcileFreshness::Fresh;
+        try {
+            if(profile) ConfigureWorkerLiveBuild(
+                request,ReconcileWorkMode::PrepareLiveOnly,*profile,
+                captured->second,result.windows,operation->second.desktops);
+            else accepted=false;
+        } catch(...) { accepted=false; }
+        if(accepted){
+            try {
+                accepted=operation->second.waitingReconcileApps.insert(
+                    route.app).second;
+            } catch(...) { accepted=false; }
+        }
+        if(accepted && RequestReconcileWork(request)) return;
+        operation->second.waitingReconcileApps.erase(route.app);
+        accepted=false;
+    }
+    operation->second.failed=true;
+    if(operation->second.outstanding>0) --operation->second.outstanding;
+    if(operation->second.failed){
+        g_reconcileDeadlines.cancel(route.operationId);
+        operation->second.waitingReconcileApps.clear();
+        RetireSessionRoutesForOperation(AsyncOperationOwner::ManualSave,route.operationId);
+        operation->second.outstanding=0;
+    }
+    FinishManualSave(route.operationId);
+}
+
+static void HandleManualSavePreparedResult(
+        std::unique_ptr<ReconcileResult> result){
+    if(!result) return;
+    auto operation=g_manualSaveOperations.find(result->operationId);
+    if(operation==g_manualSaveOperations.end() ||
+       operation->second.outstanding==0 ||
+       operation->second.waitingReconcileApps.erase(result->app)==0) return;
+    g_reconcileDeadlines.complete(result->operationId);
+    std::map<std::string,AppFastSnapshot> current=
+        CollectFastSnapshots(operation->second.profiles.all());
+    auto captured=operation->second.snapshots.find(result->app);
+    auto now=current.find(result->app);
+    const bool accepted=
+        result->status==ReconcileResultStatus::Completed &&
+        result->workMode==ReconcileWorkMode::PrepareLiveOnly &&
+        result->buildLiveFromInputs &&
+        result->freshness==ReconcileFreshness::Fresh &&
+        captured!=operation->second.snapshots.end() && now!=current.end() &&
+        FastSnapshotCanPersistAll(now->second) &&
+        result->identityGeneration==now->second.identityGeneration &&
+        result->contentGeneration==now->second.generation &&
+        result->fastWindows.size()==result->live.size();
+    if(accepted){
+        try { operation->second.preparedLive[result->app]=result->live; }
+        catch(...) { operation->second.failed=true; }
+    } else operation->second.failed=true;
+    if(operation->second.outstanding>0) --operation->second.outstanding;
+    if(operation->second.failed){
+        g_reconcileDeadlines.cancel(result->operationId);
+        operation->second.waitingReconcileApps.clear();
+        RetireSessionRoutesForOperation(
+            AsyncOperationOwner::ManualSave,result->operationId);
+        operation->second.outstanding=0;
+    }
+    FinishManualSave(result->operationId);
+}
+
+static void FinishManualMove(uint64_t operationId){
+    auto found=g_manualMoveOperations.find(operationId);
+    if(found!=g_manualMoveOperations.end() &&
+       found->second.cancellationPending){
+        if(found->second.liveJobIds.empty())
+            g_manualMoveOperations.erase(found);
+        return;
+    }
+    if(found==g_manualMoveOperations.end() || found->second.outstanding!=0 ||
+       !found->second.waitingSessionApps.empty() ||
+       !found->second.waitingReconcileApps.empty()) return;
+    const size_t succeeded=found->second.succeeded;
+    const size_t failed=found->second.failed;
+    const size_t already=found->second.already;
+    g_manualMoveOperations.erase(found);
+    g_reconcileDeadlines.cancel(operationId);
+    wchar_t message[220]={0};
+    if(succeeded==0 && failed==0)
+        swprintf_s(message,L"Restore: nothing to move; %u matched window(s) were already in place.",
+                   static_cast<unsigned>(already));
+    else
+        swprintf_s(message,L"Restore: moved %u, %u already in place, %u failed.",
+                   static_cast<unsigned>(succeeded),
+                   static_cast<unsigned>(already),
+                   static_cast<unsigned>(failed));
+    Balloon(message);
+}
+
+static void CancelManualMoveOperation(uint64_t operationId){
+    g_reconcileDeadlines.cancel(operationId);
+    auto found=g_manualMoveOperations.find(operationId);
+    if(found==g_manualMoveOperations.end()) return;
+    if(found->second.cancellationPending){
+        RefreshMoveCancellationPending();
+        ScheduleMoveCancellationRetry();
+        return;
+    }
+    uint64_t jobIds[MAX_LAYOUT_RECORDS]={0};
+    size_t jobCount=0;
+    for(uint64_t jobId : found->second.liveJobIds)
+        if(jobCount<MAX_LAYOUT_RECORDS) jobIds[jobCount++]=jobId;
+    PublishMoveCancellationIntent(found->second.cancellationPending,
+        jobIds,jobCount,[&](uint64_t jobId) noexcept {
+            if(MarkMoveForTerminalRetirement(jobId)) return;
+            auto runtime=g_moveRuntime.find(jobId);
+            if(runtime!=g_moveRuntime.end()) runtime->second.cancelRequested=true;
+        });
+    RefreshMoveCancellationPending();
+    found->second.waitingSessionApps.clear();
+    found->second.waitingReconcileApps.clear();
+    found->second.snapshots.clear();
+    found->second.currentDesktops.clear();
+    found->second.saved.clear();
+    RetireSessionRoutesForOperation(AsyncOperationOwner::ManualRestore,operationId);
+    for(size_t index=0;index<jobCount;++index)
+        CancelMoveJobOrDefer(jobIds[index]);
+    found=g_manualMoveOperations.find(operationId);
+    if(found!=g_manualMoveOperations.end() && found->second.liveJobIds.empty())
+        g_manualMoveOperations.erase(found);
+}
+
+static void RetireAsyncSessionOperation(const SessionRoute& route,
+                                        AsyncRetirementReason reason){
+    if(route.operationId==0) return;
+    if(route.owner==AsyncOperationOwner::AutoReconcile){
+        CancelAutoOperation(route.operationId,true);
+        return;
+    }
+    if(route.owner==AsyncOperationOwner::ManualSave){
+        auto operation=g_manualSaveOperations.find(route.operationId);
+        if(operation==g_manualSaveOperations.end()) return;
+        operation->second.failed=true;
+        operation->second.outstanding=0;
+        RetireSessionRoutesForOperation(
+            AsyncOperationOwner::ManualSave,route.operationId);
+        FinishManualSave(route.operationId);
+        return;
+    }
+    if(route.owner==AsyncOperationOwner::ManualRestore){
+        if(g_manualMoveOperations.count(route.operationId)==0) return;
+        CancelManualMoveOperation(route.operationId);
+        if(reason!=AsyncRetirementReason::Cancelled)
+            Balloon(L"Restore browser-session work was cancelled or timed out. Retry.");
+        return;
+    }
+    if(route.owner==AsyncOperationOwner::MetadataProbe){
+        g_metadataProbeOperations.erase(route.operationId);
+        return;
+    }
+    auto operation=g_searchOperations.find(route.operationId);
+    if(operation==g_searchOperations.end()) return;
+    if(operation->second.outstanding>0) --operation->second.outstanding;
+    if(operation->second.outstanding==0){
+        g_reconcileDeadlines.cancel(route.operationId);
+        g_searchOperations.erase(operation);
+    }
+}
+
+static void ProcessSessionRetirements(
+        const std::vector<AsyncSessionRetirement>& retired){
+    for(const AsyncSessionRetirement& event : retired){
+        SessionRoute route;
+        auto owned=g_sessionRoutes.find(event.route.requestId);
+        if(owned!=g_sessionRoutes.end()){
+            route=owned->second;
+            g_sessionRoutes.erase(owned);
+        } else {
+            AsyncOperationOwner owner=AsyncOperationOwner::Search;
+            if(!SessionOwnerForPurpose(event.route.purpose,owner)) continue;
+            route.owner=owner;
+            route.operationId=event.route.operationId;
+            route.app=event.route.app;
+            route.purpose=event.route.purpose;
+            route.identityGeneration=event.route.identityGeneration;
+            route.deadlineMs=event.route.deadlineMs;
+        }
+        RetireAsyncSessionOperation(route,event.reason);
+    }
+}
+
+static void RetireReconcileOperation(uint64_t operationId){
+    if(operationId==0) return;
+    g_reconcileDeadlines.cancel(operationId);
+    if(g_pendingAutoOperations.count(operationId)){
+        CancelAutoOperation(operationId,true);
+        return;
+    }
+    auto manualSave=g_manualSaveOperations.find(operationId);
+    if(manualSave!=g_manualSaveOperations.end()){
+        manualSave->second.failed=true;
+        manualSave->second.outstanding=0;
+        RetireSessionRoutesForOperation(
+            AsyncOperationOwner::ManualSave,operationId);
+        FinishManualSave(operationId);
+        return;
+    }
+    if(g_manualMoveOperations.count(operationId)){
+        CancelManualMoveOperation(operationId);
+        Balloon(L"Restore matching failed unexpectedly. Retry.");
+        return;
+    }
+    auto search=g_searchOperations.find(operationId);
+    if(search!=g_searchOperations.end()){
+        RetireSessionRoutesForOperation(AsyncOperationOwner::Search,operationId);
+        g_searchOperations.erase(search);
+    }
+}
+
+static void CancelExpiredReconcileOperations(uint64_t nowMs){
+    std::vector<uint64_t> expired;
+    g_reconcileDeadlines.expire(nowMs,expired);
+    for(uint64_t operationId : expired)
+        RetireReconcileOperation(operationId);
+}
+
+static void StartManualRestore(bool manualSource){
+    if(g_degraded || !g_sessionWorker || !g_reconcileWorker){
+        Balloon(L"Virtual-desktop or browser-session services are unavailable.");
+        return;
+    }
+    std::vector<uint64_t> old;
+    for(const auto& entry : g_manualMoveOperations) old.push_back(entry.first);
+    for(uint64_t id : old) CancelManualMoveOperation(id);
+    LayoutLoadResult loaded=LoadLayoutWithBackup(
+        LayoutPath(manualSource),UtcNowSeconds());
+    if(!loaded.usable() || loaded.sourceVersion!=4 || loaded.wins.empty()){
+        Balloon(manualSource
+            ? L"No valid v4 manual layout is available. Save one first."
+            : L"No valid v4 automatic layout is available.");
+        return;
+    }
+    ManualMoveOperation operation;
+    operation.operationId=TakeNonzeroId(g_nextOperationId);
+    operation.saved=loaded.wins;
+    for(const LayoutWin& record : operation.saved)
+        g_restoreBudgets.clearForExplicitRetry(record.recordId);
+    operation.profiles=OperationAppProfiles(ActiveProfiles());
+    operation.snapshots=CollectFastSnapshots(operation.profiles.all());
+    std::string error;
+    if(!CurrentDesktops(operation.currentDesktops,&error)){
+        Balloon(L"Restore could not collect the current desktop set.");
+        return;
+    }
+    bool any=false;
+    for(const auto& entry : operation.snapshots){
+        if(!FastSnapshotCanPersistAll(entry.second)){
+            Balloon(L"Restore paused because window enumeration or desktop lookup was incomplete.");
+            return;
+        }
+        any=any || !entry.second.windows.empty();
+    }
+    if(!any){ Balloon(L"No browser windows are open to restore."); return; }
+    const uint64_t operationId=operation.operationId;
+    try {
+        if(!g_manualMoveOperations.emplace(operationId,operation).second) return;
+    } catch(...) { Balloon(L"Restore could not be started."); return; }
+    bool failed=false;
+    for(const AppProfile& profile : operation.profiles.all()){
+        const AppFastSnapshot& snapshot=operation.snapshots[profile.id];
+        if(snapshot.windows.empty()) continue;
+        uint64_t request=RequestSessionWork(
+            AsyncOperationOwner::ManualRestore,operationId,profile,snapshot,
+            SessionPurpose::ManualRestore);
+        if(!request){ failed=true; break; }
+        g_manualMoveOperations[operationId].waitingSessionApps.insert(profile.id);
+    }
+    if(failed){
+        CancelManualMoveOperation(operationId);
+        Balloon(L"Restore could not acquire browser session data. Retry.");
+        return;
+    }
+    FinishManualMove(operationId);
+}
+
+static void HandleManualRestoreSessionResult(const SessionRoute& route,
+                                             const SessionResult& result){
+    auto operation=g_manualMoveOperations.find(route.operationId);
+    if(operation==g_manualMoveOperations.end() ||
+       operation->second.waitingSessionApps.erase(route.app)==0) return;
+    std::map<std::string,AppFastSnapshot> current=
+        CollectFastSnapshots(operation->second.profiles.all());
+    auto captured=operation->second.snapshots.find(route.app);
+    auto now=current.find(route.app);
+    if(!SessionDataUsable(result.status) || !result.windows ||
+       captured==operation->second.snapshots.end() || now==current.end() ||
+       !FastSnapshotCanPersistAll(now->second) ||
+       captured->second.identityGeneration!=now->second.identityGeneration ||
+       captured->second.generation!=now->second.generation ||
+       route.contentGeneration!=now->second.generation){
+        CancelManualMoveOperation(route.operationId);
+        Balloon(L"Restore was cancelled because its window snapshot became stale.");
+        return;
+    }
+    const AppProfile* profile=operation->second.profiles.find(route.app);
+    if(!profile){ CancelManualMoveOperation(route.operationId); return; }
+    ReconcileRequest request;
+    request.operationId=route.operationId;
+    request.app=route.app;
+    request.identityGeneration=now->second.identityGeneration;
+    request.contentGeneration=now->second.generation;
+    request.sessionRequestId=result.requestId;
+    request.sessionDataGeneration=result.dataGeneration;
+    request.nowUtc=UtcNowSeconds();
+    request.freshness=result.status==SessionDataStatus::Fresh
+        ? ReconcileFreshness::Fresh : ReconcileFreshness::CachedStale;
+    request.saved=operation->second.saved;
+    try { ConfigureWorkerLiveBuild(request,ReconcileWorkMode::Plan,*profile,
+                                   captured->second,result.windows,
+                                   operation->second.currentDesktops); }
+    catch(...) { CancelManualMoveOperation(route.operationId); return; }
+    bool tracked=false;
+    try {
+        tracked=operation->second.waitingReconcileApps.insert(route.app).second;
+    } catch(...) { tracked=false; }
+    if(!tracked || !RequestReconcileWork(request)){
+        operation->second.waitingReconcileApps.erase(route.app);
+        CancelManualMoveOperation(route.operationId);
+        Balloon(L"Restore matching could not be queued.");
+    }
+}
+
+static ReservedAutoIdentity ReservationForManualMove(
+        const FastWin& fast,const MoveToken& token,const std::string& recordId,
+        bool& provisionalNeedsInsert,bool& reservationReady){
+    provisionalNeedsInsert=false;
+    reservationReady=false;
+    ReservedAutoIdentity reservation;
+    reservation.token=token;
+    reservation.identity=IdentityOf(fast);
+    reservation.app=fast.app;
+    reservation.recordId=recordId;
+    reservation.originDesktop=fast.desktop;
+    auto bound=g_recordByRuntime.find(RuntimeKey(fast));
+    if(bound!=g_recordByRuntime.end() &&
+       SameIdentity(bound->second.identity,IdentityOf(fast))){
+        reservation.recordId=bound->second.recordId;
+        reservationReady=true;
+    } else if(!fast.app.empty() && !GuidIsZero(fast.desktop)){
+        std::string id;
+        auto existing=g_provisionalRecordByRuntime.find(RuntimeKey(fast));
+        if(existing==g_provisionalRecordByRuntime.end()){
+            id=NewRecordId();
+            GUID parsed{};
+            if(ParseNonzeroLayoutGuid(id,parsed)) provisionalNeedsInsert=true;
+            else id.clear();
+        } else id=existing->second;
+        if(!id.empty()){
+            LayoutWin origin;
+            origin.recordId=id;
+            origin.app=fast.app;
+            origin.desktop=fast.desktop;
+            origin.deskIndex=SnapshotDesktopIndex(fast.desktop);
+            origin.activeTitle=W2U8(fast.title);
+            MarkSeen(origin,UtcNowSeconds());
+            if(!BindReservationToProvisionalOrigin(
+                    origin,reservation.recordId)){
+                provisionalNeedsInsert=false;
+                return reservation;
+            }
+            origin.recordId=reservation.recordId;
+            reservation.provisionalOriginRecord=origin;
+            reservation.hasProvisionalOriginRecord=true;
+            reservationReady=true;
+        }
+    }
+    return reservation;
+}
+
+static bool QueueManualMove(ManualMoveOperation& operation,
+                            const FastWin& fast,const LayoutWin& saved,
+                            size_t itemIndex){
+    const std::string runtimeKey=RuntimeKey(fast);
+    MoveJob job;
+    job.token.owner=MoveOwner::ManualTray;
+    job.token.operationId=operation.operationId;
+    job.token.jobId=TakeNonzeroId(g_nextMoveJobId);
+    job.token.itemIndex=itemIndex;
+    job.runtimeKey=runtimeKey;
+    job.recordId=saved.recordId;
+    job.destination=saved.desktop;
+    MoveRuntimeBinding runtime;
+    runtime.window=fast;
+    runtime.destination=saved.desktop;
+    bool provisionalNeedsInsert=false;
+    bool reservationReady=false;
+    ReservedAutoIdentity reservation=
+        ReservationForManualMove(fast,job.token,saved.recordId,
+                                 provisionalNeedsInsert,reservationReady);
+    if(!reservationReady) return false;
+    ReservationHandoff handoff;
+    bool insertedProvisional=false;
+    bool insertedRuntime=false;
+    bool enqueued=false;
+    bool insertedLiveJob=false;
+    bool incrementedOutstanding=false;
+    const bool completed=RunFailureAtomicMoveSetup([&]{
+        if(!BeginReservationHandoff(runtimeKey,reservation,handoff))
+            return false;
+        job.recordId=handoff.installed.recordId;
+        if(provisionalNeedsInsert){
+            if(!g_provisionalRecordByRuntime.emplace(
+                    runtimeKey,handoff.installed.recordId).second) return false;
+            insertedProvisional=true;
+        }
+        if(!g_moveRuntime.emplace(job.token.jobId,runtime).second) return false;
+        insertedRuntime=true;
+        if(!operation.liveJobIds.insert(job.token.jobId).second) return false;
+        insertedLiveJob=true;
+        ++operation.outstanding;
+        incrementedOutstanding=true;
+        if(!g_moveQueue.enqueue(job)) return false;
+        enqueued=true;
+        return true;
+    },[&]{
+        if(enqueued){
+            try { g_moveQueue.cancelJob(job.token.jobId); } catch(...) {}
+        }
+        if(insertedLiveJob) operation.liveJobIds.erase(job.token.jobId);
+        if(incrementedOutstanding && operation.outstanding>0)
+            --operation.outstanding;
+        if(insertedRuntime) g_moveRuntime.erase(job.token.jobId);
+        RollbackReservationHandoff(handoff);
+        if(insertedProvisional){
+            auto provisional=g_provisionalRecordByRuntime.find(runtimeKey);
+            if(provisional!=g_provisionalRecordByRuntime.end() &&
+               provisional->second==handoff.installed.recordId)
+                g_provisionalRecordByRuntime.erase(provisional);
+        }
+    });
+    if(!completed) return false;
+    return true;
+}
+
+static void HandleManualReconcileResult(std::unique_ptr<ReconcileResult> result){
+    if(!result) return;
+    auto operation=g_manualMoveOperations.find(result->operationId);
+    if(operation==g_manualMoveOperations.end() ||
+       operation->second.cancellationPending ||
+       operation->second.waitingReconcileApps.erase(result->app)==0) return;
+    g_reconcileDeadlines.complete(result->operationId);
+    auto captured=operation->second.snapshots.find(result->app);
+    std::map<std::string,AppFastSnapshot> current=
+        CollectFastSnapshots(operation->second.profiles.all());
+    auto now=current.find(result->app);
+    if(result->status!=ReconcileResultStatus::Completed ||
+       result->workMode!=ReconcileWorkMode::Plan ||
+       !result->buildLiveFromInputs || result->plan.deferred ||
+       captured==operation->second.snapshots.end() || now==current.end() ||
+       !FastSnapshotCanPersistAll(now->second) ||
+       result->identityGeneration!=now->second.identityGeneration ||
+       result->contentGeneration!=now->second.generation){
+        CancelManualMoveOperation(result->operationId);
+        Balloon(L"Restore matching became stale or too complex. Retry.");
+        return;
+    }
+    std::set<size_t> restoredIndices;
+    for(const RestoreRequest& restore : result->plan.restores)
+        restoredIndices.insert(restore.liveIndex);
+    for(const LayoutMatch& match : result->plan.matches){
+        if(match.savedIndex>=result->saved.size() ||
+           match.liveIndex>=result->fastWindows.size()) continue;
+        const LayoutWin& saved=result->saved[match.savedIndex];
+        const FastWin& fast=result->fastWindows[match.liveIndex];
+        if(ResolveSavedDesktop(saved,operation->second.currentDesktops)<0){
+            ++operation->second.failed;
+            continue;
+        }
+        if(GuidEq(fast.desktop,saved.desktop)){
+            ++operation->second.already;
+            continue;
+        }
+        if(restoredIndices.count(match.liveIndex)==0 ||
+           !QueueManualMove(operation->second,fast,saved,match.liveIndex))
+            ++operation->second.failed;
+    }
+    if(operation->second.outstanding) ArmMoveTimer();
+    FinishManualMove(result->operationId);
+}
 // ================================ CLI mode ===================================
+static bool AcquireCliSession(const AppProfile& profile,
+                              std::shared_ptr<const std::vector<WinFp> >& output){
+    output.reset();
+    std::wstring before=ResolveBrowserSessionPath(profile);
+    SessionStamp beforeStamp;
+    if(before.empty() || !GetSessionStamp(before,beforeStamp)) return false;
+    SessionFileReadResult read=ReadBrowserSessionFileBounded(
+        before,MAX_BROWSER_SESSION_BYTES);
+    if(read.status!=FileReadStatus::Ok || !read.readStampKnown ||
+       read.readStamp!=beforeStamp) return false;
+    std::unique_ptr<std::vector<WinFp> > parsed(new(std::nothrow) std::vector<WinFp>());
+    if(!parsed || !ParseBrowserSessionData(profile,read.bytes,*parsed)) return false;
+    std::wstring after=ResolveBrowserSessionPath(profile);
+    SessionStamp afterStamp;
+    if(after!=before || !GetSessionStamp(after,afterStamp) ||
+       beforeStamp!=read.readStamp || read.readStamp!=afterStamp) return false;
+    try { output=std::shared_ptr<const std::vector<WinFp> >(parsed.release()); }
+    catch(...) { return false; }
+    return true;
+}
+
+static bool CliSaveCheckpoint(std::string& summary){
+    std::map<std::string,AppFastSnapshot> snapshots=CollectFastSnapshots();
+    std::vector<DeskRec> desktops;
+    std::string error;
+    if(!CurrentDesktops(desktops,&error)){
+        summary="Failed to collect desktops: "+error;
+        return false;
+    }
+    std::vector<ReconcileRequest> requests;
+    const std::vector<AppProfile> profiles=ActiveProfiles();
+    requests.reserve(profiles.size());
+    for(const AppProfile& profile : profiles){
+        auto snapshot=snapshots.find(profile.id);
+        if(snapshot==snapshots.end() || !FastSnapshotCanPersistAll(snapshot->second)){
+            summary="Window enumeration or desktop lookup was incomplete; no file was changed.";
+            return false;
+        }
+        if(snapshot->second.windows.empty()) continue;
+        std::shared_ptr<const std::vector<WinFp> > session;
+        if(!AcquireCliSession(profile,session)){
+            summary="Fresh browser session data was unavailable; no file was changed.";
+            return false;
+        }
+        requests.push_back(MakeCliLiveRequest(
+            profile,snapshot->second,session,desktops));
+    }
+    PreparedCliProfileBatch prepared;
+    if(!BuildCliProfileBatch(requests,prepared)){
+        summary="Browser window preparation failed; no file was changed.";
+        return false;
+    }
+    std::vector<LayoutWin> records;
+    std::set<std::string> recordIds;
+    records.reserve(prepared.live.size());
+    for(LayoutWin& record : prepared.live){
+        record.recordId=NewRecordId();
+        GUID id{};
+        std::string canonical;
+        if(GuidIsZero(record.desktop) ||
+           !ParseNonzeroLayoutGuid(record.recordId,id,&canonical) ||
+           !recordIds.insert(canonical).second){
+            summary="Could not allocate valid record IDs; no file was changed.";
+            return false;
+        }
+        record.recordId=canonical;
+        MarkSeen(record,UtcNowSeconds());
+        record.missingSinceUtc=0;
+        records.push_back(std::move(record));
+    }
+    if(records.empty()){
+        summary="No browser windows found. Nothing to save.";
+        return false;
+    }
+    std::string bytes;
+    std::vector<LayoutWin> checked=records;
+    if(!BuildCheckedLayoutSnapshot(
+            desktops,checked,UtcNowSeconds(),bytes,&error)){
+        summary="Failed to validate manual layout: "+error;
+        return false;
+    }
+    std::map<std::string,AppFastSnapshot> currentSnapshots=
+        CollectFastSnapshots();
+    std::vector<DeskRec> currentDesktops;
+    if(!CurrentDesktops(currentDesktops,&error) ||
+       !CliCheckpointInputsStillCurrent(
+           snapshots,currentSnapshots,desktops,currentDesktops)){
+        summary="Window or desktop state changed while saving; no file was changed.";
+        return false;
+    }
+    ScopedLayoutLock lock;
+    if(!lock.acquired()){
+        summary="Layout storage is busy; no file was changed.";
+        return false;
+    }
+    LayoutLoadResult prior=LoadLayoutWithBackupLocked(
+        LayoutPath(true),UtcNowSeconds());
+    if(prior.status==LayoutLoadStatus::Unavailable ||
+       !AtomicWriteText(LayoutPath(true),bytes,&error,
+                        prior.status==LayoutLoadStatus::Recovered)){
+        summary="Failed to atomically write manual layout: "+error;
+        return false;
+    }
+    summary="Saved layout: "+std::to_string(records.size())+" window(s).";
+    return true;
+}
+
+static bool WaitForCliVerify(HANDLE timer,DWORD delayMs){
+    LARGE_INTEGER due{};
+    due.QuadPart=-static_cast<LONGLONG>(delayMs)*10000LL;
+    return timer && SetWaitableTimer(timer,&due,0,nullptr,nullptr,FALSE) &&
+        WaitForSingleObject(timer,delayMs+1000)==WAIT_OBJECT_0;
+}
+
+static bool CliRestoreCheckpoint(bool manual,std::string& summary,
+                                 std::vector<std::string>& lines){
+    LayoutLoadResult loaded=LoadLayoutWithBackup(
+        LayoutPath(manual),UtcNowSeconds());
+    if(!loaded.usable() || loaded.sourceVersion!=4 || loaded.wins.empty()){
+        summary=manual ? "No valid v4 manual layout." : "No valid v4 automatic layout.";
+        return false;
+    }
+    std::vector<DeskRec> desktops;
+    std::string error;
+    if(!CurrentDesktops(desktops,&error)){
+        summary="Failed to collect desktops: "+error;
+        return false;
+    }
+    std::map<std::string,AppFastSnapshot> snapshots=CollectFastSnapshots();
+    std::vector<ReconcileRequest> requests;
+    const std::vector<AppProfile> profiles=ActiveProfiles();
+    requests.reserve(profiles.size());
+    for(const AppProfile& profile : profiles){
+        auto snapshot=snapshots.find(profile.id);
+        if(snapshot==snapshots.end() || !FastSnapshotCanPersistAll(snapshot->second)){
+            summary="Window enumeration or desktop lookup was incomplete.";
+            return false;
+        }
+        if(snapshot->second.windows.empty()) continue;
+        std::shared_ptr<const std::vector<WinFp> > session;
+        if(!AcquireCliSession(profile,session)){
+            summary="Fresh browser session data was unavailable.";
+            return false;
+        }
+        requests.push_back(MakeCliLiveRequest(
+            profile,snapshot->second,session,desktops));
+    }
+    PreparedCliProfileBatch prepared;
+    if(!BuildCliProfileBatch(requests,prepared)){
+        summary="Browser window preparation failed; no windows were moved.";
+        return false;
+    }
+    std::vector<LayoutWin> live=std::move(prepared.live);
+    std::vector<FastWin> fast=std::move(prepared.fastWindows);
+    if(live.empty()){
+        summary="No browser windows are open to restore.";
+        return false;
+    }
+    bool tooComplex=false;
+    std::vector<LayoutMatch> matches=MatchOneToOne(
+        loaded.wins,live,0.55,&tooComplex);
+    if(tooComplex){ summary="Restore candidate set is too complex."; return false; }
+
+    MoveQueue queue;
+    std::map<uint64_t,MoveRuntimeBinding> runtimes;
+    uint64_t nextJob=0;
+    size_t already=0,failed=0,moved=0;
+    for(const LayoutMatch& match : matches){
+        if(match.savedIndex>=loaded.wins.size() || match.liveIndex>=fast.size()) continue;
+        const LayoutWin& saved=loaded.wins[match.savedIndex];
+        if(ResolveSavedDesktop(saved,desktops)<0){
+            ++failed;
+            lines.push_back("[no target] "+live[match.liveIndex].activeTitle);
+            continue;
+        }
+        if(GuidEq(fast[match.liveIndex].desktop,saved.desktop)){
+            ++already;
+            lines.push_back("[already there] "+live[match.liveIndex].activeTitle);
+            continue;
+        }
+        MoveJob job;
+        job.token.owner=MoveOwner::ManualTray;
+        job.token.operationId=1;
+        job.token.jobId=++nextJob;
+        job.token.itemIndex=match.liveIndex;
+        job.runtimeKey=RuntimeKey(fast[match.liveIndex]);
+        job.recordId=saved.recordId;
+        job.destination=saved.desktop;
+        MoveRuntimeBinding runtime;
+        runtime.window=fast[match.liveIndex];
+        runtime.destination=saved.desktop;
+        bool queued=false;
+        try {
+            runtimes.emplace(job.token.jobId,runtime);
+            queued=queue.enqueue(job);
+        } catch(...) { queued=false; }
+        if(!queued){
+            runtimes.erase(job.token.jobId);
+            ++failed;
+        }
+    }
+    UniqueWinHandle timer(CreateWaitableTimerW(nullptr,FALSE,nullptr));
+    if(!queue.empty() && !timer){
+        summary="Could not create the restore verification timer.";
+        return false;
+    }
+    while(!queue.empty()){
+        const MoveJob* front=queue.front();
+        if(!front) break;
+        auto runtime=runtimes.find(front->token.jobId);
+        MoveResult result;
+        if(runtime==runtimes.end()){
+            result=queue.cancelJob(front->token.jobId);
+        } else if(queue.nextAction()==MoveAction::Issue){
+            WindowIdentityRecapture identity=WindowIdentityRecapture::Match;
+            MoveAttemptOutcome current=ReadMoveDestination(
+                runtime->second,identity);
+            if(identity==WindowIdentityRecapture::Lost){
+                result=queue.cancelJob(front->token.jobId);
+            } else if(identity==WindowIdentityRecapture::Indeterminate){
+                const IdentityRecaptureRetryAction unknown=
+                    runtime->second.identityRecaptureBudget.observe(identity);
+                if(unknown==IdentityRecaptureRetryAction::RetireCancelled ||
+                   !WaitForCliVerify(timer.get(),MOVE_VERIFY_INTERVAL_MS))
+                    result=queue.cancelJob(front->token.jobId);
+            } else if(current==MoveAttemptOutcome::OnDestination ||
+               current==MoveAttemptOutcome::PermanentFailure)
+                result=queue.onIssued(current);
+            else {
+                HRESULT issued=IssueWindowMove(runtime->second,identity);
+                if(identity==WindowIdentityRecapture::Lost)
+                    result=queue.cancelJob(front->token.jobId);
+                else if(identity==WindowIdentityRecapture::Indeterminate){
+                    const IdentityRecaptureRetryAction unknown=
+                        runtime->second.identityRecaptureBudget.observe(identity);
+                    if(unknown==IdentityRecaptureRetryAction::RetireCancelled ||
+                       !WaitForCliVerify(timer.get(),MOVE_VERIFY_INTERVAL_MS))
+                        result=queue.cancelJob(front->token.jobId);
+                } else {
+                    runtime->second.identityRecaptureBudget.reset();
+                    result=queue.onIssued(SUCCEEDED(issued)
+                        ? MoveAttemptOutcome::Accepted
+                        : (RetryableMoveHresult(issued)
+                            ? MoveAttemptOutcome::TransientFailure
+                            : MoveAttemptOutcome::PermanentFailure));
+                }
+            }
+        } else {
+            if(!WaitForCliVerify(timer.get(),MOVE_VERIFY_INTERVAL_MS)){
+                result=queue.onVerified(MoveAttemptOutcome::PermanentFailure);
+            } else {
+                WindowIdentityRecapture identity=WindowIdentityRecapture::Match;
+                MoveAttemptOutcome verified=ReadMoveDestination(
+                    runtime->second,identity);
+                if(identity==WindowIdentityRecapture::Lost)
+                    result=queue.cancelJob(front->token.jobId);
+                else if(identity==WindowIdentityRecapture::Indeterminate){
+                    if(runtime->second.identityRecaptureBudget.observe(identity)==
+                       IdentityRecaptureRetryAction::RetireCancelled)
+                        result=queue.cancelJob(front->token.jobId);
+                } else {
+                    runtime->second.identityRecaptureBudget.reset();
+                    result=queue.onVerified(verified);
+                }
+            }
+        }
+        if(result.completed){
+            runtimes.erase(result.token.jobId);
+            if(result.terminal==MoveTerminal::Succeeded){
+                ++moved;
+                lines.push_back("[moved] "+result.recordId);
+            } else {
+                ++failed;
+                lines.push_back("[FAILED] "+result.recordId);
+            }
+        }
+    }
+    summary="Restore: moved "+std::to_string(moved)+", "+
+        std::to_string(already)+" already in place, "+
+        std::to_string(failed)+" failed.";
+    return failed==0;
+}
+
 static int CliRun(const std::wstring& cmd){
     if(cmd==L"list"||cmd==L"status"){
         UINT count=0; g_vdmi->GetCount(&count);
         printf("Virtual desktops: %u\n",count);
-        for(UINT i=0;i<count;++i){ IVirtualDesktop* d=GetDesktopByIndex(i); if(!d)continue; GUID g={0};d->GetID(&g);
+        for(UINT i=0;i<count;++i){ ScopedComPtr<IVirtualDesktop> d(GetDesktopByIndex(i)); if(!d)continue; GUID g={0};d->GetID(&g);
             std::wstring nm=DesktopNameFromRegistry(g); std::string nmU8=nm.empty()?std::string():("("+W2U8(nm)+")");
-            printf("  [%u] %s  %s\n",i,W2U8(GuidToString(g)).c_str(),nmU8.c_str()); d->Release(); }
+            printf("  [%u] %s  %s\n",i,W2U8(GuidToString(g)).c_str(),nmU8.c_str()); }
         if(cmd==L"status"){
-            for(auto& prof:ActiveProfiles()){ int bound=0; auto fps=BuildLiveFingerprintsFor(prof,&bound);
-                if(fps.empty())continue;
-                printf("\n%s: %d live window(s) (bound to session data: %d)\n",prof.id.c_str(),(int)fps.size(),bound);
-                for(auto& f:fps){ int idx=GuidIsZero(f.desktop)?-1:GetDesktopIndexByGuid(f.desktop);
-                    printf("  hwnd=0x%p desktop=[%d] tabs=%d active=\"%s\"\n",(void*)f.hwnd,idx,f.tabCount,f.activeTitle.c_str());
-                    printf("        domains:"); for(auto& kv:f.counts)printf(" %s:%d",kv.first.c_str(),kv.second); printf("\n"); }
+            std::vector<DeskRec> desks; std::string error;
+            const bool desktopsReady=CurrentDesktops(desks,&error);
+            std::map<std::string,AppFastSnapshot> snapshots=CollectFastSnapshots();
+            for(const AppProfile& profile : ActiveProfiles()){
+                auto snapshot=snapshots.find(profile.id);
+                if(snapshot==snapshots.end() || snapshot->second.windows.empty()) continue;
+                std::shared_ptr<const std::vector<WinFp> > session;
+                bool fresh=AcquireCliSession(profile,session);
+                PreparedCliProfileBatch prepared;
+                std::vector<ReconcileRequest> requests;
+                requests.push_back(MakeCliLiveRequest(
+                    profile,snapshot->second,session,desks));
+                 const bool preparationReady=
+                     desktopsReady && fresh &&
+                     BuildCliProfileBatch(requests,prepared);
+                 std::vector<CliStatusRow> rows;
+                 bool rowsReady=BuildCliStatusRows(
+                     snapshot->second,desks,
+                     preparationReady ? &prepared : nullptr,
+                     preparationReady,rows);
+                 if(!rowsReady){
+                     rows.clear();
+                     rowsReady=BuildCliStatusRows(
+                         snapshot->second,desks,nullptr,false,rows);
+                 }
+                 printf("\n%s: %d live window(s) (session data: %s)\n",
+                        profile.id.c_str(),
+                        rowsReady ? static_cast<int>(rows.size()) : 0,
+                        preparationReady?"fresh":"unavailable");
+                 for(const CliStatusRow& row : rows){
+                     if(row.fingerprintAvailable)
+                         printf("  hwnd=0x%p desktop=[%d] tabs=%d active=\"%s\"\n",
+                                (void*)row.window.hwnd,row.deskIndex,row.tabCount,
+                                row.activeTitle.c_str());
+                     else
+                         printf("  hwnd=0x%p desktop=[%d] tabs=? active=\"%s\" fingerprint=unavailable\n",
+                                (void*)row.window.hwnd,row.deskIndex,
+                                row.activeTitle.c_str());
+                 }
             }
         }
         return 0;
     }
-    if(cmd==L"save"){ std::string s=RunSaveManual(); printf("%s\n",s.c_str()); printf("Manual layout: %s\n",W2U8(LayoutPath(true)).c_str()); return 0; }
-    if(cmd==L"restore"){ std::vector<std::string> lines; std::string s=RunRestore(true,&lines); for(auto& l:lines)printf("  %s\n",l.c_str()); printf("\n%s\n",s.c_str()); return 0; }
-    if(cmd==L"restore-auto"){ std::vector<std::string> lines; std::string s=RunRestore(false,&lines); for(auto& l:lines)printf("  %s\n",l.c_str()); printf("\n%s\n",s.c_str()); return 0; }
+    if(cmd==L"save"){
+        std::string summary;
+        bool ok=CliSaveCheckpoint(summary);
+        printf("%s\nManual layout: %s\n",summary.c_str(),
+               W2U8(LayoutPath(true)).c_str());
+        return ok?0:1;
+    }
+    if(cmd==L"restore" || cmd==L"restore-auto"){
+        std::vector<std::string> lines; std::string summary;
+        bool ok=CliRestoreCheckpoint(cmd==L"restore",summary,lines);
+        for(const std::string& line : lines) printf("  %s\n",line.c_str());
+        printf("\n%s\n",summary.c_str());
+        return ok?0:1;
+    }
     printf("Usage: vde <save|restore|restore-auto|status|list>\n");
     printf("  save          save current window layout to layout-manual.txt\n");
     printf("  restore       restore from layout-manual.txt\n");
@@ -467,20 +3765,19 @@ struct Tile { GUID guid; std::wstring name; int index; std::vector<WinItem> wind
 static std::vector<Tile> g_tiles;
 static int  g_sel=0;
 static HWND g_target=nullptr; static std::wstring g_targetTitle;
-static HWND g_main=nullptr;
-static std::unique_ptr<SessionWorker> g_sessionWorker; // Task 8 starts submitting work.
 static HWND g_settings=nullptr;
 static HINSTANCE g_inst=nullptr;
 static HFONT g_uiFont=nullptr;
-static unsigned long long g_lastLayoutSig=0;
 static const UINT WM_TRAY=WM_APP+1;
 static NOTIFYICONDATAW g_nid={0};
 static int g_dpi=96;
 static int S(int v){ return MulDiv(v,g_dpi,96); }   // px@96dpi -> px@текущий DPI
 
-static void StopSessionWorker(HWND messageWindow){
+static void StopWorkers(HWND messageWindow){
     if(g_sessionWorker){ g_sessionWorker->Stop(); g_sessionWorker.reset(); }
+    if(g_reconcileWorker){ g_reconcileWorker->Stop(); g_reconcileWorker.reset(); }
     DrainPostedSessionResults(messageWindow);
+    DrainPostedReconcileResults(messageWindow);
 }
 static int TILE_W=240,TILE_H=150,PAD=16,HEADER=44,SEARCH_H=40;  // базовые (96 dpi); пересчёт в InitMetrics
 static int g_cols=1,g_rows=1;
@@ -539,11 +3836,120 @@ static void BuildModel(){
         for(size_t i=0;i<g_tiles.size();++i) if(GuidEq(g_tiles[i].guid,cur)){g_sel=(int)i;break;}
 }
 static bool g_tabBlobsBuilt=false;
-// Lazily fold each browser window's all-tab text into its search field (first time the user searches).
+static void HandleSearchSessionResult(const SessionRoute& route,
+                                       const SessionResult& result){
+    auto operation=g_searchOperations.find(route.operationId);
+    if(operation==g_searchOperations.end()) return;
+    auto captured=operation->second.snapshots.find(route.app);
+    bool queued=false;
+    if(captured!=operation->second.snapshots.end() &&
+       SessionDataUsable(result.status) && result.windows){
+        std::map<std::string,AppFastSnapshot> current=CollectFastSnapshots();
+        auto now=current.find(route.app);
+        if(now!=current.end() && now->second.identityGeneration==route.identityGeneration &&
+           now->second.generation==route.contentGeneration &&
+           now->second.generation==captured->second.generation &&
+           FastSnapshotCanPersistAll(now->second)){
+            std::vector<AppProfile> profiles;
+            const AppProfile* profile=FindActiveProfile(route.app,profiles);
+            if(profile){
+                ReconcileRequest request;
+                request.operationId=route.operationId;
+                request.app=route.app;
+                request.identityGeneration=route.identityGeneration;
+                request.contentGeneration=route.contentGeneration;
+                request.sessionRequestId=result.requestId;
+                request.sessionDataGeneration=result.dataGeneration;
+                request.nowUtc=UtcNowSeconds();
+                request.freshness=result.status==SessionDataStatus::Fresh
+                    ? ReconcileFreshness::Fresh : ReconcileFreshness::CachedStale;
+                try {
+                    const std::vector<DeskRec> noDesktopLookup;
+                    ConfigureWorkerLiveBuild(request,
+                        ReconcileWorkMode::PrepareLiveOnly,*profile,
+                        captured->second,result.windows,noDesktopLookup);
+                    queued=operation->second.waitingReconcileApps.insert(
+                        route.app).second;
+                    if(queued && !RequestReconcileWork(request)){
+                        operation->second.waitingReconcileApps.erase(route.app);
+                        queued=false;
+                    }
+                } catch(...) { queued=false; }
+            }
+        }
+    }
+    if(queued) return;
+    if(operation->second.outstanding>0) --operation->second.outstanding;
+    if(operation->second.outstanding==0){
+        g_reconcileDeadlines.cancel(route.operationId);
+        g_searchOperations.erase(operation);
+    }
+}
+
+static void HandleSearchReconcileResult(std::unique_ptr<ReconcileResult> result){
+    if(!result) return;
+    auto operation=g_searchOperations.find(result->operationId);
+    if(operation==g_searchOperations.end() || operation->second.outstanding==0 ||
+       operation->second.waitingReconcileApps.erase(result->app)==0)
+        return;
+    g_reconcileDeadlines.complete(result->operationId);
+    bool accepted=false;
+    auto captured=operation->second.snapshots.find(result->app);
+    std::map<std::string,AppFastSnapshot> current=CollectFastSnapshots();
+    auto now=current.find(result->app);
+    if(result->status==ReconcileResultStatus::Completed &&
+       result->workMode==ReconcileWorkMode::PrepareLiveOnly &&
+       result->buildLiveFromInputs &&
+       captured!=operation->second.snapshots.end() && now!=current.end() &&
+       FastSnapshotCanPersistAll(now->second) &&
+       result->identityGeneration==now->second.identityGeneration &&
+       result->contentGeneration==now->second.generation &&
+       result->fastWindows.size()==result->sessionIndexByFast.size()){
+        for(size_t index=0;index<result->fastWindows.size();++index){
+            const WinFp* session=ReconcileSessionForFast(*result,index);
+            if(!session || session->tabsBlob.empty()) continue;
+            std::wstring blob=U82W(session->tabsBlob);
+            if(!blob.empty()) CharLowerW(&blob[0]);
+            for(Tile& tile : g_tiles)
+                for(WinItem& item : tile.windows)
+                    if(item.hwnd==result->fastWindows[index].hwnd)
+                        item.search=item.titleLC+L" "+blob;
+        }
+        accepted=true;
+    }
+    if(operation->second.outstanding>0) --operation->second.outstanding;
+    if(operation->second.outstanding==0){
+        g_reconcileDeadlines.cancel(result->operationId);
+        g_searchOperations.erase(operation);
+    }
+    if(accepted && g_main) InvalidateRect(g_main,nullptr,FALSE);
+}
+
+// Lazily request all-tab text without reading browser files on the UI thread.
 static void EnsureTabSearch(){
-    if(g_tabBlobsBuilt) return; g_tabBlobsBuilt=true;
-    auto blobs=BuildTabBlobs(); if(blobs.empty()) return;
-    for(auto& t:g_tiles) for(auto& w:t.windows){ auto it=blobs.find(w.hwnd); if(it!=blobs.end() && !it->second.empty()) w.search = w.titleLC + L" " + it->second; }
+    if(g_tabBlobsBuilt) return;
+    g_tabBlobsBuilt=true;
+    SearchOperation operation;
+    operation.operationId=TakeNonzeroId(g_nextOperationId);
+    operation.snapshots=CollectFastSnapshots();
+    const uint64_t operationId=operation.operationId;
+    try {
+        if(!g_searchOperations.emplace(operationId,operation).second) return;
+    } catch(...) { return; }
+    std::vector<AppProfile> profiles=ActiveProfiles();
+    for(const AppProfile& profile : profiles){
+        auto snapshot=operation.snapshots.find(profile.id);
+        if(snapshot==operation.snapshots.end() || snapshot->second.windows.empty() ||
+           !FastSnapshotCanObserve(snapshot->second)) continue;
+        uint64_t request=RequestSessionWork(
+            AsyncOperationOwner::Search,operationId,profile,snapshot->second,
+            SessionPurpose::Search);
+        if(request) ++g_searchOperations[operationId].outstanding;
+    }
+    if(g_searchOperations[operationId].outstanding==0){
+        g_reconcileDeadlines.cancel(operationId);
+        g_searchOperations.erase(operationId);
+    }
 }
 static void LayoutTiles(int clientW){
     int n=(int)g_tiles.size();
@@ -651,7 +4057,151 @@ static void EnsurePickerChildren(){
             SendMessageW(g_tip,TTM_ADDTOOLW,0,(LPARAM)&ti); SendMessageW(g_tip,TTM_SETMAXTIPWIDTH,0,S(600)); }
     }
 }
-static void Commit(int idx){ if(idx<0||idx>=(int)g_tiles.size())return; HidePicker(); if(g_target&&IsWindow(g_target)){ IVirtualDesktop* d=GetDesktopByIndex((UINT)g_tiles[idx].index); if(d){ GUID g={0};d->GetID(&g); MoveWindowToDesktop(g_target,d,g); if(SWITCH_AFTER_MOVE)g_vdmi->SwitchDesktop(d); d->Release(); } } }
+static bool CaptureFastWindowForMove(HWND hwnd,FastWin& output,bool& tracked,
+                                     bool& titleComplete){
+    tracked=false;
+    titleComplete=true;
+    if(!IsWindow(hwnd)) return false;
+    DWORD pid=0;
+    if(!GetWindowThreadProcessId(hwnd,&pid) || pid==0) return false;
+    ProcessSnapshot process=ReadProcessSnapshot(pid);
+    if(process.started==0) return false;
+    FastWin captured;
+    captured.hwnd=hwnd;
+    captured.pid=pid;
+    captured.processStart=process.started;
+    wchar_t className[64]={0};
+    if(GetClassNameW(hwnd,className,64)>0){
+        std::vector<AppProfile> profiles=ActiveProfiles();
+        const AppProfile* profile=ClassifyBrowserCandidate(
+            className,process.image,profiles);
+        if(profile){ captured.app=profile->id; tracked=true; }
+    }
+    int length=GetWindowTextLengthW(hwnd);
+    if(length>0){
+        try { captured.title.resize(static_cast<size_t>(length)+1,L'\0'); }
+        catch(...) { titleComplete=false; }
+        if(titleComplete){
+            int copied=GetWindowTextW(hwnd,&captured.title[0],length+1);
+            if(copied<=0){ captured.title.clear(); titleComplete=false; }
+            else captured.title.resize(static_cast<size_t>(copied));
+        }
+    }
+    if(g_vdmDoc){
+        HRESULT read=g_vdmDoc->GetWindowDesktopId(hwnd,&captured.desktop);
+        if(FAILED(read)) captured.desktop=GUID{};
+    }
+    output=std::move(captured);
+    return true;
+}
+
+static void Commit(int idx){
+    if(idx<0 || idx>=(int)g_tiles.size()) return;
+    HidePicker();
+    if(!g_target || !IsWindow(g_target)) return;
+    const GUID destination=g_tiles[idx].guid;
+    if(GuidIsZero(destination) || GetDesktopIndexByGuid(destination)<0) return;
+    FastWin fast;
+    bool tracked=false,titleComplete=true;
+    if(!CaptureFastWindowForMove(g_target,fast,tracked,titleComplete)) return;
+    const std::string runtimeKey=RuntimeKey(fast);
+
+    PickerMoveOperation operation;
+    operation.operationId=TakeNonzeroId(g_nextOperationId);
+    MoveJob job;
+    job.token.owner=MoveOwner::Picker;
+    job.token.operationId=operation.operationId;
+    job.token.jobId=TakeNonzeroId(g_nextMoveJobId);
+    job.token.itemIndex=0;
+    job.runtimeKey=runtimeKey;
+    job.destination=destination;
+    ReservedAutoIdentity reservation;
+    reservation.token=job.token;
+    reservation.identity=IdentityOf(fast);
+    reservation.app=fast.app;
+    reservation.originDesktop=fast.desktop;
+    bool provisionalNeedsInsert=false;
+    auto bound=g_recordByRuntime.find(runtimeKey);
+    if(bound!=g_recordByRuntime.end() &&
+       SameIdentity(bound->second.identity,IdentityOf(fast))){
+        reservation.recordId=bound->second.recordId;
+        job.recordId=bound->second.recordId;
+    } else if(tracked && titleComplete && g_autoLoaded &&
+              g_autoWritesAllowed && !GuidIsZero(fast.desktop)){
+        std::string recordId;
+        auto provisional=g_provisionalRecordByRuntime.find(runtimeKey);
+        if(provisional==g_provisionalRecordByRuntime.end()){
+            recordId=NewRecordId();
+            GUID parsed{};
+            if(ParseNonzeroLayoutGuid(recordId,parsed))
+                provisionalNeedsInsert=true;
+            else recordId.clear();
+        } else recordId=provisional->second;
+        if(!recordId.empty()){
+            reservation.recordId=recordId;
+            job.recordId=recordId;
+            LayoutWin origin;
+            origin.recordId=recordId;
+            origin.app=fast.app;
+            origin.desktop=fast.desktop;
+            origin.deskIndex=SnapshotDesktopIndex(fast.desktop);
+            origin.activeTitle=W2U8(fast.title);
+            MarkSeen(origin,UtcNowSeconds());
+            reservation.provisionalOriginRecord=origin;
+            reservation.hasProvisionalOriginRecord=true;
+        }
+    }
+    if(!reservation.recordId.empty())
+        g_restoreBudgets.clearForExplicitRetry(reservation.recordId);
+    MoveRuntimeBinding runtime;
+    runtime.window=fast;
+    runtime.destination=destination;
+    ReservationHandoff handoff;
+    bool insertedProvisional=false;
+    bool insertedPickerOperation=false;
+    bool insertedRuntime=false;
+    bool enqueued=false;
+    const bool queued=RunFailureAtomicMoveSetup([&]{
+        if(!BeginReservationHandoff(runtimeKey,reservation,handoff))
+            return false;
+        job.recordId=handoff.installed.recordId;
+        if(provisionalNeedsInsert){
+            if(!g_provisionalRecordByRuntime.emplace(
+                    runtimeKey,handoff.installed.recordId).second) return false;
+            insertedProvisional=true;
+        }
+        if(!operation.liveJobIds.insert(job.token.jobId).second) return false;
+        if(!g_pickerOperations.emplace(operation.operationId,operation).second)
+            return false;
+        insertedPickerOperation=true;
+        if(!g_moveRuntime.emplace(job.token.jobId,runtime).second) return false;
+        insertedRuntime=true;
+        if(!g_moveQueue.enqueue(job)) return false;
+        enqueued=true;
+        return true;
+    },[&]{
+        if(enqueued){
+            try { g_moveQueue.cancelJob(job.token.jobId); } catch(...) {}
+        }
+        if(insertedRuntime) g_moveRuntime.erase(job.token.jobId);
+        if(insertedPickerOperation) g_pickerOperations.erase(operation.operationId);
+        RollbackReservationHandoff(handoff);
+        if(insertedProvisional){
+            auto provisional=g_provisionalRecordByRuntime.find(runtimeKey);
+            if(provisional!=g_provisionalRecordByRuntime.end() &&
+               provisional->second==handoff.installed.recordId)
+                g_provisionalRecordByRuntime.erase(provisional);
+        }
+    });
+    if(!queued){
+        return;
+    }
+    ArmMoveTimer();
+    if(SWITCH_AFTER_MOVE){
+        ScopedComPtr<IVirtualDesktop> desktop(GetDesktopByGuid(destination));
+        if(desktop) g_vdmi->SwitchDesktop(desktop.get());
+    }
+}
 static void ShowPicker(){
     if(g_degraded) return;   // desktop COM unavailable; startup dialog + tray tip already explain
     g_target=GetForegroundWindow(); if(g_target==g_main)g_target=nullptr;
@@ -701,23 +4251,6 @@ static void Balloon(const std::wstring& text){
 }
 
 // ============================ settings / autofix =============================
-// Дешёвая подпись раскладки: только окна Firefox + их десктоп (без разбора sessionstore).
-// Порядко-независимая (сумма пер-оконных хэшей), чтобы смена z-порядка при фокусе не считалась изменением.
-// Cheap order-independent signature of {window -> desktop} across all tracked apps.
-// Changes when any tracked window moves desktops or appears/disappears -> triggers auto-save.
-static unsigned long long LayoutSignature(){
-    unsigned long long acc=0;
-    for(auto& prof:ActiveProfiles()) for(auto& w:EnumAppWindows(prof)){
-        if(GuidIsZero(w.desktop)) continue;
-        unsigned long long h=1469598103934665603ULL; // FNV-1a
-        unsigned long long hv=(unsigned long long)(uintptr_t)w.hwnd;
-        const unsigned char* b=(const unsigned char*)&hv; for(size_t i=0;i<sizeof(hv);++i){ h^=b[i]; h*=1099511628211ULL; }
-        b=(const unsigned char*)&w.desktop; for(size_t i=0;i<sizeof(w.desktop);++i){ h^=b[i]; h*=1099511628211ULL; }
-        acc += h;
-    }
-    return acc;
-}
-
 static void LoadSettings(){
     HKEY hk;
     if(RegOpenKeyExW(HKEY_CURRENT_USER,L"Software\\VirtualDesktopsExtention",0,KEY_READ,&hk)==ERROR_SUCCESS){
@@ -748,9 +4281,23 @@ static bool ApplyHotkey(){
     UnregisterHotKey(g_main,1);
     return RegisterHotKey(g_main,1,g_hotMods|MOD_NOREPEAT,g_hotVk)!=0;
 }
-static void ApplyAutoFix(){   // enable/disable the lifecycle monitor timer
-    if(g_autoFix && !g_degraded){ g_lastLayoutSig=0; SetTimer(g_main,TIMER_MONITOR,MONITOR_INTERVAL_MS,nullptr); }
-    else KillTimer(g_main,TIMER_MONITOR);
+static void ApplyAutoFix(){
+    if(g_autoFix && !g_degraded){
+        if(!g_autoLoaded && !TryLoadAutoLayoutAndInitialize())
+            g_autoLoadRetry.failed(MonotonicNowMs());
+        if(!SetTimer(g_main,TIMER_MONITOR,MONITOR_INTERVAL_MS,nullptr))
+            ReportStorageError(L"Automatic monitoring could not be started.");
+        return;
+    }
+    KillTimer(g_main,TIMER_HEARTBEAT);
+    KillTimer(g_main,TIMER_AUTO_FLUSH);
+    g_flushTimerArmed=false;
+    g_flushTimerDueMs=0;
+    g_heartbeatTimerArmed=false;
+    ResetAutoRuntimeState();
+    if(g_sessionRoutes.empty() && g_reconcileDeadlines.empty())
+        KillTimer(g_main,TIMER_MONITOR);
+    if(g_moveQueue.empty()) KillTimer(g_main,TIMER_MOVE_VERIFY);
 }
 
 // Переключиться на десктоп. SwitchDesktop = слот 6 vtable (совпадает на 23H2/24H2).
@@ -819,18 +4366,33 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         if(LOWORD(wp)==IDOK){
             WORD r=(WORD)SendMessageW(GetDlgItem(hwnd,IDC_HOTKEY),HKM_GETHOTKEY,0,0);
             BYTE vk=LOBYTE(r), hf=HIBYTE(r);
+            UINT newHotVk=g_hotVk,newHotMods=g_hotMods;
             if(vk!=0){
                 UINT mods=0;
                 if(hf&HOTKEYF_SHIFT)mods|=MOD_SHIFT;
                 if(hf&HOTKEYF_CONTROL)mods|=MOD_CONTROL;
                 if(hf&HOTKEYF_ALT)mods|=MOD_ALT;
-                g_hotVk=vk; g_hotMods=mods;
+                newHotVk=vk; newHotMods=mods;
             }
-            g_autoFix = (IsDlgButtonChecked(hwnd,IDC_AUTOFIX)==BST_CHECKED);
-            SetRunAtLogon(IsDlgButtonChecked(hwnd,IDC_AUTOSTART)==BST_CHECKED);
-            g_appFirefox=(IsDlgButtonChecked(hwnd,IDC_APP_FF)==BST_CHECKED);
-            g_appChrome =(IsDlgButtonChecked(hwnd,IDC_APP_CR)==BST_CHECKED);
-            g_appEdge   =(IsDlgButtonChecked(hwnd,IDC_APP_ED)==BST_CHECKED);
+            const bool newAutoFix=IsDlgButtonChecked(hwnd,IDC_AUTOFIX)==BST_CHECKED;
+            const bool newRunAtLogon=IsDlgButtonChecked(hwnd,IDC_AUTOSTART)==BST_CHECKED;
+            const bool newFirefox=IsDlgButtonChecked(hwnd,IDC_APP_FF)==BST_CHECKED;
+            const bool newChrome=IsDlgButtonChecked(hwnd,IDC_APP_CR)==BST_CHECKED;
+            const bool newEdge=IsDlgButtonChecked(hwnd,IDC_APP_ED)==BST_CHECKED;
+            const bool profileChanged=newFirefox!=g_appFirefox ||
+                newChrome!=g_appChrome || newEdge!=g_appEdge;
+            if(g_autoFix && (!newAutoFix || profileChanged) &&
+               !CheckpointAutoLayout(CheckpointReason::SettingsChange)){
+                MessageBoxW(hwnd,L"The current automatic layout could not be saved. Settings were not changed; retry after storage becomes available.",APP_NAME,MB_ICONWARNING);
+                return 0;
+            }
+            if(profileChanged) ResetAutoRuntimeState();
+            g_hotVk=newHotVk; g_hotMods=newHotMods;
+            g_autoFix=newAutoFix;
+            g_appFirefox=newFirefox;
+            g_appChrome=newChrome;
+            g_appEdge=newEdge;
+            SetRunAtLogon(newRunAtLogon);
             SaveSettings();
             bool ok=ApplyHotkey();
             ApplyAutoFix();
@@ -1075,30 +4637,68 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             g_searchText=LowerW(s); if(!g_searchText.empty()) EnsureTabSearch(); InvalidateRect(hwnd,nullptr,FALSE);
         }
         return 0;
+    case WM_MOVE_CANCEL_RETRY:
+        if(g_moveCancellationPending){
+            try { AdvanceMoveQueue(); }
+            catch(...) {}
+            RefreshMoveCancellationPending();
+            if(g_moveCancellationPending && !ScheduleMoveCancellationRetry())
+                ReportStorageError(L"Cancelled window moves remain protected; cancellation will retry on the next move request.");
+        }
+        return 0;
     case WM_TIMER:
-        if(wp==TIMER_STARTUP){                                // one-shot: startup settle finished
-            KillTimer(hwnd,TIMER_STARTUP);
-            if(g_autoFix && AnyAppPresent()){ int mv=0; std::string s=RunRestore(false,nullptr,&mv); if(mv>0)Balloon(U82W(s)); g_lastLayoutSig=LayoutSignature(); }   // no balloon if nothing moved
+        if(wp==TIMER_HEARTBEAT){
+            CheckpointAutoLayout(CheckpointReason::Heartbeat);
             return 0;
         }
-        if(wp==TIMER_MONITOR && g_autoFix && !g_degraded){
-            bool present = AnyAppPresent();
-            LcAction a = LcOnTick(g_lc, present, LAUNCH_SETTLE_TICKS);
-            if(a==LcAction::DoRestore){                        // app appeared & stabilized ⇒ restore
-                int mv=0; std::string s=RunRestore(false,nullptr,&mv); if(mv>0)Balloon(U82W(s)); g_lastLayoutSig=LayoutSignature();   // no balloon if nothing moved
-            } else if(a==LcAction::AutoSave){                  // steady state: track + save-on-change
-                g_observedApps.insert("firefox");
-                std::set<std::string> s; CollectPresentWindows(&s,nullptr); for(auto& k:s) g_seenKeys.insert(k);
-                unsigned long long sig=LayoutSignature();
-                if(sig!=g_lastLayoutSig){ g_lastLayoutSig=sig; RunSaveAuto(&g_seenKeys,&g_observedApps); }
+        if(wp==TIMER_AUTO_FLUSH){
+            KillTimer(hwnd,TIMER_AUTO_FLUSH);
+            g_flushTimerArmed=false;
+            g_flushTimerDueMs=0;
+            if(g_autoDirty) FlushAutoLayout(g_dirtyFlush.conflicted());
+            return 0;
+        }
+        if(wp==TIMER_MOVE_VERIFY){
+            AdvanceMoveQueue();
+            return 0;
+        }
+        if(wp==TIMER_MONITOR){
+            const uint64_t nowMs=MonotonicNowMs();
+            CancelExpiredSessionRoutes(nowMs);
+            CancelExpiredReconcileOperations(nowMs);
+            if(!g_autoFix || g_degraded){
+                if(g_sessionRoutes.empty() && g_reconcileDeadlines.empty())
+                    KillTimer(hwnd,TIMER_MONITOR);
+                return 0;
             }
+            if(!g_autoLoaded){
+                if(g_autoLoadRetry.due(nowMs) &&
+                   !TryLoadAutoLayoutAndInitialize())
+                    g_autoLoadRetry.failed(nowMs);
+                return 0;
+            }
+            ObserveFastSnapshots(CollectFastSnapshots());
+            CancelExpiredSessionRoutes(MonotonicNowMs());
         }
         return 0;
     case WM_ACTIVATE: if(LOWORD(wp)==WA_INACTIVE)HidePicker(); return 0;
     case WM_SESSION_RESULT: {
-        // Task 8 supplies generation/profile acceptance. Until then no requests
-        // are submitted, but ownership is still consumed immediately and safely.
         std::unique_ptr<SessionResult> result((SessionResult*)lp);
+        try { HandleSessionResult(std::move(result)); }
+        catch(...) {}
+        if((!g_autoFix || g_degraded) && g_sessionRoutes.empty() &&
+           g_reconcileDeadlines.empty())
+            KillTimer(hwnd,TIMER_MONITOR);
+        return 0;
+    }
+    case WM_RECONCILE_RESULT: {
+        std::unique_ptr<ReconcileResult> result((ReconcileResult*)lp);
+        const uint64_t operationId=result ? result->operationId : 0;
+        try { HandleReconcileResult(std::move(result)); }
+        catch(...) { RetireReconcileOperation(operationId); }
+        if((!g_autoFix || g_degraded) && g_sessionRoutes.empty() &&
+           g_reconcileDeadlines.empty())
+            KillTimer(hwnd,TIMER_MONITOR);
         return 0;
     }
     case WM_TRAY:
@@ -1117,28 +4717,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             SetForegroundWindow(hwnd);
             int cmd=TrackPopupMenu(m,TPM_RETURNCMD|TPM_RIGHTBUTTON,pt.x,pt.y,0,hwnd,nullptr); DestroyMenu(m);
             if(cmd==200)ShowPicker();
-            else if(cmd==201)Balloon(U82W(RunSaveManual()));
-            else if(cmd==202)Balloon(U82W(RunRestore(true)));
-            else if(cmd==204)Balloon(U82W(RunRestore(false)));
+            else if(cmd==201)StartManualSave();
+            else if(cmd==202)StartManualRestore(true);
+            else if(cmd==204)StartManualRestore(false);
             else if(cmd==203)OpenSettings();
             else if(cmd==206)OpenHelp();
             else if(cmd==205)OpenAbout();
             else if(cmd==209)DestroyWindow(hwnd);
         } else if(LOWORD(lp)==WM_LBUTTONDBLCLK) ShowPicker();
         return 0;
+    case WM_QUERYENDSESSION:
+        CheckpointAutoLayout(CheckpointReason::QueryEndSession);
+        return TRUE;
+    case WM_ENDSESSION:
+        if(wp) FinalizeAutoLayout();
+        return 0;
     case WM_DESTROY:
-        StopSessionWorker(hwnd); // join before the message-only owner disappears
-        if(g_autoFix && !g_degraded && LcOnExit(g_lc, AnyAppPresent())==LcAction::FinalSave){   // save only if windows are open (R2)
-            RunSaveAuto(&g_seenKeys,&g_observedApps);
-            std::vector<DeskRec> dd; std::vector<LayoutWin> recs; std::string t;   // age grace counters by one run
-            UnixSeconds nowUtc=UtcNowSeconds();
-            if(ReadFileBytes(LayoutPath(false),t) && ParseLayout(t,dd,recs,nowUtc)){
-                auto kept = ReconcileGrace(recs, g_seenKeys, g_observedApps, MISSING_RUNS_MAX);
-                std::vector<DeskRec> desks; std::string error, snapshot;
-                if(CurrentDesktops(desks,&error) && BuildCheckedLayoutSnapshot(desks,kept,nowUtc,snapshot,&error))
-                    WriteTextFile(LayoutPath(false), snapshot);
-            }
-        }
+        FinalizeAutoLayout();
+        KillTimer(hwnd,TIMER_MONITOR);
+        KillTimer(hwnd,TIMER_MOVE_VERIFY);
+        KillTimer(hwnd,TIMER_HEARTBEAT);
+        KillTimer(hwnd,TIMER_AUTO_FLUSH);
+        StopWorkers(hwnd);
         TrayRemove(); UnregisterHotKey(hwnd,1); PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd,msg,wp,lp);
@@ -1171,6 +4771,8 @@ static int RunGui(HINSTANCE hInst){
     if(!g_main)return 3;
     try { g_sessionWorker.reset(new SessionWorker(g_main)); }
     catch(...) { g_sessionWorker.reset(); }
+    try { g_reconcileWorker.reset(new ReconcileWorker(g_main)); }
+    catch(...) { g_reconcileWorker.reset(); }
     { DWORD pref=2; DwmSetWindowAttribute(g_main,33,&pref,sizeof(pref)); }   // DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND (Win11)
     TrayAdd(g_main);
     bool hk=ApplyHotkey();
@@ -1178,8 +4780,6 @@ static int RunGui(HINSTANCE hInst){
                                L"Another app may be using it. Change it in Settings,\n"
                                L"or open the picker via double-click on the tray icon.",APP_NAME,MB_ICONWARNING);
     ApplyAutoFix();   // start the lifecycle monitor timer if enabled
-    if(!g_degraded){ bool present=AnyAppPresent(); LcAction a=LcOnStartup(g_lc,present);   // R1: restore now if windows already open
-      if(g_autoFix && a==LcAction::StartupRestore) SetTimer(g_main,TIMER_STARTUP,STARTUP_SETTLE_MS,nullptr); }
     std::wstring hkStr=HotkeyString(), tip;
     if(g_degraded)     tip=L"Running in limited mode (compatibility issue). See About for details.";
     else if(g_autoFix) tip=L"Running. Auto-restore is on. Press "+hkStr+L" to open the desktop picker.";
@@ -1205,26 +4805,79 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int){
     bool cli = (cmd==L"save"||cmd==L"restore"||cmd==L"restore-auto"||cmd==L"status"||cmd==L"list"||cmd==L"-h"||cmd==L"--help"||cmd==L"/?");
 
     if(FAILED(CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED))) return 1;
-
-    MigrateLegacyLayout();   // rename legacy layout.txt -> layout-auto.txt (once)
-
-    int rc;
-    if(cli){
-        if(AttachConsole(ATTACH_PARENT_PROCESS)){ FILE* f; freopen_s(&f,"CONOUT$","w",stdout); freopen_s(&f,"CONOUT$","w",stderr); }
-        SetConsoleOutputCP(CP_UTF8);
-        if(!InitServices() || !SanityCheckServices()){ printf("Virtual-desktop services unavailable: a Windows update may have changed the undocumented interfaces. Please report your build (%lu) to info@conus.vision or https://github.com/conus-vision/win-vde\n",(unsigned long)GetWindowsBuild()); rc=3; }
-        else { WriteLastGoodBuild(GetWindowsBuild()); rc=CliRun(cmd); }
-    } else {
-        g_inst=hInst; InitMetrics();
-        bool good = InitServices() && SanityCheckServices();
-        if(good){ WriteLastGoodBuild(GetWindowsBuild()); rc=RunGui(hInst); }
-        else {                                              // R12: don't die silently — explain + degraded tray
-            g_degraded=true;
-            DWORD last=ReadLastGoodBuild();
-            ShowCompatIssue(last!=0 && last!=GetWindowsBuild());
-            rc=RunGui(hInst);
+    UniqueWinHandle trayMutex;
+    bool trayMutexOwned=false;
+    auto acquireTrayInstance=[&](){
+        HANDLE raw=CreateMutexW(nullptr,TRUE,
+            L"Local\\VirtualDesktopExtension.Tray.Instance");
+        const DWORD error=GetLastError();
+        if(!raw){
+            MessageBoxW(nullptr,L"Could not create the tray instance guard.",
+                        APP_NAME,MB_OK|MB_ICONERROR);
+            return TrayInstanceAcquireStatus::Failed;
         }
+        trayMutex.reset(raw);
+        if(error==ERROR_ALREADY_EXISTS){
+            trayMutex.reset();
+            MessageBoxW(nullptr,L"Virtual Desktop Extension is already running.",
+                        APP_NAME,MB_OK|MB_ICONINFORMATION);
+            return TrayInstanceAcquireStatus::AlreadyRunning;
+        }
+        trayMutexOwned=true;
+        return TrayInstanceAcquireStatus::Acquired;
+    };
+    auto releaseTrayInstance=[&](){
+        if(trayMutexOwned && trayMutex) ReleaseMutex(trayMutex.get());
+        trayMutexOwned=false;
+        trayMutex.reset();
+    };
+    auto dispatch=[&](){
+        int dispatchResult=1;
+        if(cli){
+            if(AttachConsole(ATTACH_PARENT_PROCESS)){ FILE* f; freopen_s(&f,"CONOUT$","w",stdout); freopen_s(&f,"CONOUT$","w",stderr); }
+            SetConsoleOutputCP(CP_UTF8);
+            dispatchResult=RunCliWithLoadedSettings(
+                []{ LoadSettings(); },
+                [&](){
+                    if(!InitializeServicesWithRollback(
+                            []{ return InitServices(); },
+                            []{ return SanityCheckServices(); },
+                            []{ ReleaseServices(); })){
+                        printf("Virtual-desktop services unavailable: a Windows update may have changed the undocumented interfaces. Please report your build (%lu) to info@conus.vision or https://github.com/conus-vision/win-vde\n",(unsigned long)GetWindowsBuild());
+                        return 3;
+                    }
+                    WriteLastGoodBuild(GetWindowsBuild());
+                    return CliRun(cmd);
+                });
+        } else {
+            g_inst=hInst;
+            InitMetrics();
+            bool good=InitializeServicesWithRollback(
+                []{ return InitServices(); },
+                []{ return SanityCheckServices(); },
+                []{ ReleaseServices(); });
+            if(good){
+                WriteLastGoodBuild(GetWindowsBuild());
+                dispatchResult=RunGui(hInst);
+            } else { // explain the degraded mode instead of exiting silently
+                g_degraded=true;
+                DWORD last=ReadLastGoodBuild();
+                ShowCompatIssue(last!=0 && last!=GetWindowsBuild());
+                dispatchResult=RunGui(hInst);
+            }
+        }
+        ReleaseServices();
+        return dispatchResult;
+    };
+
+    int rc=1;
+    try { rc=RunWithTrayInstanceScope(
+        cli,acquireTrayInstance,dispatch,releaseTrayInstance); }
+    catch(...) {
+        ReleaseServices();
+        CoUninitialize();
+        return 1;
     }
-    ReleaseServices(); CoUninitialize();
+    CoUninitialize();
     return rc;
 }

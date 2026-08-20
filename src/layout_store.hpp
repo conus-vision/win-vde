@@ -43,6 +43,11 @@ struct LayoutLoadResult {
     }
 };
 
+inline bool PreserveExistingBackupForPublish(bool alreadyRequested,
+                                             LayoutLoadStatus loadStatus){
+    return alreadyRequested || loadStatus==LayoutLoadStatus::Recovered;
+}
+
 class ScopedLayoutLock {
 public:
     explicit ScopedLayoutLock(DWORD timeoutMs=0){
@@ -66,6 +71,193 @@ private:
 inline bool SameRevision(const LayoutRevision& a,const LayoutRevision& b){
     return a.sourcePath==b.sourcePath && a.exists==b.exists && a.size==b.size &&
         a.mtime==b.mtime && a.contentHash==b.contentHash;
+}
+
+enum class RecordDeltaKind {
+    ExplicitUpsert, ValidatedRuntimeUpsert, MissingMark, ExpireDelete
+};
+
+struct RecordDelta {
+    RecordDeltaKind kind=RecordDeltaKind::ValidatedRuntimeUpsert;
+    bool erase=false;
+    LayoutWin record;
+    LayoutRevision baseRevision;
+    bool baseRecordPresent=false;
+    LayoutWin baseRecord;
+    UnixSeconds changedUtc=0;
+    uint64_t causalGeneration=0;
+};
+
+struct RebaseResult {
+    std::vector<LayoutWin> records;
+    std::set<std::string> deferredConflictRecordIds;
+};
+
+inline bool SameRecordForDelta(const LayoutWin& left,const LayoutWin& right){
+    return left.recordId==right.recordId && left.app==right.app &&
+        left.deskIndex==right.deskIndex && GuidEq(left.desktop,right.desktop) &&
+        left.activeTitle==right.activeTitle &&
+        left.activeDomain==right.activeDomain && left.tabCount==right.tabCount &&
+        left.counts==right.counts && left.lastSeenUtc==right.lastSeenUtc &&
+        left.missingSinceUtc==right.missingSinceUtc;
+}
+
+inline UnixSeconds RecordSemanticTimestamp(const LayoutWin& record){
+    return (std::max)(record.lastSeenUtc,record.missingSinceUtc);
+}
+
+inline RecordDelta ChainRecordDelta(const RecordDelta& first,
+                                    const RecordDelta& later){
+    RecordDelta chained=later;
+    chained.baseRevision=first.baseRevision;
+    chained.baseRecordPresent=first.baseRecordPresent;
+    chained.baseRecord=first.baseRecord;
+    return chained;
+}
+
+namespace layout_store_delta_detail {
+
+inline bool CanonicalRecordId(const std::string& value,std::string& canonical){
+    GUID parsed{};
+    return ParseNonzeroLayoutGuid(value,parsed,&canonical);
+}
+
+inline bool ValidDeltaRecord(const LayoutWin& record,const std::string& expectedId){
+    std::string canonical;
+    return CanonicalRecordId(record.recordId,canonical) && canonical==expectedId &&
+        IsSupportedLayoutApp(record.app) && !GuidIsZero(record.desktop) &&
+        record.lastSeenUtc>=0 && record.missingSinceUtc>=0;
+}
+
+inline void BuildRecordIndex(const std::vector<LayoutWin>& records,
+                             std::map<std::string,size_t>& index){
+    index.clear();
+    for(size_t position=0;position<records.size();++position){
+        std::string canonical;
+        if(CanonicalRecordId(records[position].recordId,canonical))
+            index[canonical]=position;
+    }
+}
+
+inline void EraseRecord(std::vector<LayoutWin>& records,size_t position,
+                        std::map<std::string,size_t>& index){
+    records.erase(records.begin()+static_cast<std::ptrdiff_t>(position));
+    BuildRecordIndex(records,index);
+}
+
+} // namespace layout_store_delta_detail
+
+inline RebaseResult RebaseRecordDeltas(
+        const std::vector<LayoutWin>& latest,
+        const LayoutRevision& latestRevision,
+        const std::map<std::string,RecordDelta>& deltas,
+        UnixSeconds nowUtc){
+    RebaseResult result;
+    result.records=latest;
+    std::map<std::string,size_t> recordIndex;
+    layout_store_delta_detail::BuildRecordIndex(result.records,recordIndex);
+
+    for(const auto& item : deltas){
+        const RecordDelta& delta=item.second;
+        std::string deltaId;
+        if(!layout_store_delta_detail::CanonicalRecordId(item.first,deltaId)){
+            result.deferredConflictRecordIds.insert(item.first);
+            continue;
+        }
+        const bool erase=delta.kind==RecordDeltaKind::ExpireDelete;
+        if(erase!=delta.erase || delta.changedUtc<=0 || delta.causalGeneration==0 ||
+           (!erase && !layout_store_delta_detail::ValidDeltaRecord(
+                delta.record,deltaId))){
+            result.deferredConflictRecordIds.insert(item.first);
+            continue;
+        }
+        if(delta.baseRecordPresent){
+            std::string baseId;
+            if(!layout_store_delta_detail::CanonicalRecordId(
+                    delta.baseRecord.recordId,baseId) || baseId!=deltaId){
+                result.deferredConflictRecordIds.insert(item.first);
+                continue;
+            }
+        }
+
+        auto found=recordIndex.find(deltaId);
+        const bool latestPresent=found!=recordIndex.end();
+        const bool baseUnchanged=SameRevision(delta.baseRevision,latestRevision) ||
+            (latestPresent==delta.baseRecordPresent &&
+             (!latestPresent || SameRecordForDelta(
+                result.records[found->second],delta.baseRecord)));
+        bool apply=baseUnchanged;
+        if(!apply && erase){
+            apply=!latestPresent || IsExpired(result.records[found->second],nowUtc);
+        } else if(!apply &&
+                  (delta.kind==RecordDeltaKind::ExplicitUpsert ||
+                   delta.kind==RecordDeltaKind::ValidatedRuntimeUpsert) &&
+                  latestPresent && delta.baseRecordPresent){
+            const LayoutWin& disk=result.records[found->second];
+            apply=disk.app==delta.baseRecord.app && disk.app==delta.record.app &&
+                  delta.changedUtc>RecordSemanticTimestamp(disk);
+        }
+
+        if(!apply){
+            result.deferredConflictRecordIds.insert(item.first);
+            continue;
+        }
+        if(erase){
+            if(latestPresent)
+                layout_store_delta_detail::EraseRecord(
+                    result.records,found->second,recordIndex);
+            continue;
+        }
+        if(latestPresent) result.records[found->second]=delta.record;
+        else {
+            result.records.push_back(delta.record);
+            recordIndex[deltaId]=result.records.size()-1;
+        }
+    }
+    return result;
+}
+
+struct ValidatedRecordTouch {
+    std::string recordId;
+    UnixSeconds lastSeenUtc=0;
+    uint64_t causalGeneration=0;
+};
+
+struct TouchRebaseResult {
+    std::vector<LayoutWin> records;
+    std::set<std::string> deferredRecordIds;
+};
+
+inline TouchRebaseResult ReapplyValidatedTouches(
+        const std::vector<LayoutWin>& latest,
+        const std::map<std::string,ValidatedRecordTouch>& touches,
+        const std::map<std::string,uint64_t>& currentCausalGenerations){
+    TouchRebaseResult result;
+    result.records=latest;
+    std::map<std::string,size_t> index;
+    layout_store_delta_detail::BuildRecordIndex(result.records,index);
+    for(const auto& item : touches){
+        const ValidatedRecordTouch& touch=item.second;
+        std::string canonical;
+        auto generation=currentCausalGenerations.find(item.first);
+        if(item.first!=touch.recordId ||
+           !layout_store_delta_detail::CanonicalRecordId(item.first,canonical) ||
+           touch.lastSeenUtc<=0 || touch.causalGeneration==0 ||
+           generation==currentCausalGenerations.end() ||
+           generation->second!=touch.causalGeneration){
+            result.deferredRecordIds.insert(item.first);
+            continue;
+        }
+        auto found=index.find(canonical);
+        if(found==index.end()){
+            result.deferredRecordIds.insert(item.first);
+            continue;
+        }
+        LayoutWin& record=result.records[found->second];
+        record.lastSeenUtc=(std::max)(record.lastSeenUtc,touch.lastSeenUtc);
+        record.missingSinceUtc=0;
+    }
+    return result;
 }
 
 namespace layout_store_detail {
@@ -1074,7 +1266,8 @@ inline bool TryRecoverSoleTemp(const std::wstring& path,UnixSeconds nowUtc,const
         }
         result.status=LayoutLoadStatus::CorruptPreserved;
         result.writesAllowed=true;
-        result.revision=candidate.revision;
+        result.revision.sourcePath=path;
+        result.revision.exists=false;
         result.error="corrupt temporary layout was preserved diagnostically";
         return true;
     }
@@ -1554,7 +1747,7 @@ inline LayoutLoadResult LoadLayoutWithBackupLocked(const std::wstring& path,Unix
     LayoutLoadResult result;
     result.status=LayoutLoadStatus::CorruptPreserved;
     result.writesAllowed=true;
-    result.revision=corrupt.front()->revision;
+    result.revision=primary.revision;
     result.error="corrupt layout streams were preserved diagnostically";
     return result;
 }
@@ -1569,4 +1762,114 @@ inline LayoutLoadResult LoadLayoutWithBackup(const std::wstring& path,UnixSecond
     ScopedLayoutLock lock(lockTimeoutMs);
     if(!lock.acquired()) return layout_store_detail::UnavailableLoad(path,"layout mutex is busy or unavailable");
     return LoadLayoutWithBackupLocked(path,nowUtc);
+}
+
+enum class LegacyLayoutMigrationStatus {
+    NotNeeded, NoSource, Migrated, Failed
+};
+
+struct LegacyLayoutMigrationResult {
+    LegacyLayoutMigrationStatus status=LegacyLayoutMigrationStatus::Failed;
+    LayoutLoadResult target;
+    std::string error;
+    bool succeeded() const { return status!=LegacyLayoutMigrationStatus::Failed; }
+};
+
+inline LegacyLayoutMigrationResult MigrateLegacyLayoutLocked(
+        const std::wstring& legacyPath,const std::wstring& targetPath,
+        UnixSeconds nowUtc,const LayoutFsOps& ops,
+        RecordIdGenerator idGenerator=NewRecordId){
+    LegacyLayoutMigrationResult result;
+    result.target=LoadLayoutWithBackupLocked(targetPath,nowUtc,ops);
+    if(result.target.status==LayoutLoadStatus::Unavailable){
+        result.error=result.target.error.empty() ?
+            "automatic layout storage is unavailable" : result.target.error;
+        return result;
+    }
+    // Recovery has priority over migration.  CorruptPreserved is also an
+    // existing target state, not permission to replace it with unrelated
+    // legacy bytes; only a fully settled Missing state may migrate.
+    if(result.target.status!=LayoutLoadStatus::Missing){
+        result.status=LegacyLayoutMigrationStatus::NotNeeded;
+        return result;
+    }
+    if(legacyPath==targetPath){
+        result.error="legacy and automatic layout paths are identical";
+        return result;
+    }
+    if(nowUtc<=0){
+        result.error="legacy migration requires a positive clock";
+        return result;
+    }
+
+    FileReadResult source=ReadFileBytesBounded(legacyPath,MAX_LAYOUT_FILE_BYTES,ops);
+    if(source.status==FileReadStatus::Missing){
+        result.status=LegacyLayoutMigrationStatus::NoSource;
+        return result;
+    }
+    if(source.status!=FileReadStatus::Ok){
+        result.error=source.error.empty() ?
+            "legacy layout storage is unavailable" : source.error;
+        return result;
+    }
+
+    std::vector<DeskRec> desks;
+    std::vector<LayoutWin> wins;
+    std::string error;
+    int sourceVersion=0;
+    if(!ParseLayout(source.bytes,desks,wins,nowUtc,&error,&sourceVersion,idGenerator)){
+        result.error=error.empty() ? "legacy layout is invalid" : error;
+        return result;
+    }
+    std::string checkedV4;
+    if(!BuildCheckedLayoutSnapshot(desks,wins,nowUtc,checkedV4,&error)){
+        result.error=error.empty() ? "legacy layout cannot be represented as v4" : error;
+        return result;
+    }
+    if(!AtomicWriteText(targetPath,checkedV4,&error,false,ops)){
+        result.error=error.empty() ? "automatic layout atomic write failed" : error;
+        return result;
+    }
+
+    result.target=LoadLayoutWithBackupLocked(targetPath,nowUtc,ops);
+    if(result.target.status!=LayoutLoadStatus::Valid || result.target.sourceVersion!=4 ||
+       !result.target.revision.exists || result.target.revision.sourcePath!=targetPath){
+        result.error=result.target.error.empty() ?
+            "installed automatic layout could not be verified" : result.target.error;
+        return result;
+    }
+
+    // Retiring the source is deliberately best-effort.  Verify that it still
+    // names the bytes we migrated; if it changed, or the rename fails, leave it
+    // untouched.  The now-valid automatic target wins on every later launch.
+    std::string verifyError;
+    if(layout_store_detail::VerifyExactFile(legacyPath,source.bytes,ops,&verifyError)){
+        ops.moveFile(legacyPath,legacyPath+L".migrated",
+            MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH);
+    }
+    result.status=LegacyLayoutMigrationStatus::Migrated;
+    result.error.clear();
+    return result;
+}
+
+inline LegacyLayoutMigrationResult MigrateLegacyLayoutLocked(
+        const std::wstring& legacyPath,const std::wstring& targetPath,
+        UnixSeconds nowUtc,RecordIdGenerator idGenerator=NewRecordId){
+    LayoutFsOps ops;
+    return MigrateLegacyLayoutLocked(legacyPath,targetPath,nowUtc,ops,idGenerator);
+}
+
+inline LegacyLayoutMigrationResult MigrateLegacyLayout(
+        const std::wstring& legacyPath,const std::wstring& targetPath,
+        UnixSeconds nowUtc,DWORD lockTimeoutMs=0,
+        RecordIdGenerator idGenerator=NewRecordId){
+    ScopedLayoutLock lock(lockTimeoutMs);
+    if(!lock.acquired()){
+        LegacyLayoutMigrationResult result;
+        result.target=layout_store_detail::UnavailableLoad(
+            targetPath,"layout mutex is busy or unavailable");
+        result.error=result.target.error;
+        return result;
+    }
+    return MigrateLegacyLayoutLocked(legacyPath,targetPath,nowUtc,idGenerator);
 }
