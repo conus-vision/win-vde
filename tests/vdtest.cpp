@@ -1614,6 +1614,20 @@ static void test_picker_ui_action_gate_and_auto_supersession_are_exact(){
           PickerAutoSupersession::WaitForIssuedReadback);
 }
 
+static void test_picker_close_rejects_controlled_transition_without_cancel(){
+    PickerState idle=PickerTransitionFixture(122);
+    CHECK(RoutePickerClose(idle)==PickerCloseRoute::Hide);
+
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=122;
+    CHECK(AdvancePickerTransition(idle,begin).kind==
+          PickerEffectKind::MoveTarget);
+    CHECK(RoutePickerClose(idle)==PickerCloseRoute::Reject);
+    CHECK(!idle.transition.cancelRequested);
+    CHECK(!idle.transition.dismissed);
+}
+
 static void test_picker_observation_kick_survives_post_and_timer_failure_once(){
     PickerState state=PickerTransitionFixture(131);
     PickerObservation begin;
@@ -1703,6 +1717,123 @@ static void test_picker_save_result_and_fresh_generation_callbacks_are_typed(){
           PickerEffectKind::Refresh);
     CHECK(state.transition.diagnostic==
           PickerSaveFailureDiagnostic(PopupSaveFailure::StorageReadOnly));
+}
+
+static void test_ctrl_move_non_browser_never_mutates_auto_layout(){
+    for(bool unrelatedFreshPresent : {false,true}){
+        LayoutWin remembered;
+        remembered.recordId="remembered-firefox";
+        remembered.app="firefox";
+        remembered.activeTitle="saved tab";
+        std::vector<LayoutWin> automaticLayout{remembered};
+        std::map<std::string,LayoutWin> acceptedFreshElsewhere;
+        if(unrelatedFreshPresent)
+            acceptedFreshElsewhere["other-runtime"]=remembered;
+        const size_t recordsBefore=automaticLayout.size();
+        const size_t freshBefore=acceptedFreshElsewhere.size();
+        int mutations=0,writes=0,callbacks=0;
+
+        const PopupSaveResult result=RunPickerPersistenceTransaction(
+            PopupBrowserClassification::NotTracked,std::string(),
+            PopupPersistenceReadiness::Ready,
+            [&](const std::string& app){
+                ++mutations;
+                automaticLayout.push_back(remembered);
+                acceptedFreshElsewhere.clear();
+                ++writes;
+                PopupSaveResult saved;
+                saved.status=PopupSaveStatus::Saved;
+                saved.app=app;
+                return saved;
+            });
+        CHECK(result.status==PopupSaveStatus::NotTracked);
+        CHECK(result.failure==PopupSaveFailure::None);
+        CHECK(result.app.empty());
+        CHECK(!CompletePickerLifecycleForSave(
+            result,[&](const std::string&){ ++callbacks; }));
+        CHECK(mutations==0 && writes==0 && callbacks==0);
+        CHECK(automaticLayout.size()==recordsBefore);
+        CHECK(automaticLayout[0].recordId=="remembered-firefox");
+        CHECK(acceptedFreshElsewhere.size()==freshBefore);
+        if(unrelatedFreshPresent)
+            CHECK(acceptedFreshElsewhere.count("other-runtime")==1);
+    }
+}
+
+static void test_ctrl_move_tracked_browser_unwritable_reports_failed(){
+    LayoutWin remembered;
+    remembered.recordId="tracked-firefox";
+    remembered.app="firefox";
+    remembered.activeTitle="saved tab";
+    std::vector<LayoutWin> automaticLayout{remembered};
+    const LayoutWin before=automaticLayout[0];
+    int mutations=0,writes=0,callbacks=0;
+
+    const PopupSaveResult result=RunPickerPersistenceTransaction(
+        PopupBrowserClassification::Tracked,"firefox",
+        PopupPersistenceReadiness::ReadOnly,
+        [&](const std::string& app){
+            ++mutations;
+            automaticLayout[0].desktop=
+                G(L"{231A0000-0000-0000-0000-000000000099}");
+            ++writes;
+            PopupSaveResult saved;
+            saved.status=PopupSaveStatus::Saved;
+            saved.app=app;
+            return saved;
+        });
+    CHECK(result.status==PopupSaveStatus::Failed);
+    CHECK(result.failure==PopupSaveFailure::StorageReadOnly);
+    CHECK(result.app=="firefox");
+    CHECK(!CompletePickerLifecycleForSave(
+        result,[&](const std::string&){ ++callbacks; }));
+    CHECK(mutations==0 && writes==0 && callbacks==0);
+    CHECK(automaticLayout.size()==1);
+    CHECK(automaticLayout[0].recordId==before.recordId);
+    CHECK(GuidEq(automaticLayout[0].desktop,before.desktop));
+}
+
+static void test_picker_persistence_app_staging_contains_allocation_failure(){
+    PopupSaveResult result;
+    const std::string app(256,'f');
+    int assignments=0;
+    CHECK(!TryStagePickerPersistenceAppNoThrow(
+        result,app,[&](std::string&,const std::string&){
+            ++assignments;
+            throw std::bad_alloc();
+        }));
+    CHECK(assignments==1 && result.app.empty());
+    CHECK(TryStagePickerPersistenceAppNoThrow(
+        result,app,[&](std::string& output,const std::string& value){
+            ++assignments;
+            output=value;
+        }));
+    CHECK(assignments==2 && result.app==app);
+
+    const PopupSaveResult failed=RunPickerPersistenceTransaction(
+        PopupBrowserClassification::Tracked,app,
+        PopupPersistenceReadiness::Ready,
+        [&](const std::string&)->PopupSaveResult {
+            throw std::bad_alloc();
+        });
+    CHECK(failed.status==PopupSaveStatus::Failed);
+    CHECK(failed.failure==PopupSaveFailure::Unexpected);
+    CHECK(failed.app==app);
+
+    int committedWithoutApp=0;
+    const PopupSaveResult unstaged=RunPickerPersistenceTransaction(
+        PopupBrowserClassification::Tracked,app,
+        PopupPersistenceReadiness::Ready,
+        [&](const std::string&)->PopupSaveResult {
+            ++committedWithoutApp;
+            PopupSaveResult saved;
+            saved.status=PopupSaveStatus::Saved;
+            return saved;
+        });
+    CHECK(committedWithoutApp==1);
+    CHECK(unstaged.status==PopupSaveStatus::Failed);
+    CHECK(unstaged.failure==PopupSaveFailure::Unexpected);
+    CHECK(unstaged.app.empty());
 }
 
 static void test_picker_api_ack_distinguishes_invocation_and_identity_quality(){
@@ -1963,8 +2094,12 @@ static void test_picker_raw_edit_and_tab_cache_are_model_generation_scoped(){
     CHECK(PickerTabSearchRetryPostNeeded(cache,9,L"tab only"));
     CHECK(MarkPickerTabSearchRetryPosted(cache,9,L"tab only"));
     CHECK(!PickerTabSearchRetryPostNeeded(cache,9,L"tab only"));
-    CHECK(ConsumePickerTabSearchRetryPost(cache,9,L"tab only"));
+    CHECK(AcquirePickerTabSearchRetryPostLeaseWhenIdle(
+        cache,false,9,L"tab only"));
+    CHECK(!cache.retryPosted && cache.retryDeliveryPending &&
+          cache.routeFreed);
     CHECK(BeginPickerTabSearchAttempt(cache,902,9,L"tab only"));
+    CHECK(!cache.retryDeliveryPending && !cache.routeFreed);
     CHECK(CompletePickerTabSearchAttempt(cache,902,9,L"tab only"));
     CHECK(PickerTabSearchCacheUsable(cache,9,L"tab only"));
 
@@ -2005,15 +2140,16 @@ static void test_picker_raw_edit_and_tab_cache_are_model_generation_scoped(){
     CHECK(CompletePickerTabSearchAttempt(cache,1201,12,L"failure"));
     CHECK(PickerTabSearchRetryPostNeeded(cache,12,L"failure"));
     CHECK(MarkPickerTabSearchRetryPosted(cache,12,L"failure"));
-    CHECK(!ConsumePickerTabSearchRetryPostWhenIdle(
+    CHECK(!AcquirePickerTabSearchRetryPostLeaseWhenIdle(
         cache,true,12,L"failure"));
     CHECK(cache.retryPosted && cache.routeFreed);
-    CHECK(!ConsumePickerTabSearchRetryPostWhenIdle(
+    CHECK(!AcquirePickerTabSearchRetryPostLeaseWhenIdle(
         cache,false,13,L"failure"));
     CHECK(cache.retryPosted && cache.routeFreed);
-    CHECK(ConsumePickerTabSearchRetryPostWhenIdle(
+    CHECK(AcquirePickerTabSearchRetryPostLeaseWhenIdle(
         cache,false,12,L"failure"));
-    CHECK(!cache.retryPosted && !cache.routeFreed);
+    CHECK(!cache.retryPosted && cache.retryDeliveryPending &&
+          cache.routeFreed);
 
     InvalidatePickerTabSearchCache(cache,13);
     CHECK(BeginPickerTabSearchAttempt(cache,1301,13,L"durable"));
@@ -2025,19 +2161,20 @@ static void test_picker_raw_edit_and_tab_cache_are_model_generation_scoped(){
         cache,13,L"durable"));
     CHECK(PickerTabSearchRetryDeliveryKickNeeded(
         cache,13,L"durable"));
-    CHECK(!ConsumePickerTabSearchRetryDeliveryWhenIdle(
+    CHECK(!PickerTabSearchRetryDeliveryReadyWhenIdle(
         cache,true,13,L"durable"));
-    CHECK(!ConsumePickerTabSearchRetryDeliveryWhenIdle(
+    CHECK(!PickerTabSearchRetryDeliveryReadyWhenIdle(
         cache,false,14,L"durable"));
     CHECK(PickerTabSearchRetryDeliveryKickNeeded(
         cache,13,L"durable"));
-    CHECK(ConsumePickerTabSearchRetryDeliveryWhenIdle(
+    CHECK(PickerTabSearchRetryDeliveryReadyWhenIdle(
         cache,false,13,L"durable"));
-    CHECK(!PickerTabSearchRetryDeliveryKickNeeded(
+    CHECK(PickerTabSearchRetryDeliveryKickNeeded(
         cache,13,L"durable"));
-    CHECK(!cache.retryPosted && !cache.routeFreed &&
+    CHECK(!cache.retryPosted && cache.routeFreed &&
           cache.retryAttempts==0);
     CHECK(BeginPickerTabSearchAttempt(cache,1302,13,L"durable"));
+    CHECK(!cache.retryDeliveryPending && !cache.routeFreed);
     CHECK(cache.retryAttempts==1);
     CHECK(MarkPickerTabSearchRetryNeeded(
         cache,1302,13,L"durable","firefox",
@@ -2056,6 +2193,84 @@ static void test_picker_raw_edit_and_tab_cache_are_model_generation_scoped(){
     CHECK(cache.retryPosted && cache.retryAttempts==1);
     InvalidatePickerTabSearchCache(cache,14);
     CHECK(!cache.retryDeliveryPending);
+}
+
+static void test_picker_tab_retry_delivery_is_failure_atomic(){
+    PickerTabSearchCacheState cache;
+    CHECK(BeginPickerTabSearchAttempt(cache,1401,14,L"atomic"));
+    CHECK(MarkPickerTabSearchRetryNeeded(
+        cache,1401,14,L"atomic","firefox",
+        PickerTabSearchRetryTrigger::Immediate));
+    CHECK(CompletePickerTabSearchAttempt(cache,1401,14,L"atomic"));
+    CHECK(MarkPickerTabSearchRetryPosted(cache,14,L"atomic"));
+    CHECK(AcquirePickerTabSearchRetryPostLeaseWhenIdle(
+        cache,false,14,L"atomic"));
+
+    bool operationPublished=false;
+    bool partialRoute=false;
+    int cleanups=0;
+    PickerTabSearchEnsureOutcome outcome=RunPickerTabSearchEnsureAttempt(
+        cache,1402,14,L"atomic",
+        [&]()->bool {
+            operationPublished=true;
+            throw std::bad_alloc();
+        },
+        [&](){ partialRoute=true; return true; },
+        [&]() noexcept {
+            operationPublished=false;
+            partialRoute=false;
+            ++cleanups;
+        });
+    CHECK(outcome==PickerTabSearchEnsureOutcome::RetryPreserved);
+    CHECK(cleanups==1 && !operationPublished && !partialRoute);
+    CHECK(!cache.pending && cache.retryNeeded && cache.routeFreed &&
+          cache.retryDeliveryPending && cache.retryAttempts==0);
+
+    outcome=RunPickerTabSearchEnsureAttempt(
+        cache,1403,14,L"atomic",
+        [&](){ operationPublished=true; return true; },
+        [&]()->bool {
+            partialRoute=true;
+            throw std::bad_alloc();
+        },
+        [&]() noexcept {
+            operationPublished=false;
+            partialRoute=false;
+            ++cleanups;
+        });
+    CHECK(outcome==PickerTabSearchEnsureOutcome::RetryPreserved);
+    CHECK(cleanups==2 && !operationPublished && !partialRoute);
+    CHECK(!cache.pending && cache.retryNeeded && cache.routeFreed &&
+          cache.retryDeliveryPending && cache.retryAttempts==1);
+
+    outcome=RunPickerTabSearchEnsureAttempt(
+        cache,1404,14,L"atomic",
+        [&](){ operationPublished=true; return true; },
+        [&](){
+            CHECK(PickerTabSearchAttemptMatches(
+                cache,1404,14,L"atomic"));
+            CHECK(CompletePickerTabSearchAttempt(
+                cache,1404,14,L"atomic"));
+            operationPublished=false;
+            return true;
+        },
+        [&]() noexcept {
+            operationPublished=false;
+            ++cleanups;
+        });
+    CHECK(outcome==PickerTabSearchEnsureOutcome::AttemptCommitted);
+    CHECK(cleanups==2 && !operationPublished);
+    CHECK(PickerTabSearchCacheUsable(cache,14,L"atomic"));
+    CHECK(!cache.retryDeliveryPending && !cache.routeFreed);
+
+    bool foreignOperation=true;
+    int ownedCleanups=0;
+    CHECK(!CleanupPickerTabSearchPublishedOperation(
+        false,[&](){ foreignOperation=false; ++ownedCleanups; }));
+    CHECK(foreignOperation && ownedCleanups==0);
+    CHECK(CleanupPickerTabSearchPublishedOperation(
+        true,[&](){ ++ownedCleanups; }));
+    CHECK(foreignOperation && ownedCleanups==1);
 }
 
 static void test_picker_nonidle_gate_includes_all_tray_mutators(){
@@ -9925,6 +10140,50 @@ static void test_picker_search_retry_uses_a_distinct_timer_channel(){
           std::string::npos);
     CHECK(source.find("KillTimer(messageWindow,TIMER_PICKER_SEARCH_RETRY)")!=
           std::string::npos);
+    CHECK(source.find("RunPickerTabSearchEnsureAttempt(")!=
+          std::string::npos);
+    CHECK(source.find("AcquirePickerTabSearchRetryPostLeaseWhenIdle(")!=
+          std::string::npos);
+    CHECK(source.find("PickerTabSearchRetryDeliveryReadyWhenIdle(")!=
+          std::string::npos);
+}
+
+static void test_picker_close_route_is_used_by_the_window_procedure(){
+    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    CHECK(!source.empty());
+    CHECK(source.find("RoutePickerClose(g_picker)")!=std::string::npos);
+    CHECK(source.find(
+        "case WM_CLOSE:\r\n        if(g_picker.controlledTransition())")==
+        std::string::npos);
+    CHECK(source.find(
+        "case WM_CLOSE:\n        if(g_picker.controlledTransition())")==
+        std::string::npos);
+}
+
+static void test_picker_persistence_transaction_is_used_by_save(){
+    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    const std::string header=ReadRawFile(L"src\\picker_state.hpp");
+    CHECK(!source.empty());
+    CHECK(!header.empty());
+    CHECK(source.find("RunPickerPersistenceTransaction(")!=
+          std::string::npos);
+    CHECK(source.find("CleanupPickerTabSearchPublishedOperation(")!=
+          std::string::npos);
+    CHECK(header.find("TryStagePickerPersistenceAppNoThrow(")!=
+          std::string::npos);
+    CHECK(header.find("TryStagePickerPersistenceAppNoThrow(result,app")!=
+          std::string::npos);
+    const size_t transaction=source.find(
+        "return RunPickerPersistenceTransaction(");
+    const size_t appStaged=source.find(
+        "TryStagePickerPersistenceAppNoThrow(result,exactApp)",
+        transaction);
+    const size_t firstMutationBoundary=source.find(
+        "const std::string runtimeKey=RuntimeKey(identity);",transaction);
+    CHECK(transaction!=std::string::npos);
+    CHECK(appStaged!=std::string::npos);
+    CHECK(firstMutationBoundary!=std::string::npos);
+    CHECK(transaction<appStaged && appStaged<firstMutationBoundary);
 }
 
 static void test_session_bounded_reader_binds_bytes_to_exact_aba_handle(){
@@ -16596,6 +16855,8 @@ int main(){
     test_footer_mousemove_resets_tooltip_only_once_per_transition();
     test_visible_branding_and_help_retention_are_exact();
     test_picker_search_retry_uses_a_distinct_timer_channel();
+    test_picker_close_route_is_used_by_the_window_procedure();
+    test_picker_persistence_transaction_is_used_by_save();
     test_picker_distinguishes_current_selected_and_active();
     test_picker_zero_guids_and_partial_identities_never_highlight();
     test_picker_active_identity_rejects_hwnd_reuse();
@@ -16628,14 +16889,19 @@ int main(){
     test_picker_escape_hides_once_rolls_back_and_never_refocuses();
     test_picker_rollback_exhaustion_preserves_actual_readbacks();
     test_picker_ui_action_gate_and_auto_supersession_are_exact();
+    test_picker_close_rejects_controlled_transition_without_cancel();
     test_picker_observation_kick_survives_post_and_timer_failure_once();
     test_picker_save_result_and_fresh_generation_callbacks_are_typed();
+    test_ctrl_move_non_browser_never_mutates_auto_layout();
+    test_ctrl_move_tracked_browser_unwritable_reports_failed();
+    test_picker_persistence_app_staging_contains_allocation_failure();
     test_picker_api_ack_distinguishes_invocation_and_identity_quality();
     test_picker_post_switch_reads_current_then_popup_and_requires_both();
     test_picker_escape_after_save_emission_is_a_commit_cutoff();
     test_picker_cancel_discards_only_matching_unissued_non_save_effect();
     test_picker_reservation_filter_and_owner_replacement_are_exact();
     test_picker_raw_edit_and_tab_cache_are_model_generation_scoped();
+    test_picker_tab_retry_delivery_is_failure_atomic();
     test_picker_nonidle_gate_includes_all_tray_mutators();
     test_picker_shutdown_driver_preserves_delays_and_skips_ui_work();
     test_picker_forward_attempt_matrix_has_independent_exact_budgets();

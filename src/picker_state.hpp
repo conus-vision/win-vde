@@ -650,6 +650,8 @@ enum class PickerUiAction {
     Selection, ManualSave, ManualRestore, Settings, About, Help, TrayExit
 };
 
+enum class PickerCloseRoute { Hide, Reject };
+
 enum class PickerIdleEditInputRoute { Edit, Grid, Swallow };
 
 inline PickerIdleEditInputRoute RoutePickerIdleEditInput(
@@ -786,6 +788,69 @@ struct PopupSaveResult {
     PopupSaveFailure failure=PopupSaveFailure::None;
     std::string app;
 };
+
+template<class Assign>
+inline bool TryStagePickerPersistenceAppNoThrow(
+        PopupSaveResult& result,const std::string& app,
+        Assign&& assign) noexcept {
+    try {
+        assign(result.app,app);
+        return true;
+    } catch(...) { return false; }
+}
+
+inline bool TryStagePickerPersistenceAppNoThrow(
+        PopupSaveResult& result,const std::string& app) noexcept {
+    return TryStagePickerPersistenceAppNoThrow(
+        result,app,[](std::string& output,const std::string& value){
+            std::string staged=value;
+            output.swap(staged);
+        });
+}
+
+template<class Persist>
+inline PopupSaveResult RunPickerPersistenceTransaction(
+        PopupBrowserClassification classification,const std::string& app,
+        PopupPersistenceReadiness readiness,Persist&& persist) noexcept {
+    PopupSaveResult result;
+    result.status=PopupSaveStatus::Failed;
+    if(classification==PopupBrowserClassification::NotTracked){
+        result.status=PopupSaveStatus::NotTracked;
+        return result;
+    }
+    if(classification!=PopupBrowserClassification::Tracked || app.empty()){
+        result.failure=PopupSaveFailure::Classification;
+        TryStagePickerPersistenceAppNoThrow(result,app);
+        return result;
+    }
+    if(readiness==PopupPersistenceReadiness::Unavailable){
+        result.failure=PopupSaveFailure::StorageUnavailable;
+        TryStagePickerPersistenceAppNoThrow(result,app);
+        return result;
+    }
+    if(readiness!=PopupPersistenceReadiness::Ready){
+        result.failure=PopupSaveFailure::StorageReadOnly;
+        TryStagePickerPersistenceAppNoThrow(result,app);
+        return result;
+    }
+    if(!TryStagePickerPersistenceAppNoThrow(result,app)){
+        result.failure=PopupSaveFailure::Unexpected;
+        return result;
+    }
+    try {
+        PopupSaveResult persisted=persist(app);
+        if(persisted.status!=PopupSaveStatus::NotTracked &&
+           persisted.app.empty()){
+            persisted.status=PopupSaveStatus::Failed;
+            persisted.failure=PopupSaveFailure::Unexpected;
+        }
+        return persisted;
+    } catch(...) {
+        result.status=PopupSaveStatus::Failed;
+        result.failure=PopupSaveFailure::Unexpected;
+        return result;
+    }
+}
 
 inline const wchar_t* PickerSaveFailureDiagnostic(
         PopupSaveFailure failure) noexcept {
@@ -1549,36 +1614,88 @@ inline bool PickerTabSearchRetryDeliveryKickNeeded(
                cache,modelGeneration,normalizedQuery);
 }
 
-inline bool ConsumePickerTabSearchRetryDeliveryWhenIdle(
+inline bool PickerTabSearchRetryDeliveryReadyWhenIdle(
+        const PickerTabSearchCacheState& cache,bool controlledTransition,
+        uint64_t modelGeneration,
+        const std::wstring& normalizedQuery) noexcept {
+    return !controlledTransition &&
+           PickerTabSearchRetryDeliveryKickNeeded(
+               cache,modelGeneration,normalizedQuery);
+}
+
+inline bool AcquirePickerTabSearchRetryPostLeaseWhenIdle(
         PickerTabSearchCacheState& cache,bool controlledTransition,
         uint64_t modelGeneration,
         const std::wstring& normalizedQuery) noexcept {
-    if(controlledTransition ||
-       !PickerTabSearchRetryDeliveryKickNeeded(
+    if(controlledTransition || !cache.retryPosted || cache.pending ||
+       !cache.retryNeeded || !cache.routeFreed || cache.retryAttempts>=4 ||
+       !PickerTabSearchKeyMatches(
            cache,modelGeneration,normalizedQuery)) return false;
-    cache.retryDeliveryPending=false;
-    cache.routeFreed=false;
-    return true;
-}
-
-inline bool ConsumePickerTabSearchRetryPost(
-        PickerTabSearchCacheState& cache,uint64_t modelGeneration,
-        const std::wstring& normalizedQuery) noexcept {
-    if(!cache.retryPosted || !PickerTabSearchKeyMatches(
-            cache,modelGeneration,normalizedQuery)) return false;
     cache.retryPosted=false;
-    cache.retryDeliveryPending=false;
-    cache.routeFreed=false;
+    cache.retryDeliveryPending=true;
     return true;
 }
 
-inline bool ConsumePickerTabSearchRetryPostWhenIdle(
-        PickerTabSearchCacheState& cache,bool controlledTransition,
+inline bool RestorePickerTabSearchRetryAfterEnsureFailure(
+        PickerTabSearchCacheState& cache,uint64_t attemptId,
         uint64_t modelGeneration,
         const std::wstring& normalizedQuery) noexcept {
-    if(controlledTransition) return false;
-    return ConsumePickerTabSearchRetryPost(
-        cache,modelGeneration,normalizedQuery);
+    if(attemptId==0 || cache.attemptId!=attemptId ||
+       !PickerTabSearchKeyMatches(
+           cache,modelGeneration,normalizedQuery)) return false;
+    cache.ready=false;
+    cache.pending=false;
+    cache.retryNeeded=true;
+    cache.routeFreed=true;
+    cache.retryPosted=false;
+    cache.retryDeliveryPending=true;
+    cache.blockedAppMask=0;
+    cache.blockedOnAnyRoute=false;
+    return true;
+}
+
+enum class PickerTabSearchEnsureOutcome {
+    AttemptCommitted, RetryPreserved
+};
+
+template<class Cleanup>
+inline bool CleanupPickerTabSearchPublishedOperation(
+        bool published,Cleanup&& cleanup) noexcept {
+    if(!published) return false;
+    try {
+        cleanup();
+        return true;
+    } catch(...) { return false; }
+}
+
+template<class Publish,class Dispatch,class Cleanup>
+inline PickerTabSearchEnsureOutcome RunPickerTabSearchEnsureAttempt(
+        PickerTabSearchCacheState& cache,uint64_t attemptId,
+        uint64_t modelGeneration,const std::wstring& normalizedQuery,
+        Publish&& publish,Dispatch&& dispatch,Cleanup&& cleanup) noexcept {
+    bool begun=false;
+    const auto cleanupNoThrow=[&]() noexcept {
+        try { cleanup(); } catch(...) {}
+    };
+    try {
+        if(!publish()){
+            cleanupNoThrow();
+            return PickerTabSearchEnsureOutcome::RetryPreserved;
+        }
+        if(!BeginPickerTabSearchAttempt(
+                cache,attemptId,modelGeneration,normalizedQuery)){
+            cleanupNoThrow();
+            return PickerTabSearchEnsureOutcome::RetryPreserved;
+        }
+        begun=true;
+        if(dispatch())
+            return PickerTabSearchEnsureOutcome::AttemptCommitted;
+    } catch(...) {}
+    cleanupNoThrow();
+    if(begun)
+        RestorePickerTabSearchRetryAfterEnsureFailure(
+            cache,attemptId,modelGeneration,normalizedQuery);
+    return PickerTabSearchEnsureOutcome::RetryPreserved;
 }
 
 inline void InvalidatePickerTabSearchCache(
@@ -1600,6 +1717,12 @@ inline void InvalidatePickerTabSearchCache(
 inline bool PickerUiActionAllowed(const PickerState& state,
                                   PickerUiAction action) noexcept {
     return action==PickerUiAction::TrayExit || !state.controlledTransition();
+}
+
+inline PickerCloseRoute RoutePickerClose(const PickerState& state) noexcept {
+    return state.controlledTransition()
+        ? PickerCloseRoute::Reject
+        : PickerCloseRoute::Hide;
 }
 
 enum class PickerShutdownRoute { Proceed, CancelThenProceed };

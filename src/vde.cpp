@@ -1211,21 +1211,18 @@ static PopupSaveResult SavePopupMovedWindow(
         std::string app;
         const PopupBrowserClassification classification=
             ClassifyTrackedBrowserWindow(identity,app);
-        if(classification==PopupBrowserClassification::NotTracked){
-            result.status=PopupSaveStatus::NotTracked;
-            return result;
-        }
-        result.app=app.empty() ? transition.app : app;
-        if(classification!=PopupBrowserClassification::Tracked){
-            result.failure=PopupSaveFailure::Classification;
-            return result;
-        }
-        if(!g_autoLoaded){
-            result.failure=PopupSaveFailure::StorageUnavailable;
-            return result;
-        }
-        if(!g_autoWritesAllowed || !g_autoFix || g_degraded){
-            result.failure=PopupSaveFailure::StorageReadOnly;
+        const PopupPersistenceReadiness readiness=!g_autoLoaded
+            ? PopupPersistenceReadiness::Unavailable
+            : (!g_autoWritesAllowed || !g_autoFix || g_degraded)
+                ? PopupPersistenceReadiness::ReadOnly
+                : PopupPersistenceReadiness::Ready;
+        const std::string& terminalApp=app.empty() ? transition.app : app;
+        return RunPickerPersistenceTransaction(
+            classification,terminalApp,readiness,
+            [&](const std::string& exactApp)->PopupSaveResult {
+        PopupSaveResult result;
+        if(!TryStagePickerPersistenceAppNoThrow(result,exactApp)){
+            result.failure=PopupSaveFailure::Unexpected;
             return result;
         }
 
@@ -1423,6 +1420,7 @@ static PopupSaveResult SavePopupMovedWindow(
         result.status=PopupSaveStatus::Saved;
         result.failure=PopupSaveFailure::None;
         return result;
+            });
     } catch(...) {
         result.status=PopupSaveStatus::Failed;
         if(result.failure==PopupSaveFailure::None)
@@ -5514,61 +5512,104 @@ static void HandleSearchReconcileResult(std::unique_ptr<ReconcileResult> result)
     }
 }
 
-// Lazily request all-tab text without reading browser files on the UI thread.
-static void EnsureTabSearch(){
-    if(g_picker.searchText.empty()){
-        InvalidatePickerTabSearchCache(
-            g_pickerTabSearchCache,g_picker.modelGeneration);
-        return;
-    }
-    if(PickerTabSearchCacheUsable(
-            g_pickerTabSearchCache,g_picker.modelGeneration,
-            g_picker.searchText) ||
-       (g_pickerTabSearchCache.pending &&
-        PickerTabSearchKeyMatches(
-            g_pickerTabSearchCache,g_picker.modelGeneration,
-            g_picker.searchText))) return;
-    SearchOperation operation;
-    operation.operationId=TakeNonzeroId(g_nextOperationId);
-    operation.pickerModelGeneration=g_picker.modelGeneration;
-    operation.pickerQuery=g_picker.searchText;
-    operation.snapshots=CollectFastSnapshots();
-    const uint64_t operationId=operation.operationId;
-    std::wstring stagedQuery=operation.pickerQuery;
+static void CleanupPickerTabSearchEnsureOperation(
+        uint64_t operationId) noexcept {
+    if(operationId==0) return;
     try {
-        if(!g_searchOperations.emplace(operationId,operation).second) return;
-    } catch(...) { return; }
-    if(!BeginPickerTabSearchAttempt(
-            g_pickerTabSearchCache,operationId,
-            operation.pickerModelGeneration,
-            stagedQuery)){
-        g_searchOperations.erase(operationId);
-        return;
-    }
-    std::vector<AppProfile> profiles=ActiveProfiles();
-    for(const AppProfile& profile : profiles){
-        auto snapshot=operation.snapshots.find(profile.id);
-        if(snapshot==operation.snapshots.end() || snapshot->second.windows.empty() ||
-           !FastSnapshotCanObserve(snapshot->second)) continue;
-        PickerTabSearchRetryTrigger retryTrigger=
-            PickerTabSearchRetryTrigger::Immediate;
-        uint64_t request=RequestSessionWork(
-            AsyncOperationOwner::Search,operationId,profile,snapshot->second,
-            SessionPurpose::Search,&retryTrigger);
-        if(request) ++g_searchOperations[operationId].outstanding;
-        else MarkPickerTabSearchRetryNeeded(
-            g_pickerTabSearchCache,operationId,
-            operation.pickerModelGeneration,
-            operation.pickerQuery,profile.id,retryTrigger);
-    }
-    if(g_searchOperations[operationId].outstanding==0){
-        g_reconcileDeadlines.cancel(operationId);
-        CompletePickerTabSearchAttempt(
-            g_pickerTabSearchCache,operationId,
-            operation.pickerModelGeneration,
-            operation.pickerQuery);
-        g_searchOperations.erase(operationId);
+        RetireSessionRoutesForOperation(
+            AsyncOperationOwner::Search,operationId);
+    } catch(...) {}
+    try { g_reconcileDeadlines.cancel(operationId); } catch(...) {}
+    g_searchOperations.erase(operationId);
+}
+
+// Lazily request all-tab text without reading browser files on the UI thread.
+static PickerTabSearchEnsureOutcome EnsureTabSearch() noexcept {
+    try {
+        if(g_picker.searchText.empty()){
+            InvalidatePickerTabSearchCache(
+                g_pickerTabSearchCache,g_picker.modelGeneration);
+            return PickerTabSearchEnsureOutcome::AttemptCommitted;
+        }
+        if(PickerTabSearchCacheUsable(
+                g_pickerTabSearchCache,g_picker.modelGeneration,
+                g_picker.searchText) ||
+           (g_pickerTabSearchCache.pending &&
+            PickerTabSearchKeyMatches(
+                g_pickerTabSearchCache,g_picker.modelGeneration,
+                g_picker.searchText)))
+            return PickerTabSearchEnsureOutcome::AttemptCommitted;
+
+        SearchOperation operation;
+        operation.operationId=TakeNonzeroId(g_nextOperationId);
+        operation.pickerModelGeneration=g_picker.modelGeneration;
+        operation.pickerQuery=g_picker.searchText;
+        operation.snapshots=CollectFastSnapshots();
+        std::vector<AppProfile> profiles=ActiveProfiles();
+        const uint64_t operationId=operation.operationId;
+        const uint64_t modelGeneration=operation.pickerModelGeneration;
+        std::wstring stagedQuery=operation.pickerQuery;
+        bool operationPublished=false;
+        const PickerTabSearchEnsureOutcome outcome=
+            RunPickerTabSearchEnsureAttempt(
+                g_pickerTabSearchCache,operationId,modelGeneration,
+                stagedQuery,
+                [&](){
+                    operationPublished=g_searchOperations.emplace(
+                        operationId,std::move(operation)).second;
+                    return operationPublished;
+                },
+                [&](){
+                    for(const AppProfile& profile : profiles){
+                        auto stored=g_searchOperations.find(operationId);
+                        if(stored==g_searchOperations.end()) return false;
+                        auto snapshot=
+                            stored->second.snapshots.find(profile.id);
+                        if(snapshot==stored->second.snapshots.end() ||
+                           snapshot->second.windows.empty() ||
+                           !FastSnapshotCanObserve(snapshot->second))
+                            continue;
+                        PickerTabSearchRetryTrigger retryTrigger=
+                            PickerTabSearchRetryTrigger::Immediate;
+                        const uint64_t request=RequestSessionWork(
+                            AsyncOperationOwner::Search,operationId,profile,
+                            snapshot->second,SessionPurpose::Search,
+                            &retryTrigger);
+                        stored=g_searchOperations.find(operationId);
+                        if(stored==g_searchOperations.end()) return false;
+                        if(request)
+                            ++stored->second.outstanding;
+                        else
+                            MarkPickerTabSearchRetryNeeded(
+                                g_pickerTabSearchCache,operationId,
+                                modelGeneration,stagedQuery,profile.id,
+                                retryTrigger);
+                    }
+                    auto stored=g_searchOperations.find(operationId);
+                    if(stored==g_searchOperations.end()) return false;
+                    if(stored->second.outstanding==0){
+                        g_reconcileDeadlines.cancel(operationId);
+                        CompletePickerTabSearchAttempt(
+                            g_pickerTabSearchCache,operationId,
+                            modelGeneration,stagedQuery);
+                        g_searchOperations.erase(stored);
+                        SchedulePickerTabSearchRetry();
+                    }
+                    return true;
+                },
+                [&]() noexcept {
+                    CleanupPickerTabSearchPublishedOperation(
+                        operationPublished,[&](){
+                            CleanupPickerTabSearchEnsureOperation(
+                                operationId);
+                        });
+                });
+        if(outcome==PickerTabSearchEnsureOutcome::RetryPreserved)
+            SchedulePickerTabSearchRetry();
+        return outcome;
+    } catch(...) {
         SchedulePickerTabSearchRetry();
+        return PickerTabSearchEnsureOutcome::RetryPreserved;
     }
 }
 static void LayoutTiles(int clientW){
@@ -6450,10 +6491,10 @@ static bool FinalizePickerRuntimeTransition() noexcept {
         InvalidatePickerTabSearchCache(
             g_pickerTabSearchCache,g_picker.modelGeneration);
     else
-        resumeTabSearch=ConsumePickerTabSearchRetryPostWhenIdle(
+        resumeTabSearch=AcquirePickerTabSearchRetryPostLeaseWhenIdle(
             g_pickerTabSearchCache,false,g_picker.modelGeneration,
             g_picker.searchText) ||
-            ConsumePickerTabSearchRetryDeliveryWhenIdle(
+            PickerTabSearchRetryDeliveryReadyWhenIdle(
                 g_pickerTabSearchCache,false,g_picker.modelGeneration,
                 g_picker.searchText);
     g_pickerTerminalizationPending=false;
@@ -7608,8 +7649,7 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     switch(msg){
     case WM_HOTKEY: ShowPicker(CapturePickerTarget()); return 0;
     case WM_CLOSE:
-        if(g_picker.controlledTransition()) RequestPickerCancellation();
-        else HidePicker();
+        if(RoutePickerClose(g_picker)==PickerCloseRoute::Hide) HidePicker();
         return 0;
     case WM_PICKER_TRANSITION:
         if(g_runtimeQuiescence.acceptsDispatch())
@@ -7617,7 +7657,7 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         return 0;
     case WM_PICKER_SEARCH_RETRY:
         if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
-        if(ConsumePickerTabSearchRetryPostWhenIdle(
+        if(AcquirePickerTabSearchRetryPostLeaseWhenIdle(
                 g_pickerTabSearchCache,g_picker.controlledTransition(),
                 g_picker.modelGeneration,g_picker.searchText))
             EnsureTabSearch();
@@ -7800,7 +7840,7 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
         if(wp==TIMER_PICKER_SEARCH_RETRY){
             KillTimer(hwnd,TIMER_PICKER_SEARCH_RETRY);
-            if(ConsumePickerTabSearchRetryDeliveryWhenIdle(
+            if(PickerTabSearchRetryDeliveryReadyWhenIdle(
                     g_pickerTabSearchCache,g_picker.controlledTransition(),
                     g_picker.modelGeneration,g_picker.searchText))
                 EnsureTabSearch();
