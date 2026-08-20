@@ -244,6 +244,7 @@ static std::map<std::string,uint64_t> g_lastFreshSessionSignature;
 static MoveQueue g_moveQueue;
 static RestoreBudgets g_restoreBudgets;
 static CheckpointController g_checkpointController;
+static RuntimeQuiescenceState g_runtimeQuiescence;
 static AsyncSessionRouteGate g_sessionRouteGate;
 static AsyncReconcileDeadlineGate g_reconcileDeadlines;
 static DirtyFlushController g_dirtyFlush;
@@ -256,7 +257,7 @@ static bool g_flushTimerArmed=false;
 static uint64_t g_flushTimerDueMs=0;
 static bool g_heartbeatTimerArmed=false;
 static bool g_moveCancellationPending=false;
-static unsigned g_moveCancellationPostRetries=0;
+static MoveCancellationRetryState g_moveCancellationRetry;
 static LayoutRevision g_autoRevision;
 static LayoutPublishCandidate g_pendingAutoPublishCandidate;
 static std::map<std::string,RecordDelta> g_dirtyRecordDeltas;
@@ -694,6 +695,17 @@ static void ScheduleAutoFlush(UINT delayMs=AUTO_FLUSH_INTERVAL_MS){
     g_flushTimerArmed=false;
     g_flushTimerDueMs=0;
     ReportStorageError(L"Automatic layout flush timer could not be started; final checkpoints remain enabled.");
+}
+
+static void MaintainAutoFlushTimer() noexcept {
+    try {
+        const bool eligible=g_main && g_autoLoaded && g_autoWritesAllowed &&
+            g_autoFix && !g_degraded;
+        if(ShouldMaintainDirtyFlush(
+                eligible,g_autoDirty && g_dirtyFlush.dirty(),
+                g_flushTimerArmed))
+            ScheduleAutoFlush();
+    } catch(...) {}
 }
 
 static void MarkAutoDirty(bool schedule=true){
@@ -1340,22 +1352,16 @@ static std::set<std::string> UpdateBoundRecords(
            !SameIdentity(binding->second.identity,IdentityOf(fast))) continue;
         const LayoutWin* existing=FindAutoRecord(binding->second.recordId);
         if(!existing){ g_recordByRuntime.erase(binding); continue; }
-        LayoutWin desired=*existing;
-        if(!GuidIsZero(fast.desktop)){
-            desired.desktop=fast.desktop;
-            desired.deskIndex=live[index].deskIndex;
-        }
-        if(freshness==ReconcileFreshness::Fresh){
-            desired.activeTitle=live[index].activeTitle;
-            desired.activeDomain=live[index].activeDomain;
-            desired.tabCount=live[index].tabCount;
-            desired.counts=live[index].counts;
-        }
-        MarkSeen(desired,nowUtc);
-        if(!UpsertAutoRecord(desired,RecordDeltaKind::ValidatedRuntimeUpsert,
-                             nowUtc,snapshot.generation)) continue;
+        const std::string recordId=existing->recordId;
+        if(!CommitBoundRecordRefresh(
+                *existing,fast,live[index],freshness,nowUtc,runtime,
+                g_provisionalRecordByRuntime,[&](const LayoutWin& desired){
+                    return UpsertAutoRecord(
+                        desired,RecordDeltaKind::ValidatedRuntimeUpsert,
+                        nowUtc,snapshot.generation);
+                })) continue;
         binding->second.causalGeneration=snapshot.generation;
-        reserved.insert(desired.recordId);
+        reserved.insert(recordId);
         g_pendingRecordByRuntime.erase(runtime);
     }
     return reserved;
@@ -1634,22 +1640,27 @@ static void RefreshMoveCancellationPending() noexcept {
             g_moveCancellationPending=true;
             break;
         }
-    if(!g_moveCancellationPending) g_moveCancellationPostRetries=0;
+    if(!g_moveCancellationPending) g_moveCancellationRetry.clear();
+}
+
+
+static size_t PendingMoveCancellationCount() noexcept {
+    size_t count=0;
+    for(const auto& runtime : g_moveRuntime)
+        if(runtime.second.cancelRequested && count!=(std::numeric_limits<size_t>::max)())
+            ++count;
+    return count;
 }
 
 static bool ScheduleMoveCancellationRetry(){
-    if(!g_moveCancellationPending || !g_main) return !g_moveCancellationPending;
-    if(SetTimer(g_main,TIMER_MOVE_VERIFY,MOVE_VERIFY_INTERVAL_MS,nullptr)){
-        g_moveCancellationPostRetries=0;
-        return true;
-    }
-    static const unsigned kMaxPostRetries=8;
-    if(g_moveCancellationPostRetries<kMaxPostRetries &&
-       PostMessageW(g_main,WM_MOVE_CANCEL_RETRY,0,0)){
-        ++g_moveCancellationPostRetries;
-        return true;
-    }
-    return false;
+    if(!g_main) return !g_moveCancellationPending;
+    return g_moveCancellationRetry.request(g_moveCancellationPending,
+        [](){
+            return SetTimer(g_main,TIMER_MOVE_VERIFY,
+                            MOVE_VERIFY_INTERVAL_MS,nullptr)!=0;
+        },[](){
+            return PostMessageW(g_main,WM_MOVE_CANCEL_RETRY,0,0)!=FALSE;
+        });
 }
 
 static bool MoveCancellationAwaitsTerminal(uint64_t jobId) noexcept {
@@ -2314,6 +2325,51 @@ static void FinalizeMoveReservation(const MoveResult& result,
     }
 }
 
+static void RetireMoveOwnerDispatchFailure(const MoveResult& result) noexcept {
+    try {
+        if(result.token.owner==MoveOwner::AutoReconcile){
+            auto operation=g_pendingAutoOperations.find(result.token.operationId);
+            if(operation==g_pendingAutoOperations.end()) return;
+            if(operation->second.liveJobIds.erase(result.token.jobId)!=0 &&
+               operation->second.outstanding>0)
+                --operation->second.outstanding;
+            operation->second.hadFailure=true;
+            if(operation->second.cancellationPending){
+                if(operation->second.liveJobIds.empty())
+                    g_pendingAutoOperations.erase(operation);
+                return;
+            }
+            if(operation->second.outstanding==0)
+                FinishAutoOperation(result.token.operationId);
+            return;
+        }
+        if(result.token.owner==MoveOwner::ManualTray){
+            auto operation=g_manualMoveOperations.find(result.token.operationId);
+            if(operation==g_manualMoveOperations.end()) return;
+            if(operation->second.liveJobIds.erase(result.token.jobId)!=0){
+                if(operation->second.outstanding>0) --operation->second.outstanding;
+                ++operation->second.failed;
+            }
+            if(operation->second.cancellationPending){
+                if(operation->second.liveJobIds.empty())
+                    g_manualMoveOperations.erase(operation);
+                return;
+            }
+            if(operation->second.outstanding==0)
+                FinishManualMove(result.token.operationId);
+            return;
+        }
+        auto operation=g_pickerOperations.find(result.token.operationId);
+        if(operation==g_pickerOperations.end()) return;
+        operation->second.liveJobIds.erase(result.token.jobId);
+        if(operation->second.liveJobIds.empty()){
+            const bool report=!operation->second.completionReported;
+            g_pickerOperations.erase(operation);
+            if(report) Balloon(L"The window move completed, but its result could not be processed safely.");
+        }
+    } catch(...) {}
+}
+
 static void DispatchMoveResult(const MoveResult& result,
                                bool consumeCheckpointWhileProtected){
     if(!result.completed || result.token.jobId==0) return;
@@ -2332,8 +2388,9 @@ static void DispatchMoveResult(const MoveResult& result,
     try {
         DispatchMoveOwnerResult(result,hadRuntime,runtime);
     } catch(...) {
+        RetireMoveOwnerDispatchFailure(result);
         FinalizeMoveReservation(result,protect);
-        throw;
+        return;
     }
     FinalizeMoveReservation(result,protect);
 }
@@ -2871,8 +2928,8 @@ static bool CheckpointAutoLayout(CheckpointReason reason){
     } catch(...) { return false; }
 }
 
-static void FinalizeAutoLayout(){
-    CheckpointAutoLayout(CheckpointReason::Finalize);
+static bool FinalizeAutoLayout(){
+    return CheckpointAutoLayout(CheckpointReason::Finalize);
 }
 
 static bool TryLoadAutoLayoutAndInitialize(){
@@ -2889,16 +2946,36 @@ static bool TryLoadAutoLayoutAndInitialize(){
                 const std::vector<AppProfile> profiles=ActiveProfiles();
                 const std::map<std::string,AppFastSnapshot> snapshots=
                     CollectFastSnapshots(profiles);
-                return PrepareInitialLifecycleStates(
-                    profiles,snapshots,MonotonicNowMs(),g_lifecycleByApp,
-                    g_lastFreshSessionSignature,
-                    [](const std::string&,LcState& state,
-                       const AppFastSnapshot& snapshot,uint64_t nowMs){
-                        (void)LcObserve(state,true,
-                            snapshot.windowSetSignature,
-                            snapshot.settleSignature,
-                            snapshot.layoutSignature,0,nowMs);
-                    });
+                InitialLifecyclePreparation prepared;
+                if(!PrepareInitialLifecycleStates(
+                        profiles,snapshots,MonotonicNowMs(),prepared))
+                    return false;
+                std::map<std::string,uint64_t> missingGenerations;
+                for(const InitialMissingApp& missing : prepared.missingApps)
+                    if(!missingGenerations.emplace(
+                            missing.app,missing.generation).second)
+                        return false;
+                FinalCheckpointMutationState mutation;
+                const UnixSeconds nowUtc=UtcNowSeconds();
+                if(!BuildInitialMissingMutation(
+                        g_autoRecords,g_dirtyRecordDeltas,g_validatedTouches,
+                        g_deferredRecordConflicts,
+                        g_provisionalRecordByRuntime,g_autoRevision,
+                        missingGenerations,nowUtc,mutation)) return false;
+                bool changed=mutation.records.size()!=g_autoRecords.size();
+                for(size_t index=0;!changed && index<mutation.records.size();++index)
+                    changed=!SameRecordForDelta(
+                        mutation.records[index],g_autoRecords[index]);
+                g_autoRecords.swap(mutation.records);
+                g_dirtyRecordDeltas.swap(mutation.deltas);
+                g_validatedTouches.swap(mutation.touches);
+                g_deferredRecordConflicts.swap(mutation.conflicts);
+                g_provisionalRecordByRuntime.swap(
+                    mutation.provisionalRecordByRuntime);
+                g_lifecycleByApp.swap(prepared.states);
+                g_lastFreshSessionSignature.swap(prepared.signatures);
+                if(changed) MarkAutoDirty(false);
+                return true;
             } catch(...) { return false; }
         },
         [](){
@@ -3499,6 +3576,98 @@ static void RetireReconcileOperation(uint64_t operationId){
     if(search!=g_searchOperations.end()){
         RetireSessionRoutesForOperation(AsyncOperationOwner::Search,operationId);
         g_searchOperations.erase(search);
+    }
+}
+
+static void ForceCancelAutoOperationNoThrow(uint64_t operationId) noexcept {
+    try {
+        auto operation=g_pendingAutoOperations.find(operationId);
+        if(operation==g_pendingAutoOperations.end()) return;
+        operation->second.cancellationPending=true;
+        for(uint64_t jobId : operation->second.liveJobIds){
+            if(MarkMoveForTerminalRetirement(jobId)) continue;
+            auto runtime=g_moveRuntime.find(jobId);
+            if(runtime!=g_moveRuntime.end()) runtime->second.cancelRequested=true;
+        }
+        if(operation->second.liveJobIds.empty()){
+            auto lifecycle=g_lifecycleByApp.find(operation->second.app);
+            if(lifecycle!=g_lifecycleByApp.end())
+                LcCancelRestore(lifecycle->second,
+                    operation->second.lifecycleGeneration,
+                    MonotonicNowMs(),true);
+            g_pendingAutoOperations.erase(operation);
+        }
+        RefreshMoveCancellationPending();
+        ScheduleMoveCancellationRetry();
+    } catch(...) {}
+}
+
+static void ForceCancelManualOperationNoThrow(uint64_t operationId) noexcept {
+    try {
+        auto operation=g_manualMoveOperations.find(operationId);
+        if(operation==g_manualMoveOperations.end()) return;
+        operation->second.cancellationPending=true;
+        for(uint64_t jobId : operation->second.liveJobIds){
+            if(MarkMoveForTerminalRetirement(jobId)) continue;
+            auto runtime=g_moveRuntime.find(jobId);
+            if(runtime!=g_moveRuntime.end()) runtime->second.cancelRequested=true;
+        }
+        operation->second.waitingSessionApps.clear();
+        operation->second.waitingReconcileApps.clear();
+        if(operation->second.liveJobIds.empty())
+            g_manualMoveOperations.erase(operation);
+        RefreshMoveCancellationPending();
+        ScheduleMoveCancellationRetry();
+    } catch(...) {}
+}
+
+static void RetireFailedSessionResult(uint64_t requestId) noexcept {
+    if(requestId==0) return;
+    auto found=g_sessionRoutes.find(requestId);
+    if(found==g_sessionRoutes.end()) return;
+    SessionRoute route;
+    route.owner=found->second.owner;
+    route.operationId=found->second.operationId;
+    route.purpose=found->second.purpose;
+    route.identityGeneration=found->second.identityGeneration;
+    route.contentGeneration=found->second.contentGeneration;
+    route.deadlineMs=found->second.deadlineMs;
+    g_sessionRouteGate.abandon(
+        requestId,route.operationId,route.identityGeneration);
+    g_sessionRoutes.erase(found);
+    try { RetireAsyncSessionOperation(route,AsyncRetirementReason::Failed); }
+    catch(...) {
+        // The route is no longer replayable.  Best-effort owner retirement is
+        // contained so a reporting/allocation failure cannot unwind WndProc.
+        try {
+            if(route.owner==AsyncOperationOwner::AutoReconcile)
+                ForceCancelAutoOperationNoThrow(route.operationId);
+            else if(route.owner==AsyncOperationOwner::ManualRestore)
+                ForceCancelManualOperationNoThrow(route.operationId);
+            else if(route.owner==AsyncOperationOwner::ManualSave)
+                g_manualSaveOperations.erase(route.operationId);
+            else if(route.owner==AsyncOperationOwner::MetadataProbe)
+                g_metadataProbeOperations.erase(route.operationId);
+            else g_searchOperations.erase(route.operationId);
+        } catch(...) {}
+    }
+}
+
+static void RetireFailedReconcileResult(uint64_t operationId) noexcept {
+    if(operationId==0) return;
+    try { RetireReconcileOperation(operationId); }
+    catch(...) {
+        try {
+            g_reconcileDeadlines.cancel(operationId);
+            if(g_pendingAutoOperations.count(operationId))
+                ForceCancelAutoOperationNoThrow(operationId);
+            else if(g_manualMoveOperations.count(operationId))
+                ForceCancelManualOperationNoThrow(operationId);
+            else {
+                g_manualSaveOperations.erase(operationId);
+                g_searchOperations.erase(operationId);
+            }
+        } catch(...) {}
     }
 }
 
@@ -4147,6 +4316,20 @@ static void StopWorkers(HWND messageWindow){
     if(g_reconcileWorker){ g_reconcileWorker->Stop(); g_reconcileWorker.reset(); }
     DrainPostedSessionResults(messageWindow);
     DrainPostedReconcileResults(messageWindow);
+}
+
+static bool QuiesceRuntime(HWND messageWindow) noexcept {
+    return RunRuntimeQuiescence(g_runtimeQuiescence,[&](){
+        KillTimer(messageWindow,TIMER_MONITOR);
+        KillTimer(messageWindow,TIMER_MOVE_VERIFY);
+        KillTimer(messageWindow,TIMER_HEARTBEAT);
+        KillTimer(messageWindow,TIMER_AUTO_FLUSH);
+        g_flushTimerArmed=false;
+        g_flushTimerDueMs=0;
+        g_heartbeatTimerArmed=false;
+        g_moveCancellationRetry.clear();
+        StopWorkers(messageWindow);
+    });
 }
 static int TILE_W=240,TILE_H=150,PAD=16,HEADER=44,SEARCH_H=40;  // базовые (96 dpi); пересчёт в InitMetrics
 static int g_cols=1,g_rows=1;
@@ -5020,7 +5203,7 @@ static void OpenHelp(){
     if(g_help){ ShowWindow(g_help,SW_SHOW); SetForegroundWindow(g_help); }
 }
 
-static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
+static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     switch(msg){
     case WM_HOTKEY: ShowPicker(); return 0;
     case WM_PAINT:{ PAINTSTRUCT ps; HDC hdc=BeginPaint(hwnd,&ps); RECT cr; GetClientRect(hwnd,&cr); Paint(hdc,cr); EndPaint(hwnd,&ps); return 0; }
@@ -5071,74 +5254,114 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         }
         return 0;
     case WM_MOVE_CANCEL_RETRY:
+        if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
         if(g_moveCancellationPending){
-            try { AdvanceMoveQueue(); }
-            catch(...) {}
-            RefreshMoveCancellationPending();
-            if(g_moveCancellationPending && !ScheduleMoveCancellationRetry())
-                ReportStorageError(L"Cancelled window moves remain protected; cancellation will retry on the next move request.");
+            const size_t before=PendingMoveCancellationCount();
+            RunMessageRouteNoThrow(
+                [](){ AdvanceMoveQueue(); },[](){},[&](){
+                    RefreshMoveCancellationPending();
+                    const size_t after=PendingMoveCancellationCount();
+                    g_moveCancellationRetry.completePostedAttempt(before,after);
+                    if(g_moveCancellationPending &&
+                       !ScheduleMoveCancellationRetry())
+                        ReportStorageError(L"Cancelled window moves remain protected; cancellation will retry on the next move request.");
+                });
+        } else {
+            g_moveCancellationRetry.clear();
         }
         return 0;
     case WM_AUTO_TIMER_RETRY:
-        if(g_autoFix && !g_degraded && !g_autoLoadRetry.loaded)
-            TryLoadAutoLayoutAndInitialize();
+        if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
+        RunMessageRouteNoThrow([](){
+            if(g_autoFix && !g_degraded && !g_autoLoadRetry.loaded)
+                TryLoadAutoLayoutAndInitialize();
+        },[](){},[](){});
         return 0;
     case WM_TIMER:
+        if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
         if(wp==TIMER_HEARTBEAT){
-            CheckpointAutoLayout(CheckpointReason::Heartbeat);
+            RunMessageRouteNoThrow([](){
+                CheckpointAutoLayout(CheckpointReason::Heartbeat);
+            },[](){},[](){});
             return 0;
         }
         if(wp==TIMER_AUTO_FLUSH){
             KillTimer(hwnd,TIMER_AUTO_FLUSH);
             g_flushTimerArmed=false;
             g_flushTimerDueMs=0;
-            if(g_autoDirty) FlushAutoLayout(g_dirtyFlush.conflicted());
+            RunMessageRouteNoThrow([](){
+                if(g_autoDirty) FlushAutoLayout(g_dirtyFlush.conflicted());
+            },[](){},[](){ MaintainAutoFlushTimer(); });
             return 0;
         }
         if(wp==TIMER_MOVE_VERIFY){
-            AdvanceMoveQueue();
+            RunMessageRouteNoThrow([](){ AdvanceMoveQueue(); },[](){
+                try {
+                    const MoveJob* front=g_moveQueue.front();
+                    if(front){
+                        const uint64_t jobId=front->token.jobId;
+                        if(!MarkMoveForTerminalRetirement(jobId)){
+                            auto runtime=g_moveRuntime.find(jobId);
+                            if(runtime!=g_moveRuntime.end())
+                                runtime->second.cancelRequested=true;
+                        }
+                    }
+                    RefreshMoveCancellationPending();
+                    ScheduleMoveCancellationRetry();
+                } catch(...) {}
+            },[](){});
             return 0;
         }
         if(wp==TIMER_MONITOR){
-            const uint64_t nowMs=MonotonicNowMs();
-            CancelExpiredSessionRoutes(nowMs);
-            CancelExpiredReconcileOperations(nowMs);
-            if(!g_autoFix || g_degraded){
-                if(g_sessionRoutes.empty() && g_reconcileDeadlines.empty())
-                    KillTimer(hwnd,TIMER_MONITOR);
-                return 0;
-            }
-            if(!g_autoLoadRetry.loaded){
-                if(!g_autoLoadRetry.monitorStarted ||
-                   g_autoLoadRetry.due(nowMs))
-                    TryLoadAutoLayoutAndInitialize();
-                return 0;
-            }
-            ObserveFastSnapshots(CollectFastSnapshots());
-            CancelExpiredSessionRoutes(MonotonicNowMs());
+            RunMessageRouteNoThrow([&](){
+                const uint64_t nowMs=MonotonicNowMs();
+                CancelExpiredSessionRoutes(nowMs);
+                CancelExpiredReconcileOperations(nowMs);
+                if(!g_autoFix || g_degraded){
+                    if(g_sessionRoutes.empty() && g_reconcileDeadlines.empty())
+                        KillTimer(hwnd,TIMER_MONITOR);
+                    return;
+                }
+                if(!g_autoLoadRetry.loaded){
+                    if(!g_autoLoadRetry.monitorStarted ||
+                       g_autoLoadRetry.due(nowMs))
+                        TryLoadAutoLayoutAndInitialize();
+                    return;
+                }
+                ObserveFastSnapshots(CollectFastSnapshots());
+                CancelExpiredSessionRoutes(MonotonicNowMs());
+            },[](){},[](){ MaintainAutoFlushTimer(); });
         }
         return 0;
     case WM_ACTIVATE: if(LOWORD(wp)==WA_INACTIVE)HidePicker(); return 0;
     case WM_SESSION_RESULT: {
         std::unique_ptr<SessionResult> result((SessionResult*)lp);
-        try { HandleSessionResult(std::move(result)); }
-        catch(...) {}
-        if((!g_autoFix || g_degraded) && g_sessionRoutes.empty() &&
-           g_reconcileDeadlines.empty())
-            KillTimer(hwnd,TIMER_MONITOR);
+        if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
+        const uint64_t requestId=result ? result->requestId : 0;
+        RunMessageRouteNoThrow(
+            [&](){ HandleSessionResult(std::move(result)); },
+            [&](){ RetireFailedSessionResult(requestId); },[&](){
+                if((!g_autoFix || g_degraded) && g_sessionRoutes.empty() &&
+                   g_reconcileDeadlines.empty())
+                    KillTimer(hwnd,TIMER_MONITOR);
+            });
         return 0;
     }
     case WM_RECONCILE_RESULT: {
         std::unique_ptr<ReconcileResult> result((ReconcileResult*)lp);
+        if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
         const uint64_t operationId=result ? result->operationId : 0;
-        try { HandleReconcileResult(std::move(result)); }
-        catch(...) { RetireReconcileOperation(operationId); }
-        if((!g_autoFix || g_degraded) && g_sessionRoutes.empty() &&
-           g_reconcileDeadlines.empty())
-            KillTimer(hwnd,TIMER_MONITOR);
+        RunMessageRouteNoThrow(
+            [&](){ HandleReconcileResult(std::move(result)); },
+            [&](){ RetireFailedReconcileResult(operationId); },[&](){
+                if((!g_autoFix || g_degraded) && g_sessionRoutes.empty() &&
+                   g_reconcileDeadlines.empty())
+                    KillTimer(hwnd,TIMER_MONITOR);
+            });
         return 0;
     }
     case WM_TRAY:
+        if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
         if(LOWORD(lp)==WM_RBUTTONUP){
             POINT pt; GetCursorPos(&pt); HMENU m=CreatePopupMenu();
             AppendMenuW(m,MF_STRING,200,L"Open desktop picker");
@@ -5160,25 +5383,31 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             else if(cmd==203)OpenSettings();
             else if(cmd==206)OpenHelp();
             else if(cmd==205)OpenAbout();
-            else if(cmd==209)DestroyWindow(hwnd);
+            else if(cmd==209) RunTrayExit(
+                [](){ return FinalizeAutoLayout(); },
+                [=](){ DestroyWindow(hwnd); });
         } else if(LOWORD(lp)==WM_LBUTTONDBLCLK) ShowPicker();
         return 0;
     case WM_QUERYENDSESSION:
         CheckpointAutoLayout(CheckpointReason::QueryEndSession);
         return TRUE;
     case WM_ENDSESSION:
-        if(wp) FinalizeAutoLayout();
+        FinalizeSessionAndQuiesce(wp!=0,
+            [](){ return FinalizeAutoLayout(); },
+            [=](){ return QuiesceRuntime(hwnd); });
         return 0;
     case WM_DESTROY:
         FinalizeAutoLayout();
-        KillTimer(hwnd,TIMER_MONITOR);
-        KillTimer(hwnd,TIMER_MOVE_VERIFY);
-        KillTimer(hwnd,TIMER_HEARTBEAT);
-        KillTimer(hwnd,TIMER_AUTO_FLUSH);
-        StopWorkers(hwnd);
+        QuiesceRuntime(hwnd);
         TrayRemove(); UnregisterHotKey(hwnd,1); PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd,msg,wp,lp);
+}
+
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+        noexcept {
+    try { return WndProcImpl(hwnd,msg,wp,lp); }
+    catch(...) { return 0; }
 }
 
 // ================================ entry ======================================
@@ -5223,7 +5452,23 @@ static int RunGui(HINSTANCE hInst){
     else               tip=L"Running. Press "+hkStr+L" to move the active window to a desktop.";
     Balloon(tip);
     MSG msg;
-    while(GetMessageW(&msg,nullptr,0,0)){
+    for(;;){
+        DWORD waitMs=INFINITE;
+        uint32_t retryDelay=0;
+        if(g_runtimeQuiescence.acceptsDispatch() && g_autoFix && !g_degraded &&
+           g_autoLoadRetry.monitorRetryDelayMs(
+               MonotonicNowMs(),retryDelay))
+            waitMs=static_cast<DWORD>(retryDelay);
+        const DWORD wait=MsgWaitForMultipleObjectsEx(
+            0,nullptr,waitMs,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
+        if(wait==WAIT_TIMEOUT){
+            if(g_runtimeQuiescence.acceptsDispatch())
+                TryLoadAutoLayoutAndInitialize();
+            continue;
+        }
+        if(wait==WAIT_FAILED) break;
+        if(!PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)) continue;
+        if(msg.message==WM_QUIT) break;
         if(g_settings && IsDialogMessageW(g_settings,&msg)) continue;
         if(g_about && IsDialogMessageW(g_about,&msg)) continue;
         if(g_compat && IsDialogMessageW(g_compat,&msg)) continue;

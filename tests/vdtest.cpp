@@ -11883,50 +11883,32 @@ static void test_corrective_initial_observation_is_transactional_before_async_wo
     FinalizeFastSnapshot("chrome",2,tracker,chrome);
     snapshots["chrome"]=chrome;
 
-    std::map<std::string,LcState> lifecycle;
-    lifecycle["prior"].initialized=true;
-    std::map<std::string,uint64_t> signatures;
-    signatures["prior"]=77;
-    std::vector<std::string> stagedApps;
+    InitialLifecyclePreparation prepared;
+    prepared.states["prior"].initialized=true;
+    prepared.signatures["prior"]=77;
     int preparedApps=0;
     const bool first=PrepareInitialLifecycleStates(
-        profiles,snapshots,500,lifecycle,signatures,
-        [&](const std::string& app,LcState& state,
-            const AppFastSnapshot& snapshot,uint64_t nowMs){
-            ++preparedApps;
-            const LcDecision decision=LcObserve(
-                state,true,snapshot.windowSetSignature,
-                snapshot.settleSignature,snapshot.layoutSignature,0,nowMs);
-            CHECK(decision.action==LcAction::None);
-            stagedApps.push_back(app);
-            if(app=="chrome") throw 7;
+        profiles,snapshots,500,prepared,
+        [&](InitialLifecycleFaultPoint point){
+            if(point==InitialLifecycleFaultPoint::AfterApp &&
+               ++preparedApps==2) throw 7;
         });
     CHECK(!first && preparedApps==2);
-    CHECK(lifecycle.size()==1 && lifecycle.count("prior")==1 &&
-          signatures.size()==1 && signatures["prior"]==77);
+    CHECK(prepared.states.size()==1 && prepared.states.count("prior")==1 &&
+          prepared.signatures.size()==1 && prepared.signatures["prior"]==77);
     // The first attempt staged A locally, but no owner/route/wave was
     // published, so a hypothetical late generation cannot match anything.
-    CHECK((stagedApps==std::vector<std::string>{"firefox","chrome"}));
-    CHECK(lifecycle.count("firefox")==0);
+    CHECK(prepared.states.count("firefox")==0);
 
-    stagedApps.clear();
-    CHECK(PrepareInitialLifecycleStates(
-        profiles,snapshots,600,lifecycle,signatures,
-        [&](const std::string& app,LcState& state,
-            const AppFastSnapshot& snapshot,uint64_t nowMs){
-            const LcDecision decision=LcObserve(
-                state,true,snapshot.windowSetSignature,
-                snapshot.settleSignature,snapshot.layoutSignature,0,nowMs);
-            CHECK(decision.action==LcAction::None);
-            stagedApps.push_back(app);
-        }));
-    CHECK(lifecycle.size()==2 && signatures.size()==2 &&
-          lifecycle.count("firefox")==1 && lifecycle.count("chrome")==1 &&
-          lifecycle.count("prior")==0);
+    CHECK(PrepareInitialLifecycleStates(profiles,snapshots,600,prepared));
+    CHECK(prepared.states.size()==2 && prepared.signatures.size()==2 &&
+          prepared.states.count("firefox")==1 &&
+          prepared.states.count("chrome")==1 &&
+          prepared.states.count("prior")==0);
 
     std::map<std::string,uint64_t> routes;
     std::vector<std::string> owners;
-    LcState& state=lifecycle["firefox"];
+    LcState& state=prepared.states["firefox"];
     const AppFastSnapshot& current=snapshots["firefox"];
     const LcDecision wave=LcObserve(
         state,true,current.windowSetSignature,current.settleSignature,
@@ -11941,6 +11923,181 @@ static void test_corrective_initial_observation_is_transactional_before_async_wo
     CHECK(wave.action==LcAction::BeginRestore && wave.generation!=0);
     CHECK(duplicate.action==LcAction::None && routes.size()==1 &&
           routes["firefox"]==wave.generation && owners.size()==1);
+}
+
+static void test_corrective_fresh_bound_refresh_promotes_exact_provisional(){
+    const UnixSeconds now=1700007000;
+    LayoutWin existing=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009301}","firefox",
+        "old","old.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-50);
+    existing.provisional=true;
+    FastWin fast=SnapshotWindow(9301,9302,9303,L"fresh",
+        G(L"{231A0000-0000-0000-0000-000000000002}"));
+    LayoutWin live=existing;
+    live.activeTitle="fresh";
+    live.activeDomain="fresh.example";
+    live.tabCount=3;
+    live.counts={{"fresh.example",3}};
+    live.deskIndex=1;
+
+    std::map<std::string,std::string> provisionals;
+    const std::string runtime=RuntimeKey(fast);
+    provisionals[runtime]=existing.recordId;
+    provisionals["other-runtime"]=existing.recordId;
+    LayoutWin committed;
+    int writes=0;
+    CHECK(CommitBoundRecordRefresh(existing,fast,live,
+        ReconcileFreshness::Fresh,now,runtime,provisionals,
+        [&](const LayoutWin& desired){ committed=desired; ++writes; return true; }));
+    CHECK(writes==1 && committed.recordId==existing.recordId);
+    CHECK(!committed.provisional && committed.activeTitle=="fresh" &&
+          committed.activeDomain=="fresh.example" && committed.tabCount==3 &&
+          committed.counts==live.counts && committed.lastSeenUtc==now &&
+          committed.missingSinceUtc==0);
+    CHECK(GuidEq(committed.desktop,fast.desktop) && committed.deskIndex==1);
+    CHECK(provisionals.count(runtime)==0 &&
+          provisionals.count("other-runtime")==1);
+
+    LayoutWin cached;
+    provisionals[runtime]=existing.recordId;
+    CHECK(CommitBoundRecordRefresh(existing,fast,live,
+        ReconcileFreshness::CachedStale,now+1,runtime,provisionals,
+        [&](const LayoutWin& desired){ cached=desired; return true; }));
+    CHECK(cached.provisional && cached.activeTitle==existing.activeTitle &&
+          provisionals[runtime]==existing.recordId);
+
+    provisionals[runtime]="{00000000-0000-0000-0000-000000009302}";
+    CHECK(CommitBoundRecordRefresh(existing,fast,live,
+        ReconcileFreshness::Fresh,now+2,runtime,provisionals,
+        [](const LayoutWin&){ return true; }));
+    CHECK(provisionals[runtime]==
+          "{00000000-0000-0000-0000-000000009302}");
+    CHECK(!CommitBoundRecordRefresh(existing,fast,live,
+        ReconcileFreshness::Fresh,now+3,runtime,provisionals,
+        [](const LayoutWin&){ return false; }));
+    CHECK(provisionals[runtime]==
+          "{00000000-0000-0000-0000-000000009302}");
+
+    std::vector<LayoutWin> backing(1,existing);
+    const std::string stableRecordId=backing[0].recordId;
+    provisionals[runtime]=stableRecordId;
+    std::vector<LayoutWin> displaced;
+    CHECK(CommitBoundRecordRefresh(backing[0],fast,live,
+        ReconcileFreshness::Fresh,now+4,runtime,provisionals,
+        [&](const LayoutWin& desired){
+            std::vector<LayoutWin> replacement(1,desired);
+            backing.swap(replacement);
+            displaced.swap(replacement);
+            displaced[0].recordId=
+                "{00000000-0000-0000-0000-000000009399}";
+            return true;
+        }));
+    CHECK(provisionals.count(runtime)==0);
+}
+
+static void test_corrective_startup_complete_empty_marks_missing_transactionally(){
+    const UnixSeconds now=1700007100;
+    std::vector<AppProfile> profiles;
+    profiles.push_back(sessionTestProfile("firefox"));
+    profiles.push_back(sessionTestProfile("chrome",AppProfile::CHROMIUM));
+    profiles.push_back(sessionTestProfile("edge",AppProfile::CHROMIUM));
+    SnapshotVersionTracker tracker;
+    std::map<std::string,AppFastSnapshot> snapshots;
+    AppFastSnapshot firefox;
+    FinalizeFastSnapshot("firefox",1,tracker,firefox);
+    snapshots["firefox"]=firefox;
+    AppFastSnapshot chrome;
+    chrome.windows.push_back(SnapshotWindow(9311,9312,9313,L"live",
+        G(L"{231A0000-0000-0000-0000-000000000003}")));
+    FinalizeFastSnapshot("chrome",2,tracker,chrome);
+    snapshots["chrome"]=chrome;
+    AppFastSnapshot edge;
+    edge.enumerationComplete=false;
+    FinalizeFastSnapshot("edge",3,tracker,edge);
+    snapshots["edge"]=edge;
+
+    InitialLifecyclePreparation sentinel;
+    sentinel.states["sentinel"].initialized=true;
+    sentinel.signatures["sentinel"]=77;
+    sentinel.missingApps.push_back({"sentinel",77});
+    InitialLifecyclePreparation prepared=sentinel;
+    int injected=0;
+    CHECK(!PrepareInitialLifecycleStates(
+        profiles,snapshots,500,prepared,[&](InitialLifecycleFaultPoint point){
+            if(point==InitialLifecycleFaultPoint::BeforePublish && ++injected==1)
+                throw std::bad_alloc();
+        }));
+    CHECK(prepared.states.size()==1 && prepared.states.count("sentinel")==1);
+    CHECK(prepared.signatures.size()==1 && prepared.signatures["sentinel"]==77);
+    CHECK(prepared.missingApps.size()==1 &&
+          prepared.missingApps[0].app=="sentinel");
+
+    CHECK(PrepareInitialLifecycleStates(profiles,snapshots,600,prepared));
+    CHECK(prepared.states.size()==2 && prepared.states.count("firefox")==1 &&
+          prepared.states.count("chrome")==1 && prepared.states.count("edge")==0);
+    CHECK(!prepared.states["firefox"].present &&
+          prepared.states["chrome"].present);
+    CHECK(prepared.missingApps.size()==1 &&
+          prepared.missingApps[0].app=="firefox" &&
+          prepared.missingApps[0].generation!=0);
+
+    LayoutWin recent=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009311}","firefox",
+        "recent","a.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-10);
+    LayoutWin expired=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009312}","firefox",
+        "expired","b.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),
+        now-WINDOW_RETENTION_SECONDS-1);
+    LayoutWin incomplete=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009313}","edge",
+        "keep","c.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),
+        now-WINDOW_RETENTION_SECONDS-1);
+    ValidatedRecordTouch expiredTouch;
+    expiredTouch.recordId=expired.recordId;
+    expiredTouch.lastSeenUtc=expired.lastSeenUtc;
+    expiredTouch.causalGeneration=88;
+    FinalCheckpointMutationState mutationSentinel;
+    mutationSentinel.records.push_back(incomplete);
+    mutationSentinel.provisionalRecordByRuntime["sentinel"]=incomplete.recordId;
+    FinalCheckpointMutationState mutation=mutationSentinel;
+    const std::map<std::string,uint64_t> missing={{"firefox",91}};
+    const std::map<std::string,std::string> provisionals={
+        {"expired-runtime",expired.recordId},{"edge-runtime",incomplete.recordId}};
+    int perRecord=0;
+    CHECK(!BuildInitialMissingMutation(
+        {recent,expired,incomplete},{},{{expired.recordId,expiredTouch}}, {},
+        provisionals,LayoutRevision(),missing,now,mutation,
+        [&](InitialMissingFaultPoint point){
+            if(point==InitialMissingFaultPoint::PerRecord && ++perRecord==1)
+                throw std::bad_alloc();
+        }));
+    CHECK(mutation.records.size()==1 &&
+          mutation.records[0].recordId==incomplete.recordId &&
+          mutation.provisionalRecordByRuntime.count("sentinel")==1);
+
+    CHECK(BuildInitialMissingMutation(
+        {recent,expired,incomplete},{},{{expired.recordId,expiredTouch}}, {},
+        provisionals,LayoutRevision(),missing,now,mutation));
+    CHECK(mutation.records.size()==2);
+    const LayoutWin* marked=nullptr;
+    const LayoutWin* kept=nullptr;
+    for(const LayoutWin& record : mutation.records){
+        if(record.recordId==recent.recordId) marked=&record;
+        if(record.recordId==incomplete.recordId) kept=&record;
+    }
+    CHECK(marked && marked->missingSinceUtc==recent.lastSeenUtc);
+    CHECK(kept && SameLayoutWinFields(*kept,incomplete));
+    CHECK(mutation.deltas.count(recent.recordId)==1 &&
+          mutation.deltas.at(recent.recordId).kind==RecordDeltaKind::MissingMark);
+    CHECK(mutation.deltas.count(expired.recordId)==1 &&
+          mutation.deltas.at(expired.recordId).kind==RecordDeltaKind::ExpireDelete);
+    CHECK(mutation.touches.count(expired.recordId)==0 &&
+          mutation.provisionalRecordByRuntime.count("expired-runtime")==0 &&
+          mutation.provisionalRecordByRuntime.count("edge-runtime")==1);
 }
 
 static void test_corrective_monitor_arm_failure_backs_off_before_loading(){
@@ -12049,6 +12206,102 @@ static void test_corrective_unavailable_load_then_heartbeat_retry_initializes_on
           heartbeatAttempts==2 && heartbeatStarts==1 && alternatePosts==0);
 }
 
+static void test_corrective_move_cancellation_retry_progresses_beyond_eight_jobs(){
+    MoveCancellationRetryState retry;
+    size_t remaining=12;
+    int queuedMessages=0,maxQueuedMessages=0,timerAttempts=0;
+    auto request=[&](){
+        return retry.request(remaining!=0,
+            [&](){ ++timerAttempts; return false; },
+            [&](){ ++queuedMessages; maxQueuedMessages=(std::max)(
+                maxQueuedMessages,queuedMessages); return true; });
+    };
+    CHECK(request() && queuedMessages==1);
+    size_t retired=0;
+    while(queuedMessages){
+        --queuedMessages;
+        const size_t before=remaining;
+        if(remaining){ --remaining; ++retired; }
+        retry.completePostedAttempt(before,remaining);
+        CHECK(request());
+    }
+    CHECK(retired==12 && remaining==0 && maxQueuedMessages==1 &&
+          timerAttempts==12 && !retry.postOutstanding());
+
+    remaining=1;
+    CHECK(retry.request(true,[](){ return false; },[](){ return false; })==false);
+    CHECK(!retry.postOutstanding());
+    CHECK(retry.request(true,[](){ return false; },[](){ return true; }));
+    for(unsigned attempt=0;
+        attempt<MoveCancellationRetryState::kMaxConsecutiveNoProgress;
+        ++attempt){
+        retry.completePostedAttempt(1,1);
+        if(attempt+1<MoveCancellationRetryState::kMaxConsecutiveNoProgress)
+            CHECK(retry.request(true,[](){ return false; },[](){ return true; }));
+    }
+    CHECK(!retry.request(true,[](){ return false; },[](){ return true; }));
+    retry.completePostedAttempt(1,0);
+    CHECK(retry.consecutiveNoProgress()==0);
+}
+
+static void test_corrective_monitor_retry_deadline_survives_post_cap(){
+    AutoLoadRetryState state;
+    uint64_t now=0;
+    int monitorAttempts=0,loads=0,initializations=0,heartbeats=0;
+    for(int failure=0;failure<7;++failure){
+        CHECK(AdvanceAutoRuntimeStart(state,now,
+            [&](){ ++monitorAttempts; return false; },
+            [&](){ ++loads; return true; },
+            [&](){ ++initializations; return true; },
+            [&](){ ++heartbeats; return true; },[](){ return false; })==
+            AutoRuntimeStartResult::MonitorUnavailable);
+        uint32_t delay=0;
+        CHECK(state.monitorRetryDelayMs(now,delay) && delay>0);
+        uint32_t early=0;
+        CHECK(state.monitorRetryDelayMs(now+delay-1,early) && early==1);
+        now+=delay;
+    }
+    CHECK(monitorAttempts==7 && loads==0 && initializations==0 && heartbeats==0);
+    CHECK(AdvanceAutoRuntimeStart(state,now,
+        [&](){ ++monitorAttempts; return true; },
+        [&](){ ++loads; return true; },
+        [&](){ ++initializations; return true; },
+        [&](){ ++heartbeats; return true; },[](){ return false; })==
+        AutoRuntimeStartResult::Ready);
+    CHECK(state.loaded && monitorAttempts==8 && loads==1 &&
+          initializations==1 && heartbeats==1);
+    uint32_t disabled=123;
+    CHECK(!state.monitorRetryDelayMs(now,disabled));
+
+    AutoLoadRetryState saturated;
+    saturated.nextAttemptMs=UINT64_MAX;
+    uint32_t delay=0;
+    CHECK(saturated.monitorRetryDelayMs(0,delay) && delay==UINT32_MAX-1);
+    saturated.lastAttemptMs=100;
+    saturated.nextAttemptMs=200;
+    CHECK(saturated.monitorRetryDelayMs(300,delay) && delay==0);
+}
+
+static void test_corrective_stable_monitor_rearms_dirty_flush_after_timer_failure(){
+    bool dirty=true,armed=false,eligible=true;
+    int armAttempts=0;
+    auto maintain=[&](bool armSucceeds){
+        if(!ShouldMaintainDirtyFlush(eligible,dirty,armed)) return;
+        ++armAttempts;
+        if(armSucceeds) armed=true;
+    };
+    maintain(false);
+    CHECK(dirty && !armed && armAttempts==1);
+    maintain(true); // next otherwise-stable monitor tick
+    CHECK(dirty && armed && armAttempts==2);
+    maintain(true);
+    CHECK(armAttempts==2);
+    armed=false; dirty=false; maintain(true);
+    CHECK(armAttempts==2);
+    dirty=true; eligible=false; maintain(true);
+    CHECK(armAttempts==2);
+}
+
 static void test_checkpoint_controller_heartbeat_and_session_end_chain(){
     CheckpointController controller;
     int calls=0;
@@ -12080,6 +12333,142 @@ static void test_checkpoint_failed_end_is_retryable_at_destroy(){
     CHECK(controller.dispatch(
         CheckpointReason::Finalize,true,true,false,failThenPass));
     CHECK(calls==2 && controller.finalization.finished);
+}
+
+static void test_corrective_tray_exit_finalizes_before_destroy_and_retries_once(){
+    CheckpointController controller;
+    int writes=0,destroys=0;
+    auto checkpoint=[&](CheckpointReason){
+        ++writes;
+        return writes>1;
+    };
+    CHECK(RunTrayExit(
+        [&](){ return controller.dispatch(
+            CheckpointReason::Finalize,true,true,false,checkpoint); },
+        [&](){
+            ++destroys;
+            CHECK(controller.dispatch(
+                CheckpointReason::Finalize,true,true,false,checkpoint));
+        }));
+    CHECK(writes==2 && destroys==1 && controller.finalization.finished);
+
+    CheckpointController throwing;
+    writes=0; destroys=0;
+    CHECK(RunTrayExit(
+        [&](){
+            return throwing.dispatch(CheckpointReason::Finalize,true,true,false,
+                [&](CheckpointReason)->bool{ ++writes; throw std::bad_alloc(); });
+        },[&](){
+            ++destroys;
+            CHECK(throwing.dispatch(CheckpointReason::Finalize,true,true,false,
+                [&](CheckpointReason){ ++writes; return true; }));
+        }));
+    CHECK(writes==2 && destroys==1 && throwing.finalization.finished);
+
+    CheckpointController alreadySaved;
+    writes=0; destroys=0;
+    CHECK(RunTrayExit(
+        [&](){ return alreadySaved.dispatch(
+            CheckpointReason::Finalize,true,true,false,
+            [&](CheckpointReason){ ++writes; return true; }); },
+        [&](){
+            ++destroys;
+            CHECK(alreadySaved.dispatch(
+                CheckpointReason::Finalize,true,true,false,
+                [&](CheckpointReason){ ++writes; return true; }));
+        }));
+    CHECK(writes==1 && destroys==1);
+}
+
+static void test_corrective_successful_session_end_quiesces_late_work(){
+    RuntimeQuiescenceState cancelled;
+    int cancelledFinalizations=0,cancelledQuiesces=0;
+    CHECK(!FinalizeSessionAndQuiesce(false,
+        [&](){ ++cancelledFinalizations; return true; },
+        [&](){ return RunRuntimeQuiescence(cancelled,
+            [&](){ ++cancelledQuiesces; }); }));
+    CHECK(cancelled.acceptsDispatch() && cancelledFinalizations==0 &&
+          cancelledQuiesces==0);
+
+    RuntimeQuiescenceState failedSave;
+    int failedFinalizations=0,failedQuiesces=0;
+    CHECK(FinalizeSessionAndQuiesce(true,
+        [&](){ ++failedFinalizations; return false; },
+        [&](){ return RunRuntimeQuiescence(failedSave,
+            [&](){ ++failedQuiesces; }); }));
+    CHECK(!failedSave.acceptsDispatch() && failedSave.quiesced() &&
+          failedFinalizations==1 && failedQuiesces==1);
+
+    RuntimeQuiescenceState state;
+    int finalizations=0,quiesces=0,timerCallbacks=0,resultCallbacks=0;
+    CHECK(FinalizeSessionAndQuiesce(true,
+        [&](){ ++finalizations; return true; },
+        [&](){ return RunRuntimeQuiescence(state,[&](){ ++quiesces; }); }));
+    CHECK(!state.acceptsDispatch() && state.quiesced() &&
+          finalizations==1 && quiesces==1);
+    if(state.acceptsDispatch()) ++timerCallbacks;
+    if(state.acceptsDispatch()) ++resultCallbacks;
+    CHECK(timerCallbacks==0 && resultCallbacks==0);
+    CHECK(RunRuntimeQuiescence(state,[&](){ ++quiesces; }));
+    CHECK(quiesces==1);
+
+    RuntimeQuiescenceState retry;
+    int cleanupAttempts=0;
+    CHECK(!RunRuntimeQuiescence(retry,[&](){
+        ++cleanupAttempts;
+        throw std::bad_alloc();
+    }));
+    CHECK(!retry.acceptsDispatch() && !retry.quiesced());
+    CHECK(RunRuntimeQuiescence(retry,[&](){ ++cleanupAttempts; }));
+    CHECK(retry.quiesced() && cleanupAttempts==2);
+}
+
+static void test_corrective_message_routes_are_no_throw_and_retire_exactly_once(){
+    int retired[6]={0,0,0,0,0,0};
+    int finallyCalls[6]={0,0,0,0,0,0};
+    for(int route=0;route<6;++route){
+        CHECK(!RunMessageRouteNoThrow(
+            [route](){ if(route>=0) throw std::bad_alloc(); },
+            [&](){ ++retired[route]; if(route==5) throw 7; },
+            [&](){ ++finallyCalls[route]; }));
+    }
+    for(int route=0;route<6;++route)
+        CHECK(retired[route]==1 && finallyCalls[route]==1);
+
+    int unrelatedRetired=0,destructions=0;
+    struct OwnedProbe {
+        int* destructions;
+        ~OwnedProbe(){ ++*destructions; }
+    };
+    {
+        std::unique_ptr<OwnedProbe> payload(new OwnedProbe{&destructions});
+        CHECK(!RunMessageRouteNoThrow(
+            [&](){ CHECK(payload.get()!=nullptr); throw std::bad_alloc(); },
+            [&](){ ++retired[2]; },[](){}));
+    }
+    CHECK(destructions==1 && retired[2]==2 && unrelatedRetired==0);
+    CHECK(RunMessageRouteNoThrow(
+        [](){},[&](){ ++unrelatedRetired; },[](){}));
+    CHECK(unrelatedRetired==0);
+
+    AsyncSessionRouteGate routes;
+    std::vector<AsyncSessionRetirement> events;
+    AsyncSessionRoute target=SessionRoute(
+        99301,99302,"firefox",SessionPurpose::ManualSave,99303,99400);
+    AsyncSessionRoute sibling=SessionRoute(
+        99304,99305,"chrome",SessionPurpose::Search,99306,99400);
+    CHECK(routes.submit(target,99000,events)==AsyncRouteAdmission::Accepted);
+    CHECK(routes.submit(sibling,99000,events)==AsyncRouteAdmission::Accepted);
+    CHECK(!routes.abandon(target.requestId,target.operationId,
+                          target.identityGeneration+1));
+    CHECK(routes.outstanding()==2);
+    CHECK(routes.abandon(target.requestId,target.operationId,
+                         target.identityGeneration));
+    CHECK(routes.outstanding()==1);
+    CHECK(!routes.abandon(target.requestId,target.operationId,
+                          target.identityGeneration));
+    CHECK(routes.retire(sibling.requestId,sibling.operationId,
+        sibling.identityGeneration,AsyncRetirementReason::Completed,events));
 }
 
 static void test_settings_checkpoint_rejects_enabled_unloaded_and_preserves_state(){
@@ -12551,12 +12940,20 @@ int main(){
     test_manual_restore_keeps_fixture_bytes_and_reports_once();
     test_auto_load_retry_uses_capped_backoff_and_initializes_once();
     test_corrective_initial_observation_is_transactional_before_async_work();
+    test_corrective_fresh_bound_refresh_promotes_exact_provisional();
+    test_corrective_startup_complete_empty_marks_missing_transactionally();
     test_corrective_monitor_arm_failure_backs_off_before_loading();
     test_corrective_monitor_alternate_rearm_is_bounded();
     test_corrective_failed_monitor_retry_post_remains_unready();
     test_corrective_unavailable_load_then_heartbeat_retry_initializes_once();
+    test_corrective_move_cancellation_retry_progresses_beyond_eight_jobs();
+    test_corrective_monitor_retry_deadline_survives_post_cap();
+    test_corrective_stable_monitor_rearms_dirty_flush_after_timer_failure();
     test_checkpoint_controller_heartbeat_and_session_end_chain();
     test_checkpoint_failed_end_is_retryable_at_destroy();
+    test_corrective_tray_exit_finalizes_before_destroy_and_retries_once();
+    test_corrective_successful_session_end_quiesces_late_work();
+    test_corrective_message_routes_are_no_throw_and_retire_exactly_once();
     test_settings_checkpoint_rejects_enabled_unloaded_and_preserves_state();
     test_settings_transaction_rolls_back_and_cancels_only_auto_owner();
     test_checkpoint_reservation_defers_one_heartbeat_but_not_final();

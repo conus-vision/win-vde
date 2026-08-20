@@ -462,6 +462,94 @@ struct FinalCheckpointMutationState {
     std::map<std::string,std::string> provisionalRecordByRuntime;
 };
 
+enum class InitialMissingFaultPoint { InitialCopies, PerRecord, BeforePublish };
+
+inline bool BuildInitialMissingMutation(
+        const std::vector<LayoutWin>& records,
+        const std::map<std::string,RecordDelta>& deltas,
+        const std::map<std::string,ValidatedRecordTouch>& touches,
+        const std::map<std::string,DeferredRecordConflict>& conflicts,
+        const std::map<std::string,std::string>& provisionalByRuntime,
+        const LayoutRevision& revision,
+        const std::map<std::string,uint64_t>& missingGenerations,
+        UnixSeconds nowUtc,FinalCheckpointMutationState& output,
+        const std::function<void(InitialMissingFaultPoint)>& injectFault={}){
+    if(nowUtc<=0 || records.size()>MAX_LAYOUT_RECORDS ||
+       provisionalByRuntime.size()>MAX_LAYOUT_RECORDS ||
+       missingGenerations.size()>3) return false;
+    for(const auto& missing : missingGenerations)
+        if(!IsSupportedLayoutApp(missing.first) || missing.second==0)
+            return false;
+    try {
+        if(injectFault) injectFault(InitialMissingFaultPoint::InitialCopies);
+        std::vector<LayoutWin> stagedRecords=records;
+        std::map<std::string,RecordDelta> stagedDeltas=deltas;
+        std::map<std::string,ValidatedRecordTouch> stagedTouches=touches;
+        std::map<std::string,DeferredRecordConflict> stagedConflicts=conflicts;
+        std::map<std::string,std::string> stagedProvisionals=
+            provisionalByRuntime;
+        const std::vector<LayoutWin> sourceRecords=records;
+        for(const LayoutWin& before : sourceRecords){
+            const auto missing=missingGenerations.find(before.app);
+            if(missing==missingGenerations.end()) continue;
+            LayoutWin desired=before;
+            MarkMissing(desired,nowUtc);
+            const bool erase=IsExpired(desired,nowUtc);
+            if(!erase && SameRecordForDelta(before,desired)) continue;
+            RecordDelta delta;
+            delta.kind=erase ? RecordDeltaKind::ExpireDelete
+                             : RecordDeltaKind::MissingMark;
+            delta.record=desired;
+            delta.erase=erase;
+            delta.baseRevision=revision;
+            delta.baseRecordPresent=true;
+            delta.baseRecord=before;
+            delta.changedUtc=nowUtc;
+            delta.causalGeneration=missing->second;
+            std::vector<LayoutWin> nextRecords;
+            std::map<std::string,RecordDelta> nextDeltas;
+            std::map<std::string,DeferredRecordConflict> nextConflicts;
+            if(StageRecordDeltaMutation(
+                    stagedRecords,stagedDeltas,stagedConflicts,delta,true,
+                    nextRecords,nextDeltas,nextConflicts)!=
+               RecordDeltaStageResult::Accepted) return false;
+            stagedRecords.swap(nextRecords);
+            stagedDeltas.swap(nextDeltas);
+            stagedConflicts.swap(nextConflicts);
+            if(erase){
+                std::string canonical;
+                if(!layout_store_delta_detail::CanonicalRecordId(
+                        before.recordId,canonical)) return false;
+                stagedTouches.erase(canonical);
+                for(auto provisional=stagedProvisionals.begin();
+                    provisional!=stagedProvisionals.end();){
+                    std::string provisionalId;
+                    if(layout_store_delta_detail::CanonicalRecordId(
+                            provisional->second,provisionalId) &&
+                       provisionalId==canonical)
+                        provisional=stagedProvisionals.erase(provisional);
+                    else ++provisional;
+                }
+            }
+            if(injectFault) injectFault(InitialMissingFaultPoint::PerRecord);
+        }
+        if(injectFault) injectFault(InitialMissingFaultPoint::BeforePublish);
+        FinalCheckpointMutationState staged;
+        staged.records.swap(stagedRecords);
+        staged.deltas.swap(stagedDeltas);
+        staged.touches.swap(stagedTouches);
+        staged.conflicts.swap(stagedConflicts);
+        staged.provisionalRecordByRuntime.swap(stagedProvisionals);
+        output.records.swap(staged.records);
+        output.deltas.swap(staged.deltas);
+        output.touches.swap(staged.touches);
+        output.conflicts.swap(staged.conflicts);
+        output.provisionalRecordByRuntime.swap(
+            staged.provisionalRecordByRuntime);
+        return true;
+    } catch(...) { return false; }
+}
+
 inline bool SameFinalCheckpointSemantic(const LayoutWin& left,
                                         const LayoutWin& right){
     return left.recordId==right.recordId && left.app==right.app &&

@@ -66,6 +66,15 @@ struct AutoLoadRetryState {
         return !loaded && (nextAttemptMs==0 || nowMs>=nextAttemptMs);
     }
 
+    bool monitorRetryDelayMs(uint64_t nowMs,uint32_t& delayOut) const noexcept {
+        if(loaded || monitorStarted || nextAttemptMs==0) return false;
+        if(nowMs>=nextAttemptMs){ delayOut=0; return true; }
+        const uint64_t remaining=nextAttemptMs-nowMs;
+        const uint64_t maximum=static_cast<uint64_t>(UINT32_MAX)-1;
+        delayOut=static_cast<uint32_t>((std::min)(remaining,maximum));
+        return true;
+    }
+
     void failed(uint64_t nowMs){
         const unsigned shift=(std::min)(retryAttempt,6U);
         const uint64_t delay=(std::min<uint64_t>)(60000,1000ULL<<shift);
@@ -377,6 +386,25 @@ inline bool RunTerminalCompletionOrFail(Complete complete,Fail fail) noexcept {
     }
 }
 
+template<class Work,class Fail,class Finally>
+inline bool RunMessageRouteNoThrow(Work work,Fail fail,Finally finallyWork)
+        noexcept {
+    bool completed=true;
+    try { work(); }
+    catch(...) {
+        completed=false;
+        try { fail(); } catch(...) {}
+    }
+    try { finallyWork(); }
+    catch(...) {
+        if(completed){
+            completed=false;
+            try { fail(); } catch(...) {}
+        }
+    }
+    return completed;
+}
+
 enum class IssuedMoveRetirementAction {
     WaitForReadback,
     CancelAfterSafeReadback,
@@ -427,7 +455,12 @@ public:
         if(reason!=CheckpointReason::Finalize)
             return checkpoint ? checkpoint(reason) : false;
         if(!finalization.begin()) return finalization.finished;
-        const bool saved=checkpoint && checkpoint(reason);
+        bool saved=false;
+        try { saved=checkpoint && checkpoint(reason); }
+        catch(...) {
+            finalization.retry();
+            return false;
+        }
         if(saved) finalization.finish();
         else finalization.retry();
         return saved;
@@ -468,6 +501,53 @@ public:
         }
     }
 };
+
+template<class Finalize,class Destroy>
+inline bool RunTrayExit(Finalize finalize,Destroy destroy) noexcept {
+    try { (void)finalize(); } catch(...) {}
+    try { destroy(); return true; }
+    catch(...) { return false; }
+}
+
+class RuntimeQuiescenceState {
+public:
+    enum class Phase { Running, Quiescing, Quiesced };
+
+    bool begin() noexcept {
+        if(phase_==Phase::Quiesced) return false;
+        if(phase_==Phase::Running) phase_=Phase::Quiescing;
+        return true;
+    }
+    void finish() noexcept { phase_=Phase::Quiesced; }
+    bool acceptsDispatch() const noexcept { return phase_==Phase::Running; }
+    bool quiesced() const noexcept { return phase_==Phase::Quiesced; }
+
+private:
+    Phase phase_=Phase::Running;
+};
+
+template<class Quiesce>
+inline bool RunRuntimeQuiescence(RuntimeQuiescenceState& state,
+                                 Quiesce quiesce) noexcept {
+    if(state.quiesced()) return true;
+    if(!state.begin()) return false;
+    try {
+        quiesce();
+        state.finish();
+        return true;
+    } catch(...) {
+        return false;
+    }
+}
+
+template<class Finalize,class Quiesce>
+inline bool FinalizeSessionAndQuiesce(bool ending,Finalize finalize,
+                                      Quiesce quiesce) noexcept {
+    if(!ending) return false;
+    try { (void)finalize(); } catch(...) {}
+    try { return quiesce(); }
+    catch(...) { return false; }
+}
 
 enum class TrayInstanceAcquireStatus { Acquired, AlreadyRunning, Failed };
 
@@ -890,6 +970,19 @@ public:
         return true;
     }
 
+    bool abandon(uint64_t requestId,uint64_t operationId,
+                 uint64_t identityGeneration) noexcept {
+        const auto request=byRequest_.find(requestId);
+        if(request==byRequest_.end()) return false;
+        const auto route=byApp_.find(request->second);
+        if(route==byApp_.end() || route->second.requestId!=requestId ||
+           route->second.operationId!=operationId ||
+           route->second.identityGeneration!=identityGeneration) return false;
+        byRequest_.erase(request);
+        byApp_.erase(route);
+        return true;
+    }
+
     size_t expire(uint64_t nowMs,
                   std::vector<AsyncSessionRetirement>& retired){
         retired.clear();
@@ -1165,7 +1258,53 @@ inline bool ArmMoveWorkOrCancel(bool hasWork,
     return false;
 }
 
+inline bool ShouldMaintainDirtyFlush(bool eligible,bool dirty,
+                                     bool timerArmed) noexcept {
+    return eligible && dirty && !timerArmed;
+}
+
 enum class MoveArmFailureCleanup { Completed, Rearmed, Unresolved };
+
+class MoveCancellationRetryState {
+public:
+    enum : unsigned { kMaxConsecutiveNoProgress=8 };
+
+    template<class ArmTimer,class PostOne>
+    bool request(bool pending,ArmTimer armTimer,PostOne postOne) noexcept {
+        if(!pending){ clear(); return true; }
+        bool armed=false;
+        try { armed=armTimer(); } catch(...) { armed=false; }
+        if(armed){ clear(); return true; }
+        if(postOutstanding_) return true;
+        if(consecutiveNoProgress_>=kMaxConsecutiveNoProgress) return false;
+        bool posted=false;
+        try { posted=postOne(); } catch(...) { posted=false; }
+        if(posted) postOutstanding_=true;
+        return posted;
+    }
+
+    void completePostedAttempt(size_t before,size_t after) noexcept {
+        postOutstanding_=false;
+        if(after<before) consecutiveNoProgress_=0;
+        else if(consecutiveNoProgress_!=
+                (std::numeric_limits<unsigned>::max)())
+            ++consecutiveNoProgress_;
+    }
+
+    void clear() noexcept {
+        postOutstanding_=false;
+        consecutiveNoProgress_=0;
+    }
+
+    bool postOutstanding() const noexcept { return postOutstanding_; }
+    unsigned consecutiveNoProgress() const noexcept {
+        return consecutiveNoProgress_;
+    }
+
+private:
+    bool postOutstanding_=false;
+    unsigned consecutiveNoProgress_=0;
+};
 
 inline MoveArmFailureCleanup RecoverMoveArmFailure(
         const std::function<bool()>& cancelOne,
@@ -1279,6 +1418,41 @@ struct NewRecordRequest {
 };
 
 enum class ReconcileFreshness { Fresh, CachedStale };
+
+template<class Commit>
+inline bool CommitBoundRecordRefresh(
+        const LayoutWin& existing,const FastWin& fast,const LayoutWin& live,
+        ReconcileFreshness freshness,UnixSeconds nowUtc,
+        const std::string& runtimeKey,
+        std::map<std::string,std::string>& provisionalByRuntime,
+        Commit&& commit) noexcept {
+    if(nowUtc<=0 || runtimeKey.empty() || fast.app!=existing.app ||
+       live.app!=existing.app) return false;
+    try {
+        const std::string existingRecordId=existing.recordId;
+        LayoutWin desired=existing;
+        if(!GuidIsZero(fast.desktop)){
+            desired.desktop=fast.desktop;
+            desired.deskIndex=live.deskIndex;
+        }
+        if(freshness==ReconcileFreshness::Fresh){
+            desired.activeTitle=live.activeTitle;
+            desired.activeDomain=live.activeDomain;
+            desired.tabCount=live.tabCount;
+            desired.counts=live.counts;
+            desired.provisional=false;
+        }
+        MarkSeen(desired,nowUtc);
+        if(!commit(desired)) return false;
+        if(freshness==ReconcileFreshness::Fresh){
+            const auto provisional=provisionalByRuntime.find(runtimeKey);
+            if(provisional!=provisionalByRuntime.end() &&
+               provisional->second==existingRecordId)
+                provisionalByRuntime.erase(provisional);
+        }
+        return true;
+    } catch(...) { return false; }
+}
 
 struct ReconcilePlan {
     std::string app;
@@ -2190,29 +2364,55 @@ inline LcDecision LcObserve(LcState& state,
     return {};
 }
 
-template<class Observe>
+enum class InitialLifecycleFaultPoint { AfterApp, BeforePublish };
+
+struct InitialMissingApp {
+    std::string app;
+    uint64_t generation=0;
+};
+
+struct InitialLifecyclePreparation {
+    std::map<std::string,LcState> states;
+    std::map<std::string,uint64_t> signatures;
+    std::vector<InitialMissingApp> missingApps;
+};
+
 inline bool PrepareInitialLifecycleStates(
         const std::vector<AppProfile>& profiles,
         const std::map<std::string,AppFastSnapshot>& snapshots,
-        uint64_t nowMs,std::map<std::string,LcState>& statesOut,
-        std::map<std::string,uint64_t>& signaturesOut,
-        Observe observe) noexcept {
+        uint64_t nowMs,InitialLifecyclePreparation& output,
+        const std::function<void(InitialLifecycleFaultPoint)>& injectFault={})
+        noexcept {
     try {
-        std::map<std::string,LcState> states;
-        std::map<std::string,uint64_t> signatures;
+        InitialLifecyclePreparation staged;
+        if(profiles.size()>3 || snapshots.size()>3) return false;
         for(const AppProfile& profile : profiles){
             const auto found=snapshots.find(profile.id);
             if(found==snapshots.end() ||
-               !FastSnapshotCanObserve(found->second) ||
-               found->second.windows.empty()) continue;
+               !FastSnapshotCanObserve(found->second)) continue;
             LcState state;
-            observe(profile.id,state,found->second,nowMs);
+            const bool present=!found->second.windows.empty();
+            const LcDecision decision=LcObserve(
+                state,present,found->second.windowSetSignature,
+                found->second.settleSignature,
+                found->second.layoutSignature,0,nowMs);
             if(!state.initialized ||
-               !states.emplace(profile.id,std::move(state)).second ||
-               !signatures.emplace(profile.id,0).second) return false;
+               !staged.states.emplace(profile.id,std::move(state)).second ||
+               !staged.signatures.emplace(profile.id,0).second) return false;
+            if(decision.action==LcAction::MarkMissingFromLastSeen){
+                if(decision.generation==0 || found->second.generation==0)
+                    return false;
+                InitialMissingApp missing;
+                missing.app=profile.id;
+                missing.generation=found->second.generation;
+                staged.missingApps.push_back(std::move(missing));
+            } else if(decision.action!=LcAction::None) return false;
+            if(injectFault) injectFault(InitialLifecycleFaultPoint::AfterApp);
         }
-        statesOut.swap(states);
-        signaturesOut.swap(signatures);
+        if(injectFault) injectFault(InitialLifecycleFaultPoint::BeforePublish);
+        output.states.swap(staged.states);
+        output.signatures.swap(staged.signatures);
+        output.missingApps.swap(staged.missingApps);
         return true;
     } catch(...) { return false; }
 }
