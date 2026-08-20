@@ -3,6 +3,7 @@
 #define UNICODE
 #define _UNICODE
 #include "window_identity.hpp" // must be self-contained at first include
+#include "picker_state.hpp"
 #include "reconcile_worker.hpp"
 #include "session_worker.hpp"
 #include "move_queue.hpp"
@@ -88,6 +89,382 @@ static void test_strict_counts_parsing(){
 }
 
 static GUID G(const wchar_t* s){ GUID g{}; StringToGuid(s, g); return g; }
+
+static WindowIdentityKey IK(uintptr_t hwnd,DWORD pid,uint64_t started){
+    WindowIdentityKey key;
+    key.hwnd=hwnd;
+    key.pid=pid;
+    key.processStart=started;
+    return key;
+}
+
+static void test_picker_distinguishes_current_selected_and_active(){
+    PickerState state;
+    const GUID current=G(L"{231A0000-0000-0000-0000-000000000001}");
+    const GUID selected=G(L"{231A0000-0000-0000-0000-000000000002}");
+    state.currentDesktop=current;
+    CHECK(SetPickerSelection(state,4,selected));
+    state.activeWindow=IK(10,20,30);
+
+    CHECK(IsCurrentDesktop(state,current));
+    CHECK(!IsCurrentDesktop(state,selected));
+    CHECK(IsSelectedDesktop(state,selected));
+    CHECK(!IsSelectedDesktop(state,current));
+    CHECK(state.selectedIndex==4);
+    CHECK(IsActiveWindow(state,IK(10,20,30)));
+    CHECK(!IsActiveWindow(state,IK(10,21,30)));
+    CHECK(!IsActiveWindow(state,IK(10,20,31)));
+}
+
+static void test_picker_zero_guids_and_partial_identities_never_highlight(){
+    PickerState state;
+    const GUID zero={0};
+    const GUID valid=G(L"{231A0000-0000-0000-0000-000000000001}");
+    CHECK(!IsCurrentDesktop(state,zero));
+    CHECK(!IsCurrentDesktop(state,valid));
+    CHECK(!IsSelectedDesktop(state,zero));
+    CHECK(!IsSelectedDesktop(state,valid));
+    CHECK(!IsActiveWindow(state,IK(0,0,0)));
+
+    CHECK(SetPickerSelection(state,3,valid));
+    CHECK(!SetPickerSelection(state,0,zero));
+    CHECK(!SetPickerSelection(state,-1,valid));
+    CHECK(GuidEq(state.selectedDesktop,valid));
+    CHECK(state.selectedIndex==3);
+}
+
+static void test_picker_active_identity_rejects_hwnd_reuse(){
+    PickerState state;
+    state.activeWindow=IK(0x1234,77,9001);
+    CHECK(IsActiveWindow(state,IK(0x1234,77,9001)));
+    CHECK(!IsActiveWindow(state,IK(0x1234,77,9002)));
+    CHECK(!IsActiveWindow(state,IK(0x1234,78,9001)));
+    CHECK(!IsActiveWindow(state,IK(0x1235,77,9001)));
+    CHECK(!IsActiveWindow(state,IK(0x1234,77,0)));
+}
+
+static void test_picker_selection_resolution_preserves_then_falls_back(){
+    const GUID first=G(L"{231A0000-0000-0000-0000-000000000001}");
+    const GUID current=G(L"{231A0000-0000-0000-0000-000000000002}");
+    const GUID selected=G(L"{231A0000-0000-0000-0000-000000000003}");
+    const GUID missing=G(L"{231A0000-0000-0000-0000-000000000004}");
+    const std::vector<GUID> desktops={first,selected,current};
+
+    PickerState state;
+    state.currentDesktop=current;
+    state.selectedDesktop=selected;
+    state.selectedIndex=99;
+    CHECK(ResolvePickerSelection(state,desktops));
+    CHECK(GuidEq(state.selectedDesktop,selected));
+    CHECK(state.selectedIndex==1);
+
+    state.selectedDesktop=missing;
+    state.selectedIndex=99;
+    CHECK(ResolvePickerSelection(state,desktops));
+    CHECK(GuidEq(state.selectedDesktop,current));
+    CHECK(state.selectedIndex==2);
+
+    state.currentDesktop=GUID{};
+    state.selectedDesktop=missing;
+    state.selectedIndex=99;
+    CHECK(ResolvePickerSelection(state,desktops));
+    CHECK(GuidEq(state.selectedDesktop,first));
+    CHECK(state.selectedIndex==0);
+
+    CHECK(!ResolvePickerSelection(state,{}));
+    CHECK(GuidIsZero(state.selectedDesktop));
+    CHECK(state.selectedIndex==-1);
+}
+
+static void test_picker_selection_updates_pair_without_touching_current(){
+    PickerState state;
+    const GUID current=G(L"{231A0000-0000-0000-0000-000000000001}");
+    const GUID selected=G(L"{231A0000-0000-0000-0000-000000000002}");
+    state.currentDesktop=current;
+    CHECK(SetPickerSelection(state,7,selected));
+    CHECK(GuidEq(state.currentDesktop,current));
+    CHECK(GuidEq(state.selectedDesktop,selected));
+    CHECK(state.selectedIndex==7);
+}
+
+static void test_picker_refresh_preserves_search_scroll_and_identity(){
+    PickerState state;
+    const GUID desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    state.searchText=L"github";
+    state.searchActive=true;
+    state.controlledTransition=true;
+    state.currentDesktop=desktop;
+    CHECK(SetPickerSelection(state,5,desktop));
+    state.activeWindow=IK(10,20,30);
+    state.scrollByDesktop[GuidKey(desktop)]=3;
+
+    PickerState refreshed=PreservePickerUi(state);
+    CHECK(refreshed.searchText==L"github");
+    CHECK(refreshed.searchActive);
+    CHECK(refreshed.controlledTransition);
+    CHECK(IsCurrentDesktop(refreshed,desktop));
+    CHECK(IsSelectedDesktop(refreshed,desktop));
+    CHECK(refreshed.selectedIndex==5);
+    CHECK(IsActiveWindow(refreshed,IK(10,20,30)));
+    CHECK(refreshed.scrollByDesktop.at(GuidKey(desktop))==3);
+
+    refreshed.searchText=L"changed";
+    refreshed.scrollByDesktop[GuidKey(desktop)]=9;
+    CHECK(state.searchText==L"github");
+    CHECK(state.scrollByDesktop.at(GuidKey(desktop))==3);
+}
+
+static void test_picker_refresh_transaction_publishes_only_complete_stage(){
+    const GUID priorDesktop=G(
+        L"{231A0000-0000-0000-0000-000000000001}");
+    const GUID nextDesktop=G(
+        L"{231A0000-0000-0000-0000-000000000002}");
+    std::vector<int> model={1,2};
+    PickerState state;
+    state.currentDesktop=priorDesktop;
+    CHECK(SetPickerSelection(state,1,priorDesktop));
+    state.searchText=L"preserve";
+
+    CHECK(!RunPickerRefreshTransaction(model,state,
+        [&](std::vector<int>& staged,PickerState& next)->bool {
+            staged.push_back(7);
+            next.currentDesktop=nextDesktop;
+            throw std::bad_alloc();
+        }));
+    CHECK((model==std::vector<int>{1,2}));
+    CHECK(IsCurrentDesktop(state,priorDesktop));
+    CHECK(IsSelectedDesktop(state,priorDesktop));
+    CHECK(state.selectedIndex==1 && state.searchText==L"preserve");
+
+    CHECK(!RunPickerRefreshTransaction(model,state,
+        [&](std::vector<int>& staged,PickerState& next){
+            staged.push_back(8);
+            next.currentDesktop=nextDesktop;
+            return false;
+        }));
+    CHECK((model==std::vector<int>{1,2}));
+    CHECK(IsCurrentDesktop(state,priorDesktop));
+
+    CHECK(RunPickerRefreshTransaction(model,state,
+        [&](std::vector<int>& staged,PickerState& next){
+            staged.push_back(9);
+            next.currentDesktop=nextDesktop;
+            CHECK(SetPickerSelection(next,0,nextDesktop));
+            return true;
+        }));
+    CHECK((model==std::vector<int>{9}));
+    CHECK(IsCurrentDesktop(state,nextDesktop));
+    CHECK(IsSelectedDesktop(state,nextDesktop));
+    CHECK(state.selectedIndex==0 && state.searchText==L"preserve");
+}
+
+static void test_blend_color_respects_channels_and_alpha_endpoints(){
+    const COLORREF background=RGB(10,20,30);
+    const COLORREF accent=RGB(110,120,130);
+    CHECK(BlendColor(background,accent,0)==background);
+    CHECK(BlendColor(background,accent,255)==accent);
+    CHECK(BlendColor(background,accent,128)==RGB(60,70,80));
+}
+
+static void test_picker_dim_search_keeps_current_and_selection_distinct(){
+    const COLORREF normal=RGB(28,28,33);
+    const COLORREF active=RGB(242,150,5);
+    const COLORREF current=BlendColor(normal,active,48);
+    const COLORREF dim=RGB(22,22,26);
+    const COLORREF passive=RGB(107,96,79);
+    const COLORREF normalDim=PickerTileFill(normal,current,dim,false,true);
+    const COLORREF currentDim=PickerTileFill(normal,current,dim,true,true);
+    CHECK(PickerTileFill(normal,current,dim,false,false)==normal);
+    CHECK(PickerTileFill(normal,current,dim,true,false)==current);
+    CHECK(normalDim==BlendColor(normal,dim,160));
+    CHECK(currentDim==BlendColor(current,dim,160));
+    CHECK(currentDim!=normalDim);
+    CHECK(PickerTileBorder(false,active,passive)==passive);
+    CHECK(PickerTileBorder(true,active,passive)==active);
+}
+
+static void test_picker_visible_scroll_clamps_without_mutating_saved_value(){
+    const int savedScroll=9;
+    CHECK(PickerVisibleScroll(savedScroll,3)==3);
+    CHECK(savedScroll==9);
+    CHECK(PickerVisibleScroll(2,3)==2);
+    CHECK(PickerVisibleScroll(-4,3)==0);
+    CHECK(PickerVisibleScroll(2,-1)==0);
+}
+
+static void test_picker_wheel_scroll_saturates_at_integer_bounds(){
+    CHECK(AdvancePickerScroll(0,120)==0);
+    CHECK(AdvancePickerScroll(3,120)==2);
+    CHECK(AdvancePickerScroll(3,-120)==4);
+    CHECK(AdvancePickerScroll(INT_MAX,-120)==INT_MAX);
+    CHECK(AdvancePickerScroll(3,0)==3);
+}
+
+static void test_picker_target_failed_recapture_clears_entire_capture(){
+    PickerTargetCaptureState capture;
+    capture.hwnd=0x1234;
+    capture.identity=IK(0x1234,77,9001);
+    capture.title=L"target";
+    CHECK(CompletePickerTargetRecapture(
+        capture,WindowIdentityRecapture::Match));
+    CHECK(capture.hwnd==0x1234 && capture.title==L"target");
+
+    CHECK(!CompletePickerTargetRecapture(
+        capture,WindowIdentityRecapture::Lost));
+    CHECK(capture.hwnd==0);
+    CHECK(!IsActiveWindow(PickerState{},capture.identity));
+    CHECK(capture.title.empty());
+
+    capture.hwnd=0x5678;
+    capture.identity=IK(0x5678,88,9002);
+    capture.title=L"other";
+    CHECK(!CompletePickerTargetRecapture(
+        capture,WindowIdentityRecapture::Indeterminate));
+    CHECK(capture.hwnd==0 && capture.identity.hwnd==0 &&
+          capture.title.empty());
+}
+
+static void test_picker_row_requires_complete_stable_identity(){
+    const WindowIdentityKey complete=IK(0x1234,77,9001);
+    CHECK(AcceptPickerRowIdentity(
+        complete,WindowIdentityRecapture::Match));
+    CHECK(!AcceptPickerRowIdentity(
+        complete,WindowIdentityRecapture::Lost));
+    CHECK(!AcceptPickerRowIdentity(
+        complete,WindowIdentityRecapture::Indeterminate));
+    CHECK(!AcceptPickerRowIdentity(
+        IK(0x1234,77,0),WindowIdentityRecapture::Match));
+}
+
+static void test_picker_failed_current_read_clears_only_current(){
+    PickerState state;
+    const GUID current=G(L"{231A0000-0000-0000-0000-000000000001}");
+    const GUID selected=G(L"{231A0000-0000-0000-0000-000000000002}");
+    state.currentDesktop=current;
+    CHECK(SetPickerSelection(state,4,selected));
+    CHECK(!SetPickerCurrentDesktop(state,GUID{}));
+    CHECK(GuidIsZero(state.currentDesktop));
+    CHECK(IsSelectedDesktop(state,selected));
+    CHECK(state.selectedIndex==4);
+    CHECK(SetPickerCurrentDesktop(state,current));
+    CHECK(IsCurrentDesktop(state,current));
+}
+
+static void test_picker_desktop_snapshot_rejects_zero_and_duplicates(){
+    const GUID first=G(L"{231A0000-0000-0000-0000-000000000001}");
+    const GUID second=G(L"{231A0000-0000-0000-0000-000000000002}");
+    std::vector<GUID> snapshot;
+    CHECK(AppendUniquePickerDesktop(snapshot,first));
+    CHECK(!AppendUniquePickerDesktop(snapshot,GUID{}));
+    CHECK(!AppendUniquePickerDesktop(snapshot,first));
+    CHECK(snapshot.size()==1 && GuidEq(snapshot[0],first));
+    CHECK(AppendUniquePickerDesktop(snapshot,second));
+    CHECK(snapshot.size()==2 && GuidEq(snapshot[1],second));
+}
+
+static void test_picker_filter_cache_is_transactional_and_precomputed(){
+    const std::vector<std::wstring> rows={L"github issue",L"mail",L"github pr"};
+    std::vector<size_t> filtered={99};
+    CHECK(BuildPickerFilteredIndices(rows,L"github",filtered,
+        [](const std::wstring& value)->const std::wstring& { return value; }));
+    CHECK((filtered==std::vector<size_t>{0,2}));
+
+    const std::vector<size_t> prior=filtered;
+    CHECK(!BuildPickerFilteredIndices(rows,L"github",filtered,
+        [&](const std::wstring& value)->const std::wstring& {
+            if(value==L"mail") throw std::bad_alloc();
+            return value;
+        }));
+    CHECK(filtered==prior);
+}
+
+static void test_picker_bitmap_replacement_deselects_before_delete(){
+    PickerBitmapSelection state;
+    state.original=11;
+    state.selected=11;
+    uintptr_t release=0;
+    CHECK(PublishPickerBitmapReplacement(state,22,11,release));
+    CHECK(state.owned==22 && state.selected==22 && release==0);
+    CHECK(PublishPickerBitmapReplacement(state,33,22,release));
+    CHECK(state.owned==33 && state.selected==33 && release==22);
+
+    const PickerBitmapSelection prior=state;
+    release=77;
+    CHECK(!PublishPickerBitmapReplacement(state,44,11,release));
+    CHECK(state.owned==prior.owned && state.selected==prior.selected);
+    CHECK(release==77);
+}
+
+static void test_picker_valid_current_commits_only_with_model(){
+    const GUID prior=G(L"{231A0000-0000-0000-0000-000000000001}");
+    const GUID observed=G(L"{231A0000-0000-0000-0000-000000000002}");
+    std::vector<int> model={1,2};
+    PickerState state;
+    state.currentDesktop=prior;
+
+    CHECK(!RunPickerRefreshWithCurrent(model,state,observed,
+        [](std::vector<int>& staged,PickerState&)->bool {
+            staged.push_back(9);
+            return false;
+        }));
+    CHECK((model==std::vector<int>{1,2}));
+    CHECK(IsCurrentDesktop(state,prior));
+
+    CHECK(RunPickerRefreshWithCurrent(model,state,observed,
+        [](std::vector<int>& staged,PickerState&){
+            staged.push_back(7);
+            return true;
+        }));
+    CHECK((model==std::vector<int>{7}));
+    CHECK(IsCurrentDesktop(state,observed));
+
+    CHECK(!RunPickerRefreshWithCurrent(model,state,GUID{},
+        [](std::vector<int>& staged,PickerState&)->bool {
+            staged.push_back(8);
+            return false;
+        }));
+    CHECK((model==std::vector<int>{7}));
+    CHECK(GuidIsZero(state.currentDesktop));
+}
+
+static void test_picker_paint_cache_failure_blocks_show_transactionally(){
+    std::vector<int> cache={1,2};
+    CHECK(!RunPickerPaintCacheTransaction(cache,
+        [](std::vector<int>& staged){
+            staged.push_back(9);
+            return false;
+        }));
+    CHECK((cache==std::vector<int>{1,2}));
+    CHECK(!PickerShowPreparationComplete(true,false));
+    CHECK(!PickerShowPreparationComplete(false,true));
+
+    CHECK(RunPickerPaintCacheTransaction(cache,
+        [](std::vector<int>& staged){
+            staged.push_back(7);
+            return true;
+        }));
+    CHECK((cache==std::vector<int>{7}));
+    CHECK(PickerShowPreparationComplete(true,true));
+}
+
+struct FakePickerComOutput {
+    explicit FakePickerComOutput(int& releases):releases_(releases){}
+    void Release(){ ++releases_; delete this; }
+private:
+    int& releases_;
+};
+
+static void test_picker_com_output_is_owned_even_on_failed_call(){
+    int releases=0;
+    {
+        PickerScopedComOutput<FakePickerComOutput> output;
+        *output.put()=new FakePickerComOutput(releases);
+        const HRESULT simulatedResult=E_FAIL;
+        CHECK(FAILED(simulatedResult));
+        CHECK(static_cast<bool>(output));
+    }
+    CHECK(releases==1);
+}
 
 static MoveJob MJ(MoveOwner owner, uint64_t operationId,
                   uint64_t jobId, const char* runtimeKey){
@@ -12887,6 +13264,26 @@ static void test_validated_touch_rebase_preserves_external_semantics(){
 }
 
 int main(){
+    test_picker_distinguishes_current_selected_and_active();
+    test_picker_zero_guids_and_partial_identities_never_highlight();
+    test_picker_active_identity_rejects_hwnd_reuse();
+    test_picker_selection_resolution_preserves_then_falls_back();
+    test_picker_selection_updates_pair_without_touching_current();
+    test_picker_refresh_preserves_search_scroll_and_identity();
+    test_picker_refresh_transaction_publishes_only_complete_stage();
+    test_blend_color_respects_channels_and_alpha_endpoints();
+    test_picker_dim_search_keeps_current_and_selection_distinct();
+    test_picker_visible_scroll_clamps_without_mutating_saved_value();
+    test_picker_wheel_scroll_saturates_at_integer_bounds();
+    test_picker_target_failed_recapture_clears_entire_capture();
+    test_picker_row_requires_complete_stable_identity();
+    test_picker_failed_current_read_clears_only_current();
+    test_picker_desktop_snapshot_rejects_zero_and_duplicates();
+    test_picker_filter_cache_is_transactional_and_precomputed();
+    test_picker_bitmap_replacement_deselects_before_delete();
+    test_picker_valid_current_commits_only_with_model();
+    test_picker_paint_cache_failure_blocks_show_transactionally();
+    test_picker_com_output_is_owned_even_on_failed_call();
     test_finalization_runs_once();
     test_window_identity_requires_full_nonzero_process_identity();
     test_snapshot_versions_change_only_for_changed_inputs();
