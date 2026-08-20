@@ -819,6 +819,64 @@ static std::vector<LayoutMatch> CountingReconcileMatcher(
     return MatchOneToOne(saved,live,acceptScore,tooComplex);
 }
 
+static std::vector<LayoutMatch> DuplicateSavedReconcileMatcher(
+        const std::vector<LayoutWin>& saved,
+        const std::vector<LayoutWin>& live,
+        double acceptScore,
+        bool* tooComplex){
+    (void)saved; (void)live; (void)acceptScore;
+    if(tooComplex) *tooComplex=false;
+    return {Candidate(0,0,0.9),Candidate(0,1,0.9)};
+}
+
+static std::vector<LayoutMatch> DuplicateLiveReconcileMatcher(
+        const std::vector<LayoutWin>& saved,
+        const std::vector<LayoutWin>& live,
+        double acceptScore,
+        bool* tooComplex){
+    (void)saved; (void)live; (void)acceptScore;
+    if(tooComplex) *tooComplex=false;
+    return {Candidate(0,0,0.9),Candidate(1,0,0.9)};
+}
+
+enum class InjectedMatchMode {
+    SavedOutOfRange, LiveOutOfRange, OtherAppLive, NotANumber,
+    Infinity, BelowThreshold, TooMany, Valid
+};
+
+static InjectedMatchMode& CurrentInjectedMatchMode(){
+    static InjectedMatchMode mode=InjectedMatchMode::Valid;
+    return mode;
+}
+
+static std::vector<LayoutMatch> ConfigurableReconcileMatcher(
+        const std::vector<LayoutWin>& saved,
+        const std::vector<LayoutWin>& live,
+        double acceptScore,
+        bool* tooComplex){
+    if(tooComplex) *tooComplex=false;
+    switch(CurrentInjectedMatchMode()){
+    case InjectedMatchMode::SavedOutOfRange:
+        return {Candidate(saved.size(),0,acceptScore)};
+    case InjectedMatchMode::LiveOutOfRange:
+        return {Candidate(0,live.size(),acceptScore)};
+    case InjectedMatchMode::OtherAppLive:
+        return {Candidate(0,1,acceptScore)};
+    case InjectedMatchMode::NotANumber:
+        return {Candidate(0,0,std::numeric_limits<double>::quiet_NaN())};
+    case InjectedMatchMode::Infinity:
+        return {Candidate(0,0,std::numeric_limits<double>::infinity())};
+    case InjectedMatchMode::BelowThreshold:
+        return {Candidate(0,0,acceptScore-0.01)};
+    case InjectedMatchMode::TooMany:
+        return std::vector<LayoutMatch>(
+            MAX_LAYOUT_RECORDS+1,Candidate(0,0,acceptScore));
+    case InjectedMatchMode::Valid:
+        return {Candidate(0,0,acceptScore)};
+    }
+    return {};
+}
+
 static bool SameLayoutWinFields(const LayoutWin& left, const LayoutWin& right){
     return left.recordId==right.recordId && left.app==right.app &&
         left.deskIndex==right.deskIndex && GuidEq(left.desktop,right.desktop) &&
@@ -1548,6 +1606,101 @@ static void test_reconcile_guaranteed_capacity_defers_before_matcher(){
     CHECK(CountingReconcileMatcherCalls()==0);
     CHECK(CountingRecordIdGeneratorCalls()==0);
     ResetCountingReconcileMatcher();
+    ResetCountingRecordIdGenerator();
+}
+
+static void test_reconcile_duplicate_injected_match_ownership_defers_cleanly(){
+    const UnixSeconds now=2000001690;
+    LayoutWin savedA=ReconcileTestRecord(
+        DeterministicRecordId(33000),"chrome","A","a.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-10);
+    LayoutWin savedB=ReconcileTestRecord(
+        DeterministicRecordId(33001),"chrome","B","b.example",1,
+        G(L"{231A0000-0000-0000-0000-000000000002}"),now-10);
+    LayoutWin liveA=MatchRecord("chrome","A","a.example",1,{{"a.example",1}});
+    liveA.deskIndex=savedA.deskIndex;
+    liveA.desktop=savedA.desktop;
+    LayoutWin liveB=MatchRecord("chrome","B","b.example",1,{{"b.example",1}});
+    liveB.deskIndex=savedB.deskIndex;
+    liveB.desktop=savedB.desktop;
+    const ReconcileMatcher invalidMatchers[]={
+        DuplicateSavedReconcileMatcher,DuplicateLiveReconcileMatcher
+    };
+
+    for(ReconcileMatcher matcher : invalidMatchers){
+        ResetCountingRecordIdGenerator();
+        ReconcilePlan plan=PlanAppReconcile(
+            {savedA,savedB},{liveA,liveB},"chrome",now,{},ReconcileFreshness::Fresh,
+            CountingRecordIdGenerator,matcher);
+        CHECK(plan.app=="chrome" && plan.nowUtc==now &&
+            plan.freshness==ReconcileFreshness::Fresh);
+        CHECK(plan.deferred);
+        CHECK(plan.matches.empty());
+        CHECK(plan.restores.empty());
+        CHECK(plan.newRecords.empty());
+        CHECK(plan.missingSavedIndices.empty());
+        CHECK(CountingRecordIdGeneratorCalls()==0);
+        ResetCountingRecordIdGenerator();
+    }
+}
+
+static void test_reconcile_rejects_all_malformed_injected_matches(){
+    const UnixSeconds now=2000001695;
+    LayoutWin saved=ReconcileTestRecord(
+        DeterministicRecordId(33002),"chrome","Saved","same.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-10);
+    LayoutWin liveChrome=MatchRecord(
+        "chrome","Live","same.example",1,{{"same.example",1}});
+    liveChrome.deskIndex=saved.deskIndex;
+    liveChrome.desktop=saved.desktop;
+    LayoutWin liveFirefox=MatchRecord(
+        "firefox","Other","other.example",1,{{"other.example",1}});
+    liveFirefox.deskIndex=1;
+    liveFirefox.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+    const InjectedMatchMode invalidModes[]={
+        InjectedMatchMode::SavedOutOfRange,InjectedMatchMode::LiveOutOfRange,
+        InjectedMatchMode::OtherAppLive,InjectedMatchMode::NotANumber,
+        InjectedMatchMode::Infinity,InjectedMatchMode::BelowThreshold,
+        InjectedMatchMode::TooMany
+    };
+
+    for(InjectedMatchMode mode : invalidModes){
+        CurrentInjectedMatchMode()=mode;
+        ResetCountingRecordIdGenerator();
+        ReconcilePlan plan=PlanAppReconcile(
+            {saved},{liveChrome,liveFirefox},"chrome",now,{},
+            ReconcileFreshness::Fresh,CountingRecordIdGenerator,
+            ConfigurableReconcileMatcher);
+        CHECK(plan.app=="chrome" && plan.nowUtc==now &&
+            plan.freshness==ReconcileFreshness::Fresh);
+        CHECK(plan.deferred);
+        CHECK(plan.matches.empty());
+        CHECK(plan.restores.empty());
+        CHECK(plan.newRecords.empty());
+        CHECK(plan.missingSavedIndices.empty());
+        CHECK(CountingRecordIdGeneratorCalls()==0);
+        ResetCountingRecordIdGenerator();
+    }
+
+    CurrentInjectedMatchMode()=InjectedMatchMode::Valid;
+    ResetCountingRecordIdGenerator();
+    ReconcilePlan valid=PlanAppReconcile(
+        {saved},{liveChrome,liveFirefox},"chrome",now,{},
+        ReconcileFreshness::Fresh,CountingRecordIdGenerator,
+        ConfigurableReconcileMatcher);
+    CHECK(!valid.deferred);
+    CHECK(valid.matches.size()==1 && valid.matches[0].savedIndex==0 &&
+        valid.matches[0].liveIndex==0 && valid.matches[0].score==0.55);
+    CHECK(valid.restores.empty());
+    CHECK(valid.newRecords.empty());
+    CHECK(valid.missingSavedIndices.empty());
+    CHECK(CountingRecordIdGeneratorCalls()==0);
+    std::vector<LayoutWin> committed=CommitAppReconcile(
+        {saved},{liveChrome,liveFirefox},valid,{},now);
+    CHECK(committed.size()==1);
+    CHECK(committed[0].recordId==saved.recordId);
+    CHECK(committed[0].activeTitle==liveChrome.activeTitle);
+    CHECK(committed[0].lastSeenUtc==now && committed[0].missingSinceUtc==0);
     ResetCountingRecordIdGenerator();
 }
 
@@ -7758,6 +7911,8 @@ int main(){
     test_reconcile_malformed_reserved_id_defers_before_work();
     test_reconcile_reserved_id_cap_is_fail_closed_at_boundary();
     test_reconcile_guaranteed_capacity_defers_before_matcher();
+    test_reconcile_duplicate_injected_match_ownership_defers_cleanly();
+    test_reconcile_rejects_all_malformed_injected_matches();
     test_reconcile_unsupported_app_defers_without_generation();
     test_commit_reconcile_rejects_out_of_range_mixed_plan_atomically();
     test_commit_reconcile_rejects_malformed_restore_sets_atomically();

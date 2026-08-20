@@ -2,6 +2,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -116,9 +117,24 @@ inline ReconcilePlan PlanAppReconcile(
              unavoidableNew>MAX_LAYOUT_RECORDS-retainedExisting))
         return deferredPlan();
 
+    const double acceptScore=0.55;
     bool tooComplex=false;
-    std::vector<LayoutMatch> assigned=matcher(eligible,live,0.55,&tooComplex);
+    std::vector<LayoutMatch> assigned=matcher(eligible,live,acceptScore,&tooComplex);
     if(tooComplex) return deferredPlan();
+    if(assigned.size()>MAX_LAYOUT_RECORDS || assigned.size()>eligible.size() ||
+            assigned.size()>live.size())
+        return deferredPlan();
+    std::vector<bool> assignedSaved(eligible.size(),false);
+    std::vector<bool> assignedLive(live.size(),false);
+    for(const LayoutMatch& match : assigned){
+        if(match.savedIndex>=eligible.size() || match.liveIndex>=live.size() ||
+                live[match.liveIndex].app!=app || !std::isfinite(match.score) ||
+                match.score<acceptScore || assignedSaved[match.savedIndex] ||
+                assignedLive[match.liveIndex])
+            return deferredPlan();
+        assignedSaved[match.savedIndex]=true;
+        assignedLive[match.liveIndex]=true;
+    }
 
     std::vector<bool> matchedSaved(existing.size(),false);
     std::vector<bool> matchedLive(live.size(),false);
