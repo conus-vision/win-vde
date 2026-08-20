@@ -78,17 +78,19 @@ static UINT g_hotVk   = 'D';
 static bool g_autoFix = true;                   // монитор: авто-сохранение и авто-восстановление раскладки
 static bool g_degraded = false;                 // недокументированный COM не работает (обновление Windows) -> урезанный режим
 static bool g_appFirefox = true, g_appChrome = true, g_appEdge = true;  // какие приложения отслеживать
-static const bool SWITCH_AFTER_MOVE = false;    // переключаться на десктоп после переноса окна
-
 #define IDI_APPICON 101    // должен совпадать с ID в vde.rc
 #define TIMER_MONITOR 1
 #define TIMER_MOVE_VERIFY 3
 #define TIMER_HEARTBEAT 4
 #define TIMER_AUTO_FLUSH 5
+#define TIMER_PICKER_TRANSITION 6
+#define WM_PICKER_TRANSITION (WM_APP + 16)
+#define WM_PICKER_SEARCH_RETRY (WM_APP + 17)
 #define WM_MOVE_CANCEL_RETRY (WM_APP + 14)
 #define WM_AUTO_TIMER_RETRY (WM_APP + 15)
 #define MONITOR_INTERVAL_MS 5000
 #define MOVE_VERIFY_INTERVAL_MS 150
+#define PICKER_IDLE_REFRESH_MS 1000
 #define AUTO_FLUSH_INTERVAL_MS 500
 #define CONFLICT_RECHECK_INTERVAL_MS (60U * 1000U)
 #define HEARTBEAT_INTERVAL_MS (6U * 60U * 60U * 1000U)
@@ -106,6 +108,9 @@ static const wchar_t* APP_VERSION = L"1.0.0";
 
 static HWND g_main=nullptr;
 static void Balloon(const std::wstring& text);
+static PickerState g_picker;
+static PickerTabSearchCacheState g_pickerTabSearchCache;
+static bool g_suppressPickerCtrlSpaceChar=false;
 
 struct RuntimeRecordBinding {
     std::string app;
@@ -122,6 +127,7 @@ struct MoveRuntimeBinding {
     bool issueAwaitingVerify=false;
     bool retireAfterVerify=false;
     bool cancelRequested=false;
+    bool timerArmFailureCancellation=false;
     IdentityRecaptureRetryBudget identityRecaptureBudget;
     IssuedMoveRetirementTracker retirement;
 };
@@ -132,8 +138,17 @@ struct ReservedAutoIdentity {
     std::string app;
     std::string recordId;
     GUID originDesktop={0};
+    uint64_t identityGeneration=0;
+    LayoutWin acceptedFreshRecord;
+    bool hasAcceptedFreshRecord=false;
     LayoutWin provisionalOriginRecord;
     bool hasProvisionalOriginRecord=false;
+};
+
+struct AcceptedFreshRuntime {
+    WindowIdentityKey identity;
+    uint64_t identityGeneration=0;
+    LayoutWin record;
 };
 
 enum class AsyncOperationOwner {
@@ -163,29 +178,25 @@ struct AutoRestoreOperation {
     uint64_t sessionDataGeneration=0;
     ReconcileFreshness freshness=ReconcileFreshness::Fresh;
     bool reconcilePending=false;
+    bool reconcileFastKnown=false;
     ReconcileWorkMode reconcileMode=ReconcileWorkMode::Plan;
     std::vector<FastWin> reconcileFast;
     std::unique_ptr<ReconcileResult> reconcile;
+    std::map<std::string,PickerOperationLifetimeClaim>
+        pickerClaimedRecordByRuntime;
     MoveTerminalOutcomes successfulLive;
     std::set<uint64_t> liveJobIds;
     size_t outstanding=0;
     bool hadExhausted=false;
     bool hadFailure=false;
     bool cancellationPending=false;
-};
-
-struct PickerMoveOperation {
-    uint64_t operationId=0;
-    std::set<uint64_t> liveJobIds;
-    std::string app;
-    uint64_t lifecycleSaveGeneration=0;
-    uint64_t lifecycleLayoutSignature=0;
-    uint64_t lifecycleSessionSignature=0;
-    bool completionReported=false;
+    PickerOperationClaimRearmControl pickerClaimRearm;
 };
 
 struct SearchOperation {
     uint64_t operationId=0;
+    uint64_t pickerModelGeneration=0;
+    std::wstring pickerQuery;
     size_t outstanding=0;
     std::map<std::string,AppFastSnapshot> snapshots;
     std::set<std::string> waitingReconcileApps;
@@ -234,10 +245,10 @@ static std::map<std::string,RuntimeRecordBinding> g_recordByRuntime;
 static std::map<std::string,std::string> g_pendingRecordByRuntime;
 static std::map<std::string,std::string> g_provisionalRecordByRuntime;
 static std::map<std::string,ReservedAutoIdentity> g_reservedAutoIdentities;
+static std::map<std::string,AcceptedFreshRuntime> g_acceptedFreshByRuntime;
 static std::map<uint64_t,MoveRuntimeBinding> g_moveRuntime;
 static std::map<uint64_t,SessionRoute> g_sessionRoutes;
 static std::map<uint64_t,AutoRestoreOperation> g_pendingAutoOperations;
-static std::map<uint64_t,PickerMoveOperation> g_pickerOperations;
 static std::map<uint64_t,SearchOperation> g_searchOperations;
 static std::map<uint64_t,MetadataProbeOperation> g_metadataProbeOperations;
 static std::map<uint64_t,ManualSaveOperation> g_manualSaveOperations;
@@ -378,12 +389,6 @@ static IVirtualDesktop* GetDesktopByGuid(const GUID& t){ IObjectArray* a=nullptr
     for(UINT i=0;i<n;++i){ IVirtualDesktop* d=nullptr; if(SUCCEEDED(a->GetAt(i,kIID_IVirtualDesktop,(void**)&d))&&d){ GUID g={0};d->GetID(&g); if(IsEqualGUID(g,t)){r=d;break;} d->Release(); } } a->Release(); return r; }
 static int GetDesktopIndexByGuid(const GUID& t){ IObjectArray* a=nullptr; if(FAILED(g_vdmi->GetDesktops(&a))||!a)return -1; UINT n=0;a->GetCount(&n); int idx=-1;
     for(UINT i=0;i<n;++i){ IVirtualDesktop* d=nullptr; if(SUCCEEDED(a->GetAt(i,kIID_IVirtualDesktop,(void**)&d))&&d){ GUID g={0};d->GetID(&g); if(IsEqualGUID(g,t)){idx=(int)i;d->Release();break;} d->Release(); } } a->Release(); return idx; }
-
-// ============================ Firefox windows =================================
-static std::wstring StripSuffixes(std::wstring t, const std::vector<std::wstring>& sfx){
-    for(auto& s:sfx){ size_t l=s.size(); if(t.size()>=l&&_wcsicmp(t.c_str()+(t.size()-l),s.c_str())==0){ t.resize(t.size()-l); return t; } }
-    return t;
-}
 
 class UniqueWinHandle {
 public:
@@ -1036,6 +1041,26 @@ static const AppProfile* FindActiveProfile(const std::string& app,
     return nullptr;
 }
 
+static bool BuildPickerCapturedTitleOnlyProvisional(
+        const std::string& app,const std::wstring& capturedTitle,
+        LayoutWin& output) noexcept {
+    try {
+        std::vector<AppProfile> profiles;
+        const AppProfile* profile=FindActiveProfile(app,profiles);
+        if(!profile || capturedTitle.empty()) return false;
+        const std::wstring normalized=StripReconcileTitleSuffix(
+            capturedTitle,profile->titleSuffixes);
+        const std::string title=W2U8(normalized);
+        if(!PickerTitleOnlyProvisionalFieldsUsable(app,title)) return false;
+        LayoutWin built;
+        built.app=app;
+        built.activeTitle=title;
+        built.provisional=true;
+        output=std::move(built);
+        return true;
+    } catch(...) { return false; }
+}
+
 static int SnapshotDesktopIndex(const GUID& guid){
     for(const DeskRec& desktop : g_autoDesktops)
         if(GuidEq(desktop.guid,guid)) return desktop.index;
@@ -1142,78 +1167,188 @@ static bool EraseAutoRecord(const LayoutWin& previous,RecordDeltaKind kind,
     return false;
 }
 
-static bool PersistPickerMovedWindow(const MoveResult& result,
-                                     const MoveRuntimeBinding& runtime,
-                                     const std::string& app){
+static void MarkPickerOperationClaimsPublished(
+        const std::string& runtimeKey,
+        const std::string& recordId) noexcept {
+    if(runtimeKey.empty() || recordId.empty()) return;
     try {
-        const WindowIdentityKey identity=IdentityOf(runtime.window);
+        for(auto& operation : g_pendingAutoOperations)
+            MarkPickerOperationLifetimeClaimPublished(
+                operation.second.pickerClaimedRecordByRuntime,
+                runtimeKey,recordId,PopupSaveStatus::Saved,
+                PopupSaveFailure::None);
+    } catch(...) {}
+}
+
+static void MarkPickerOperationClaimsTerminalOutcome(
+        const std::string& runtimeKey,const std::string& recordId,
+        bool targetRestored) noexcept {
+    if(runtimeKey.empty() || recordId.empty()) return;
+    try {
+        for(auto& operation : g_pendingAutoOperations)
+            MarkPickerOperationLifetimeClaimTerminalOutcome(
+                operation.second.pickerClaimedRecordByRuntime,
+                runtimeKey,recordId,targetRestored);
+    } catch(...) {}
+}
+
+static PopupSaveResult SavePopupMovedWindow(
+        const PickerTransition& transition) noexcept {
+    PopupSaveResult result;
+    result.status=PopupSaveStatus::Failed;
+    try {
+        const WindowIdentityKey identity=transition.target;
+        const WindowIdentityRecapture recapture=
+            RecaptureGenericWindowIdentity(identity);
+        if(recapture!=WindowIdentityRecapture::Match){
+            result.failure=recapture==WindowIdentityRecapture::Lost
+                ? PopupSaveFailure::IdentityLost
+                : PopupSaveFailure::IdentityIndeterminate;
+            return result;
+        }
+
+        std::string app;
+        const PopupBrowserClassification classification=
+            ClassifyTrackedBrowserWindow(identity,app);
+        if(classification==PopupBrowserClassification::NotTracked){
+            result.status=PopupSaveStatus::NotTracked;
+            return result;
+        }
+        result.app=app.empty() ? transition.app : app;
+        if(classification!=PopupBrowserClassification::Tracked){
+            result.failure=PopupSaveFailure::Classification;
+            return result;
+        }
+        if(!g_autoLoaded){
+            result.failure=PopupSaveFailure::StorageUnavailable;
+            return result;
+        }
+        if(!g_autoWritesAllowed || !g_autoFix || g_degraded){
+            result.failure=PopupSaveFailure::StorageReadOnly;
+            return result;
+        }
+
         const std::string runtimeKey=RuntimeKey(identity);
         auto reserved=g_reservedAutoIdentities.find(runtimeKey);
         if(reserved==g_reservedAutoIdentities.end() ||
-           !SameMoveToken(reserved->second.token,result.token) ||
+           !SameMoveToken(reserved->second.token,
+                          transition.reservationToken) ||
            !SameIdentity(reserved->second.identity,identity) ||
-           app.empty() || GuidIsZero(runtime.destination)) return false;
-
-        const int deskIndex=GetDesktopIndexByGuid(runtime.destination);
-        if(deskIndex<0) return false;
-        const UnixSeconds nowUtc=UtcNowSeconds();
-        if(nowUtc<=0 || result.token.operationId==0) return false;
-
+           !PickerTerminalReservationAppAllowed(
+               reserved->second.app,app) ||
+           GuidIsZero(transition.destination)){
+            result.failure=PopupSaveFailure::ReservationUnavailable;
+            return result;
+        }
+        GUID parsedId{};
         std::string recordId;
+        LayoutWin terminalProvisional;
+        bool hasTerminalProvisional=false;
+        PopupSaveFailure recordFailure=PopupSaveFailure::InvalidRecordId;
         if(!SelectPopupPersistRecordId(
                 reserved->second.recordId,
                 [&](std::string& selected){
                     return SelectPendingPopupRecordId(
                         identity,app,g_pendingRecordByRuntime,
                         [&](const std::string& candidate,
-                            const std::string& candidateApp,
+                            const std::string& expectedApp,
                             std::string& canonical){
                             GUID parsed{};
                             if(!ParseNonzeroLayoutGuid(
-                                    candidate,parsed,&canonical)) return false;
-                            for(const LayoutWin& saved : g_autoRecords){
-                                GUID savedGuid{};
-                                std::string savedCanonical;
-                                if(ParseNonzeroLayoutGuid(
-                                        saved.recordId,savedGuid,
-                                        &savedCanonical) &&
-                                   savedCanonical==canonical &&
-                                   saved.app==candidateApp) return true;
-                            }
+                                    candidate,parsed,&canonical))
+                                return false;
+                            for(const LayoutWin& saved : g_autoRecords)
+                                if(saved.recordId==canonical &&
+                                   saved.app==expectedApp) return true;
                             return false;
                         },selected);
                 },
                 [&](std::string& selected){
-                    selected=NewRecordId();
-                    return !selected.empty();
-                },recordId)) return false;
-        GUID parsedId{};
-        std::string canonicalId;
-        if(!ParseNonzeroLayoutGuid(recordId,parsedId,&canonicalId)) return false;
-        recordId.swap(canonicalId);
+                    recordFailure=PopupSaveFailure::IncompleteTitle;
+                    if(!transition.capturedTitleComplete ||
+                       transition.capturedTitle.empty()) return false;
+                    std::string generated=NewRecordId();
+                    GUID parsed{};
+                    std::string canonical;
+                    if(!ParseNonzeroLayoutGuid(
+                            generated,parsed,&canonical)){
+                        recordFailure=PopupSaveFailure::InvalidRecordId;
+                        return false;
+                    }
+                    if(!BuildPickerCapturedTitleOnlyProvisional(
+                            app,transition.capturedTitle,
+                            terminalProvisional)) return false;
+                    selected.swap(canonical);
+                    hasTerminalProvisional=true;
+                    return true;
+                },recordId) ||
+           !ParseNonzeroLayoutGuid(recordId,parsedId,&recordId)){
+            result.failure=recordFailure;
+            return result;
+        }
+        const int deskIndex=GetDesktopIndexByGuid(transition.destination);
+        const UnixSeconds nowUtc=UtcNowSeconds();
+        if(deskIndex<0 || nowUtc<=0 ||
+           transition.reservationToken.operationId==0){
+            result.failure=PopupSaveFailure::DesktopUnavailable;
+            return result;
+        }
 
         const LayoutWin* before=nullptr;
         for(const LayoutWin& current : g_autoRecords)
             if(current.recordId==recordId){ before=&current; break; }
-        if(before && before->app!=app) return false;
+        if(before && before->app!=app){
+            result.failure=PopupSaveFailure::WrongProfile;
+            return result;
+        }
+        auto acceptedAfterEntry=g_acceptedFreshByRuntime.find(runtimeKey);
+        const bool hasAcceptedAfterEntry=
+            acceptedAfterEntry!=g_acceptedFreshByRuntime.end() &&
+            acceptedAfterEntry->second.record.app==app;
+        const PickerFreshRecordSource freshSource=
+            SelectPickerFreshRecordSource(
+                identity,transition.identityGeneration,
+                reserved->second.hasAcceptedFreshRecord,
+                reserved->second.identity,
+                reserved->second.identityGeneration,
+                hasAcceptedAfterEntry,
+                hasAcceptedAfterEntry
+                    ? acceptedAfterEntry->second.identity
+                    : WindowIdentityKey{},
+                hasAcceptedAfterEntry
+                    ? acceptedAfterEntry->second.identityGeneration
+                    : 0);
+        const bool fresh=freshSource!=PickerFreshRecordSource::None;
 
         LayoutWin desired;
-        if(before) desired=*before;
-        else if(reserved->second.hasProvisionalOriginRecord &&
-                reserved->second.provisionalOriginRecord.recordId==recordId &&
-                reserved->second.provisionalOriginRecord.app==app)
+        if(freshSource==PickerFreshRecordSource::AcceptedAfterEntry){
+            desired=acceptedAfterEntry->second.record;
+            desired.provisional=false;
+        } else if(freshSource==PickerFreshRecordSource::Reserved){
+            desired=reserved->second.acceptedFreshRecord;
+            desired.provisional=false;
+        } else if(before){
+            desired=*before;
+        } else if(reserved->second.hasProvisionalOriginRecord){
             desired=reserved->second.provisionalOriginRecord;
-        else {
-            desired.recordId=recordId;
-            desired.app=app;
-            desired.activeTitle=W2U8(runtime.window.title);
             desired.provisional=true;
+        } else if(hasTerminalProvisional){
+            desired=terminalProvisional;
+            desired.provisional=true;
+        } else {
+            result.failure=!transition.capturedTitleComplete
+                ? PopupSaveFailure::IncompleteTitle
+                : PopupSaveFailure::FingerprintUnavailable;
+            return result;
+        }
+        if(!before && !fresh && desired.activeTitle.empty()){
+            result.failure=PopupSaveFailure::IncompleteTitle;
+            return result;
         }
         desired.recordId=recordId;
         desired.app=app;
-        desired.desktop=runtime.destination;
+        desired.desktop=transition.destination;
         desired.deskIndex=deskIndex;
-        if(!before) desired.provisional=true;
         MarkSeen(desired,nowUtc);
 
         RecordDelta delta;
@@ -1223,33 +1358,33 @@ static bool PersistPickerMovedWindow(const MoveResult& result,
         delta.baseRecordPresent=before!=nullptr;
         if(before) delta.baseRecord=*before;
         delta.changedUtc=nowUtc;
-        delta.causalGeneration=result.token.operationId;
+        delta.causalGeneration=transition.reservationToken.operationId;
         std::vector<LayoutWin> stagedRecords;
         std::map<std::string,RecordDelta> stagedDeltas;
         std::map<std::string,DeferredRecordConflict> stagedConflicts;
         if(StageRecordDeltaMutation(
-                g_autoRecords,g_dirtyRecordDeltas,g_deferredRecordConflicts,
-                delta,true,stagedRecords,stagedDeltas,stagedConflicts)!=
-           RecordDeltaStageResult::Accepted) return false;
+                g_autoRecords,g_dirtyRecordDeltas,
+                g_deferredRecordConflicts,delta,true,stagedRecords,
+                stagedDeltas,stagedConflicts)!=
+           RecordDeltaStageResult::Accepted){
+            result.failure=PopupSaveFailure::StageRejected;
+            return result;
+        }
 
         std::map<std::string,ValidatedRecordTouch> stagedTouches=
             g_validatedTouches;
         ValidatedRecordTouch touch;
         touch.recordId=recordId;
         touch.lastSeenUtc=desired.lastSeenUtc;
-        touch.causalGeneration=result.token.operationId;
-        auto previousTouch=stagedTouches.find(recordId);
-        if(previousTouch==stagedTouches.end() ||
-           previousTouch->second.lastSeenUtc<touch.lastSeenUtc)
-            stagedTouches[recordId]=touch;
-
+        touch.causalGeneration=transition.reservationToken.operationId;
+        stagedTouches[recordId]=touch;
         std::map<std::string,RuntimeRecordBinding> stagedBindings=
             g_recordByRuntime;
         RuntimeRecordBinding binding;
         binding.app=app;
         binding.recordId=recordId;
         binding.identity=identity;
-        binding.causalGeneration=result.token.operationId;
+        binding.causalGeneration=transition.reservationToken.operationId;
         stagedBindings[runtimeKey]=binding;
         std::map<std::string,std::string> stagedPending=
             g_pendingRecordByRuntime;
@@ -1258,11 +1393,11 @@ static bool PersistPickerMovedWindow(const MoveResult& result,
         stagedPending.erase(runtimeKey);
         stagedProvisional.erase(runtimeKey);
 
-        // Staging may allocate.  Recheck the full HWND/PID/process-start
-        // identity at the no-throw publication boundary so a reused HWND can
-        // never inherit the browser record prepared for its predecessor.
         if(RecaptureGenericWindowIdentity(identity)!=
-           WindowIdentityRecapture::Match) return false;
+           WindowIdentityRecapture::Match){
+            result.failure=PopupSaveFailure::IdentityChanged;
+            return result;
+        }
         g_autoRecords.swap(stagedRecords);
         g_dirtyRecordDeltas.swap(stagedDeltas);
         g_deferredRecordConflicts.swap(stagedConflicts);
@@ -1273,8 +1408,26 @@ static bool PersistPickerMovedWindow(const MoveResult& result,
         g_dirtyFlush.setConflict(!g_deferredRecordConflicts.empty(),
                                  MonotonicNowMs());
         MarkAutoDirty(false);
-        return FlushAutoLayout(true);
-    } catch(...) { return false; }
+        // The exact record/delta/binding publication is already durable in
+        // memory here.  Mark the accepted-plan claim before the flush so a
+        // write failure remains queued ownership and cannot be mistaken for
+        // a pre-Save cancellation.  This uses the already captured runtime
+        // key and record ID, so the terminal outcome does not depend on a
+        // later allocating identity lookup.
+        MarkPickerOperationClaimsPublished(runtimeKey,recordId);
+        if(!FlushAutoLayout(true)){
+            result.failure=PopupSaveFailure::FlushFailed;
+            return result;
+        }
+        result.status=PopupSaveStatus::Saved;
+        result.failure=PopupSaveFailure::None;
+        return result;
+    } catch(...) {
+        result.status=PopupSaveStatus::Failed;
+        if(result.failure==PopupSaveFailure::None)
+            result.failure=PopupSaveFailure::Unexpected;
+        return result;
+    }
 }
 
 static void MarkAppMissingFromLastSeen(const std::string& app,UnixSeconds nowUtc,
@@ -1351,22 +1504,41 @@ static void PruneStaleRuntimeState(
     }
 }
 
+static bool ReconcileFastHasUsableAcceptedFresh(
+        const ReconcileResult& result,size_t fastIndex) noexcept;
+
 static std::set<std::string> UpdateBoundRecords(
         const std::string& app,const AppFastSnapshot& snapshot,
-        const std::vector<LayoutWin>& live,ReconcileFreshness freshness,
-        UnixSeconds nowUtc){
+        const ReconcileResult& result,UnixSeconds nowUtc){
     std::set<std::string> reserved;
-    for(size_t index=0;index<snapshot.windows.size() && index<live.size();++index){
+    for(size_t index=0;
+        index<snapshot.windows.size() && index<result.live.size();++index){
         const FastWin& fast=snapshot.windows[index];
         const std::string runtime=RuntimeKey(fast);
+        auto pickerReservation=g_reservedAutoIdentities.find(runtime);
+        if(pickerReservation!=g_reservedAutoIdentities.end() &&
+           pickerReservation->second.token.owner==MoveOwner::Picker &&
+           SameIdentity(pickerReservation->second.identity,
+                        IdentityOf(fast))){
+            if(!pickerReservation->second.recordId.empty())
+                reserved.insert(pickerReservation->second.recordId);
+            continue;
+        }
         auto binding=g_recordByRuntime.find(runtime);
         if(binding==g_recordByRuntime.end() || binding->second.app!=app ||
            !SameIdentity(binding->second.identity,IdentityOf(fast))) continue;
         const LayoutWin* existing=FindAutoRecord(binding->second.recordId);
         if(!existing){ g_recordByRuntime.erase(binding); continue; }
         const std::string recordId=existing->recordId;
+        const ReconcileFreshness rowFreshness=
+            PickerRowUsesFreshFingerprint(
+                result.freshness==ReconcileFreshness::Fresh,
+                ReconcileFastHasUsableAcceptedFresh(result,index))
+                ? ReconcileFreshness::Fresh
+                : ReconcileFreshness::CachedStale;
         if(!CommitBoundRecordRefresh(
-                *existing,fast,live[index],freshness,nowUtc,runtime,
+                *existing,fast,result.live[index],rowFreshness,
+                nowUtc,runtime,
                 g_provisionalRecordByRuntime,[&](const LayoutWin& desired){
                     return UpsertAutoRecord(
                         desired,RecordDeltaKind::ValidatedRuntimeUpsert,
@@ -1377,6 +1549,57 @@ static std::set<std::string> UpdateBoundRecords(
         g_pendingRecordByRuntime.erase(runtime);
     }
     return reserved;
+}
+
+static bool ReconcileFastHasUsableAcceptedFresh(
+        const ReconcileResult& result,size_t fastIndex) noexcept {
+    if(result.status!=ReconcileResultStatus::Completed ||
+       result.workMode!=ReconcileWorkMode::PrepareLiveOnly ||
+       !result.buildLiveFromInputs || result.app.empty() ||
+       result.identityGeneration==0 ||
+       fastIndex>=result.fastWindows.size() ||
+       fastIndex>=result.live.size()) return false;
+    const WindowIdentityKey identity=IdentityOf(result.fastWindows[fastIndex]);
+    const WinFp* session=ReconcileSessionForFast(result,fastIndex);
+    const LayoutWin& live=result.live[fastIndex];
+    const bool associationMatches=session && live.tabCount>=0 &&
+        live.activeDomain==session->activeDomain &&
+        live.tabCount==session->tabCount && live.counts==session->counts &&
+        (session->activeTitle.empty() ||
+         live.activeTitle==session->activeTitle);
+    return PickerAcceptedFreshRowUsable(
+        result.freshness==ReconcileFreshness::Fresh,
+        associationMatches,identity,live.app==result.app,
+        live.activeTitle,live.counts);
+}
+
+static bool RememberAcceptedFreshRuntimeRecords(
+        const ReconcileResult& result) noexcept {
+    if(result.app.empty() || result.identityGeneration==0 ||
+       result.fastWindows.size()!=result.live.size() ||
+       result.fastWindows.size()!=result.sessionIndexByFast.size())
+        return false;
+    try {
+        std::map<std::string,AcceptedFreshRuntime> staged=
+            g_acceptedFreshByRuntime;
+        for(auto it=staged.begin();it!=staged.end();){
+            if(it->second.record.app==result.app) it=staged.erase(it);
+            else ++it;
+        }
+        for(size_t index=0;index<result.fastWindows.size();++index){
+            if(!ReconcileFastHasUsableAcceptedFresh(result,index)) continue;
+            const WindowIdentityKey identity=
+                IdentityOf(result.fastWindows[index]);
+            AcceptedFreshRuntime accepted;
+            accepted.identity=identity;
+            accepted.identityGeneration=result.identityGeneration;
+            accepted.record=result.live[index];
+            accepted.record.app=result.app;
+            staged[RuntimeKey(identity)]=std::move(accepted);
+        }
+        g_acceptedFreshByRuntime.swap(staged);
+        return true;
+    } catch(...) { return false; }
 }
 
 static bool SaveObservedApp(const std::string& app,
@@ -1527,7 +1750,7 @@ static bool SessionOwnerForPurpose(SessionPurpose purpose,
     return false;
 }
 
-static void CancelAutoOperation(uint64_t operationId,bool rearm);
+static void CancelAutoOperation(uint64_t operationId,bool rearm) noexcept;
 static void CancelManualSaveOperation(uint64_t operationId);
 static void CancelManualMoveOperation(uint64_t operationId);
 static void FinishManualSave(uint64_t operationId);
@@ -1541,9 +1764,26 @@ static void ProcessSessionRetirements(
 static void RetireReconcileOperation(uint64_t operationId);
 static void CancelExpiredReconcileOperations(uint64_t nowMs);
 
+static void SchedulePickerTabSearchRetry(
+        const std::string* freedApp=nullptr) noexcept {
+    if(freedApp)
+        NotePickerTabSearchRouteFreed(
+            g_pickerTabSearchCache,*freedApp);
+    if(!g_main || !PickerTabSearchRetryPostNeeded(
+            g_pickerTabSearchCache,g_picker.modelGeneration,
+            g_picker.searchText)) return;
+    if(PostMessageW(g_main,WM_PICKER_SEARCH_RETRY,0,0))
+        MarkPickerTabSearchRetryPosted(
+            g_pickerTabSearchCache,g_picker.modelGeneration,
+            g_picker.searchText);
+}
+
 static uint64_t RequestSessionWork(AsyncOperationOwner owner,uint64_t operationId,
         const AppProfile& profile,const AppFastSnapshot& snapshot,
-        SessionPurpose purpose){
+        SessionPurpose purpose,
+        PickerTabSearchRetryTrigger* searchRetryTrigger=nullptr){
+    if(searchRetryTrigger)
+        *searchRetryTrigger=PickerTabSearchRetryTrigger::Immediate;
     SessionPurpose ownerPurpose=SessionPurpose::MetadataProbe;
     if(!g_sessionWorker || !g_main || operationId==0 ||
        snapshot.identityGeneration==0 ||
@@ -1576,8 +1816,18 @@ static uint64_t RequestSessionWork(AsyncOperationOwner owner,uint64_t operationI
     gated.identityGeneration=snapshot.identityGeneration;
     gated.deadlineMs=route.deadlineMs;
     std::vector<AsyncSessionRetirement> retired;
-    if(g_sessionRouteGate.submit(gated,now,retired)!=
-       AsyncRouteAdmission::Accepted) return 0;
+    const AsyncRouteAdmission admission=
+        g_sessionRouteGate.submit(gated,now,retired);
+    if(admission!=AsyncRouteAdmission::Accepted){
+        if(searchRetryTrigger){
+            if(admission==AsyncRouteAdmission::RejectedProtected)
+                *searchRetryTrigger=
+                    PickerTabSearchRetryTrigger::ExactAppRoute;
+            else if(admission==AsyncRouteAdmission::RejectedCapacity)
+                *searchRetryTrigger=PickerTabSearchRetryTrigger::AnyRoute;
+        }
+        return 0;
+    }
     ProcessSessionRetirements(retired);
 
     try {
@@ -1632,6 +1882,9 @@ static void DispatchMoveResult(const MoveResult& result,
                                bool consumeCheckpointWhileProtected);
 static void AdvanceMoveQueue();
 static void FinishAutoOperation(uint64_t operationId);
+static bool QueueAutoMove(AutoRestoreOperation& operation,
+                          const ReconcileResult& result,
+                          const RestoreRequest& restore);
 static void FinishManualMove(uint64_t operationId);
 static bool ExecuteCheckpoint(CheckpointReason reason);
 
@@ -1719,13 +1972,13 @@ static bool CancelMoveJobOrDefer(uint64_t jobId){
     return cancelled.completed;
 }
 
-static void CancelAutoOperation(uint64_t operationId,bool rearm){
-    g_reconcileDeadlines.cancel(operationId);
+static void CancelAutoOperation(uint64_t operationId,bool rearm) noexcept {
+    try { g_reconcileDeadlines.cancel(operationId); } catch(...) {}
     auto found=g_pendingAutoOperations.find(operationId);
     if(found==g_pendingAutoOperations.end()) return;
     if(found->second.cancellationPending){
         RefreshMoveCancellationPending();
-        ScheduleMoveCancellationRetry();
+        try { ScheduleMoveCancellationRetry(); } catch(...) {}
         return;
     }
     const uint64_t lifecycleGeneration=found->second.lifecycleGeneration;
@@ -1741,18 +1994,27 @@ static void CancelAutoOperation(uint64_t operationId,bool rearm){
             if(runtime!=g_moveRuntime.end()) runtime->second.cancelRequested=true;
         });
     RefreshMoveCancellationPending();
+    if(state!=g_lifecycleByApp.end()){
+        try {
+            LcCancelRestore(state->second,lifecycleGeneration,
+                            MonotonicNowMs(),rearm);
+        } catch(...) {}
+    }
     found->second.reconcile.reset();
     found->second.reconcileFast.clear();
-    RetireSessionRoutesForOperation(
-        AsyncOperationOwner::AutoReconcile,operationId);
-    if(state!=g_lifecycleByApp.end())
-        LcCancelRestore(state->second,lifecycleGeneration,MonotonicNowMs(),rearm);
+    try {
+        RetireSessionRoutesForOperation(
+            AsyncOperationOwner::AutoReconcile,operationId);
+    } catch(...) {}
     for(size_t index=0;index<jobCount;++index)
-        CancelMoveJobOrDefer(jobIds[index]);
+        try { CancelMoveJobOrDefer(jobIds[index]); } catch(...) {}
     found=g_pendingAutoOperations.find(operationId);
     if(found!=g_pendingAutoOperations.end() && found->second.liveJobIds.empty())
         g_pendingAutoOperations.erase(found);
 }
+
+static_assert(noexcept(CancelAutoOperation(uint64_t{},true)),
+    "automatic cancellation must not escape WndProc");
 
 static void CancelExpiredSessionRoutes(uint64_t nowMs){
     std::vector<AsyncSessionRetirement> retired;
@@ -1911,28 +2173,25 @@ static MoveAttemptOutcome ReadMoveDestination(const MoveRuntimeBinding& binding,
         : MoveAttemptOutcome::PermanentFailure;
 }
 
-static bool CancelNextMoveAfterArmFailure(){
+static bool CancelNextMoveAfterArmFailure() noexcept {
     const MoveJob* front=g_moveQueue.front();
     if(!front){ RefreshMoveCancellationPending(); return true; }
     const uint64_t jobId=front->token.jobId;
     auto runtime=g_moveRuntime.find(jobId);
     if(runtime!=g_moveRuntime.end() && !runtime->second.cancelRequested)
         return false;
-    MoveResult cancelled;
-    if(!TryCancelQueuedMove(jobId,cancelled)){
+    bool cancellationPublished=false;
+    try { cancellationPublished=CancelMoveJobOrDefer(jobId); }
+    catch(...) { cancellationPublished=false; }
+    if(!cancellationPublished){
         RefreshMoveCancellationPending();
         return false;
-    }
-    try { DispatchMoveResult(cancelled); }
-    catch(...) {
-        // DispatchMoveResult settles runtime/reservation ownership before an
-        // owner callback is allowed to escape.
     }
     RefreshMoveCancellationPending();
     return g_moveQueue.empty();
 }
 
-static bool ArmMoveTimer(){
+static bool ArmMoveTimer() noexcept {
     if(g_moveQueue.empty()) return true;
     try {
         if(g_main && SetTimer(g_main,TIMER_MOVE_VERIFY,
@@ -1942,19 +2201,35 @@ static bool ArmMoveTimer(){
     // No timer means no queued job may Issue.  Mark every retained runtime
     // first, cancel at most one synchronously, then rearm/post bounded retry
     // work so allocation failure preserves coherent guarded ownership.
-    for(auto& runtime : g_moveRuntime) runtime.second.cancelRequested=true;
+    for(auto& runtime : g_moveRuntime){
+        runtime.second.cancelRequested=true;
+        runtime.second.timerArmFailureCancellation=true;
+    }
     RefreshMoveCancellationPending();
-    const MoveArmFailureCleanup cleanup=RecoverMoveArmFailure(
-        [](){ return CancelNextMoveAfterArmFailure(); },
-        [](){ return ScheduleMoveCancellationRetry(); });
-    if(cleanup==MoveArmFailureCleanup::Completed)
-        ReportStorageError(L"Window-move verification could not be started; queued moves were cancelled safely.");
-    else if(cleanup==MoveArmFailureCleanup::Rearmed)
-        ReportStorageError(L"Window-move verification could not be started; queued moves are being cancelled safely.");
-    else
-        ReportStorageError(L"Window-move verification could not be started; queued moves remain protected and cancellation will retry on the next move request.");
+    MoveArmFailureCleanup cleanup=MoveArmFailureCleanup::Unresolved;
+    try {
+        if(CancelNextMoveAfterArmFailure())
+            cleanup=MoveArmFailureCleanup::Completed;
+    } catch(...) {}
+    if(cleanup==MoveArmFailureCleanup::Unresolved){
+        try {
+            if(ScheduleMoveCancellationRetry())
+                cleanup=MoveArmFailureCleanup::Rearmed;
+        } catch(...) {}
+    }
+    try {
+        if(cleanup==MoveArmFailureCleanup::Completed)
+            ReportStorageError(L"Window-move verification could not be started; queued moves were cancelled safely.");
+        else if(cleanup==MoveArmFailureCleanup::Rearmed)
+            ReportStorageError(L"Window-move verification could not be started; queued moves are being cancelled safely.");
+        else
+            ReportStorageError(L"Window-move verification could not be started; queued moves remain protected and cancellation will retry on the next move request.");
+    } catch(...) {}
     return false;
 }
+
+static_assert(noexcept(ArmMoveTimer()),
+    "move-timer arm failure recovery must not escape WndProc");
 
 static bool HandleIndeterminateMoveIdentity(
         uint64_t jobId,MoveRuntimeBinding& runtime,
@@ -1985,7 +2260,10 @@ static void AdvanceMoveQueue(){
         if(TryCancelQueuedMove(jobId,cancelled)) DispatchMoveResult(cancelled);
         return;
     }
-    if(runtime->second.cancelRequested){
+    if(ShouldCancelMoveBeforeIssuedReadback(
+            runtime->second.cancelRequested,
+            runtime->second.retireAfterVerify,
+            g_moveQueue.nextAction()==MoveAction::Verify)){
         MoveResult cancelled;
         if(TryCancelQueuedMove(jobId,cancelled)){
             try { DispatchMoveResult(cancelled); }
@@ -2068,23 +2346,140 @@ static bool ReleaseMoveReservation(const MoveResult& result){
 }
 
 static bool ConsumeCheckpointAndReleaseMoveReservation(
-        const MoveResult& result){
-    auto reserved=g_reservedAutoIdentities.find(result.runtimeKey);
-    if(reserved==g_reservedAutoIdentities.end() ||
-       !SameMoveToken(reserved->second.token,result.token)) return false;
+        const MoveToken& token,const std::string& runtimeKey){
+    const auto tokenStillReserved=[&]() noexcept {
+        for(const auto& reservation : g_reservedAutoIdentities)
+            if(SameMoveToken(reservation.second.token,token)) return true;
+        return false;
+    };
+    auto reserved=g_reservedAutoIdentities.find(runtimeKey);
+    PickerTerminalGuardReleaseAction release=
+        DecidePickerTerminalGuardRelease(
+            reserved!=g_reservedAutoIdentities.end(),
+            reserved!=g_reservedAutoIdentities.end() &&
+                SameMoveToken(reserved->second.token,token),
+            tokenStillReserved());
+    if(release==PickerTerminalGuardReleaseAction::ResolvedAbsent)
+        return true;
+    if(release!=PickerTerminalGuardReleaseAction::ConsumeExact)
+        return false;
     const bool lastReservation=g_reservedAutoIdentities.size()==1;
     g_checkpointController.acknowledgeReservationBeforeRelease(
         true,lastReservation,g_autoFix && !g_degraded,g_autoLoaded,
         [](CheckpointReason reason){ return ExecuteCheckpoint(reason); });
     // The checkpoint callback must observe the guard.  Re-find afterward so
     // cleanup stays safe even if injected code altered the reservation map.
-    reserved=g_reservedAutoIdentities.find(result.runtimeKey);
-    if(reserved!=g_reservedAutoIdentities.end() &&
-       SameMoveToken(reserved->second.token,result.token)){
+    reserved=g_reservedAutoIdentities.find(runtimeKey);
+    release=DecidePickerTerminalGuardRelease(
+        reserved!=g_reservedAutoIdentities.end(),
+        reserved!=g_reservedAutoIdentities.end() &&
+            SameMoveToken(reserved->second.token,token),
+        tokenStillReserved());
+    if(release==PickerTerminalGuardReleaseAction::ResolvedAbsent)
+        return true;
+    if(release==PickerTerminalGuardReleaseAction::ConsumeExact){
         g_reservedAutoIdentities.erase(reserved);
         return true;
     }
     return false;
+}
+
+static bool ConsumeCheckpointAndReleaseMoveReservation(
+        const MoveResult& result){
+    return ConsumeCheckpointAndReleaseMoveReservation(
+        result.token,result.runtimeKey);
+}
+
+enum class PickerClaimRearmAttempt {
+    None, MoveQueued, RetryOperation
+};
+
+static PickerClaimRearmAttempt RearmUnpublishedPickerClaimRestores(
+        AutoRestoreOperation& operation) noexcept {
+    if(!operation.reconcile ||
+       operation.pickerClaimedRecordByRuntime.empty())
+        return PickerClaimRearmAttempt::None;
+    bool rearmed=false;
+    try {
+        const ReconcileResult& result=*operation.reconcile;
+        for(auto claim=operation.pickerClaimedRecordByRuntime.begin();
+            claim!=operation.pickerClaimedRecordByRuntime.end();){
+            const bool recordCurrentlyExists=
+                FindAutoRecord(claim->second.recordId)!=nullptr;
+            const RestoreRequest* selected=nullptr;
+            bool ambiguous=false;
+            for(const RestoreRequest& restore : result.plan.restores){
+                if(restore.savedIndex>=result.saved.size() ||
+                   restore.liveIndex>=operation.reconcileFast.size() ||
+                   operation.successfulLive.succeeded(restore.liveIndex) ||
+                   result.saved[restore.savedIndex].recordId!=
+                       claim->second.recordId ||
+                   RuntimeKey(operation.reconcileFast[restore.liveIndex])!=
+                       claim->first) continue;
+                if(selected){
+                    selected=nullptr;
+                    ambiguous=true;
+                    break;
+                }
+                selected=&restore;
+            }
+            if(ambiguous) return PickerClaimRearmAttempt::RetryOperation;
+            const PickerOperationLifetimeClaimReleaseAction action=
+                DecidePickerOperationLifetimeClaimRelease(
+                    claim->second,recordCurrentlyExists,
+                    selected!=nullptr && !ambiguous);
+            if(action==
+                    PickerOperationLifetimeClaimReleaseAction::ProtectPublished){
+                ++claim;
+                continue;
+            }
+            if(action==
+                    PickerOperationLifetimeClaimReleaseAction::RearmOperation){
+                ObservePickerOperationClaimQueuePublication(
+                    operation.pickerClaimRearm,false);
+                return PickerClaimRearmAttempt::RetryOperation;
+            }
+            if(action!=
+                    PickerOperationLifetimeClaimReleaseAction::RearmRestore){
+                claim=operation.pickerClaimedRecordByRuntime.erase(claim);
+                continue;
+            }
+            const bool queuePublished=selected &&
+                QueueAutoMove(operation,result,*selected);
+            if(ObservePickerOperationClaimQueuePublication(
+                    operation.pickerClaimRearm,queuePublished)==
+                    PickerOperationClaimQueueAction::
+                        RetainClaimAndRearmOperation)
+                return PickerClaimRearmAttempt::RetryOperation;
+            claim=operation.pickerClaimedRecordByRuntime.erase(claim);
+            rearmed=true;
+        }
+    } catch(...) {
+        ObservePickerOperationClaimQueuePublication(
+            operation.pickerClaimRearm,false);
+        return PickerClaimRearmAttempt::RetryOperation;
+    }
+    if(rearmed){
+        // Arm failure can synchronously cancel a queued restore.  Publish the
+        // retry-wave intent before that reentrant boundary so Cancelled can
+        // never complete the accepted operation as Success.
+        const uint64_t operationId=operation.operationId;
+        BeginPickerOperationClaimMoveArm(operation.pickerClaimRearm);
+        const bool armed=ArmMoveTimer();
+        auto current=g_pendingAutoOperations.find(operationId);
+        const PickerRearmedMoveArmAction armAction=
+            current!=g_pendingAutoOperations.end()
+                ? CompletePickerOperationClaimMoveArm(
+                    current->second.pickerClaimRearm,armed)
+                : DecidePickerRearmedMoveArmResult(armed);
+        if(armAction==
+                PickerRearmedMoveArmAction::RearmOperation){
+            CancelAutoOperation(operationId,true);
+            return PickerClaimRearmAttempt::RetryOperation;
+        }
+    }
+    return rearmed ? PickerClaimRearmAttempt::MoveQueued
+                   : PickerClaimRearmAttempt::None;
 }
 
 static void FinishAutoOperation(uint64_t operationId){
@@ -2095,8 +2490,27 @@ static void FinishAutoOperation(uint64_t operationId){
             g_pendingAutoOperations.erase(found);
         return;
     }
-    if(found==g_pendingAutoOperations.end() || found->second.outstanding!=0) return;
+    if(found==g_pendingAutoOperations.end()) return;
+    if(PickerOperationClaimRearmRequiresRetry(
+            found->second.pickerClaimRearm)){
+        CancelAutoOperation(operationId,true);
+        return;
+    }
+    if(found->second.outstanding!=0) return;
     AutoRestoreOperation& operation=found->second;
+    for(const auto& claim : operation.pickerClaimedRecordByRuntime){
+        auto reservation=g_reservedAutoIdentities.find(claim.first);
+        if(reservation!=g_reservedAutoIdentities.end() &&
+           reservation->second.token.owner==MoveOwner::Picker)
+            return;
+    }
+    const PickerClaimRearmAttempt pickerRearm=
+        RearmUnpublishedPickerClaimRestores(operation);
+    if(pickerRearm==PickerClaimRearmAttempt::RetryOperation){
+        CancelAutoOperation(operationId,true);
+        return;
+    }
+    if(pickerRearm==PickerClaimRearmAttempt::MoveQueued) return;
     g_reconcileDeadlines.cancel(operationId);
     auto lifecycle=g_lifecycleByApp.find(operation.app);
     RunTerminalCompletionOrFail([&](){
@@ -2124,12 +2538,51 @@ static void FinishAutoOperation(uint64_t operationId){
             result.saved,result.live,result.plan,
             successfulLiveIndices,result.plan.nowUtc);
     std::map<std::string,LayoutWin> baseById,committedById;
+    std::set<std::string> pickerProtectedRecordIds;
+    std::set<std::string> pickerProtectedClaimRuntimes;
+    for(const auto& claim : operation.pickerClaimedRecordByRuntime){
+        const bool recordCurrentlyExists=
+            FindAutoRecord(claim.second.recordId)!=nullptr;
+        if(PickerOperationLifetimeClaimMustProtect(
+                claim.second,recordCurrentlyExists)){
+            pickerProtectedRecordIds.insert(claim.second.recordId);
+            pickerProtectedClaimRuntimes.insert(claim.first);
+        }
+    }
+    for(const auto& reservation : g_reservedAutoIdentities)
+        if(reservation.second.token.owner==MoveOwner::Picker &&
+           reservation.second.app==operation.app &&
+           !reservation.second.recordId.empty())
+            pickerProtectedRecordIds.insert(reservation.second.recordId);
+    for(const LayoutMatch& match : result.plan.matches){
+        if(match.savedIndex>=result.saved.size() ||
+           match.liveIndex>=operation.reconcileFast.size()) continue;
+        const FastWin& fast=operation.reconcileFast[match.liveIndex];
+        auto reservation=g_reservedAutoIdentities.find(RuntimeKey(fast));
+        if(reservation!=g_reservedAutoIdentities.end() &&
+           reservation->second.token.owner==MoveOwner::Picker &&
+           SameIdentity(reservation->second.identity,IdentityOf(fast)) &&
+           !result.saved[match.savedIndex].recordId.empty())
+            pickerProtectedRecordIds.insert(
+                result.saved[match.savedIndex].recordId);
+    }
+    for(const NewRecordRequest& created : result.plan.newRecords){
+        if(created.liveIndex>=operation.reconcileFast.size() ||
+           created.recordId.empty()) continue;
+        const FastWin& fast=operation.reconcileFast[created.liveIndex];
+        auto reservation=g_reservedAutoIdentities.find(RuntimeKey(fast));
+        if(reservation!=g_reservedAutoIdentities.end() &&
+           reservation->second.token.owner==MoveOwner::Picker &&
+           SameIdentity(reservation->second.identity,IdentityOf(fast)))
+            pickerProtectedRecordIds.insert(created.recordId);
+    }
     for(const LayoutWin& record : result.saved)
         if(record.app==operation.app) baseById[record.recordId]=record;
     for(const LayoutWin& record : committed)
         if(record.app==operation.app) committedById[record.recordId]=record;
 
     for(const auto& entry : baseById){
+        if(pickerProtectedRecordIds.count(entry.first)!=0) continue;
         if(committedById.count(entry.first)!=0) continue;
         const LayoutWin* current=FindAutoRecord(entry.first);
         if(current && SameRecordForDelta(*current,entry.second))
@@ -2137,6 +2590,7 @@ static void FinishAutoOperation(uint64_t operationId){
                             nowUtc,operation.contentGeneration);
     }
     for(const auto& entry : committedById){
+        if(pickerProtectedRecordIds.count(entry.first)!=0) continue;
         auto base=baseById.find(entry.first);
         if(base!=baseById.end() &&
            SameRecordForDelta(base->second,entry.second)) continue;
@@ -2155,6 +2609,15 @@ static void FinishAutoOperation(uint64_t operationId){
            match.liveIndex>=operation.reconcileFast.size()) continue;
         const FastWin& fast=operation.reconcileFast[match.liveIndex];
         const std::string runtime=RuntimeKey(fast);
+        if(pickerProtectedClaimRuntimes.count(runtime)!=0 &&
+           PickerOperationLifetimeClaimMatches(
+               operation.pickerClaimedRecordByRuntime,IdentityOf(fast),
+               result.saved[match.savedIndex].recordId)) continue;
+        auto pickerReservation=g_reservedAutoIdentities.find(runtime);
+        if(pickerReservation!=g_reservedAutoIdentities.end() &&
+           pickerReservation->second.token.owner==MoveOwner::Picker &&
+           SameIdentity(pickerReservation->second.identity,
+                        IdentityOf(fast))) continue;
         const bool required=restoreIndices.count(match.liveIndex)!=0;
         const bool succeeded=!required ||
             operation.successfulLive.succeeded(match.liveIndex);
@@ -2174,6 +2637,16 @@ static void FinishAutoOperation(uint64_t operationId){
     for(const NewRecordRequest& created : result.plan.newRecords){
         if(created.liveIndex>=operation.reconcileFast.size()) continue;
         const FastWin& fast=operation.reconcileFast[created.liveIndex];
+        if(pickerProtectedClaimRuntimes.count(RuntimeKey(fast))!=0 &&
+           PickerOperationLifetimeClaimMatches(
+               operation.pickerClaimedRecordByRuntime,IdentityOf(fast),
+               created.recordId)) continue;
+        auto pickerReservation=g_reservedAutoIdentities.find(
+            RuntimeKey(fast));
+        if(pickerReservation!=g_reservedAutoIdentities.end() &&
+           pickerReservation->second.token.owner==MoveOwner::Picker &&
+           SameIdentity(pickerReservation->second.identity,
+                        IdentityOf(fast))) continue;
         RuntimeRecordBinding binding;
         binding.app=operation.app;
         binding.recordId=created.recordId;
@@ -2206,6 +2679,27 @@ static void FinishAutoOperation(uint64_t operationId){
     g_pendingAutoOperations.erase(found);
 }
 
+static void FinishAutoOperationsClaimedByPicker(
+        const std::string& runtimeKey) noexcept {
+    if(runtimeKey.empty()) return;
+    try {
+        bool haveCursor=false;
+        uint64_t cursor=0;
+        for(;;){
+            auto operation=PickerOperationCursorNext(
+                g_pendingAutoOperations,haveCursor,cursor);
+            if(operation==g_pendingAutoOperations.end()) break;
+            const uint64_t operationId=operation->first;
+            const bool ready=operation->second.outstanding==0 &&
+                operation->second.pickerClaimedRecordByRuntime.count(
+                    runtimeKey)!=0;
+            cursor=operationId;
+            haveCursor=true;
+            if(ready) FinishAutoOperation(operationId);
+        }
+    } catch(...) {}
+}
+
 static void DispatchMoveOwnerResult(const MoveResult& result,bool hadRuntime,
                                     MoveRuntimeBinding& runtime){
     if(result.token.owner==MoveOwner::AutoReconcile){
@@ -2216,6 +2710,13 @@ static void DispatchMoveOwnerResult(const MoveResult& result,bool hadRuntime,
         if(operation->second.cancellationPending){
             if(operation->second.liveJobIds.empty())
                 g_pendingAutoOperations.erase(operation);
+            return;
+        }
+        if(result.terminal==MoveTerminal::Cancelled && hadRuntime &&
+           DecidePickerAutoCancelledMoveOwnerAction(
+               runtime.timerArmFailureCancellation)==
+               PickerAutoCancelledMoveOwnerAction::RearmOperation){
+            CancelAutoOperation(result.token.operationId,true);
             return;
         }
         if(result.terminal==MoveTerminal::Succeeded){
@@ -2253,70 +2754,6 @@ static void DispatchMoveOwnerResult(const MoveResult& result,bool hadRuntime,
         return;
     }
 
-    if(result.token.owner==MoveOwner::Picker){
-        auto operation=g_pickerOperations.find(result.token.operationId);
-        if(operation==g_pickerOperations.end() ||
-           operation->second.liveJobIds.erase(result.token.jobId)==0) return;
-        PopupPersistenceResult persistence=PopupPersistenceResult::NotTracked;
-        std::string persistedApp;
-        if(result.terminal==MoveTerminal::Succeeded){
-            if(!hadRuntime){
-                persistence=PopupPersistenceResult::IdentityIndeterminate;
-            } else {
-                const WindowIdentityKey expected=IdentityOf(runtime.window);
-                persistence=CompletePopupMovePersistence(
-                    expected,
-                    [](const WindowIdentityKey& identity){
-                        return RecaptureGenericWindowIdentity(identity);
-                    },
-                    [&](const WindowIdentityKey& identity){
-                        return ClassifyTrackedBrowserWindow(identity,persistedApp);
-                    },
-                    [](){
-                        if(!g_autoLoaded)
-                            return PopupPersistenceReadiness::Unavailable;
-                        if(!g_autoWritesAllowed || !g_autoFix || g_degraded)
-                            return PopupPersistenceReadiness::ReadOnly;
-                        return PopupPersistenceReadiness::Ready;
-                    },
-                    [&](){
-                        return PersistPickerMovedWindow(
-                            result,runtime,persistedApp);
-                    });
-            }
-        }
-        if(persistence==PopupPersistenceResult::Saved &&
-           operation->second.app==persistedApp){
-            CompletePopupLifecycleAfterPersistence(persistence,[&]{
-                auto lifecycle=g_lifecycleByApp.find(operation->second.app);
-                if(lifecycle!=g_lifecycleByApp.end())
-                    LcExplicitSaveCompleted(
-                        lifecycle->second,
-                        operation->second.lifecycleSaveGeneration,
-                        operation->second.lifecycleLayoutSignature,
-                        operation->second.lifecycleSessionSignature,
-                        MonotonicNowMs());
-            });
-        }
-        if(operation->second.liveJobIds.empty()){
-            const bool mayReport=!operation->second.completionReported;
-            g_pickerOperations.erase(operation);
-            if(!mayReport) return;
-            if(result.terminal!=MoveTerminal::Succeeded)
-                Balloon(L"The window could not be moved to that desktop.");
-            else if(persistence==PopupPersistenceResult::IdentityLost ||
-                    persistence==PopupPersistenceResult::IdentityIndeterminate)
-                Balloon(L"The window moved, but its identity changed before the browser layout could be saved.");
-            else if(persistence==PopupPersistenceResult::ClassificationFailed)
-                Balloon(L"The window moved, but browser classification failed and its layout was not saved.");
-            else if(persistence==PopupPersistenceResult::StorageUnavailable)
-                Balloon(L"The window moved, but automatic layout storage is unavailable and the destination was not saved.");
-            else if(persistence==PopupPersistenceResult::StorageReadOnly)
-                Balloon(L"The window moved, but automatic layout storage is read-only or disabled and the destination was not saved.");
-            else if(persistence==PopupPersistenceResult::SaveFailed)
-                Balloon(L"The window moved, but its browser destination could not be saved; the change remains pending for retry.");
-        }
-    }
 }
 
 static void FinalizeMoveReservation(const MoveResult& result,
@@ -2370,14 +2807,6 @@ static void RetireMoveOwnerDispatchFailure(const MoveResult& result) noexcept {
             if(operation->second.outstanding==0)
                 FinishManualMove(result.token.operationId);
             return;
-        }
-        auto operation=g_pickerOperations.find(result.token.operationId);
-        if(operation==g_pickerOperations.end()) return;
-        operation->second.liveJobIds.erase(result.token.jobId);
-        if(operation->second.liveJobIds.empty()){
-            const bool report=!operation->second.completionReported;
-            g_pickerOperations.erase(operation);
-            if(report) Balloon(L"The window move completed, but its result could not be processed safely.");
         }
     } catch(...) {}
 }
@@ -2543,12 +2972,14 @@ static void HandleSessionResult(std::unique_ptr<SessionResult> result){
             expected.identityGeneration,reason,retired)){
         g_sessionRoutes.erase(route);
         RetireAsyncSessionOperation(expected,AsyncRetirementReason::Failed);
+        SchedulePickerTabSearchRetry(&expected.app);
         return;
     }
     g_sessionRoutes.erase(route);
     if(result->app!=expected.app || result->purpose!=expected.purpose ||
        result->identityGeneration!=expected.identityGeneration){
         RetireAsyncSessionOperation(expected,AsyncRetirementReason::Failed);
+        SchedulePickerTabSearchRetry(&expected.app);
         return;
     }
     try {
@@ -2565,6 +2996,7 @@ static void HandleSessionResult(std::unique_ptr<SessionResult> result){
     } catch(...) {
         RetireAsyncSessionOperation(expected,AsyncRetirementReason::Failed);
     }
+    SchedulePickerTabSearchRetry(&expected.app);
 }
 
 static bool QueueAutoMove(AutoRestoreOperation& operation,
@@ -2575,8 +3007,8 @@ static bool QueueAutoMove(AutoRestoreOperation& operation,
     const FastWin& fast=operation.reconcileFast[restore.liveIndex];
     const std::string runtimeKey=RuntimeKey(fast);
     const LayoutWin& saved=result.saved[restore.savedIndex];
-    g_pendingRecordByRuntime[runtimeKey]=saved.recordId;
     if(g_reservedAutoIdentities.count(runtimeKey)) return false;
+    g_pendingRecordByRuntime[runtimeKey]=saved.recordId;
     if(GetDesktopIndexByGuid(restore.destination)<0) return false;
 
     RestoreBudgetKey budget;
@@ -2637,6 +3069,186 @@ static bool QueueAutoMove(AutoRestoreOperation& operation,
     return published;
 }
 
+static void SwapLayoutWinNoThrow(LayoutWin& left,LayoutWin& right) noexcept;
+
+static PickerLatePlanHandoffAction TransferLateAcceptedPlanRecordToPicker(
+        AutoRestoreOperation& operation,
+        const ReconcileResult& accepted) noexcept {
+    try {
+        bool found=false;
+        bool selectedRecordExists=false;
+        std::string selected,runtimeKey;
+        MoveToken pickerToken;
+        auto acceptExact=[&](const FastWin& candidate,
+                             const std::string& candidateRecordId,
+                             bool requireExisting)->bool {
+            const std::string runtime=RuntimeKey(candidate);
+            auto reservation=g_reservedAutoIdentities.find(runtime);
+            const bool exactPickerReservation=
+                reservation!=g_reservedAutoIdentities.end() &&
+                reservation->second.token.owner==MoveOwner::Picker &&
+                SameIdentity(reservation->second.identity,
+                             IdentityOf(candidate));
+            if(!exactPickerReservation) return true;
+            const bool sameTransition=
+                g_picker.controlledTransition() &&
+                SameMoveToken(reservation->second.token,
+                              g_picker.transition.reservationToken) &&
+                SameIdentity(g_picker.transition.target,
+                             IdentityOf(candidate));
+            const PickerLatePlanHandoffAction action=
+                DecidePickerLatePlanHandoff(
+                    true,sameTransition,
+                    sameTransition &&
+                        g_picker.transition.commitCutoffReached);
+            if(action!=PickerLatePlanHandoffAction::TransferBeforeSave)
+                return false;
+            GUID parsed{};
+            std::string canonical;
+            const LayoutWin* current=nullptr;
+            if(!ParseNonzeroLayoutGuid(
+                    candidateRecordId,parsed,&canonical) ||
+               (requireExisting &&
+                (!(current=FindAutoRecord(canonical)) ||
+                 current->app!=operation.app))) return false;
+            const PickerAcceptedPlanRecordResult accumulated=
+                [&](){
+                    const bool previouslyFound=found;
+                    const PickerAcceptedPlanRecordResult value=
+                AccumulatePickerAcceptedPlanRecord(
+                    g_picker.transition.target,operation.app,
+                    IdentityOf(candidate),operation.app,canonical,
+                    selected,found);
+                    if(value==PickerAcceptedPlanRecordResult::Selected){
+                        if(previouslyFound &&
+                           selectedRecordExists!=requireExisting)
+                            return PickerAcceptedPlanRecordResult::Rejected;
+                        if(!previouslyFound)
+                            selectedRecordExists=requireExisting;
+                    }
+                    return value;
+                }();
+            if(accumulated==PickerAcceptedPlanRecordResult::Rejected)
+                return false;
+            if(runtimeKey.empty()){
+                runtimeKey=runtime;
+                pickerToken=reservation->second.token;
+            } else if(runtimeKey!=runtime ||
+                      !SameMoveToken(pickerToken,
+                                     reservation->second.token)){
+                return false;
+            }
+            return true;
+        };
+        for(const LayoutMatch& match : accepted.plan.matches){
+            if(match.savedIndex>=accepted.saved.size() ||
+               match.liveIndex>=operation.reconcileFast.size()) continue;
+            const LayoutWin& saved=accepted.saved[match.savedIndex];
+            if(saved.app!=operation.app ||
+               !acceptExact(operation.reconcileFast[match.liveIndex],
+                            saved.recordId,true))
+                return PickerLatePlanHandoffAction::RejectPlan;
+        }
+        for(const NewRecordRequest& created : accepted.plan.newRecords){
+            if(created.liveIndex>=operation.reconcileFast.size() ||
+               created.liveIndex>=accepted.live.size()) continue;
+            if(accepted.live[created.liveIndex].app!=operation.app ||
+               !acceptExact(operation.reconcileFast[created.liveIndex],
+                            created.recordId,false))
+                return PickerLatePlanHandoffAction::RejectPlan;
+        }
+        if(!found) return PickerLatePlanHandoffAction::Ignore;
+
+        auto reservation=g_reservedAutoIdentities.find(runtimeKey);
+        if(reservation==g_reservedAutoIdentities.end() ||
+           !SameMoveToken(reservation->second.token,pickerToken) ||
+           !SameMoveToken(g_picker.transition.reservationToken,pickerToken) ||
+           g_picker.transition.commitCutoffReached ||
+           (!reservation->second.app.empty() &&
+            reservation->second.app!=operation.app) ||
+           (!g_picker.transition.app.empty() &&
+            g_picker.transition.app!=operation.app))
+            return PickerLatePlanHandoffAction::RejectPlan;
+        std::string reservedRecord=selected;
+        std::string transitionRecord=selected;
+        std::string reservedApp=operation.app;
+        std::string transitionApp=operation.app;
+        std::map<std::string,std::string> stagedPending;
+        std::map<std::string,PickerOperationLifetimeClaim> stagedClaims;
+        if(!StagePickerAcceptedPlanPendingAssociation(
+                g_pendingRecordByRuntime,runtimeKey,selected,
+                stagedPending) ||
+           !StagePickerOperationLifetimeClaim(
+                operation.pickerClaimedRecordByRuntime,runtimeKey,
+                selected,selectedRecordExists,stagedClaims))
+            return PickerLatePlanHandoffAction::RejectPlan;
+        LayoutWin acceptedFreshRecord;
+        bool hasAcceptedFresh=false;
+        auto fresh=g_acceptedFreshByRuntime.find(runtimeKey);
+        if(fresh!=g_acceptedFreshByRuntime.end() &&
+           fresh->second.record.app==operation.app &&
+           PickerFreshRuntimeMatches(
+               g_picker.transition.target,operation.identityGeneration,
+               fresh->second.identity,
+               fresh->second.identityGeneration)){
+            acceptedFreshRecord=fresh->second.record;
+            hasAcceptedFresh=true;
+        }
+        LayoutWin transferredProvisional;
+        bool hasTransferredProvisional=false;
+        if(!selectedRecordExists && !hasAcceptedFresh){
+            if(!g_picker.transition.capturedTitleComplete ||
+               !BuildPickerCapturedTitleOnlyProvisional(
+                   operation.app,g_picker.transition.capturedTitle,
+                   transferredProvisional))
+                return PickerLatePlanHandoffAction::RejectPlan;
+            transferredProvisional.recordId=selected;
+            transferredProvisional.desktop=
+                g_picker.transition.targetOrigin;
+            transferredProvisional.deskIndex=SnapshotDesktopIndex(
+                g_picker.transition.targetOrigin);
+            MarkSeen(transferredProvisional,UtcNowSeconds());
+            hasTransferredProvisional=true;
+        }
+        if(!CommitPickerAcceptedPlanRecordTransfer(
+                [&](){
+                    g_restoreBudgets.clearForExplicitRetry(selected);
+                    return true;
+                },[&]() noexcept {
+                    g_pendingRecordByRuntime.swap(stagedPending);
+                    operation.pickerClaimedRecordByRuntime.swap(
+                        stagedClaims);
+                    reservation->second.recordId.swap(reservedRecord);
+                    g_picker.transition.pendingRecordId.swap(
+                        transitionRecord);
+                    reservation->second.app.swap(reservedApp);
+                    g_picker.transition.app.swap(transitionApp);
+                    reservation->second.identityGeneration=
+                        operation.identityGeneration;
+                    g_picker.transition.identityGeneration=
+                        operation.identityGeneration;
+                    if(hasAcceptedFresh){
+                        SwapLayoutWinNoThrow(
+                            reservation->second.acceptedFreshRecord,
+                            acceptedFreshRecord);
+                        reservation->second.hasAcceptedFreshRecord=true;
+                    }
+                    if(hasTransferredProvisional){
+                        SwapLayoutWinNoThrow(
+                            reservation->second.provisionalOriginRecord,
+                            transferredProvisional);
+                        reservation->second.hasProvisionalOriginRecord=true;
+                    }
+                }))
+            return PickerLatePlanHandoffAction::RejectPlan;
+        try { g_provisionalRecordByRuntime.erase(runtimeKey); }
+        catch(...) {}
+        return PickerLatePlanHandoffAction::TransferBeforeSave;
+    } catch(...) {
+        return PickerLatePlanHandoffAction::RejectPlan;
+    }
+}
+
 static void HandleManualReconcileResult(std::unique_ptr<ReconcileResult> result);
 static void HandleManualSavePreparedResult(std::unique_ptr<ReconcileResult> result);
 static void HandleSearchReconcileResult(std::unique_ptr<ReconcileResult> result);
@@ -2684,26 +3296,42 @@ static void HandleReconcileResult(std::unique_ptr<ReconcileResult> result){
     }
     if(result->workMode==ReconcileWorkMode::PrepareLiveOnly){
         if(!result->buildLiveFromInputs ||
-           result->fastWindows.size()!=result->live.size()){
+           result->fastWindows.size()!=result->live.size() ||
+           result->fastWindows.size()!=result->sessionIndexByFast.size()){
             CancelAutoOperation(operationId,true);
             return;
         }
         AppFastSnapshot prepared=current->second;
         prepared.windows=result->fastWindows;
+        RememberAcceptedFreshRuntimeRecords(*result);
         std::set<std::string> reserved=UpdateBoundRecords(
-            result->app,prepared,result->live,result->freshness,result->nowUtc);
+            result->app,prepared,*result,result->nowUtc);
         for(const auto& entry : g_reservedAutoIdentities)
             if(entry.second.app==result->app && !entry.second.recordId.empty())
                 reserved.insert(entry.second.recordId);
 
         std::vector<LayoutWin> unboundLive;
         std::vector<FastWin> unboundFast;
+        bool omittedUnusableUnboundRow=false;
         try {
             for(size_t index=0;index<result->fastWindows.size();++index){
                 const FastWin& fast=result->fastWindows[index];
+                auto reservation=g_reservedAutoIdentities.find(
+                    RuntimeKey(fast));
+                if(reservation!=g_reservedAutoIdentities.end() &&
+                   reservation->second.token.owner==MoveOwner::Picker &&
+                   SameIdentity(reservation->second.identity,
+                                IdentityOf(fast))) continue;
                 auto bound=g_recordByRuntime.find(RuntimeKey(fast));
                 if(bound!=g_recordByRuntime.end() &&
                    SameIdentity(bound->second.identity,IdentityOf(fast))) continue;
+                if(!PickerUnboundRowEligibleForReconcilePlan(
+                        result->freshness==ReconcileFreshness::Fresh,
+                        ReconcileFastHasUsableAcceptedFresh(
+                            *result,index))){
+                    omittedUnusableUnboundRow=true;
+                    continue;
+                }
                 unboundFast.push_back(fast);
                 unboundLive.push_back(result->live[index]);
             }
@@ -2721,9 +3349,14 @@ static void HandleReconcileResult(std::unique_ptr<ReconcileResult> result){
         plan.sessionRequestId=result->sessionRequestId;
         plan.sessionDataGeneration=result->sessionDataGeneration;
         plan.nowUtc=result->nowUtc;
-        plan.freshness=result->freshness;
+        plan.freshness=PickerUnboundPlanUsesFreshness(
+            result->freshness==ReconcileFreshness::Fresh,
+            omittedUnusableUnboundRow)
+                ? ReconcileFreshness::Fresh
+                : ReconcileFreshness::CachedStale;
         try {
             operation->second.reconcileFast=unboundFast;
+            operation->second.reconcileFastKnown=true;
             plan.saved=g_autoRecords;
             plan.live.swap(unboundLive);
             plan.reservedRecordIds.swap(reserved);
@@ -2752,6 +3385,13 @@ static void HandleReconcileResult(std::unique_ptr<ReconcileResult> result){
         return;
     }
 
+    if(TransferLateAcceptedPlanRecordToPicker(
+            operation->second,*result)==
+       PickerLatePlanHandoffAction::RejectPlan){
+        CancelAutoOperation(operationId,true);
+        return;
+    }
+
     if(!operation->second.successfulLive.initialize(
             operation->second.reconcileFast.size())){
         CancelAutoOperation(operationId,true);
@@ -2765,6 +3405,13 @@ static void HandleReconcileResult(std::unique_ptr<ReconcileResult> result){
             continue;
         }
         const FastWin& fast=operation->second.reconcileFast[restore.liveIndex];
+        auto pickerReservation=g_reservedAutoIdentities.find(
+            RuntimeKey(fast));
+        if(pickerReservation!=g_reservedAutoIdentities.end() &&
+           pickerReservation->second.token.owner==MoveOwner::Picker &&
+           SameIdentity(pickerReservation->second.identity,
+                        IdentityOf(fast)))
+            continue;
         if(GuidEq(fast.desktop,restore.destination)){
             if(!operation->second.successfulLive.markSucceeded(restore.liveIndex))
                 operation->second.hadFailure=true;
@@ -2807,7 +3454,8 @@ static std::vector<FinalAppObservation> BuildFinalObservations(
             window.observed.desktop=fast.desktop;
             window.observed.deskIndex=SnapshotDesktopIndex(fast.desktop);
             window.observed.activeTitle=W2U8(
-                StripSuffixes(fast.title,profile.titleSuffixes));
+                StripReconcileTitleSuffix(
+                    fast.title,profile.titleSuffixes));
             window.desktopValid=!GuidIsZero(fast.desktop);
             window.fingerprintFresh=false;
             auto bound=g_recordByRuntime.find(runtime);
@@ -3045,6 +3693,7 @@ static void ResetAutoRuntimeState(){
     g_recordByRuntime.clear();
     g_pendingRecordByRuntime.clear();
     g_provisionalRecordByRuntime.clear();
+    g_acceptedFreshByRuntime.clear();
     g_lifecycleByApp.clear();
     g_lastFreshSessionSignature.clear();
     g_dirtyRecordDeltas.clear();
@@ -3110,10 +3759,29 @@ static void SwapReservedAutoIdentityNoThrow(
     const GUID origin=left.originDesktop;
     left.originDesktop=right.originDesktop;
     right.originDesktop=origin;
+    std::swap(left.identityGeneration,right.identityGeneration);
+    SwapLayoutWinNoThrow(
+        left.acceptedFreshRecord,right.acceptedFreshRecord);
+    std::swap(left.hasAcceptedFreshRecord,
+              right.hasAcceptedFreshRecord);
     SwapLayoutWinNoThrow(
         left.provisionalOriginRecord,right.provisionalOriginRecord);
     std::swap(left.hasProvisionalOriginRecord,
               right.hasProvisionalOriginRecord);
+}
+
+static bool PickerCanSupersedeAutoReservation(
+        const ReservedAutoIdentity& prior) noexcept {
+    if(prior.token.owner!=MoveOwner::AutoReconcile ||
+       prior.token.jobId==0) return false;
+    auto runtime=g_moveRuntime.find(prior.token.jobId);
+    if(runtime==g_moveRuntime.end() || runtime->second.cancelRequested ||
+       runtime->second.retireAfterVerify ||
+       runtime->second.issueAwaitingVerify) return false;
+    const MoveJob* front=g_moveQueue.front();
+    if(front && front->token.jobId==prior.token.jobId &&
+       g_moveQueue.nextAction()==MoveAction::Verify) return false;
+    return true;
 }
 
 static bool BeginReservationHandoff(
@@ -3124,6 +3792,14 @@ static bool BeginReservationHandoff(
         ReservationHandoff next;
         next.runtimeKey=runtimeKey;
         auto prior=g_reservedAutoIdentities.find(runtimeKey);
+        if(prior!=g_reservedAutoIdentities.end() &&
+           !PickerReservationReplacementAllowed(
+               prior->second.token.owner,replacement.token.owner))
+            return false;
+        if(prior!=g_reservedAutoIdentities.end() &&
+           replacement.token.owner==MoveOwner::Picker &&
+           !PickerCanSupersedeAutoReservation(prior->second))
+            return false;
         ReservedAutoIdentity installed=replacement;
         if(prior!=g_reservedAutoIdentities.end() &&
            SameIdentity(prior->second.identity,replacement.identity)){
@@ -3204,9 +3880,18 @@ static void RetireSessionRoutesForOperation(AsyncOperationOwner owner,
         g_sessionRouteGate.cancelOperation(purpose,operationId,ignored);
     }
     for(auto route=g_sessionRoutes.begin();route!=g_sessionRoutes.end();)
-        if(route->second.owner==owner && route->second.operationId==operationId)
+        if(route->second.owner==owner && route->second.operationId==operationId){
+            if(owner==AsyncOperationOwner::Search){
+                auto operation=g_searchOperations.find(operationId);
+                if(operation!=g_searchOperations.end())
+                    MarkPickerTabSearchRetryNeeded(
+                        g_pickerTabSearchCache,operationId,
+                        operation->second.pickerModelGeneration,
+                        operation->second.pickerQuery,route->second.app);
+            }
+            SchedulePickerTabSearchRetry(&route->second.app);
             route=g_sessionRoutes.erase(route);
-        else ++route;
+        } else ++route;
 }
 
 static void FinishManualSave(uint64_t operationId){
@@ -3534,10 +4219,21 @@ static void RetireAsyncSessionOperation(const SessionRoute& route,
     }
     auto operation=g_searchOperations.find(route.operationId);
     if(operation==g_searchOperations.end()) return;
+    MarkPickerTabSearchRetryNeeded(
+        g_pickerTabSearchCache,
+        route.operationId,
+        operation->second.pickerModelGeneration,
+        operation->second.pickerQuery,route.app);
     if(operation->second.outstanding>0) --operation->second.outstanding;
     if(operation->second.outstanding==0){
         g_reconcileDeadlines.cancel(route.operationId);
+        CompletePickerTabSearchAttempt(
+            g_pickerTabSearchCache,
+            route.operationId,
+            operation->second.pickerModelGeneration,
+            operation->second.pickerQuery);
         g_searchOperations.erase(operation);
+        SchedulePickerTabSearchRetry(&route.app);
     }
 }
 
@@ -3560,6 +4256,7 @@ static void ProcessSessionRetirements(
             route.deadlineMs=event.route.deadlineMs;
         }
         RetireAsyncSessionOperation(route,event.reason);
+        SchedulePickerTabSearchRetry(&route.app);
     }
 }
 
@@ -3587,7 +4284,18 @@ static void RetireReconcileOperation(uint64_t operationId){
     auto search=g_searchOperations.find(operationId);
     if(search!=g_searchOperations.end()){
         RetireSessionRoutesForOperation(AsyncOperationOwner::Search,operationId);
+        for(const std::string& app : search->second.waitingReconcileApps)
+            MarkPickerTabSearchRetryNeeded(
+                g_pickerTabSearchCache,operationId,
+                search->second.pickerModelGeneration,
+                search->second.pickerQuery,app,
+                PickerTabSearchRetryTrigger::Immediate);
+        CompletePickerTabSearchAttempt(
+            g_pickerTabSearchCache,operationId,
+            search->second.pickerModelGeneration,
+            search->second.pickerQuery);
         g_searchOperations.erase(search);
+        SchedulePickerTabSearchRetry();
     }
 }
 
@@ -3640,6 +4348,7 @@ static void RetireFailedSessionResult(uint64_t requestId) noexcept {
     SessionRoute route;
     route.owner=found->second.owner;
     route.operationId=found->second.operationId;
+    route.app=found->second.app;
     route.purpose=found->second.purpose;
     route.identityGeneration=found->second.identityGeneration;
     route.contentGeneration=found->second.contentGeneration;
@@ -3663,6 +4372,7 @@ static void RetireFailedSessionResult(uint64_t requestId) noexcept {
             else g_searchOperations.erase(route.operationId);
         } catch(...) {}
     }
+    SchedulePickerTabSearchRetry(&route.app);
 }
 
 static void RetireFailedReconcileResult(uint64_t operationId) noexcept {
@@ -4313,8 +5023,13 @@ static int CliRun(const std::wstring& cmd){
 struct WinItem { HWND hwnd; WindowIdentityKey identity; std::wstring title; std::wstring titleLC; std::wstring search; HICON icon; };   // search = titleLC (+ all-tab text for browser windows)
 struct Tile { GUID guid; std::string guidKey; std::wstring name; std::wstring displayName; int index; std::vector<WinItem> windows; std::vector<size_t> filtered; RECT rc; int scroll=0; };
 static std::vector<Tile> g_tiles;
-static PickerState g_picker;
-static int  g_sel=-1; // legacy index kept synchronized with g_picker
+static PickerEffect g_pickerScheduledEffect;
+static bool g_pickerEffectScheduled=false;
+static PickerKickState g_pickerObservationKick;
+static bool g_pickerTerminalizationPending=false;
+static bool g_pickerPumpActive=false;
+static bool g_pickerShutdownDrain=false;
+static bool g_pickerDurableKickPending=false;
 static HWND g_target=nullptr; static std::wstring g_targetTitle;
 static HWND g_settings=nullptr;
 static HINSTANCE g_inst=nullptr;
@@ -4337,10 +5052,16 @@ static bool QuiesceRuntime(HWND messageWindow) noexcept {
         KillTimer(messageWindow,TIMER_MOVE_VERIFY);
         KillTimer(messageWindow,TIMER_HEARTBEAT);
         KillTimer(messageWindow,TIMER_AUTO_FLUSH);
+        KillTimer(messageWindow,TIMER_PICKER_TRANSITION);
         g_flushTimerArmed=false;
         g_flushTimerDueMs=0;
         g_heartbeatTimerArmed=false;
         g_moveCancellationRetry.clear();
+        g_pickerEffectScheduled=false;
+        g_pickerObservationKick.pending=false;
+        g_pickerTerminalizationPending=false;
+        g_pickerShutdownDrain=false;
+        g_pickerDurableKickPending=false;
         StopWorkers(messageWindow);
     });
 }
@@ -4514,13 +5235,15 @@ static bool PopulatePickerFilteredRows(std::vector<Tile>& tiles,
     return true;
 }
 
-static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi){
+static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi,
+                       bool selectionFromActual=false){
     const GUID observedCurrent=CurrentDesktopGuid();
     const bool published=RunPickerRefreshWithCurrent(
         g_tiles,g_picker,observedCurrent,
         [&](std::vector<Tile>& tiles,PickerState& state){
             if(!g_vdmi) return false;
             if(resetUi){
+                state.searchEditText.clear();
                 state.searchText.clear();
                 state.searchActive=false;
                 state.scrollByDesktop.clear();
@@ -4570,18 +5293,22 @@ static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi){
                context.failed) return false;
             if(!PopulatePickerFilteredRows(tiles,state.searchText))
                 return false;
+            if(selectionFromActual)
+                PreparePickerRefreshSelectionFromActual(state);
             ResolvePickerSelection(state,desktopGuids);
+            if(!PrunePickerScrollState(state,desktopGuids)) return false;
+            state.modelGeneration=state.modelGeneration==
+                (std::numeric_limits<uint64_t>::max)()
+                ? 1 : state.modelGeneration+1;
+            if(state.modelGeneration==0) state.modelGeneration=1;
             return true;
         });
-    if(published) g_sel=g_picker.selectedIndex;
     return published;
 }
 
-static bool SetPickerSelectionWithLegacy(int index) noexcept {
+static bool SetPickerSelectionCurrent(int index) noexcept {
     if(index<0 || index>=static_cast<int>(g_tiles.size())) return false;
-    if(!SetPickerSelection(g_picker,index,g_tiles[index].guid)) return false;
-    g_sel=index;
-    return true;
+    return SetPickerSelection(g_picker,index,g_tiles[index].guid);
 }
 
 static bool RememberPickerScroll(Tile& tile,int scroll) noexcept {
@@ -4615,7 +5342,8 @@ static bool RebuildPickerFilteredRows() noexcept {
     }
 }
 
-static bool ApplyPickerSearchText(std::wstring searchText) noexcept {
+static bool ApplyPickerSearchText(const std::wstring& editText,
+                                  const std::wstring& searchText) noexcept {
     try {
         std::vector<std::vector<size_t>> staged(g_tiles.size());
         for(size_t index=0;index<g_tiles.size();++index)
@@ -4624,9 +5352,12 @@ static bool ApplyPickerSearchText(std::wstring searchText) noexcept {
                     [](const WinItem& item)->const std::wstring& {
                         return item.search;
                     })) return false;
+        if(!SetPickerSearchText(g_picker,editText,searchText)) return false;
         for(size_t index=0;index<g_tiles.size();++index)
             g_tiles[index].filtered.swap(staged[index]);
-        g_picker.searchText.swap(searchText);
+        if(searchText.empty())
+            InvalidatePickerTabSearchCache(
+                g_pickerTabSearchCache,g_picker.modelGeneration);
         return true;
     } catch(...) {
         return false;
@@ -4640,14 +5371,18 @@ static void ResetPickerHoverState(
     ResetPickerHoverEventState(g_pickerHoverState,reason);
 }
 static bool RefreshPickerPaintCache() noexcept;
-static bool g_tabBlobsBuilt=false;
 static void HandleSearchSessionResult(const SessionRoute& route,
                                        const SessionResult& result){
     auto operation=g_searchOperations.find(route.operationId);
     if(operation==g_searchOperations.end()) return;
+    const bool currentPickerSearch=PickerTabSearchAttemptMatches(
+        g_pickerTabSearchCache,route.operationId,
+        g_picker.modelGeneration,g_picker.searchText) &&
+        operation->second.pickerModelGeneration==g_picker.modelGeneration &&
+        operation->second.pickerQuery==g_picker.searchText;
     auto captured=operation->second.snapshots.find(route.app);
     bool queued=false;
-    if(captured!=operation->second.snapshots.end() &&
+    if(currentPickerSearch && captured!=operation->second.snapshots.end() &&
        SessionDataUsable(result.status) && result.windows){
         std::map<std::string,AppFastSnapshot> current=CollectFastSnapshots();
         auto now=current.find(route.app);
@@ -4684,10 +5419,21 @@ static void HandleSearchSessionResult(const SessionRoute& route,
         }
     }
     if(queued) return;
+    MarkPickerTabSearchRetryNeeded(
+        g_pickerTabSearchCache,
+        route.operationId,
+        operation->second.pickerModelGeneration,
+        operation->second.pickerQuery,route.app);
     if(operation->second.outstanding>0) --operation->second.outstanding;
     if(operation->second.outstanding==0){
         g_reconcileDeadlines.cancel(route.operationId);
+        CompletePickerTabSearchAttempt(
+            g_pickerTabSearchCache,
+            route.operationId,
+            operation->second.pickerModelGeneration,
+            operation->second.pickerQuery);
         g_searchOperations.erase(operation);
+        SchedulePickerTabSearchRetry(&route.app);
     }
 }
 
@@ -4699,10 +5445,16 @@ static void HandleSearchReconcileResult(std::unique_ptr<ReconcileResult> result)
         return;
     g_reconcileDeadlines.complete(result->operationId);
     bool accepted=false;
+    const bool currentPickerSearch=PickerTabSearchAttemptMatches(
+        g_pickerTabSearchCache,result->operationId,
+        g_picker.modelGeneration,g_picker.searchText) &&
+        operation->second.pickerModelGeneration==g_picker.modelGeneration &&
+        operation->second.pickerQuery==g_picker.searchText;
     auto captured=operation->second.snapshots.find(result->app);
     std::map<std::string,AppFastSnapshot> current=CollectFastSnapshots();
     auto now=current.find(result->app);
-    if(result->status==ReconcileResultStatus::Completed &&
+    if(currentPickerSearch &&
+       result->status==ReconcileResultStatus::Completed &&
        result->workMode==ReconcileWorkMode::PrepareLiveOnly &&
        result->buildLiveFromInputs &&
        captured!=operation->second.snapshots.end() && now!=current.end() &&
@@ -4710,6 +5462,7 @@ static void HandleSearchReconcileResult(std::unique_ptr<ReconcileResult> result)
        result->identityGeneration==now->second.identityGeneration &&
        result->contentGeneration==now->second.generation &&
        result->fastWindows.size()==result->sessionIndexByFast.size()){
+        RememberAcceptedFreshRuntimeRecords(*result);
         for(size_t index=0;index<result->fastWindows.size();++index){
             const WinFp* session=ReconcileSessionForFast(*result,index);
             if(!session || session->tabsBlob.empty()) continue;
@@ -4725,10 +5478,23 @@ static void HandleSearchReconcileResult(std::unique_ptr<ReconcileResult> result)
         }
         accepted=true;
     }
+    if(!accepted)
+        MarkPickerTabSearchRetryNeeded(
+            g_pickerTabSearchCache,
+            result->operationId,
+            operation->second.pickerModelGeneration,
+            operation->second.pickerQuery,result->app,
+            PickerTabSearchRetryTrigger::Immediate);
     if(operation->second.outstanding>0) --operation->second.outstanding;
     if(operation->second.outstanding==0){
         g_reconcileDeadlines.cancel(result->operationId);
+        CompletePickerTabSearchAttempt(
+            g_pickerTabSearchCache,
+            result->operationId,
+            operation->second.pickerModelGeneration,
+            operation->second.pickerQuery);
         g_searchOperations.erase(operation);
+        SchedulePickerTabSearchRetry();
     }
     if(accepted && g_main){
         RebuildPickerFilteredRows();
@@ -4739,28 +5505,59 @@ static void HandleSearchReconcileResult(std::unique_ptr<ReconcileResult> result)
 
 // Lazily request all-tab text without reading browser files on the UI thread.
 static void EnsureTabSearch(){
-    if(g_tabBlobsBuilt) return;
-    g_tabBlobsBuilt=true;
+    if(g_picker.searchText.empty()){
+        InvalidatePickerTabSearchCache(
+            g_pickerTabSearchCache,g_picker.modelGeneration);
+        return;
+    }
+    if(PickerTabSearchCacheUsable(
+            g_pickerTabSearchCache,g_picker.modelGeneration,
+            g_picker.searchText) ||
+       (g_pickerTabSearchCache.pending &&
+        PickerTabSearchKeyMatches(
+            g_pickerTabSearchCache,g_picker.modelGeneration,
+            g_picker.searchText))) return;
     SearchOperation operation;
     operation.operationId=TakeNonzeroId(g_nextOperationId);
+    operation.pickerModelGeneration=g_picker.modelGeneration;
+    operation.pickerQuery=g_picker.searchText;
     operation.snapshots=CollectFastSnapshots();
     const uint64_t operationId=operation.operationId;
+    std::wstring stagedQuery=operation.pickerQuery;
     try {
         if(!g_searchOperations.emplace(operationId,operation).second) return;
     } catch(...) { return; }
+    if(!BeginPickerTabSearchAttempt(
+            g_pickerTabSearchCache,operationId,
+            operation.pickerModelGeneration,
+            stagedQuery)){
+        g_searchOperations.erase(operationId);
+        return;
+    }
     std::vector<AppProfile> profiles=ActiveProfiles();
     for(const AppProfile& profile : profiles){
         auto snapshot=operation.snapshots.find(profile.id);
         if(snapshot==operation.snapshots.end() || snapshot->second.windows.empty() ||
            !FastSnapshotCanObserve(snapshot->second)) continue;
+        PickerTabSearchRetryTrigger retryTrigger=
+            PickerTabSearchRetryTrigger::Immediate;
         uint64_t request=RequestSessionWork(
             AsyncOperationOwner::Search,operationId,profile,snapshot->second,
-            SessionPurpose::Search);
+            SessionPurpose::Search,&retryTrigger);
         if(request) ++g_searchOperations[operationId].outstanding;
+        else MarkPickerTabSearchRetryNeeded(
+            g_pickerTabSearchCache,operationId,
+            operation.pickerModelGeneration,
+            operation.pickerQuery,profile.id,retryTrigger);
     }
     if(g_searchOperations[operationId].outstanding==0){
         g_reconcileDeadlines.cancel(operationId);
+        CompletePickerTabSearchAttempt(
+            g_pickerTabSearchCache,operationId,
+            operation.pickerModelGeneration,
+            operation.pickerQuery);
         g_searchOperations.erase(operationId);
+        SchedulePickerTabSearchRetry();
     }
 }
 static void LayoutTiles(int clientW){
@@ -4932,6 +5729,68 @@ static bool RefreshPickerPaintCache() noexcept {
     }
     return RebuildPickerPaintCache(
         client.right,client.bottom,generation);
+}
+
+struct PickerLightweightSnapshot {
+    GUID currentDesktop={0};
+    WindowIdentityKey foreground;
+    std::wstring cachedTitle;
+    bool popupVisible=false;
+};
+
+static bool RefreshPickerHighlightsLightweight() noexcept {
+    PickerLightweightSnapshot adopted;
+    bool adoptedForeground=false;
+    const bool refreshed=RunPickerLightweightRefresh(
+        g_picker,
+        [](){
+            PickerLightweightSnapshot snapshot;
+            snapshot.currentDesktop=CurrentDesktopGuid();
+            snapshot.popupVisible=g_main && IsWindowVisible(g_main)!=FALSE;
+            const HWND foreground=GetForegroundWindow();
+            if(foreground && foreground!=g_main){
+                snapshot.foreground=CapturePickerWindowIdentity(foreground);
+                if(SameIdentity(snapshot.foreground,snapshot.foreground)){
+                    for(const Tile& tile : g_tiles){
+                        for(const WinItem& item : tile.windows){
+                            if(SameIdentity(
+                                    item.identity,snapshot.foreground)){
+                                snapshot.cachedTitle=item.title;
+                                return snapshot;
+                            }
+                        }
+                    }
+                }
+            }
+            return snapshot;
+        },
+        [&](const PickerLightweightSnapshot& snapshot,PickerState& staged){
+            if(!GuidIsZero(snapshot.currentDesktop))
+                staged.currentDesktop=snapshot.currentDesktop;
+            adopted=snapshot;
+            if(AdoptPickerIdleActiveIdentity(
+                    staged,snapshot.foreground,
+                    reinterpret_cast<uintptr_t>(g_main),
+                    reinterpret_cast<uintptr_t>(g_main),
+                    snapshot.popupVisible))
+                adoptedForeground=true;
+            return true;
+        });
+    if(!refreshed) return false;
+    if(adoptedForeground){
+        g_target=reinterpret_cast<HWND>(adopted.foreground.hwnd);
+        g_targetTitle.swap(adopted.cachedTitle);
+    }
+    const bool cacheReady=RefreshPickerPaintCache();
+    if(g_main) InvalidateRect(g_main,nullptr,FALSE);
+    return cacheReady;
+}
+
+static void ArmPickerIdleRefresh() noexcept {
+    if(g_main && !g_picker.controlledTransition() &&
+       IsWindowVisible(g_main))
+        SetTimer(g_main,TIMER_PICKER_TRANSITION,
+                 PICKER_IDLE_REFRESH_MS,nullptr);
 }
 
 class PickerBackBuffer {
@@ -5153,16 +6012,43 @@ static void TrackPickerHoverTooltip(HWND hwnd,const RowRec& row,
         (LPARAM)MAKELONG(screenPoint.x+S(16),screenPoint.y+S(20)));
 }
 static void HidePicker(){
+    if(g_picker.controlledTransition()) return;
+    if(g_main) KillTimer(g_main,TIMER_PICKER_TRANSITION);
     ResetPickerHoverState(PickerHoverResetReason::Hide);
     ShowWindow(g_main,SW_HIDE);
 }
 // Search EDIT subclass: forward navigation keys to the grid; let letters/numbers type.
 static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM wp, LPARAM lp){
+    if(g_picker.controlledTransition()){
+        if((m==WM_CHAR && wp==L' ') ||
+           (m==WM_KEYUP && wp==VK_SPACE) || m==WM_KILLFOCUS)
+            g_suppressPickerCtrlSpaceChar=false;
+        if(m==WM_KEYDOWN && wp==VK_ESCAPE)
+            SendMessageW(g_main,WM_KEYDOWN,wp,lp);
+        if(PickerControlledEditMessageAllowed(m))
+            return CallWindowProcW(g_searchOrigProc,h,m,wp,lp);
+        return 0;
+    }
     if((m==WM_KEYDOWN||m==WM_KEYUP)&&wp==VK_CONTROL){ InvalidateRect(g_main,nullptr,FALSE); return 0; }
-    if(m==WM_KEYDOWN){ switch(wp){
-        case VK_ESCAPE: case VK_RETURN: case VK_UP: case VK_DOWN: case VK_LEFT: case VK_RIGHT: case VK_TAB:
-            SendMessageW(g_main,WM_KEYDOWN,wp,lp); return 0; } }
-    if(m==WM_CHAR){ if(wp==L'\r'||wp==27||wp==L'\t') return 0;    // swallow -> no message beep
+    if((m==WM_KEYUP && wp==VK_SPACE) || m==WM_KILLFOCUS)
+        g_suppressPickerCtrlSpaceChar=false;
+    const bool controlDown=(GetKeyState(VK_CONTROL)&0x8000)!=0;
+    const bool suppressSpaceChar=m==WM_CHAR && wp==L' ' &&
+        g_suppressPickerCtrlSpaceChar;
+    const PickerIdleEditInputRoute inputRoute=RoutePickerIdleEditInput(
+        m,wp,controlDown || suppressSpaceChar);
+    if(inputRoute==PickerIdleEditInputRoute::Grid){
+        if(m==WM_KEYDOWN && wp==VK_SPACE && controlDown)
+            g_suppressPickerCtrlSpaceChar=true;
+        SendMessageW(g_main,WM_KEYDOWN,wp,lp);
+        return 0;
+    }
+    if(inputRoute==PickerIdleEditInputRoute::Swallow){
+        if(m==WM_CHAR && wp==L' ')
+            g_suppressPickerCtrlSpaceChar=false;
+        return 0;
+    }
+    if(m==WM_CHAR){
         if(!g_picker.searchActive){ g_picker.searchActive=true; RefreshPickerPaintCache(); InvalidateRect(g_main,nullptr,FALSE); } }   // typing activates the field
     if(m==WM_LBUTTONDOWN && !g_picker.searchActive){ g_picker.searchActive=true; RefreshPickerPaintCache(); InvalidateRect(g_main,nullptr,FALSE); }   // click activates
     return CallWindowProcW(g_searchOrigProc,h,m,wp,lp);
@@ -5181,6 +6067,431 @@ static void EnsurePickerChildren(){
             SendMessageW(g_tip,TTM_ADDTOOLW,0,(LPARAM)&ti); SendMessageW(g_tip,TTM_SETMAXTIPWIDTH,0,S(600)); }
     }
 }
+
+static PickerIdentityValidity PickerIdentityObservation(
+        WindowIdentityRecapture identity) noexcept {
+    switch(identity){
+    case WindowIdentityRecapture::Match:
+        return PickerIdentityValidity::Match;
+    case WindowIdentityRecapture::Lost:
+        return PickerIdentityValidity::Lost;
+    case WindowIdentityRecapture::Indeterminate:
+        return PickerIdentityValidity::Indeterminate;
+    }
+    return PickerIdentityValidity::Indeterminate;
+}
+
+static HRESULT IssuePickerWindowMove(
+        const WindowIdentityKey& expected,const GUID& destinationGuid,
+        bool& invoked,WindowIdentityRecapture& identity) noexcept {
+    invoked=false;
+    identity=WindowIdentityRecapture::Indeterminate;
+    if(GuidIsZero(destinationGuid) || !g_vdmi) return E_INVALIDARG;
+    try {
+        ScopedComPtr<IVirtualDesktop> destination(
+            GetDesktopByGuid(destinationGuid));
+        if(!destination) return E_INVALIDARG;
+        const HWND hwnd=reinterpret_cast<HWND>(expected.hwnd);
+        if(expected.pid==GetCurrentProcessId()){
+            if(!g_vdmDoc) return E_NOINTERFACE;
+            identity=RecaptureGenericWindowIdentity(expected);
+            if(identity!=WindowIdentityRecapture::Match)
+                return identity==WindowIdentityRecapture::Lost
+                    ? E_ABORT : E_PENDING;
+            invoked=true;
+            return g_vdmDoc->MoveWindowToDesktop(hwnd,destinationGuid);
+        }
+        if(!g_avc) return E_NOINTERFACE;
+        IApplicationView* rawView=nullptr;
+        const HRESULT viewResult=g_avc->GetViewForHwnd(hwnd,&rawView);
+        ScopedComPtr<IApplicationView> view(rawView);
+        if(FAILED(viewResult) || !view) return FAILED(viewResult)
+            ? viewResult : E_FAIL;
+        identity=RecaptureGenericWindowIdentity(expected);
+        if(identity!=WindowIdentityRecapture::Match)
+            return identity==WindowIdentityRecapture::Lost
+                ? E_ABORT : E_PENDING;
+        invoked=true;
+        return g_vdmi->MoveViewToDesktop(view.get(),destination.get());
+    } catch(...) { return E_FAIL; }
+}
+
+static void ReadPickerWindowDesktop(
+        HWND hwnd,PickerReadValidity& validity,GUID& desktop) noexcept {
+    validity=PickerReadValidity::Unavailable;
+    desktop=GUID{};
+    if(!hwnd || !g_vdmDoc) return;
+    GUID observed={0};
+    HRESULT result=E_FAIL;
+    try { result=g_vdmDoc->GetWindowDesktopId(hwnd,&observed); }
+    catch(...) { result=E_FAIL; }
+    if(SUCCEEDED(result) && !GuidIsZero(observed)){
+        desktop=observed;
+        validity=PickerReadValidity::Valid;
+    }
+}
+
+static bool RefreshPickerModelPreservingUi() noexcept {
+    try {
+        std::wstring editText=g_picker.searchEditText;
+        if(g_search){
+            const int length=GetWindowTextLengthW(g_search);
+            if(length>=0){
+                std::wstring current(static_cast<size_t>(length)+1,L'\0');
+                const int copied=GetWindowTextW(
+                    g_search,&current[0],length+1);
+                if(copied>=0){
+                    current.resize(static_cast<size_t>(copied));
+                    editText.swap(current);
+                }
+            }
+        }
+        for(Tile& tile : g_tiles)
+            RememberPickerScroll(tile,tile.scroll);
+        std::wstring normalized=LowerW(editText);
+        if(!SetPickerSearchText(g_picker,editText,normalized)) return false;
+        const WindowIdentityKey active=g_picker.transition.target;
+        if(!BuildModel(active,false,true)) return false;
+        std::vector<GUID> live;
+        live.reserve(g_tiles.size());
+        for(const Tile& tile : g_tiles) live.push_back(tile.guid);
+        if(!PrunePickerScrollState(g_picker,live)) return false;
+        if(g_search)
+            SetWindowTextW(g_search,g_picker.searchEditText.c_str());
+        InvalidatePickerTabSearchCache(
+            g_pickerTabSearchCache,g_picker.modelGeneration);
+        if(!g_picker.searchText.empty()) EnsureTabSearch();
+        return true;
+    } catch(...) { return false; }
+}
+
+static PickerObservation ExecutePickerEffect(
+        const PickerEffect& effect) noexcept {
+    PickerObservation observation;
+    observation.generation=effect.generation;
+    observation.effectKind=effect.kind;
+    observation.effectSerial=effect.effectSerial;
+    observation.event=PickerEvent::EffectCompleted;
+    try {
+        switch(effect.kind){
+        case PickerEffectKind::MoveTarget: {
+            observation.event=PickerEvent::ApiCompleted;
+            WindowIdentityRecapture identity=
+                WindowIdentityRecapture::Indeterminate;
+            bool invoked=false;
+            const HRESULT result=IssuePickerWindowMove(
+                g_picker.transition.target,effect.desktop,
+                invoked,identity);
+            observation.identity=PickerIdentityObservation(identity);
+            observation.apiInvoked=invoked;
+            observation.apiAccepted=SUCCEEDED(result);
+            break;
+        }
+        case PickerEffectKind::ReadTarget: {
+            observation.event=PickerEvent::ReadbackCompleted;
+            const WindowIdentityRecapture identity=
+                RecaptureGenericWindowIdentity(g_picker.transition.target);
+            observation.identity=PickerIdentityObservation(identity);
+            if(identity==WindowIdentityRecapture::Match)
+                ReadPickerWindowDesktop(
+                    reinterpret_cast<HWND>(g_picker.transition.target.hwnd),
+                    observation.targetRead,
+                    observation.actualTargetDesktop);
+            else
+                observation.targetRead=PickerReadValidity::Unavailable;
+            break;
+        }
+        case PickerEffectKind::ValidateTarget:
+            observation.identity=PickerIdentityObservation(
+                RecaptureGenericWindowIdentity(g_picker.transition.target));
+            break;
+        case PickerEffectKind::MovePopup: {
+            observation.event=PickerEvent::ApiCompleted;
+            WindowIdentityRecapture identity=
+                WindowIdentityRecapture::Indeterminate;
+            bool invoked=false;
+            WindowIdentityKey popup=CapturePickerWindowIdentity(g_main);
+            const HRESULT result=IssuePickerWindowMove(
+                popup,effect.desktop,invoked,identity);
+            observation.apiInvoked=invoked;
+            observation.apiAccepted=SUCCEEDED(result);
+            break;
+        }
+        case PickerEffectKind::ReadPopup:
+            observation.event=PickerEvent::ReadbackCompleted;
+            ReadPickerWindowDesktop(
+                g_main,observation.popupRead,
+                observation.actualPopupDesktop);
+            break;
+        case PickerEffectKind::SwitchDesktop: {
+            observation.event=PickerEvent::ApiCompleted;
+            HRESULT result=E_INVALIDARG;
+            ScopedComPtr<IVirtualDesktop> desktop(
+                GetDesktopByGuid(effect.desktop));
+            const bool rollback=
+                g_picker.transition.phase==
+                    PickerPhase::RollbackSwitchIssue;
+            if(rollback){
+                observation.identity=PickerIdentityValidity::Match;
+            } else {
+                observation.identity=PickerIdentityObservation(
+                    RecaptureGenericWindowIdentity(
+                        g_picker.transition.target));
+            }
+            if(PickerForwardSwitchInvocationAllowed(
+                    observation.identity,desktop && g_vdmi) ||
+               (rollback && desktop && g_vdmi)){
+                observation.apiInvoked=true;
+                result=g_vdmi->SwitchDesktop(desktop.get());
+            }
+            observation.apiAccepted=SUCCEEDED(result);
+            break;
+        }
+        case PickerEffectKind::ReadCurrent: {
+            observation.event=PickerEvent::ReadbackCompleted;
+            const GUID current=CurrentDesktopGuid();
+            if(!GuidIsZero(current)){
+                observation.currentRead=PickerReadValidity::Valid;
+                observation.actualCurrentDesktop=current;
+            } else {
+                observation.currentRead=PickerReadValidity::Unavailable;
+            }
+            break;
+        }
+        case PickerEffectKind::SaveExactTarget: {
+            const PopupSaveResult saved=
+                SavePopupMovedWindow(g_picker.transition);
+            observation.saveStatus=saved.status;
+            observation.saveFailure=saved.failure;
+            observation.identity=PickerIdentityObservation(
+                RecaptureGenericWindowIdentity(g_picker.transition.target));
+            CompletePickerLifecycleForSave(saved,[&](const std::string& app){
+                if(app!=g_picker.transition.app ||
+                   g_picker.transition.lifecycleSaveGeneration==0) return;
+                auto lifecycle=g_lifecycleByApp.find(app);
+                if(lifecycle!=g_lifecycleByApp.end())
+                    LcExplicitSaveCompleted(
+                        lifecycle->second,
+                        g_picker.transition.lifecycleSaveGeneration,
+                        g_picker.transition.lifecycleLayoutSignature,
+                        g_picker.transition.lifecycleSessionSignature,
+                        MonotonicNowMs());
+            });
+            break;
+        }
+        case PickerEffectKind::Refresh:
+            observation.apiAccepted=RefreshPickerModelPreservingUi();
+            if(observation.apiAccepted){
+                RefreshPickerPaintCache();
+                InvalidateRect(g_main,nullptr,FALSE);
+            }
+            break;
+        case PickerEffectKind::ShowAndFocus:
+            if(!g_picker.transition.dismissed){
+                ShowWindow(g_main,SW_SHOW);
+                SetWindowPos(g_main,HWND_TOPMOST,0,0,0,0,
+                             SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW);
+                SetForegroundWindow(g_main);
+                if(g_search) SetFocus(g_search);
+            }
+            observation.popupIsForeground=
+                GetForegroundWindow()==g_main;
+            break;
+        case PickerEffectKind::Hide:
+            ResetPickerHoverState(PickerHoverResetReason::Hide);
+            ShowWindow(g_main,SW_HIDE);
+            observation.apiAccepted=true;
+            break;
+        case PickerEffectKind::ReportFailure:
+            Balloon(g_picker.transition.diagnostic.empty()
+                ? L"The picker transition could not be completed safely."
+                : g_picker.transition.diagnostic);
+            observation.apiAccepted=true;
+            break;
+        case PickerEffectKind::None:
+            break;
+        }
+    } catch(...) {
+        observation.apiAccepted=false;
+    }
+    return observation;
+}
+
+static void PumpPickerTransitionWork() noexcept;
+
+static bool DeferPickerTransitionWork(bool delayed) noexcept {
+    if(!g_main) return false;
+    if(g_pickerShutdownDrain) return false;
+    if(delayed && SetTimer(
+            g_main,TIMER_PICKER_TRANSITION,
+            MOVE_VERIFY_INTERVAL_MS,nullptr)) return true;
+    if(PostMessageW(g_main,WM_PICKER_TRANSITION,0,0)) return true;
+    return SetTimer(g_main,TIMER_PICKER_TRANSITION,1,nullptr)!=0;
+}
+
+static void QueuePickerEffect(const PickerEffect& effect) noexcept {
+    if(effect.kind==PickerEffectKind::None){
+        if(g_picker.transition.terminalAcknowledged){
+            g_pickerTerminalizationPending=true;
+            if(!DeferPickerTransitionWork(false) && !g_pickerPumpActive)
+                PumpPickerTransitionWork();
+        }
+        return;
+    }
+    if(g_pickerEffectScheduled){
+        g_picker.transition.failed=true;
+        g_picker.transition.suppressFocus=true;
+        g_picker.transition.terminalAcknowledged=true;
+        g_pickerTerminalizationPending=true;
+        return;
+    }
+    g_pickerScheduledEffect=effect;
+    g_pickerEffectScheduled=true;
+    const bool delayed=effect.kind==PickerEffectKind::ReadTarget ||
+        effect.kind==PickerEffectKind::ReadPopup ||
+        effect.kind==PickerEffectKind::ReadCurrent;
+    if(!DeferPickerTransitionWork(delayed) && !g_pickerPumpActive)
+        PumpPickerTransitionWork();
+}
+
+static bool FinalizePickerRuntimeTransition() noexcept {
+    if(!g_picker.transition.terminalAcknowledged ||
+       g_picker.transition.pendingEffect!=PickerEffectKind::None) return false;
+    bool reservationReleased=false;
+    try {
+        reservationReleased=ConsumeCheckpointAndReleaseMoveReservation(
+            g_picker.transition.reservationToken,
+            g_picker.transition.runtimeKey);
+    } catch(...) { return false; }
+    if(!PickerRuntimeTerminalizationReady(
+            g_picker.transition,reservationReleased)) return false;
+    MarkPickerOperationClaimsTerminalOutcome(
+        g_picker.transition.runtimeKey,
+        g_picker.transition.pendingRecordId,
+        PickerTransitionTargetRestoredToOrigin(g_picker.transition));
+    std::string claimedRuntime;
+    claimedRuntime.swap(g_picker.transition.runtimeKey);
+    if(!FinalizePickerTransition(g_picker)){
+        claimedRuntime.swap(g_picker.transition.runtimeKey);
+        return false;
+    }
+    FinishAutoOperationsClaimedByPicker(claimedRuntime);
+    bool resumeTabSearch=false;
+    if(g_pickerShutdownDrain || !g_runtimeQuiescence.acceptsDispatch())
+        InvalidatePickerTabSearchCache(
+            g_pickerTabSearchCache,g_picker.modelGeneration);
+    else
+        resumeTabSearch=ConsumePickerTabSearchRetryPostWhenIdle(
+            g_pickerTabSearchCache,false,g_picker.modelGeneration,
+            g_picker.searchText);
+    g_pickerTerminalizationPending=false;
+    g_pickerDurableKickPending=false;
+    KillTimer(g_main,TIMER_PICKER_TRANSITION);
+    ArmPickerIdleRefresh();
+    try {
+        if(resumeTabSearch) EnsureTabSearch();
+        else if(!g_pickerShutdownDrain) SchedulePickerTabSearchRetry();
+    } catch(...) {
+        if(!g_pickerShutdownDrain) SchedulePickerTabSearchRetry();
+    }
+    return true;
+}
+
+static void PumpPickerTransitionWork() noexcept {
+    if(g_pickerPumpActive) return;
+    g_pickerPumpActive=true;
+    g_pickerDurableKickPending=false;
+    bool terminalRetryNoProgress=false;
+    bool terminalRetryDeferred=false;
+    if(g_main) KillTimer(g_main,TIMER_PICKER_TRANSITION);
+    for(unsigned budget=0;budget<256;++budget){
+        if(g_pickerObservationKick.pending){
+            PickerObservation observation;
+            if(!ConsumePickerObservationKick(
+                    g_pickerObservationKick,observation)) break;
+            const PickerEffect next=
+                AdvancePickerTransition(g_picker,observation);
+            if(next.kind!=PickerEffectKind::None){
+                g_pickerScheduledEffect=next;
+                g_pickerEffectScheduled=true;
+                if(DeferPickerTransitionWork(
+                        next.kind==PickerEffectKind::ReadTarget ||
+                        next.kind==PickerEffectKind::ReadPopup ||
+                        next.kind==PickerEffectKind::ReadCurrent)) break;
+                continue;
+            }
+            if(g_picker.transition.terminalAcknowledged){
+                g_pickerTerminalizationPending=true;
+                if(DeferPickerTransitionWork(false)) break;
+            }
+            continue;
+        }
+        if(g_pickerEffectScheduled){
+            const PickerEffect effect=g_pickerScheduledEffect;
+            g_pickerScheduledEffect=PickerEffect{};
+            g_pickerEffectScheduled=false;
+            const PickerObservation observation=ExecutePickerEffect(effect);
+            const bool posted=!g_pickerShutdownDrain && PostMessageW(
+                g_main,WM_PICKER_TRANSITION,0,0)!=FALSE;
+            const bool timer=posted || g_pickerShutdownDrain ? false :
+                SetTimer(g_main,TIMER_PICKER_TRANSITION,1,nullptr)!=0;
+            const PickerKickRoute route=StagePickerObservationKick(
+                g_pickerObservationKick,observation,
+                posted,timer,g_main!=nullptr);
+            if(route==PickerKickRoute::Posted ||
+               route==PickerKickRoute::TimerArmed) break;
+            continue;
+        }
+        if(g_pickerTerminalizationPending){
+            if(!FinalizePickerRuntimeTransition()){
+                terminalRetryNoProgress=true;
+                if(!g_pickerShutdownDrain && g_main)
+                    terminalRetryDeferred=SetTimer(
+                        g_main,TIMER_PICKER_TRANSITION,
+                        MOVE_VERIFY_INTERVAL_MS,nullptr)!=0;
+                break;
+            }
+            continue;
+        }
+        break;
+    }
+    g_pickerPumpActive=false;
+    if((g_pickerEffectScheduled || g_pickerObservationKick.pending ||
+        g_pickerTerminalizationPending)){
+        if(terminalRetryNoProgress){
+            if(DecidePickerTerminalNoProgressRoute(
+                    g_pickerShutdownDrain,terminalRetryDeferred)==
+                    PickerTerminalNoProgressRoute::DurableExternalKick)
+                g_pickerDurableKickPending=true;
+        } else if(!DeferPickerTransitionWork(false)){
+            g_pickerDurableKickPending=true;
+        }
+    }
+}
+
+static void RequestPickerCancellation() noexcept {
+    if(!g_picker.controlledTransition() ||
+       g_picker.transition.dismissed) return;
+    const bool unissued=DiscardPickerUnissuedEffectForCancel(
+        g_pickerScheduledEffect,g_pickerEffectScheduled,
+        g_picker.transition);
+    PickerObservation cancel;
+    cancel.event=PickerEvent::CancelRequested;
+    cancel.generation=g_picker.transition.generation;
+    cancel.unissuedEffectCancelled=unissued;
+    QueuePickerEffect(AdvancePickerTransition(g_picker,cancel));
+}
+
+static bool DrainPickerForShutdown() noexcept {
+    if(!g_picker.controlledTransition()) return true;
+    g_pickerShutdownDrain=true;
+    const bool drained=RunPickerShutdownDrain(
+        g_picker,[](){ RequestPickerCancellation(); },
+        [](){ PumpPickerTransitionWork(); });
+    g_pickerShutdownDrain=false;
+    return drained;
+}
+
 static bool CaptureFastWindowForMove(HWND hwnd,FastWin& output,bool& tracked,
                                      bool& titleComplete){
     tracked=false;
@@ -5202,7 +6513,9 @@ static bool CaptureFastWindowForMove(HWND hwnd,FastWin& output,bool& tracked,
         if(profile){ captured.app=profile->id; tracked=true; }
     }
     int length=GetWindowTextLengthW(hwnd);
-    if(length>0){
+    if(length<=0){
+        titleComplete=false;
+    } else {
         try { captured.title.resize(static_cast<size_t>(length)+1,L'\0'); }
         catch(...) { titleComplete=false; }
         if(titleComplete){
@@ -5219,162 +6532,479 @@ static bool CaptureFastWindowForMove(HWND hwnd,FastWin& output,bool& tracked,
     return true;
 }
 
-static void Commit(int idx){
-    if(idx<0 || idx>=(int)g_tiles.size()) return;
-    const uintptr_t target=reinterpret_cast<uintptr_t>(g_target);
-    if(!PickerTargetMatchesActive(target,g_picker.activeWindow)) return;
-    HidePicker();
-    if(!g_target || !IsWindow(g_target)) return;
-    const GUID destination=g_tiles[idx].guid;
-    if(GuidIsZero(destination) || GetDesktopIndexByGuid(destination)<0) return;
-    FastWin fast;
-    bool tracked=false,titleComplete=true;
-    if(!CaptureFastWindowForMove(g_target,fast,tracked,titleComplete)) return;
-    const WindowIdentityKey capturedIdentity=IdentityOf(fast);
-    if(!PickerCommitIdentityAllowed(
-            target,g_picker.activeWindow,capturedIdentity,
-            RecaptureGenericWindowIdentity(capturedIdentity))) return;
-    const std::string runtimeKey=RuntimeKey(fast);
-
-    PickerMoveOperation operation;
-    operation.operationId=TakeNonzeroId(g_nextOperationId);
-    if(tracked){
-        operation.app=fast.app;
-        auto lifecycle=g_lifecycleByApp.find(fast.app);
-        if(lifecycle!=g_lifecycleByApp.end() &&
-           lifecycle->second.saveInFlight){
-            operation.lifecycleSaveGeneration=
-                lifecycle->second.saveGeneration;
-            operation.lifecycleLayoutSignature=
-                lifecycle->second.layoutSignature;
-            operation.lifecycleSessionSignature=
-                lifecycle->second.sessionStampSignature;
-        }
-    }
-    MoveJob job;
-    job.token.owner=MoveOwner::Picker;
-    job.token.operationId=operation.operationId;
-    job.token.jobId=TakeNonzeroId(g_nextMoveJobId);
-    job.token.itemIndex=0;
-    job.runtimeKey=runtimeKey;
-    job.destination=destination;
-    ReservedAutoIdentity reservation;
-    reservation.token=job.token;
-    reservation.identity=IdentityOf(fast);
-    reservation.app=fast.app;
-    reservation.originDesktop=fast.desktop;
-    bool provisionalNeedsInsert=false;
-    auto bound=g_recordByRuntime.find(runtimeKey);
-    if(bound!=g_recordByRuntime.end() &&
-       SameIdentity(bound->second.identity,IdentityOf(fast))){
-        reservation.recordId=bound->second.recordId;
-        job.recordId=bound->second.recordId;
-    } else {
-        std::string recordId;
-        const PopupReservationRecordSource recordSource=
-            SelectPopupReservationRecord(
-                tracked,g_autoLoaded && g_autoWritesAllowed,titleComplete,
-                !GuidIsZero(fast.desktop),
-                [&](std::string& selected){
-                    return SelectPendingPopupRecordId(
-                        IdentityOf(fast),fast.app,g_pendingRecordByRuntime,
-                        [&](const std::string& candidate,
-                            const std::string& app,std::string& canonical){
-                            GUID parsed{};
-                            if(!ParseNonzeroLayoutGuid(
-                                    candidate,parsed,&canonical)) return false;
-                            for(const LayoutWin& saved : g_autoRecords){
-                                GUID savedGuid{};
-                                std::string savedCanonical;
-                                if(ParseNonzeroLayoutGuid(
-                                        saved.recordId,savedGuid,
-                                        &savedCanonical) &&
-                                   savedCanonical==canonical &&
-                                   saved.app==app) return true;
-                            }
-                            return false;
-                        },selected);
-                },
-                [&](std::string& selected){
-                    auto provisional=
-                        g_provisionalRecordByRuntime.find(runtimeKey);
-                    if(provisional!=g_provisionalRecordByRuntime.end()){
-                        selected=provisional->second;
-                        return true;
-                    }
-                    selected=NewRecordId();
+static PickerAcceptedPlanRecordResult SelectPickerAcceptedPlanRecord(
+        const WindowIdentityKey& identity,const std::string& capturedApp,
+        std::string& selectedApp,std::string& output,
+        uint64_t& selectedOperationId,uint64_t& selectedIdentityGeneration,
+        LayoutWin& selectedFreshRecord,bool& hasSelectedFreshRecord,
+        bool& selectedRecordExists) noexcept {
+    if(!SameIdentity(identity,identity))
+        return PickerAcceptedPlanRecordResult::Rejected;
+    try {
+        bool found=false;
+        std::string selected,adoptedApp=capturedApp;
+        uint64_t acceptedOperationId=0;
+        bool acceptedRecordExists=false;
+        for(const auto& entry : g_pendingAutoOperations){
+            const AutoRestoreOperation& operation=entry.second;
+            if(!capturedApp.empty() && operation.app!=capturedApp) continue;
+            bool exactInInput=false;
+            for(const FastWin& candidate : operation.reconcileFast)
+                if(SameIdentity(identity,IdentityOf(candidate))){
+                    exactInInput=true;
+                    break;
+                }
+            // A generic capture cannot identify a same-app operation, but an
+            // exact full runtime identity can.  Unknown/unrelated apps remain
+            // independent; an exact in-flight plan is a persistence barrier.
+            if(capturedApp.empty() && !exactInInput) continue;
+            if(operation.cancellationPending)
+                return PickerAcceptedPlanRecordResult::Rejected;
+            bool acceptedExactRecord=false;
+            if(operation.reconcile &&
+               !operation.reconcile->plan.deferred && exactInInput){
+                const ReconcileResult& accepted=*operation.reconcile;
+                for(const LayoutMatch& match : accepted.plan.matches){
+                    if(match.savedIndex>=accepted.saved.size() ||
+                       match.liveIndex>=operation.reconcileFast.size())
+                        continue;
+                    const FastWin& candidate=
+                        operation.reconcileFast[match.liveIndex];
+                    if(!SameIdentity(identity,IdentityOf(candidate)))
+                        continue;
+                    const LayoutWin& saved=accepted.saved[match.savedIndex];
                     GUID parsed{};
-                    if(!ParseNonzeroLayoutGuid(selected,parsed)){
-                        selected.clear();
-                        return false;
+                    std::string canonical;
+                    const LayoutWin* current=nullptr;
+                    if(!ParseNonzeroLayoutGuid(
+                            saved.recordId,parsed,&canonical) ||
+                       saved.app!=operation.app ||
+                       !(current=FindAutoRecord(canonical)) ||
+                       current->app!=operation.app)
+                        return PickerAcceptedPlanRecordResult::Rejected;
+                    const PickerAcceptedPlanRecordResult accumulated=
+                        AccumulatePickerAcceptedPlanRecordAdoptingApp(
+                            identity,capturedApp,IdentityOf(candidate),
+                            saved.app,canonical,adoptedApp,selected,found);
+                    if(accumulated==
+                       PickerAcceptedPlanRecordResult::Rejected)
+                        return accumulated;
+                    if(accumulated==
+                       PickerAcceptedPlanRecordResult::Selected){
+                        if(acceptedOperationId!=0 &&
+                           (acceptedOperationId!=entry.first ||
+                            !acceptedRecordExists))
+                            return PickerAcceptedPlanRecordResult::Rejected;
+                        acceptedOperationId=entry.first;
+                        acceptedRecordExists=true;
                     }
-                    provisionalNeedsInsert=true;
-                    return true;
-                },recordId);
-        if(recordSource!=PopupReservationRecordSource::None){
-            reservation.recordId=recordId;
-            job.recordId=recordId;
-            if(recordSource==PopupReservationRecordSource::Provisional){
-                LayoutWin origin;
-                origin.recordId=recordId;
-                origin.app=fast.app;
-                origin.desktop=fast.desktop;
-                origin.deskIndex=SnapshotDesktopIndex(fast.desktop);
-                origin.activeTitle=W2U8(fast.title);
-                MarkSeen(origin,UtcNowSeconds());
-                reservation.provisionalOriginRecord=origin;
-                reservation.hasProvisionalOriginRecord=true;
+                    acceptedExactRecord=true;
+                }
+                for(const NewRecordRequest& created :
+                    accepted.plan.newRecords){
+                    if(created.liveIndex>=operation.reconcileFast.size() ||
+                       created.liveIndex>=accepted.live.size()) continue;
+                    const FastWin& candidate=
+                        operation.reconcileFast[created.liveIndex];
+                    if(!SameIdentity(identity,IdentityOf(candidate))) continue;
+                    GUID parsed{};
+                    std::string canonical;
+                    if(!ParseNonzeroLayoutGuid(
+                            created.recordId,parsed,&canonical) ||
+                       accepted.live[created.liveIndex].app!=operation.app)
+                        return PickerAcceptedPlanRecordResult::Rejected;
+                    const PickerAcceptedPlanRecordResult accumulated=
+                        AccumulatePickerAcceptedPlanRecordAdoptingApp(
+                            identity,capturedApp,IdentityOf(candidate),
+                            operation.app,canonical,adoptedApp,selected,found);
+                    if(accumulated==
+                       PickerAcceptedPlanRecordResult::Rejected)
+                        return accumulated;
+                    if(accumulated==
+                       PickerAcceptedPlanRecordResult::Selected){
+                        if(acceptedOperationId!=0 &&
+                           (acceptedOperationId!=entry.first ||
+                            acceptedRecordExists))
+                            return PickerAcceptedPlanRecordResult::Rejected;
+                        acceptedOperationId=entry.first;
+                        acceptedRecordExists=false;
+                    }
+                    acceptedExactRecord=true;
+                }
+            }
+            const PickerInFlightPlanEntryAction action=
+                DecidePickerInFlightPlanEntry(
+                    true,operation.reconcile!=nullptr ||
+                         operation.reconcileFastKnown,
+                    exactInInput,acceptedExactRecord);
+            if(action==PickerInFlightPlanEntryAction::Wait)
+                return PickerAcceptedPlanRecordResult::Rejected;
+        }
+        if(!found) return PickerAcceptedPlanRecordResult::Unrelated;
+        if(acceptedOperationId==0 || adoptedApp.empty())
+            return PickerAcceptedPlanRecordResult::Rejected;
+        auto acceptedOperation=
+            g_pendingAutoOperations.find(acceptedOperationId);
+        if(acceptedOperation==g_pendingAutoOperations.end() ||
+           acceptedOperation->second.identityGeneration==0)
+            return PickerAcceptedPlanRecordResult::Rejected;
+        LayoutWin freshRecord;
+        bool hasFreshRecord=false;
+        auto fresh=g_acceptedFreshByRuntime.find(RuntimeKey(identity));
+        if(fresh!=g_acceptedFreshByRuntime.end() &&
+           fresh->second.record.app==adoptedApp &&
+           PickerFreshRuntimeMatches(
+               identity,acceptedOperation->second.identityGeneration,
+               fresh->second.identity,
+               fresh->second.identityGeneration)){
+            freshRecord=fresh->second.record;
+            hasFreshRecord=true;
+        }
+        selectedApp.swap(adoptedApp);
+        output.swap(selected);
+        selectedOperationId=acceptedOperationId;
+        selectedIdentityGeneration=
+            acceptedOperation->second.identityGeneration;
+        if(hasFreshRecord)
+            SwapLayoutWinNoThrow(selectedFreshRecord,freshRecord);
+        hasSelectedFreshRecord=hasFreshRecord;
+        selectedRecordExists=acceptedRecordExists;
+        return PickerAcceptedPlanRecordResult::Selected;
+    } catch(...) {
+        return PickerAcceptedPlanRecordResult::Rejected;
+    }
+}
+
+static void BeginVerifiedPickerMove(int index) noexcept {
+    if(g_picker.controlledTransition() || index<0 ||
+       index>=static_cast<int>(g_tiles.size()) ||
+       g_picker.selectedIndex!=index ||
+       !GuidEq(g_picker.selectedDesktop,g_tiles[index].guid) ||
+       !g_main || !g_vdmi || !g_vdmDoc) return;
+    try {
+        const uintptr_t targetHwnd=reinterpret_cast<uintptr_t>(g_target);
+        if(!PickerTargetMatchesActive(targetHwnd,g_picker.activeWindow) ||
+           !g_target || !IsWindow(g_target)) return;
+        const GUID destination=g_tiles[index].guid;
+        const GUID currentOrigin=CurrentDesktopGuid();
+        PickerReadValidity popupValidity=PickerReadValidity::Unavailable;
+        GUID popupOrigin={0};
+        ReadPickerWindowDesktop(g_main,popupValidity,popupOrigin);
+        if(GuidIsZero(destination) || GetDesktopIndexByGuid(destination)<0 ||
+           GuidIsZero(currentOrigin) ||
+           popupValidity!=PickerReadValidity::Valid ||
+           GuidIsZero(popupOrigin)) return;
+
+        FastWin fast;
+        bool tracked=false,titleComplete=true;
+        if(!CaptureFastWindowForMove(
+                g_target,fast,tracked,titleComplete) ||
+           GuidIsZero(fast.desktop)) return;
+        const WindowIdentityKey identity=IdentityOf(fast);
+        if(!PickerCommitIdentityAllowed(
+                targetHwnd,g_picker.activeWindow,identity,
+                RecaptureGenericWindowIdentity(identity))) return;
+        const std::string runtimeKey=RuntimeKey(identity);
+        std::string acceptedPlanApp,acceptedPlanRecord;
+        uint64_t acceptedPlanOperationId=0;
+        uint64_t acceptedPlanIdentityGeneration=0;
+        LayoutWin acceptedPlanFreshRecord;
+        bool hasAcceptedPlanFreshRecord=false;
+        bool acceptedPlanRecordExists=false;
+        const PickerAcceptedPlanRecordResult acceptedPlan=
+            SelectPickerAcceptedPlanRecord(
+                identity,fast.app,acceptedPlanApp,acceptedPlanRecord,
+                acceptedPlanOperationId,acceptedPlanIdentityGeneration,
+                acceptedPlanFreshRecord,hasAcceptedPlanFreshRecord,
+                acceptedPlanRecordExists);
+        if(acceptedPlan==PickerAcceptedPlanRecordResult::Rejected) return;
+        if(acceptedPlan==PickerAcceptedPlanRecordResult::Selected){
+            fast.app=acceptedPlanApp;
+            tracked=true;
+        }
+
+        PickerTransition prepared;
+        prepared.generation=TakeNonzeroId(g_nextOperationId);
+        prepared.reservationToken.owner=MoveOwner::Picker;
+        prepared.reservationToken.operationId=prepared.generation;
+        prepared.reservationToken.jobId=TakeNonzeroId(g_nextMoveJobId);
+        prepared.target=identity;
+        prepared.runtimeKey=runtimeKey;
+        prepared.app=fast.app;
+        prepared.targetOrigin=fast.desktop;
+        prepared.popupOrigin=popupOrigin;
+        prepared.currentOrigin=currentOrigin;
+        prepared.destination=destination;
+        prepared.capturedTitle=fast.title;
+        prepared.capturedTitleComplete=titleComplete;
+
+        ReservedAutoIdentity reservation;
+        reservation.token=prepared.reservationToken;
+        reservation.identity=identity;
+        reservation.app=fast.app;
+        reservation.originDesktop=fast.desktop;
+        if(acceptedPlan==PickerAcceptedPlanRecordResult::Selected){
+            prepared.identityGeneration=acceptedPlanIdentityGeneration;
+            reservation.identityGeneration=acceptedPlanIdentityGeneration;
+            if(hasAcceptedPlanFreshRecord){
+                reservation.acceptedFreshRecord=acceptedPlanFreshRecord;
+                reservation.hasAcceptedFreshRecord=true;
             }
         }
-    }
-    if(!reservation.recordId.empty())
-        g_restoreBudgets.clearForExplicitRetry(reservation.recordId);
-    MoveRuntimeBinding runtime;
-    runtime.window=fast;
-    runtime.destination=destination;
-    ReservationHandoff handoff;
-    bool insertedProvisional=false;
-    bool insertedPickerOperation=false;
-    bool insertedRuntime=false;
-    const bool queued=RunSuccessorFirstReservationHandoff([&]{
-        if(!BeginReservationHandoff(runtimeKey,reservation,handoff))
-            return false;
-        job.recordId=handoff.installed.recordId;
-        if(provisionalNeedsInsert){
-            if(!g_provisionalRecordByRuntime.emplace(
-                    runtimeKey,handoff.installed.recordId).second) return false;
-            insertedProvisional=true;
+        bool provisionalNeedsInsert=false;
+        bool preserveAcceptedPlanPending=false;
+
+        if(tracked){
+            std::map<std::string,AppFastSnapshot> snapshots=
+                CollectFastSnapshots();
+            auto snapshot=snapshots.find(fast.app);
+            bool exactPresent=false;
+            if(snapshot!=snapshots.end() &&
+               FastSnapshotCanObserve(snapshot->second)){
+                for(const FastWin& candidate : snapshot->second.windows)
+                    if(SameIdentity(IdentityOf(candidate),identity)){
+                        exactPresent=true;
+                        break;
+                    }
+            }
+            if(exactPresent){
+                prepared.identityGeneration=
+                    snapshot->second.identityGeneration;
+                reservation.identityGeneration=
+                    prepared.identityGeneration;
+                reservation.acceptedFreshRecord=LayoutWin{};
+                reservation.hasAcceptedFreshRecord=false;
+                auto fresh=g_acceptedFreshByRuntime.find(runtimeKey);
+                if(fresh!=g_acceptedFreshByRuntime.end() &&
+                   PickerFreshRuntimeMatches(
+                       identity,prepared.identityGeneration,
+                       fresh->second.identity,
+                       fresh->second.identityGeneration)){
+                    reservation.acceptedFreshRecord=fresh->second.record;
+                    reservation.hasAcceptedFreshRecord=true;
+                }
+            }
+            auto lifecycle=g_lifecycleByApp.find(fast.app);
+            if(lifecycle!=g_lifecycleByApp.end() &&
+               lifecycle->second.saveInFlight){
+                prepared.lifecycleSaveGeneration=
+                    lifecycle->second.saveGeneration;
+                prepared.lifecycleLayoutSignature=
+                    lifecycle->second.layoutSignature;
+                prepared.lifecycleSessionSignature=
+                    lifecycle->second.sessionStampSignature;
+            }
         }
-        if(!operation.liveJobIds.insert(job.token.jobId).second) return false;
-        if(!g_pickerOperations.emplace(operation.operationId,operation).second)
-            return false;
-        insertedPickerOperation=true;
-        if(!g_moveRuntime.emplace(job.token.jobId,runtime).second) return false;
-        insertedRuntime=true;
-        if(!g_moveQueue.enqueue(job)) return false;
-        return true;
-    },[&]() noexcept {
-        PublishReservationHandoff(handoff);
-    },[&]{
-        CancelDisplacedReservationHandoff(handoff);
-    },[&]{
-        if(insertedProvisional){
-            auto provisional=g_provisionalRecordByRuntime.find(runtimeKey);
-            if(provisional!=g_provisionalRecordByRuntime.end() &&
-               provisional->second==handoff.installed.recordId)
-                g_provisionalRecordByRuntime.erase(provisional);
+
+        auto bound=g_recordByRuntime.find(runtimeKey);
+        if(bound!=g_recordByRuntime.end() &&
+           SameIdentity(bound->second.identity,identity)){
+            if(acceptedPlan==PickerAcceptedPlanRecordResult::Selected &&
+               bound->second.recordId!=acceptedPlanRecord) return;
+            reservation.recordId=bound->second.recordId;
+        } else {
+            std::string recordId;
+            PopupReservationRecordSource source=
+                PopupReservationRecordSource::None;
+            const bool persistenceReady=
+                g_autoLoaded && g_autoWritesAllowed &&
+                g_autoFix && !g_degraded;
+            LayoutWin capturedProvisional;
+            const bool hasCapturedProvisional=titleComplete &&
+                BuildPickerCapturedTitleOnlyProvisional(
+                    fast.app,fast.title,capturedProvisional);
+            const bool acceptedNewNeedsOrigin=
+                acceptedPlan==PickerAcceptedPlanRecordResult::Selected &&
+                !acceptedPlanRecordExists &&
+                !reservation.hasAcceptedFreshRecord;
+            if(acceptedNewNeedsOrigin && !hasCapturedProvisional) return;
+            const bool safeOriginRecord=PickerHasSafeOriginRecord(
+                hasCapturedProvisional,
+                reservation.hasAcceptedFreshRecord);
+            if(acceptedPlan==PickerAcceptedPlanRecordResult::Selected){
+                recordId=acceptedPlanRecord;
+                source=PopupReservationRecordSource::Pending;
+                preserveAcceptedPlanPending=true;
+            } else {
+                source=SelectPopupReservationRecord(
+                    tracked,persistenceReady,safeOriginRecord,
+                    !GuidIsZero(fast.desktop),
+                    [&](std::string& selected){
+                        return SelectPendingPopupRecordId(
+                            identity,fast.app,g_pendingRecordByRuntime,
+                            [&](const std::string& candidate,
+                                const std::string& app,
+                                std::string& canonical){
+                                GUID parsed{};
+                                if(!ParseNonzeroLayoutGuid(
+                                        candidate,parsed,&canonical))
+                                    return false;
+                                for(const LayoutWin& saved : g_autoRecords)
+                                    if(saved.recordId==canonical &&
+                                       saved.app==app) return true;
+                                return false;
+                            },selected);
+                    },
+                    [&](std::string& selected){
+                        auto existing=g_provisionalRecordByRuntime.find(
+                            runtimeKey);
+                        if(existing!=g_provisionalRecordByRuntime.end()){
+                            selected=existing->second;
+                            return true;
+                        }
+                        selected=NewRecordId();
+                        GUID parsed{};
+                        if(!ParseNonzeroLayoutGuid(selected,parsed)){
+                            selected.clear();
+                            return false;
+                        }
+                        provisionalNeedsInsert=true;
+                        return true;
+                    },recordId);
+            }
+            if(source==PopupReservationRecordSource::None &&
+               !safeOriginRecord &&
+               PickerMayReserveStableRecordId(
+                   tracked,persistenceReady,
+                   !GuidIsZero(fast.desktop))){
+                auto existing=g_provisionalRecordByRuntime.find(runtimeKey);
+                if(existing!=g_provisionalRecordByRuntime.end()){
+                    recordId=existing->second;
+                    source=PopupReservationRecordSource::Provisional;
+                } else {
+                    recordId=NewRecordId();
+                    GUID parsed{};
+                    if(ParseNonzeroLayoutGuid(recordId,parsed)){
+                        provisionalNeedsInsert=true;
+                        source=PopupReservationRecordSource::Provisional;
+                    } else {
+                        recordId.clear();
+                    }
+                }
+            }
+            if(source!=PopupReservationRecordSource::None){
+                reservation.recordId=recordId;
+                if((source==PopupReservationRecordSource::Provisional ||
+                    acceptedNewNeedsOrigin) &&
+                   safeOriginRecord){
+                    LayoutWin origin;
+                    if(reservation.hasAcceptedFreshRecord){
+                        origin=reservation.acceptedFreshRecord;
+                        origin.provisional=false;
+                    } else {
+                        origin=capturedProvisional;
+                    }
+                    origin.recordId=recordId;
+                    origin.app=fast.app;
+                    origin.desktop=fast.desktop;
+                    origin.deskIndex=SnapshotDesktopIndex(fast.desktop);
+                    MarkSeen(origin,UtcNowSeconds());
+                    reservation.provisionalOriginRecord=origin;
+                    reservation.hasProvisionalOriginRecord=true;
+                }
+            }
         }
-        if(insertedRuntime) g_moveRuntime.erase(job.token.jobId);
-        if(insertedPickerOperation) g_pickerOperations.erase(operation.operationId);
-        RollbackReservationHandoff(handoff);
-    });
-    if(!queued){
-        return;
-    }
-    ArmMoveTimer();
-    if(SWITCH_AFTER_MOVE){
-        ScopedComPtr<IVirtualDesktop> desktop(GetDesktopByGuid(destination));
-        if(desktop) g_vdmi->SwitchDesktop(desktop.get());
+        ReservationHandoff handoff;
+        std::map<std::string,std::string> stagedAcceptedPending;
+        std::map<std::string,PickerOperationLifetimeClaim>
+            stagedOperationClaims;
+        AutoRestoreOperation* claimedOperation=nullptr;
+        bool insertedProvisional=false;
+        bool acceptedPendingPublished=false;
+        bool operationClaimPublished=false;
+        bool transitionPublished=false;
+        if(acceptedPlan==PickerAcceptedPlanRecordResult::Selected){
+            auto operation=
+                g_pendingAutoOperations.find(acceptedPlanOperationId);
+            if(operation==g_pendingAutoOperations.end() ||
+               !StagePickerOperationLifetimeClaim(
+                   operation->second.pickerClaimedRecordByRuntime,
+                   runtimeKey,acceptedPlanRecord,
+                   acceptedPlanRecordExists,stagedOperationClaims))
+                return;
+            claimedOperation=&operation->second;
+        }
+        const bool staged=RunSuccessorFirstReservationHandoff([&](){
+            if(!BeginReservationHandoff(runtimeKey,reservation,handoff))
+                return false;
+            prepared.pendingRecordId=handoff.installed.recordId;
+            if(preserveAcceptedPlanPending){
+                if(!StagePickerAcceptedPlanPendingAssociation(
+                        g_pendingRecordByRuntime,runtimeKey,
+                        handoff.installed.recordId,stagedAcceptedPending))
+                    return false;
+                g_pendingRecordByRuntime.swap(stagedAcceptedPending);
+                acceptedPendingPublished=true;
+            }
+            if(claimedOperation){
+                claimedOperation->pickerClaimedRecordByRuntime.swap(
+                    stagedOperationClaims);
+                operationClaimPublished=true;
+            }
+            if(provisionalNeedsInsert){
+                if(!g_provisionalRecordByRuntime.emplace(
+                        runtimeKey,handoff.installed.recordId).second)
+                    return false;
+                insertedProvisional=true;
+            }
+            g_picker.transition.swap(prepared);
+            transitionPublished=true;
+            return true;
+        },[&]() noexcept {
+            PublishReservationHandoff(handoff);
+        },[&](){
+            CancelDisplacedReservationHandoff(handoff);
+        },[&](){
+            if(transitionPublished){
+                g_picker.transition.swap(prepared);
+                transitionPublished=false;
+            }
+            if(acceptedPendingPublished){
+                g_pendingRecordByRuntime.swap(stagedAcceptedPending);
+                acceptedPendingPublished=false;
+            }
+            if(operationClaimPublished && claimedOperation){
+                claimedOperation->pickerClaimedRecordByRuntime.swap(
+                    stagedOperationClaims);
+                operationClaimPublished=false;
+            }
+            if(insertedProvisional){
+                auto provisional=g_provisionalRecordByRuntime.find(runtimeKey);
+                if(provisional!=g_provisionalRecordByRuntime.end() &&
+                   provisional->second==handoff.installed.recordId)
+                    g_provisionalRecordByRuntime.erase(provisional);
+            }
+            RollbackReservationHandoff(handoff);
+        });
+        if(!staged) return;
+
+        SetPickerCurrentDesktop(g_picker,currentOrigin);
+        if(!g_picker.transition.pendingRecordId.empty()){
+            try {
+                g_restoreBudgets.clearForExplicitRetry(
+                    g_picker.transition.pendingRecordId);
+            } catch(...) {}
+        }
+        PickerObservation begin;
+        begin.event=PickerEvent::Begin;
+        begin.generation=g_picker.transition.generation;
+        const PickerEffect effect=
+            AdvancePickerTransition(g_picker,begin);
+        if(effect.kind==PickerEffectKind::None){
+            MoveResult terminal;
+            terminal.completed=true;
+            terminal.terminal=MoveTerminal::Cancelled;
+            terminal.token=g_picker.transition.reservationToken;
+            terminal.runtimeKey=runtimeKey;
+            terminal.recordId=g_picker.transition.pendingRecordId;
+            ConsumeCheckpointAndReleaseMoveReservation(terminal);
+            g_picker.transition.swap(prepared);
+            return;
+        }
+        QueuePickerEffect(effect);
+    } catch(...) {
+        // Entry staging is failure-atomic; any published transition owns its
+        // exact guard and the durable pump will finish or roll it back.
     }
 }
 static PickerTargetCaptureState CapturePickerTarget() noexcept {
@@ -5409,7 +7039,7 @@ static PickerTargetCaptureState CapturePickerTarget() noexcept {
 }
 
 static void ShowPicker(PickerTargetCaptureState capture){
-    if(g_degraded) return;   // desktop COM unavailable; startup dialog + tray tip already explain
+    if(g_degraded || g_picker.controlledTransition()) return;   // desktop COM unavailable; startup dialog + tray tip already explain
     const bool modelReady=BuildModel(capture.identity,true);
     if(!modelReady){
         RefreshPickerPaintCache();
@@ -5418,7 +7048,8 @@ static void ShowPicker(PickerTargetCaptureState capture){
     InvalidatePublishedPickerPaintCache();
     g_target=reinterpret_cast<HWND>(capture.hwnd);
     g_targetTitle.swap(capture.title);
-    g_tabBlobsBuilt=false;
+    InvalidatePickerTabSearchCache(
+        g_pickerTabSearchCache,g_picker.modelGeneration);
     SIZE sz=DesiredClientSize();
     HMONITOR mon=MonitorFromWindow(g_target?g_target:g_main,MONITOR_DEFAULTTOPRIMARY); MONITORINFO mi={sizeof(mi)}; GetMonitorInfo(mon,&mi);
     RECT wr={0,0,sz.cx,sz.cy}; AdjustWindowRectEx(&wr,WS_POPUP,FALSE,WS_EX_TOOLWINDOW|WS_EX_TOPMOST);
@@ -5441,9 +7072,10 @@ static void ShowPicker(PickerTargetCaptureState capture){
     ShowWindow(g_main,SW_SHOW); SetForegroundWindow(g_main);
     if(g_search) SetFocus(g_search);
     InvalidateRect(g_main,nullptr,FALSE);
+    ArmPickerIdleRefresh();
 }
-static void MoveSel(int dx,int dy){ if(g_tiles.empty())return; int r=g_sel/g_cols,c=g_sel%g_cols; c+=dx;r+=dy; int n=(int)g_tiles.size();
-    if(c<0)c=0; if(c>=g_cols)c=g_cols-1; if(r<0)r=0; int idx=r*g_cols+c; if(idx>=n)idx=n-1; if(idx<0)idx=0; SetPickerSelectionWithLegacy(idx); RefreshPickerPaintCache(); InvalidateRect(g_main,nullptr,FALSE); }
+static void MoveSel(int dx,int dy){ if(g_picker.controlledTransition()||g_tiles.empty())return; int selected=g_picker.selectedIndex; if(selected<0||selected>=(int)g_tiles.size())selected=0; int r=selected/g_cols,c=selected%g_cols; c+=dx;r+=dy; int n=(int)g_tiles.size();
+    if(c<0)c=0; if(c>=g_cols)c=g_cols-1; if(r<0)r=0; int idx=r*g_cols+c; if(idx>=n)idx=n-1; if(idx<0)idx=0; SetPickerSelectionCurrent(idx); RefreshPickerPaintCache(); InvalidateRect(g_main,nullptr,FALSE); }
 
 // ================================ GUI: tray ==================================
 static HICON LoadAppIcon(int cx,int cy){
@@ -5521,6 +7153,7 @@ static void ApplyAutoFix(){
 // Фокус-данс через Progman, как в референсе MScholtes: без него система может
 // «вернуть» исходный десктоп из-за активного окна -> переключение уходило не туда.
 static void GoToDesktop(int idx){
+    if(g_picker.controlledTransition()) return;
     if(idx<0||idx>=(int)g_tiles.size())return;
     HidePicker();
     IVirtualDesktop* d=GetDesktopByIndex((UINT)g_tiles[idx].index);
@@ -5543,10 +7176,11 @@ static void GoToDesktop(int idx){
 }
 // Клик = переключение на десктоп; Ctrl = перенести активное окно туда.
 static void Activate(int idx, bool ctrlMove){
+    if(g_picker.controlledTransition()) return;
     if(idx<0||idx>=(int)g_tiles.size())return;
-    if(!SetPickerSelectionWithLegacy(idx)) return;
+    if(!SetPickerSelectionCurrent(idx)) return;
     RefreshPickerPaintCache();
-    if(ctrlMove) Commit(idx);
+    if(ctrlMove) BeginVerifiedPickerMove(idx);
     else         GoToDesktop(idx);
 }
 
@@ -5583,6 +7217,8 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     }
     case WM_COMMAND:
         if(LOWORD(wp)==IDOK){
+            if(!PickerUiActionAllowed(
+                    g_picker,PickerUiAction::Settings)) return 0;
             WORD r=(WORD)SendMessageW(GetDlgItem(hwnd,IDC_HOTKEY),HKM_GETHOTKEY,0,0);
             BYTE vk=LOBYTE(r), hf=HIBYTE(r);
             UINT newHotVk=g_hotVk,newHotMods=g_hotMods;
@@ -5844,8 +7480,27 @@ static bool OpenPickerFooterLink(
 }
 
 static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
+    if(g_pickerDurableKickPending && !g_pickerPumpActive &&
+       !g_pickerShutdownDrain && msg!=WM_PICKER_TRANSITION &&
+       g_runtimeQuiescence.acceptsDispatch())
+        PumpPickerTransitionWork();
     switch(msg){
     case WM_HOTKEY: ShowPicker(CapturePickerTarget()); return 0;
+    case WM_CLOSE:
+        if(g_picker.controlledTransition()) RequestPickerCancellation();
+        else HidePicker();
+        return 0;
+    case WM_PICKER_TRANSITION:
+        if(g_runtimeQuiescence.acceptsDispatch())
+            PumpPickerTransitionWork();
+        return 0;
+    case WM_PICKER_SEARCH_RETRY:
+        if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
+        if(ConsumePickerTabSearchRetryPostWhenIdle(
+                g_pickerTabSearchCache,g_picker.controlledTransition(),
+                g_picker.modelGeneration,g_picker.searchText))
+            EnsureTabSearch();
+        return 0;
     case WM_PAINT:{ ScopedPickerPaint paint(hwnd); HDC target=paint.get(); if(!target)return 0; RECT cr; GetClientRect(hwnd,&cr); HDC canvas=target; if(g_pickerBuffer.ensure(target,cr.right,cr.bottom))canvas=g_pickerBuffer.get(); Paint(target,canvas,cr); return 0; }
     case WM_ERASEBKGND: return 1;
     case WM_SETCURSOR:{
@@ -5868,17 +7523,23 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     case WM_KEYDOWN:{
         bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
         if(wp==VK_CONTROL){ InvalidateRect(hwnd,nullptr,FALSE); return 0; }
-        if(wp==VK_ESCAPE){HidePicker();return 0;}
+        if(wp==VK_ESCAPE){
+            if(g_picker.controlledTransition()) RequestPickerCancellation();
+            else HidePicker();
+            return 0;
+        }
+        if(g_picker.controlledTransition()) return 0;
         if(wp==VK_RETURN||wp==VK_SPACE){Activate(g_picker.selectedIndex,ctrl);return 0;}
         if(wp==VK_LEFT){MoveSel(-1,0);return 0;} if(wp==VK_RIGHT){MoveSel(1,0);return 0;}
         if(wp==VK_UP){MoveSel(0,-1);return 0;} if(wp==VK_DOWN){MoveSel(0,1);return 0;}
-        if(wp==VK_TAB){ bool sh=(GetKeyState(VK_SHIFT)&0x8000)!=0; int n=(int)g_tiles.size(); if(n){int selected=g_picker.selectedIndex; if(selected<0||selected>=n)selected=0; SetPickerSelectionWithLegacy((selected+(sh?-1:1)+n)%n); RefreshPickerPaintCache(); InvalidateRect(hwnd,nullptr,FALSE);} return 0; }
+        if(wp==VK_TAB){ bool sh=(GetKeyState(VK_SHIFT)&0x8000)!=0; int n=(int)g_tiles.size(); if(n){int selected=g_picker.selectedIndex; if(selected<0||selected>=n)selected=0; SetPickerSelectionCurrent((selected+(sh?-1:1)+n)%n); RefreshPickerPaintCache(); InvalidateRect(hwnd,nullptr,FALSE);} return 0; }
         if(wp>='1'&&wp<='9'){Activate((int)(wp-'1'),ctrl);return 0;} if(wp=='0'){Activate(9,ctrl);return 0;}
         return 0; }
     case WM_KEYUP:
         if(wp==VK_CONTROL) InvalidateRect(hwnd,nullptr,FALSE);
         return 0;
     case WM_LBUTTONDOWN:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+        if(g_picker.controlledTransition()) return 0;
         const bool cacheReady=PickerPaintCacheMatches(g_picker,g_pickerPaintCache.generation);
         const PickerFooterActivation footerActivation=
             ResolvePickerFooterActivation(
@@ -5932,6 +7593,7 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         return 0;
     }
     case WM_MOUSEMOVE:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+        if(g_picker.controlledTransition()) return 0;
         const bool cacheReady=PickerPaintCacheMatches(g_picker,g_pickerPaintCache.generation);
         const PickerFooterLink footerHover=HitCurrentPickerFooterLink(
             g_picker,g_pickerPaintCache.generation,
@@ -5960,7 +7622,7 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             TrackPickerHoverTooltip(hwnd,g_pickerPaintCache.hoverRows[hovRow],
                 hovRow,g_pickerPaintCache.generation,pt);
         } else if(g_lastHoverRow!=-1){ ResetPickerHoverTooltip(); }
-        for(size_t i=0;i<g_tiles.size();++i) if(PtInRect(&g_tiles[i].rc,pt)){ if(g_picker.selectedIndex!=(int)i){SetPickerSelectionWithLegacy((int)i); RefreshPickerPaintCache(); InvalidateRect(hwnd,nullptr,FALSE);} break; }
+        for(size_t i=0;i<g_tiles.size();++i) if(PtInRect(&g_tiles[i].rc,pt)){ if(g_picker.selectedIndex!=(int)i){SetPickerSelectionCurrent((int)i); RefreshPickerPaintCache(); InvalidateRect(hwnd,nullptr,FALSE);} break; }
         TRACKMOUSEEVENT tme={sizeof(tme)}; tme.dwFlags=TME_LEAVE; tme.hwndTrack=hwnd; TrackMouseEvent(&tme);
         return 0; }
     case WM_MOUSELEAVE:{
@@ -5974,13 +7636,15 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         return 0;
     }
     case WM_MOUSEWHEEL:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; ScreenToClient(hwnd,&pt); int delta=GET_WHEEL_DELTA_WPARAM(wp);   // R8: scroll a tile's window list
+        if(g_picker.controlledTransition()) return 0;
         for(auto& t:g_tiles) if(PtInRect(&t.rc,pt)){ const int maximum=PickerTileMaxScroll(t); RememberPickerScroll(t,AdvancePickerScroll(t.scroll,maximum,delta)); RefreshPickerPaintCache(); InvalidateRect(hwnd,nullptr,FALSE); break; }
         return 0; }
     case WM_COMMAND:                                            // R7: live-filter as the search text changes
+        if(g_picker.controlledTransition()) return 0;
         if(g_search && (HWND)lp==g_search && HIWORD(wp)==EN_CHANGE){
             int n=GetWindowTextLengthW(g_search); std::wstring s(n+1,0); GetWindowTextW(g_search,&s[0],n+1); s.resize(wcslen(s.c_str()));
             std::wstring searchText=LowerW(s);
-            if(ApplyPickerSearchText(std::move(searchText))){
+            if(ApplyPickerSearchText(s,searchText)){
                 if(!g_picker.searchText.empty()) EnsureTabSearch();
                 RefreshPickerPaintCache();
             }
@@ -6013,6 +7677,18 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         return 0;
     case WM_TIMER:
         if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
+        if(wp==TIMER_PICKER_TRANSITION){
+            if(g_picker.controlledTransition() || g_pickerEffectScheduled ||
+               g_pickerObservationKick.pending ||
+               g_pickerTerminalizationPending){
+                PumpPickerTransitionWork();
+            } else {
+                KillTimer(hwnd,TIMER_PICKER_TRANSITION);
+                RefreshPickerHighlightsLightweight();
+                ArmPickerIdleRefresh();
+            }
+            return 0;
+        }
         if(wp==TIMER_HEARTBEAT){
             RunMessageRouteNoThrow([](){
                 CheckpointAutoLayout(CheckpointReason::Heartbeat);
@@ -6111,6 +7787,7 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             AppendMenuW(m,MF_STRING,209,L"Exit");
             SetForegroundWindow(hwnd);
             int cmd=TrackPopupMenu(m,TPM_RETURNCMD|TPM_RIGHTBUTTON,pt.x,pt.y,0,hwnd,nullptr); DestroyMenu(m);
+            if(g_picker.controlledTransition() && cmd!=209) return 0;
             if(cmd==200)ShowPicker(std::move(pickerTarget));
             else if(cmd==201)StartManualSave();
             else if(cmd==202)StartManualRestore(true);
@@ -6119,20 +7796,23 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             else if(cmd==206)OpenHelp();
             else if(cmd==205)OpenAbout();
             else if(cmd==209) RunTrayExit(
-                [](){ return FinalizeAutoLayout(); },
+                [](){ DrainPickerForShutdown(); return FinalizeAutoLayout(); },
                 [=](){ DestroyWindow(hwnd); });
         } else if(LOWORD(lp)==WM_LBUTTONDBLCLK)
             ShowPicker(CapturePickerTarget());
         return 0;
     case WM_QUERYENDSESSION:
+        DrainPickerForShutdown();
         CheckpointAutoLayout(CheckpointReason::QueryEndSession);
         return TRUE;
     case WM_ENDSESSION:
+        if(wp!=0) DrainPickerForShutdown();
         FinalizeSessionAndQuiesce(wp!=0,
             [](){ return FinalizeAutoLayout(); },
             [=](){ return QuiesceRuntime(hwnd); });
         return 0;
     case WM_DESTROY:
+        DrainPickerForShutdown();
         FinalizeAutoLayout();
         QuiesceRuntime(hwnd);
         g_pickerBuffer.reset();

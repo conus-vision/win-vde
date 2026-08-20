@@ -1,6 +1,7 @@
 #pragma once
 
 #include "str_util.hpp"
+#include "move_queue.hpp"
 #include "window_identity.hpp"
 
 #include <algorithm>
@@ -377,18 +378,853 @@ inline std::string GuidKey(const GUID& guid){
     return W2U8(GuidToString(guid));
 }
 
+enum class PickerPhase {
+    Idle,
+    TargetIssue, TargetVerify,
+    IdentityVerifyBeforePopup,
+    PopupIssue, PopupVerify,
+    IdentityVerifyBeforeSwitch,
+    SwitchIssue, DestinationVerify,
+    RollbackTargetIssue, RollbackTargetVerify,
+    RollbackPopupIssue, RollbackPopupVerify,
+    RollbackSwitchIssue, OriginVerify,
+    SaveExactTarget, RefreshModel, FailureReport, FocusRestore
+};
+
+enum class PickerEvent {
+    Begin, ApiCompleted, ReadbackCompleted, EffectCompleted,
+    CancelRequested, Timer
+};
+
+enum class PickerEffectKind {
+    None, ValidateTarget, MoveTarget, ReadTarget, MovePopup, ReadPopup,
+    SwitchDesktop, ReadCurrent, SaveExactTarget, Refresh,
+    ShowAndFocus, Hide, ReportFailure
+};
+
+enum class PickerReadValidity { Unknown, Valid, Unavailable };
+enum class PickerIdentityValidity { Unknown, Match, Lost, Indeterminate };
+enum class PopupSaveStatus { NotTracked, Saved, Failed };
+enum class PopupSaveFailure {
+    None, IdentityLost, IdentityIndeterminate, Classification,
+    StorageUnavailable, StorageReadOnly, ReservationUnavailable,
+    InvalidRecordId, DesktopUnavailable, WrongProfile,
+    FingerprintUnavailable, IncompleteTitle, StageRejected,
+    IdentityChanged, FlushFailed, Unexpected
+};
+
+inline bool PickerTerminalReservationAppAllowed(
+        const std::string& reservedApp,
+        const std::string& terminalApp) noexcept {
+    return !terminalApp.empty() &&
+           (reservedApp.empty() || reservedApp==terminalApp);
+}
+
+struct PickerObservation {
+    PickerEvent event=PickerEvent::Timer;
+    uint64_t generation=0;
+    PickerEffectKind effectKind=PickerEffectKind::None;
+    uint64_t effectSerial=0;
+    PickerIdentityValidity identity=PickerIdentityValidity::Unknown;
+    bool apiInvoked=false;
+    bool apiAccepted=false;
+    bool unissuedEffectCancelled=false;
+    bool popupIsForeground=false;
+    PopupSaveStatus saveStatus=PopupSaveStatus::Failed;
+    PopupSaveFailure saveFailure=PopupSaveFailure::None;
+    PickerReadValidity targetRead=PickerReadValidity::Unknown;
+    PickerReadValidity popupRead=PickerReadValidity::Unknown;
+    PickerReadValidity currentRead=PickerReadValidity::Unknown;
+    GUID actualTargetDesktop={0};
+    GUID actualPopupDesktop={0};
+    GUID actualCurrentDesktop={0};
+};
+
+struct PickerEffect {
+    PickerEffectKind kind=PickerEffectKind::None;
+    uint64_t generation=0;
+    uint64_t effectSerial=0;
+    GUID desktop={0};
+};
+
+struct PickerTransition {
+    PickerPhase phase=PickerPhase::Idle;
+    uint64_t generation=0;
+    MoveToken reservationToken;
+    WindowIdentityKey target;
+    std::string runtimeKey;
+    std::string app;
+    std::string pendingRecordId;
+    std::wstring capturedTitle;
+    GUID targetOrigin={0};
+    GUID popupOrigin={0};
+    GUID currentOrigin={0};
+    GUID destination={0};
+    GUID observedTargetDesktop={0};
+    GUID observedPopupDesktop={0};
+    GUID observedCurrentDesktop={0};
+    PickerReadValidity observedTargetValidity=PickerReadValidity::Unknown;
+    PickerReadValidity observedPopupValidity=PickerReadValidity::Unknown;
+    PickerReadValidity observedCurrentValidity=PickerReadValidity::Unknown;
+    int forwardTargetAttempts=0;
+    int forwardPopupAttempts=0;
+    int forwardSwitchAttempts=0;
+    int rollbackTargetAttempts=0;
+    int rollbackPopupAttempts=0;
+    int rollbackSwitchAttempts=0;
+    int focusAttempts=0;
+    bool targetMayHaveMoved=false;
+    bool popupMayHaveMoved=false;
+    bool switchMayHaveChanged=false;
+    bool targetUnresolvedBeforeIssue=false;
+    bool popupUnresolvedBeforeIssue=false;
+    bool switchUnresolvedBeforeIssue=false;
+    bool cancelRequested=false;
+    bool dismissed=false;
+    bool failed=false;
+    std::wstring diagnostic;
+    PickerEffectKind pendingEffect=PickerEffectKind::None;
+    uint64_t effectSerial=0;
+    bool hidePending=false;
+    bool hideCompleted=false;
+    bool failureReported=false;
+    bool focusFailureTerminal=false;
+    bool targetIdentityUnusable=false;
+    bool commitCutoffReached=false;
+    bool suppressFocus=false;
+    bool terminalAcknowledged=false;
+    bool capturedTitleComplete=false;
+    PickerPhase resumeAfterHide=PickerPhase::Idle;
+    uint64_t identityGeneration=0;
+    uint64_t lifecycleSaveGeneration=0;
+    uint64_t lifecycleLayoutSignature=0;
+    uint64_t lifecycleSessionSignature=0;
+
+    void swap(PickerTransition& other) noexcept {
+        std::swap(phase,other.phase);
+        std::swap(generation,other.generation);
+        std::swap(reservationToken,other.reservationToken);
+        std::swap(target,other.target);
+        runtimeKey.swap(other.runtimeKey);
+        app.swap(other.app);
+        pendingRecordId.swap(other.pendingRecordId);
+        capturedTitle.swap(other.capturedTitle);
+        std::swap(targetOrigin,other.targetOrigin);
+        std::swap(popupOrigin,other.popupOrigin);
+        std::swap(currentOrigin,other.currentOrigin);
+        std::swap(destination,other.destination);
+        std::swap(observedTargetDesktop,other.observedTargetDesktop);
+        std::swap(observedPopupDesktop,other.observedPopupDesktop);
+        std::swap(observedCurrentDesktop,other.observedCurrentDesktop);
+        std::swap(observedTargetValidity,other.observedTargetValidity);
+        std::swap(observedPopupValidity,other.observedPopupValidity);
+        std::swap(observedCurrentValidity,other.observedCurrentValidity);
+        std::swap(forwardTargetAttempts,other.forwardTargetAttempts);
+        std::swap(forwardPopupAttempts,other.forwardPopupAttempts);
+        std::swap(forwardSwitchAttempts,other.forwardSwitchAttempts);
+        std::swap(rollbackTargetAttempts,other.rollbackTargetAttempts);
+        std::swap(rollbackPopupAttempts,other.rollbackPopupAttempts);
+        std::swap(rollbackSwitchAttempts,other.rollbackSwitchAttempts);
+        std::swap(focusAttempts,other.focusAttempts);
+        std::swap(targetMayHaveMoved,other.targetMayHaveMoved);
+        std::swap(popupMayHaveMoved,other.popupMayHaveMoved);
+        std::swap(switchMayHaveChanged,other.switchMayHaveChanged);
+        std::swap(targetUnresolvedBeforeIssue,
+                  other.targetUnresolvedBeforeIssue);
+        std::swap(popupUnresolvedBeforeIssue,
+                  other.popupUnresolvedBeforeIssue);
+        std::swap(switchUnresolvedBeforeIssue,
+                  other.switchUnresolvedBeforeIssue);
+        std::swap(cancelRequested,other.cancelRequested);
+        std::swap(dismissed,other.dismissed);
+        std::swap(failed,other.failed);
+        diagnostic.swap(other.diagnostic);
+        std::swap(pendingEffect,other.pendingEffect);
+        std::swap(effectSerial,other.effectSerial);
+        std::swap(hidePending,other.hidePending);
+        std::swap(hideCompleted,other.hideCompleted);
+        std::swap(failureReported,other.failureReported);
+        std::swap(focusFailureTerminal,other.focusFailureTerminal);
+        std::swap(targetIdentityUnusable,other.targetIdentityUnusable);
+        std::swap(commitCutoffReached,other.commitCutoffReached);
+        std::swap(suppressFocus,other.suppressFocus);
+        std::swap(terminalAcknowledged,other.terminalAcknowledged);
+        std::swap(capturedTitleComplete,other.capturedTitleComplete);
+        std::swap(resumeAfterHide,other.resumeAfterHide);
+        std::swap(identityGeneration,other.identityGeneration);
+        std::swap(lifecycleSaveGeneration,other.lifecycleSaveGeneration);
+        std::swap(lifecycleLayoutSignature,other.lifecycleLayoutSignature);
+        std::swap(lifecycleSessionSignature,other.lifecycleSessionSignature);
+    }
+};
+
+inline bool PickerRuntimeTerminalizationReady(
+        const PickerTransition& transition,
+        bool exactReservationReleased) noexcept {
+    return transition.terminalAcknowledged &&
+        transition.pendingEffect==PickerEffectKind::None &&
+        !transition.runtimeKey.empty() && exactReservationReleased;
+}
+
+enum class PickerTerminalGuardReleaseAction {
+    ResolvedAbsent, ConsumeExact, RetryExactOwner
+};
+
+inline PickerTerminalGuardReleaseAction DecidePickerTerminalGuardRelease(
+        bool keyFound,bool keyTokenMatches,
+        bool tokenFoundAnywhere) noexcept {
+    if(keyFound)
+        return keyTokenMatches
+            ? PickerTerminalGuardReleaseAction::ConsumeExact
+            : PickerTerminalGuardReleaseAction::RetryExactOwner;
+    return tokenFoundAnywhere
+        ? PickerTerminalGuardReleaseAction::RetryExactOwner
+        : PickerTerminalGuardReleaseAction::ResolvedAbsent;
+}
+
+enum class PickerTerminalNoProgressRoute {
+    DelayedTimer, DurableExternalKick
+};
+
+inline PickerTerminalNoProgressRoute DecidePickerTerminalNoProgressRoute(
+        bool shutdownDrain,bool delayedTimerArmed) noexcept {
+    return !shutdownDrain && delayedTimerArmed
+        ? PickerTerminalNoProgressRoute::DelayedTimer
+        : PickerTerminalNoProgressRoute::DurableExternalKick;
+}
+
+enum class PickerUiAction {
+    CtrlMove, PlainSwitch, FooterNavigation, CloseOrReopen, SearchEdit,
+    Selection, ManualSave, ManualRestore, Settings, About, Help, TrayExit
+};
+
+enum class PickerIdleEditInputRoute { Edit, Grid, Swallow };
+
+inline PickerIdleEditInputRoute RoutePickerIdleEditInput(
+        UINT message,WPARAM value,bool controlDown) noexcept {
+    if(message==WM_KEYDOWN){
+        switch(value){
+        case VK_ESCAPE:
+        case VK_RETURN:
+        case VK_UP:
+        case VK_DOWN:
+        case VK_LEFT:
+        case VK_RIGHT:
+        case VK_TAB:
+            return PickerIdleEditInputRoute::Grid;
+        case VK_SPACE:
+            if(controlDown) return PickerIdleEditInputRoute::Grid;
+            break;
+        }
+    }
+    if(message==WM_CHAR &&
+       (value==L'\r' || value==27 || value==L'\t' ||
+        (value==L' ' && controlDown)))
+        return PickerIdleEditInputRoute::Swallow;
+    return PickerIdleEditInputRoute::Edit;
+}
+
+inline bool PickerControlledEditMessageAllowed(UINT message) noexcept {
+    switch(message){
+    case WM_SETTEXT:
+    case WM_KEYDOWN:
+    case WM_KEYUP:
+    case WM_CHAR:
+    case WM_DEADCHAR:
+    case WM_SYSKEYDOWN:
+    case WM_SYSKEYUP:
+    case WM_SYSCHAR:
+    case WM_SYSDEADCHAR:
+    case WM_UNICHAR:
+    case WM_IME_STARTCOMPOSITION:
+    case WM_IME_ENDCOMPOSITION:
+    case WM_IME_COMPOSITION:
+    case WM_IME_CHAR:
+    case WM_IME_KEYDOWN:
+    case WM_IME_KEYUP:
+    case WM_CUT:
+    case WM_PASTE:
+    case WM_CLEAR:
+    case WM_UNDO:
+    case EM_REPLACESEL:
+    case EM_UNDO:
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_LBUTTONDBLCLK:
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+    case WM_RBUTTONDBLCLK:
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONUP:
+    case WM_MBUTTONDBLCLK:
+    case WM_XBUTTONDOWN:
+    case WM_XBUTTONUP:
+    case WM_XBUTTONDBLCLK:
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL:
+    case WM_CONTEXTMENU:
+        return false;
+    default:
+        // Painting, focus/caret, accessibility, destruction and other
+        // non-input lifecycle messages must still reach the EDIT control.
+        return true;
+    }
+}
+
+inline bool PickerReservationReplacementAllowed(
+        MoveOwner prior,MoveOwner replacement) noexcept {
+    if(prior==MoveOwner::Picker) return false;
+    if(replacement==MoveOwner::Picker)
+        return prior==MoveOwner::AutoReconcile;
+    return true;
+}
+
+template<class Reservations>
+inline bool PickerReservationBlocks(
+        const FastWin& window,const Reservations& reservations) noexcept {
+    const auto found=reservations.find(RuntimeKey(window));
+    return found!=reservations.end() &&
+           SameIdentity(found->second,IdentityOf(window));
+}
+
+enum class PickerAutoSupersession {
+    None, CancelQueued, WaitForIssuedReadback
+};
+
+inline PickerAutoSupersession DecidePickerAutoSupersession(
+        bool hasAutomaticJob,bool waitingForVerify,
+        bool issueAwaitingVerify) noexcept {
+    if(!hasAutomaticJob) return PickerAutoSupersession::None;
+    if(waitingForVerify || issueAwaitingVerify)
+        return PickerAutoSupersession::WaitForIssuedReadback;
+    return PickerAutoSupersession::CancelQueued;
+}
+
+enum class PickerKickRoute {
+    Posted, TimerArmed, InlineFallback, Teardown, PendingPreserved
+};
+
+struct PickerKickState {
+    bool pending=false;
+    PickerObservation observation;
+};
+
+inline PickerKickRoute StagePickerObservationKick(
+        PickerKickState& state,const PickerObservation& observation,
+        bool postSucceeded,bool timerSucceeded,bool runtimeAlive) noexcept {
+    if(state.pending) return PickerKickRoute::PendingPreserved;
+    state.observation=observation;
+    state.pending=true;
+    if(postSucceeded) return PickerKickRoute::Posted;
+    if(timerSucceeded) return PickerKickRoute::TimerArmed;
+    return runtimeAlive ? PickerKickRoute::InlineFallback
+                        : PickerKickRoute::Teardown;
+}
+
+inline bool ConsumePickerObservationKick(
+        PickerKickState& state,PickerObservation& output) noexcept {
+    if(!state.pending) return false;
+    output=state.observation;
+    state.pending=false;
+    return true;
+}
+
+struct PopupSaveResult {
+    PopupSaveStatus status=PopupSaveStatus::Failed;
+    PopupSaveFailure failure=PopupSaveFailure::None;
+    std::string app;
+};
+
+inline const wchar_t* PickerSaveFailureDiagnostic(
+        PopupSaveFailure failure) noexcept {
+    switch(failure){
+    case PopupSaveFailure::IdentityLost:
+        return L"The target window identity was lost before saving.";
+    case PopupSaveFailure::IdentityIndeterminate:
+        return L"The target window identity could not be verified before saving.";
+    case PopupSaveFailure::Classification:
+        return L"Browser classification failed; the destination was not saved.";
+    case PopupSaveFailure::StorageUnavailable:
+        return L"Automatic layout storage is unavailable; the destination remains unsaved.";
+    case PopupSaveFailure::StorageReadOnly:
+        return L"Automatic layout storage is read-only or disabled; the destination remains unsaved.";
+    case PopupSaveFailure::ReservationUnavailable:
+        return L"The exact picker reservation was unavailable while saving.";
+    case PopupSaveFailure::InvalidRecordId:
+        return L"The reserved browser record identifier was invalid.";
+    case PopupSaveFailure::DesktopUnavailable:
+        return L"The selected desktop could not be resolved while saving.";
+    case PopupSaveFailure::WrongProfile:
+        return L"The reserved browser record belongs to another profile.";
+    case PopupSaveFailure::FingerprintUnavailable:
+        return L"Fresh browser data and a safe provisional title were both unavailable.";
+    case PopupSaveFailure::IncompleteTitle:
+        return L"The browser title was incomplete, so no provisional record was created.";
+    case PopupSaveFailure::StageRejected:
+        return L"The exact browser record update could not be staged.";
+    case PopupSaveFailure::IdentityChanged:
+        return L"The target identity changed before the browser update could be published.";
+    case PopupSaveFailure::FlushFailed:
+        return L"The browser update remains queued because the layout file could not be written.";
+    case PopupSaveFailure::Unexpected:
+        return L"The browser destination could not be saved safely.";
+    case PopupSaveFailure::None:
+        break;
+    }
+    return L"The browser destination could not be saved.";
+}
+
+inline const wchar_t* PickerPostSaveIdentityDiagnostic(
+        PopupSaveStatus status,
+        PickerIdentityValidity identity) noexcept {
+    const bool lost=identity==PickerIdentityValidity::Lost;
+    if(status==PopupSaveStatus::Saved)
+        return lost
+            ? L"The destination was saved, but the target identity was lost afterward."
+            : L"The destination was saved, but the target identity could not be revalidated afterward.";
+    if(status==PopupSaveStatus::NotTracked)
+        return lost
+            ? L"The moved window identity was lost after the popup operation."
+            : L"The moved window identity could not be revalidated after the popup operation.";
+    return lost
+        ? L"The target identity was lost after the persistence attempt."
+        : L"The target identity could not be revalidated after the persistence attempt.";
+}
+
+template<class Complete>
+inline bool CompletePickerLifecycleForSave(
+        const PopupSaveResult& result,Complete&& complete) noexcept {
+    if(result.status!=PopupSaveStatus::Saved || result.app.empty()) return false;
+    try {
+        complete(result.app);
+        return true;
+    } catch(...) { return false; }
+}
+
+inline bool PickerFreshRuntimeMatches(
+        const WindowIdentityKey& expected,uint64_t expectedGeneration,
+        const WindowIdentityKey& cached,uint64_t cachedGeneration) noexcept {
+    return expectedGeneration!=0 && expectedGeneration==cachedGeneration &&
+           SameIdentity(expected,cached);
+}
+
+inline bool PickerAcceptedFreshRowUsable(
+        bool resultFresh,bool exactSessionAssociation,
+        const WindowIdentityKey& identity,bool appMatches,
+        const std::string& activeTitle,
+        const std::map<std::string,int>& counts) noexcept {
+    return resultFresh && exactSessionAssociation &&
+        SameIdentity(identity,identity) && appMatches &&
+        (!activeTitle.empty() || !counts.empty());
+}
+
+inline bool PickerRowUsesFreshFingerprint(
+        bool resultFresh,bool rowUsableFresh) noexcept {
+    return resultFresh && rowUsableFresh;
+}
+
+inline bool PickerUnboundRowEligibleForReconcilePlan(
+        bool resultFresh,bool rowUsableFresh) noexcept {
+    return !resultFresh || rowUsableFresh;
+}
+
+inline bool PickerUnboundPlanUsesFreshness(
+        bool resultFresh,bool omittedUnusableRow) noexcept {
+    return resultFresh && !omittedUnusableRow;
+}
+
+inline bool PickerTitleOnlyProvisionalFieldsUsable(
+        const std::string& app,
+        const std::string& normalizedTitle) noexcept {
+    return !app.empty() && !normalizedTitle.empty();
+}
+
+enum class PickerFreshRecordSource {
+    None, Reserved, AcceptedAfterEntry
+};
+
+inline PickerFreshRecordSource SelectPickerFreshRecordSource(
+        const WindowIdentityKey& expected,uint64_t expectedGeneration,
+        bool hasReserved,const WindowIdentityKey& reservedIdentity,
+        uint64_t reservedGeneration,bool hasAcceptedAfterEntry,
+        const WindowIdentityKey& acceptedIdentity,
+        uint64_t acceptedGeneration) noexcept {
+    if(hasAcceptedAfterEntry && PickerFreshRuntimeMatches(
+            expected,expectedGeneration,
+            acceptedIdentity,acceptedGeneration))
+        return PickerFreshRecordSource::AcceptedAfterEntry;
+    if(hasReserved && PickerFreshRuntimeMatches(
+            expected,expectedGeneration,
+            reservedIdentity,reservedGeneration))
+        return PickerFreshRecordSource::Reserved;
+    return PickerFreshRecordSource::None;
+}
+
+inline bool PickerHasSafeOriginRecord(bool titleComplete,
+                                      bool hasAcceptedFresh) noexcept {
+    return titleComplete || hasAcceptedFresh;
+}
+
+inline bool PickerMayReserveStableRecordId(
+        bool tracked,bool persistenceReady,
+        bool originDesktopValid) noexcept {
+    return tracked && persistenceReady && originDesktopValid;
+}
+
+enum class PickerAcceptedPlanRecordResult {
+    Unrelated, Selected, Rejected
+};
+
+inline PickerAcceptedPlanRecordResult AccumulatePickerAcceptedPlanRecord(
+        const WindowIdentityKey& expected,const std::string& expectedApp,
+        const WindowIdentityKey& candidate,const std::string& candidateApp,
+        const std::string& candidateRecordId,std::string& selected,
+        bool& found) noexcept {
+    if(!SameIdentity(expected,candidate))
+        return PickerAcceptedPlanRecordResult::Unrelated;
+    if(expectedApp.empty() || candidateApp!=expectedApp ||
+       candidateRecordId.empty())
+        return PickerAcceptedPlanRecordResult::Rejected;
+    if(found)
+        return selected==candidateRecordId
+            ? PickerAcceptedPlanRecordResult::Selected
+            : PickerAcceptedPlanRecordResult::Rejected;
+    try {
+        std::string staged=candidateRecordId;
+        selected.swap(staged);
+        found=true;
+        return PickerAcceptedPlanRecordResult::Selected;
+    } catch(...) {
+        return PickerAcceptedPlanRecordResult::Rejected;
+    }
+}
+
+inline PickerAcceptedPlanRecordResult
+AccumulatePickerAcceptedPlanRecordAdoptingApp(
+        const WindowIdentityKey& expected,const std::string& capturedApp,
+        const WindowIdentityKey& candidate,const std::string& candidateApp,
+        const std::string& candidateRecordId,std::string& selectedApp,
+        std::string& selectedRecordId,bool& found) noexcept {
+    if(!SameIdentity(expected,candidate))
+        return PickerAcceptedPlanRecordResult::Unrelated;
+    if(candidateApp.empty() || candidateRecordId.empty() ||
+       (!capturedApp.empty() && capturedApp!=candidateApp) ||
+       (!selectedApp.empty() && selectedApp!=candidateApp))
+        return PickerAcceptedPlanRecordResult::Rejected;
+    if(found)
+        return selectedApp==candidateApp &&
+               selectedRecordId==candidateRecordId
+            ? PickerAcceptedPlanRecordResult::Selected
+            : PickerAcceptedPlanRecordResult::Rejected;
+    try {
+        std::string stagedApp=candidateApp;
+        std::string stagedRecord=candidateRecordId;
+        selectedApp.swap(stagedApp);
+        selectedRecordId.swap(stagedRecord);
+        found=true;
+        return PickerAcceptedPlanRecordResult::Selected;
+    } catch(...) {
+        return PickerAcceptedPlanRecordResult::Rejected;
+    }
+}
+
+template<class PendingMap>
+inline bool StagePickerAcceptedPlanPendingAssociation(
+        const PendingMap& current,const std::string& runtimeKey,
+        const std::string& recordId,PendingMap& staged) noexcept {
+    if(runtimeKey.empty() || recordId.empty()) return false;
+    try {
+        PendingMap next=current;
+        auto existing=next.find(runtimeKey);
+        if(existing==next.end()){
+            if(!next.emplace(runtimeKey,recordId).second) return false;
+        } else {
+            existing->second=recordId;
+        }
+        staged.swap(next);
+        return true;
+    } catch(...) { return false; }
+}
+
+struct PickerOperationLifetimeClaim {
+    std::string recordId;
+    bool recordExisted=false;
+    bool pickerPublished=false;
+    bool pickerEpisodePublished=false;
+    bool pickerTerminalObserved=false;
+    bool pickerTargetRestored=false;
+};
+
+template<class ClaimMap>
+inline bool StagePickerOperationLifetimeClaim(
+        const ClaimMap& current,const std::string& runtimeKey,
+        const std::string& recordId,bool recordExisted,
+        ClaimMap& staged) noexcept {
+    if(runtimeKey.empty() || recordId.empty()) return false;
+    try {
+        ClaimMap next=current;
+        auto existing=next.find(runtimeKey);
+        if(existing==next.end()){
+            PickerOperationLifetimeClaim claim;
+            claim.recordId=recordId;
+            claim.recordExisted=recordExisted;
+            if(!next.emplace(runtimeKey,std::move(claim)).second) return false;
+        } else if(existing->second.recordId!=recordId ||
+                  existing->second.recordExisted!=recordExisted) {
+            return false;
+        } else {
+            // A repeated exact handoff is a new Picker ownership episode.
+            // Preserve an older durable publication against the stale plan,
+            // but only the newest episode may bypass rollback/rearm checks.
+            existing->second.pickerEpisodePublished=false;
+            existing->second.pickerTerminalObserved=false;
+            existing->second.pickerTargetRestored=false;
+        }
+        staged.swap(next);
+        return true;
+    } catch(...) { return false; }
+}
+
+template<class ClaimMap>
+inline bool PickerOperationLifetimeClaimMatches(
+        const ClaimMap& claims,const WindowIdentityKey& identity,
+        const std::string& recordId) noexcept {
+    if(!SameIdentity(identity,identity) || recordId.empty()) return false;
+    try {
+        const auto found=claims.find(RuntimeKey(identity));
+        return found!=claims.end() && found->second.recordId==recordId;
+    } catch(...) { return false; }
+}
+
+inline bool PickerOperationLifetimeClaimMustProtect(
+        const PickerOperationLifetimeClaim& claim,
+        bool recordCurrentlyExists) noexcept {
+    return claim.pickerPublished && !claim.recordId.empty() &&
+        (claim.recordExisted || recordCurrentlyExists);
+}
+
+inline bool PickerSavePublishesOperationLifetimeClaim(
+        PopupSaveStatus status,PopupSaveFailure failure) noexcept {
+    return status==PopupSaveStatus::Saved ||
+        (status==PopupSaveStatus::Failed &&
+         failure==PopupSaveFailure::FlushFailed);
+}
+
+template<class ClaimMap>
+inline bool MarkPickerOperationLifetimeClaimPublished(
+        ClaimMap& claims,const std::string& runtimeKey,
+        const std::string& recordId,PopupSaveStatus status,
+        PopupSaveFailure failure) noexcept {
+    if(runtimeKey.empty() || recordId.empty() ||
+       !PickerSavePublishesOperationLifetimeClaim(status,failure))
+        return false;
+    try {
+        auto found=claims.find(runtimeKey);
+        if(found==claims.end() || found->second.recordId!=recordId)
+            return false;
+        found->second.pickerPublished=true;
+        found->second.pickerEpisodePublished=true;
+        return true;
+    } catch(...) { return false; }
+}
+
+template<class ClaimMap>
+inline bool MarkPickerOperationLifetimeClaimTerminalOutcome(
+        ClaimMap& claims,const std::string& runtimeKey,
+        const std::string& recordId,bool targetRestored) noexcept {
+    if(runtimeKey.empty() || recordId.empty()) return false;
+    try {
+        auto found=claims.find(runtimeKey);
+        if(found==claims.end() || found->second.recordId!=recordId)
+            return false;
+        found->second.pickerTerminalObserved=true;
+        found->second.pickerTargetRestored=targetRestored;
+        return true;
+    } catch(...) { return false; }
+}
+
+inline bool PickerTransitionTargetRestoredToOrigin(
+        const PickerTransition& transition) noexcept {
+    return !GuidIsZero(transition.targetOrigin) &&
+        transition.observedTargetValidity==PickerReadValidity::Valid &&
+        GuidEq(transition.observedTargetDesktop,transition.targetOrigin) &&
+        !transition.targetMayHaveMoved &&
+        !transition.targetIdentityUnusable;
+}
+
+enum class PickerOperationLifetimeClaimReleaseAction {
+    ProtectPublished, RearmRestore, RearmOperation, ReleaseToPlan
+};
+
+inline PickerOperationLifetimeClaimReleaseAction
+DecidePickerOperationLifetimeClaimRelease(
+        const PickerOperationLifetimeClaim& claim,
+        bool recordCurrentlyExists,bool restoreRequired) noexcept {
+    if(!claim.pickerEpisodePublished){
+        if(!claim.pickerTerminalObserved || !claim.pickerTargetRestored)
+            return claim.pickerPublished || !restoreRequired
+                ? PickerOperationLifetimeClaimReleaseAction::RearmOperation
+                : PickerOperationLifetimeClaimReleaseAction::RearmRestore;
+        if(PickerOperationLifetimeClaimMustProtect(
+                claim,recordCurrentlyExists))
+            return PickerOperationLifetimeClaimReleaseAction::ProtectPublished;
+        if(restoreRequired)
+            return PickerOperationLifetimeClaimReleaseAction::RearmRestore;
+    }
+    return PickerOperationLifetimeClaimMustProtect(
+            claim,recordCurrentlyExists)
+        ? PickerOperationLifetimeClaimReleaseAction::ProtectPublished
+        : PickerOperationLifetimeClaimReleaseAction::ReleaseToPlan;
+}
+
+enum class PickerOperationClaimQueueAction {
+    EraseClaimAndAwaitMove, RetainClaimAndRearmOperation
+};
+
+inline PickerOperationClaimQueueAction
+DecidePickerOperationClaimQueuePublication(
+        bool queuePublished) noexcept {
+    return queuePublished
+        ? PickerOperationClaimQueueAction::EraseClaimAndAwaitMove
+        : PickerOperationClaimQueueAction::RetainClaimAndRearmOperation;
+}
+
+enum class PickerRearmedMoveArmAction { AwaitMove, RearmOperation };
+
+inline PickerRearmedMoveArmAction DecidePickerRearmedMoveArmResult(
+        bool timerArmed) noexcept {
+    return timerArmed ? PickerRearmedMoveArmAction::AwaitMove
+                      : PickerRearmedMoveArmAction::RearmOperation;
+}
+
+struct PickerOperationClaimRearmControl {
+    bool moveQueued=false;
+    bool armPending=false;
+    bool retryOperation=false;
+};
+
+inline PickerOperationClaimQueueAction
+ObservePickerOperationClaimQueuePublication(
+        PickerOperationClaimRearmControl& control,
+        bool queuePublished) noexcept {
+    const PickerOperationClaimQueueAction action=
+        DecidePickerOperationClaimQueuePublication(queuePublished);
+    if(queuePublished) control.moveQueued=true;
+    else control.retryOperation=true;
+    return action;
+}
+
+inline void BeginPickerOperationClaimMoveArm(
+        PickerOperationClaimRearmControl& control) noexcept {
+    control.armPending=control.moveQueued;
+}
+
+inline PickerRearmedMoveArmAction CompletePickerOperationClaimMoveArm(
+        PickerOperationClaimRearmControl& control,
+        bool timerArmed) noexcept {
+    const PickerRearmedMoveArmAction action=
+        DecidePickerRearmedMoveArmResult(timerArmed);
+    control.armPending=false;
+    control.moveQueued=false;
+    if(!timerArmed) control.retryOperation=true;
+    return action;
+}
+
+inline bool PickerOperationClaimRearmRequiresRetry(
+        const PickerOperationClaimRearmControl& control) noexcept {
+    return control.retryOperation || control.armPending;
+}
+
+enum class PickerAutoCancelledMoveOwnerAction {
+    IgnoreSupersession, RearmOperation
+};
+
+inline PickerAutoCancelledMoveOwnerAction
+DecidePickerAutoCancelledMoveOwnerAction(
+        bool timerArmFailureCancellation) noexcept {
+    return timerArmFailureCancellation
+        ? PickerAutoCancelledMoveOwnerAction::RearmOperation
+        : PickerAutoCancelledMoveOwnerAction::IgnoreSupersession;
+}
+
+inline bool ShouldCancelMoveBeforeIssuedReadback(
+        bool cancelRequested,bool retireAfterVerify,
+        bool waitingForVerify) noexcept {
+    return cancelRequested && !(retireAfterVerify && waitingForVerify);
+}
+
+template<class OperationMap>
+inline typename OperationMap::iterator PickerOperationCursorNext(
+        OperationMap& operations,bool haveCursor,
+        uint64_t cursor) noexcept {
+    try {
+        return haveCursor ? operations.upper_bound(cursor)
+                          : operations.begin();
+    } catch(...) { return operations.end(); }
+}
+
+enum class PickerInFlightPlanEntryAction {
+    Allow, ReuseAccepted, Wait
+};
+
+inline PickerInFlightPlanEntryAction DecidePickerInFlightPlanEntry(
+        bool sameAppOperation,bool planInputKnown,bool exactInInput,
+        bool acceptedExactRecord) noexcept {
+    if(!sameAppOperation) return PickerInFlightPlanEntryAction::Allow;
+    if(!planInputKnown) return PickerInFlightPlanEntryAction::Wait;
+    if(!exactInInput) return PickerInFlightPlanEntryAction::Allow;
+    return acceptedExactRecord
+        ? PickerInFlightPlanEntryAction::ReuseAccepted
+        : PickerInFlightPlanEntryAction::Wait;
+}
+
+enum class PickerLatePlanHandoffAction {
+    Ignore, TransferBeforeSave, RejectPlan
+};
+
+inline PickerLatePlanHandoffAction DecidePickerLatePlanHandoff(
+        bool exactPickerReservation,bool sameTransitionToken,
+        bool commitCutoffReached) noexcept {
+    if(!exactPickerReservation)
+        return PickerLatePlanHandoffAction::Ignore;
+    if(sameTransitionToken && !commitCutoffReached)
+        return PickerLatePlanHandoffAction::TransferBeforeSave;
+    return PickerLatePlanHandoffAction::RejectPlan;
+}
+
+template<class ClearBudget,class Publish>
+inline bool CommitPickerAcceptedPlanRecordTransfer(
+        ClearBudget&& clearBudget,Publish&& publish) noexcept {
+    bool cleared=false;
+    try { cleared=clearBudget(); }
+    catch(...) { cleared=false; }
+    if(!cleared) return false;
+    try {
+        publish();
+        return true;
+    } catch(...) { return false; }
+}
+
 struct PickerState {
     GUID currentDesktop={0};
     GUID selectedDesktop={0};
     int selectedIndex=-1;
     WindowIdentityKey activeWindow;
+    std::wstring searchEditText;
     std::wstring searchText;
     bool searchActive=false;
-    bool controlledTransition=false;
+    PickerTransition transition;
     std::map<std::string,int> scrollByDesktop;
+    uint64_t modelGeneration=0;
     uint64_t paintGeneration=0;
 
+    bool controlledTransition() const noexcept {
+        return transition.phase!=PickerPhase::Idle;
+    }
+
     void swap(PickerState& other) noexcept {
+        static_assert(noexcept(searchEditText.swap(other.searchEditText)),
+                      "picker edit-text swap must be noexcept");
         static_assert(noexcept(searchText.swap(other.searchText)),
                       "picker search swap must be noexcept");
         static_assert(noexcept(scrollByDesktop.swap(
@@ -406,19 +1242,1037 @@ struct PickerState {
         const WindowIdentityKey identity=activeWindow;
         activeWindow=other.activeWindow;
         other.activeWindow=identity;
+        searchEditText.swap(other.searchEditText);
         searchText.swap(other.searchText);
         const bool active=searchActive;
         searchActive=other.searchActive;
         other.searchActive=active;
-        const bool transition=controlledTransition;
-        controlledTransition=other.controlledTransition;
-        other.controlledTransition=transition;
+        transition.swap(other.transition);
         scrollByDesktop.swap(other.scrollByDesktop);
+        const uint64_t model= modelGeneration;
+        modelGeneration=other.modelGeneration;
+        other.modelGeneration=model;
         const uint64_t generation=paintGeneration;
         paintGeneration=other.paintGeneration;
         other.paintGeneration=generation;
     }
 };
+
+inline bool SetPickerSearchText(PickerState& state,
+                                const std::wstring& editText,
+                                const std::wstring& normalized) noexcept {
+    try {
+        std::wstring stagedEdit=editText;
+        std::wstring stagedNormalized=normalized;
+        state.searchEditText.swap(stagedEdit);
+        state.searchText.swap(stagedNormalized);
+        return true;
+    } catch(...) { return false; }
+}
+
+inline bool PrunePickerScrollState(
+        PickerState& state,const std::vector<GUID>& desktops) noexcept {
+    try {
+        std::vector<std::string> liveKeys;
+        liveKeys.reserve(desktops.size());
+        for(const GUID& desktop : desktops)
+            if(!GuidIsZero(desktop)) liveKeys.push_back(GuidKey(desktop));
+        std::map<std::string,int> staged=state.scrollByDesktop;
+        for(auto it=staged.begin();it!=staged.end();){
+            if(std::find(liveKeys.begin(),liveKeys.end(),it->first)==
+               liveKeys.end())
+                it=staged.erase(it);
+            else
+                ++it;
+        }
+        state.scrollByDesktop.swap(staged);
+        return true;
+    } catch(...) { return false; }
+}
+
+inline bool AdoptPickerIdleActiveIdentity(
+        PickerState& state,const WindowIdentityKey& candidate,
+        uintptr_t popupHwnd,uintptr_t mainHwnd,
+        bool popupVisible) noexcept {
+    if(!popupVisible || state.controlledTransition() ||
+       !SameIdentity(candidate,candidate) || candidate.hwnd==popupHwnd ||
+       candidate.hwnd==mainHwnd)
+        return false;
+    state.activeWindow=candidate;
+    return true;
+}
+
+struct PickerTabSearchCacheState {
+    uint64_t attemptId=0;
+    uint64_t modelGeneration=0;
+    std::wstring query;
+    bool ready=false;
+    bool pending=false;
+    bool retryNeeded=false;
+    bool routeFreed=false;
+    bool retryPosted=false;
+    unsigned retryAttempts=0;
+    unsigned blockedAppMask=0;
+    bool blockedOnAnyRoute=false;
+};
+
+enum class PickerTabSearchRetryTrigger {
+    ExactAppRoute, AnyRoute, Immediate
+};
+
+inline bool PickerTabSearchKeyMatches(
+        const PickerTabSearchCacheState& cache,uint64_t modelGeneration,
+        const std::wstring& normalizedQuery) noexcept {
+    return modelGeneration!=0 && !normalizedQuery.empty() &&
+           cache.modelGeneration==modelGeneration &&
+           cache.query==normalizedQuery;
+}
+
+inline bool PickerTabSearchAttemptMatches(
+        const PickerTabSearchCacheState& cache,uint64_t attemptId,
+        uint64_t modelGeneration,
+        const std::wstring& normalizedQuery) noexcept {
+    return cache.pending && attemptId!=0 && cache.attemptId==attemptId &&
+           PickerTabSearchKeyMatches(
+               cache,modelGeneration,normalizedQuery);
+}
+
+inline unsigned PickerTabSearchAppBit(const std::string& app) noexcept {
+    if(app=="firefox") return 1U;
+    if(app=="chrome") return 2U;
+    if(app=="edge") return 4U;
+    return 8U;
+}
+
+inline bool PickerTabSearchCacheUsable(
+        const PickerTabSearchCacheState& cache,uint64_t modelGeneration,
+        const std::wstring& normalizedQuery) noexcept {
+    return cache.ready && !cache.pending && !cache.retryNeeded &&
+           PickerTabSearchKeyMatches(
+               cache,modelGeneration,normalizedQuery);
+}
+
+inline bool BeginPickerTabSearchAttempt(
+        PickerTabSearchCacheState& cache,uint64_t attemptId,
+        uint64_t modelGeneration,
+        const std::wstring& normalizedQuery) noexcept {
+    if(attemptId==0 || modelGeneration==0 || normalizedQuery.empty() ||
+       (cache.pending && cache.attemptId==attemptId))
+        return false;
+    try {
+        const bool retrying=!cache.pending && cache.retryNeeded &&
+            PickerTabSearchKeyMatches(
+                cache,modelGeneration,normalizedQuery);
+        if(retrying && cache.retryAttempts>=4) return false;
+        std::wstring staged=normalizedQuery;
+        cache.attemptId=attemptId;
+        cache.modelGeneration=modelGeneration;
+        cache.query.swap(staged);
+        cache.ready=false;
+        cache.pending=true;
+        cache.retryNeeded=false;
+        cache.routeFreed=false;
+        cache.retryPosted=false;
+        cache.blockedAppMask=0;
+        cache.blockedOnAnyRoute=false;
+        if(retrying) ++cache.retryAttempts;
+        else cache.retryAttempts=0;
+        return true;
+    } catch(...) { return false; }
+}
+
+inline bool MarkPickerTabSearchRetryNeeded(
+        PickerTabSearchCacheState& cache,uint64_t attemptId,
+        uint64_t modelGeneration,const std::wstring& normalizedQuery,
+        const std::string& app,
+        PickerTabSearchRetryTrigger trigger=
+            PickerTabSearchRetryTrigger::ExactAppRoute) noexcept {
+    if(!PickerTabSearchAttemptMatches(
+            cache,attemptId,modelGeneration,normalizedQuery)) return false;
+    cache.retryNeeded=true;
+    cache.ready=false;
+    if(trigger==PickerTabSearchRetryTrigger::ExactAppRoute)
+        cache.blockedAppMask|=PickerTabSearchAppBit(app);
+    else if(trigger==PickerTabSearchRetryTrigger::AnyRoute)
+        cache.blockedOnAnyRoute=true;
+    else
+        cache.routeFreed=true;
+    return true;
+}
+
+inline bool CompletePickerTabSearchAttempt(
+        PickerTabSearchCacheState& cache,uint64_t attemptId,
+        uint64_t modelGeneration,
+        const std::wstring& normalizedQuery) noexcept {
+    if(!PickerTabSearchAttemptMatches(
+            cache,attemptId,modelGeneration,normalizedQuery)) return false;
+    cache.pending=false;
+    cache.ready=!cache.retryNeeded;
+    if(cache.ready){
+        cache.routeFreed=false;
+        cache.retryPosted=false;
+        cache.blockedAppMask=0;
+        cache.blockedOnAnyRoute=false;
+    }
+    return true;
+}
+
+inline void NotePickerTabSearchRouteFreed(
+        PickerTabSearchCacheState& cache,const std::string& app) noexcept {
+    if(!cache.query.empty() &&
+       (cache.blockedOnAnyRoute ||
+        (cache.blockedAppMask&PickerTabSearchAppBit(app))!=0))
+        cache.routeFreed=true;
+}
+
+inline bool PickerTabSearchRetryPostNeeded(
+        const PickerTabSearchCacheState& cache,uint64_t modelGeneration,
+        const std::wstring& normalizedQuery) noexcept {
+    return cache.retryNeeded && !cache.pending && cache.routeFreed &&
+           !cache.retryPosted && cache.retryAttempts<4 &&
+           PickerTabSearchKeyMatches(
+               cache,modelGeneration,normalizedQuery);
+}
+
+inline bool MarkPickerTabSearchRetryPosted(
+        PickerTabSearchCacheState& cache,uint64_t modelGeneration,
+        const std::wstring& normalizedQuery) noexcept {
+    if(!PickerTabSearchRetryPostNeeded(
+            cache,modelGeneration,normalizedQuery)) return false;
+    cache.retryPosted=true;
+    return true;
+}
+
+inline bool ConsumePickerTabSearchRetryPost(
+        PickerTabSearchCacheState& cache,uint64_t modelGeneration,
+        const std::wstring& normalizedQuery) noexcept {
+    if(!cache.retryPosted || !PickerTabSearchKeyMatches(
+            cache,modelGeneration,normalizedQuery)) return false;
+    cache.retryPosted=false;
+    cache.routeFreed=false;
+    return true;
+}
+
+inline bool ConsumePickerTabSearchRetryPostWhenIdle(
+        PickerTabSearchCacheState& cache,bool controlledTransition,
+        uint64_t modelGeneration,
+        const std::wstring& normalizedQuery) noexcept {
+    if(controlledTransition) return false;
+    return ConsumePickerTabSearchRetryPost(
+        cache,modelGeneration,normalizedQuery);
+}
+
+inline void InvalidatePickerTabSearchCache(
+        PickerTabSearchCacheState& cache,uint64_t modelGeneration) noexcept {
+    cache.modelGeneration=modelGeneration;
+    cache.attemptId=0;
+    cache.ready=false;
+    cache.pending=false;
+    cache.retryNeeded=false;
+    cache.routeFreed=false;
+    cache.retryPosted=false;
+    cache.retryAttempts=0;
+    cache.blockedAppMask=0;
+    cache.blockedOnAnyRoute=false;
+    cache.query.clear();
+}
+
+inline bool PickerUiActionAllowed(const PickerState& state,
+                                  PickerUiAction action) noexcept {
+    return action==PickerUiAction::TrayExit || !state.controlledTransition();
+}
+
+enum class PickerShutdownRoute { Proceed, CancelThenProceed };
+
+inline PickerShutdownRoute RoutePickerShutdown(
+        const PickerState& state) noexcept {
+    return state.controlledTransition()
+        ? PickerShutdownRoute::CancelThenProceed
+        : PickerShutdownRoute::Proceed;
+}
+
+template<class Cancel,class Pump>
+inline bool RunPickerShutdownDrain(PickerState& state,Cancel&& cancel,
+                                   Pump&& pump) noexcept {
+    if(!state.controlledTransition()) return true;
+    try { cancel(); } catch(...) {}
+    for(unsigned pass=0;pass<4 && state.controlledTransition();++pass){
+        try { pump(); } catch(...) {}
+    }
+    return !state.controlledTransition();
+}
+
+inline PickerEffect PickerNoEffect() noexcept {
+    return PickerEffect{};
+}
+
+inline bool DiscardPickerUnissuedEffectForCancel(
+        PickerEffect& scheduled,bool& hasScheduled,
+        const PickerTransition& transition) noexcept {
+    if(!hasScheduled || scheduled.kind==PickerEffectKind::None ||
+       transition.dismissed || scheduled.kind==PickerEffectKind::Hide ||
+       scheduled.generation!=transition.generation ||
+       scheduled.effectSerial!=transition.effectSerial ||
+       scheduled.kind!=transition.pendingEffect ||
+       (transition.phase==PickerPhase::SaveExactTarget &&
+        transition.commitCutoffReached) ||
+       transition.phase==PickerPhase::RefreshModel) return false;
+    scheduled=PickerEffect{};
+    hasScheduled=false;
+    return true;
+}
+
+inline bool PickerReadMatches(PickerReadValidity validity,
+                              const GUID& actual,
+                              const GUID& expected) noexcept {
+    return validity==PickerReadValidity::Valid &&
+           !GuidIsZero(actual) && !GuidIsZero(expected) &&
+           GuidEq(actual,expected);
+}
+
+inline bool PickerForwardSwitchInvocationAllowed(
+        PickerIdentityValidity identity,bool desktopReady) noexcept {
+    return desktopReady && identity==PickerIdentityValidity::Match;
+}
+
+inline GUID PickerEffectDesktop(const PickerTransition& transition,
+                                PickerEffectKind kind) noexcept {
+    switch(kind){
+    case PickerEffectKind::MoveTarget:
+        return transition.phase==PickerPhase::RollbackTargetIssue
+            ? transition.targetOrigin : transition.destination;
+    case PickerEffectKind::MovePopup:
+        return transition.phase==PickerPhase::RollbackPopupIssue
+            ? transition.currentOrigin : transition.destination;
+    case PickerEffectKind::SwitchDesktop:
+        return transition.phase==PickerPhase::RollbackSwitchIssue
+            ? transition.currentOrigin : transition.destination;
+    default:
+        return GUID{};
+    }
+}
+
+inline PickerEffect EmitPickerEffect(PickerState& state,
+                                     PickerEffectKind kind) noexcept {
+    if(kind==PickerEffectKind::None ||
+       state.transition.pendingEffect!=PickerEffectKind::None)
+        return PickerNoEffect();
+    if(state.transition.effectSerial==
+        (std::numeric_limits<uint64_t>::max)()){
+        state.transition.failed=true;
+        try { state.transition.diagnostic=
+            L"The picker transition effect counter was exhausted."; }
+        catch(...) { state.transition.diagnostic.clear(); }
+        state.transition.suppressFocus=true;
+        state.transition.terminalAcknowledged=true;
+        return PickerNoEffect();
+    }
+    ++state.transition.effectSerial;
+    if(state.transition.effectSerial==0) ++state.transition.effectSerial;
+    state.transition.pendingEffect=kind;
+    PickerEffect effect;
+    effect.kind=kind;
+    effect.generation=state.transition.generation;
+    effect.effectSerial=state.transition.effectSerial;
+    effect.desktop=PickerEffectDesktop(state.transition,kind);
+    return effect;
+}
+
+inline bool PickerObservationAcknowledges(
+        const PickerTransition& transition,
+        const PickerObservation& observation) noexcept {
+    if(observation.generation==0 ||
+       observation.generation!=transition.generation ||
+       transition.pendingEffect==PickerEffectKind::None ||
+       observation.effectKind!=transition.pendingEffect ||
+       observation.effectSerial==0 ||
+       observation.effectSerial!=transition.effectSerial)
+        return false;
+    PickerEvent expected=PickerEvent::EffectCompleted;
+    switch(transition.pendingEffect){
+    case PickerEffectKind::MoveTarget:
+    case PickerEffectKind::MovePopup:
+    case PickerEffectKind::SwitchDesktop:
+        expected=PickerEvent::ApiCompleted;
+        break;
+    case PickerEffectKind::ReadTarget:
+    case PickerEffectKind::ReadPopup:
+    case PickerEffectKind::ReadCurrent:
+        expected=PickerEvent::ReadbackCompleted;
+        break;
+    case PickerEffectKind::ValidateTarget:
+    case PickerEffectKind::SaveExactTarget:
+    case PickerEffectKind::Refresh:
+    case PickerEffectKind::ShowAndFocus:
+    case PickerEffectKind::Hide:
+    case PickerEffectKind::ReportFailure:
+        expected=PickerEvent::EffectCompleted;
+        break;
+    case PickerEffectKind::None:
+        return false;
+    }
+    return observation.event==expected;
+}
+
+inline void PickerAppendDiagnostic(PickerTransition& transition,
+                                   const wchar_t* text) noexcept {
+    if(!text || !*text) return;
+    try {
+        if(!transition.diagnostic.empty()) transition.diagnostic+=L" ";
+        transition.diagnostic+=text;
+    } catch(...) {
+        transition.diagnostic.clear();
+    }
+}
+
+inline bool PickerIdentityMatches(PickerIdentityValidity identity) noexcept {
+    return identity==PickerIdentityValidity::Match;
+}
+
+inline bool PickerIdentityIsUnusable(
+        PickerIdentityValidity identity) noexcept {
+    return identity!=PickerIdentityValidity::Match;
+}
+
+inline void PickerInvalidateObservedTarget(
+        PickerTransition& transition) noexcept {
+    transition.targetIdentityUnusable=true;
+    transition.observedTargetValidity=PickerReadValidity::Unavailable;
+    transition.observedTargetDesktop=GUID{};
+}
+
+inline void PickerAcknowledgeTerminal(
+        PickerTransition& transition) noexcept {
+    transition.pendingEffect=PickerEffectKind::None;
+    transition.hidePending=false;
+    transition.terminalAcknowledged=true;
+}
+
+inline bool FinalizePickerTransition(PickerState& state) noexcept {
+    PickerTransition& transition=state.transition;
+    if(!transition.terminalAcknowledged ||
+       transition.pendingEffect!=PickerEffectKind::None)
+        return false;
+    const uint64_t generation=transition.generation;
+    const uint64_t effectSerial=transition.effectSerial;
+    PickerTransition idle;
+    idle.generation=generation;
+    idle.effectSerial=effectSerial;
+    transition.swap(idle);
+    return true;
+}
+
+inline PickerEffect PickerStartRefresh(PickerState& state) noexcept {
+    state.transition.phase=PickerPhase::RefreshModel;
+    return EmitPickerEffect(state,PickerEffectKind::Refresh);
+}
+
+inline PickerEffect PickerIssueTarget(PickerState& state,
+                                      bool rollback) noexcept {
+    PickerTransition& transition=state.transition;
+    int& attempts=rollback ? transition.rollbackTargetAttempts
+                           : transition.forwardTargetAttempts;
+    if(attempts>=4) return PickerNoEffect();
+    ++attempts;
+    transition.targetUnresolvedBeforeIssue=transition.targetMayHaveMoved;
+    transition.targetMayHaveMoved=true;
+    transition.phase=rollback ? PickerPhase::RollbackTargetIssue
+                              : PickerPhase::TargetIssue;
+    return EmitPickerEffect(state,PickerEffectKind::MoveTarget);
+}
+
+inline PickerEffect PickerIssuePopup(PickerState& state,
+                                     bool rollback) noexcept {
+    PickerTransition& transition=state.transition;
+    int& attempts=rollback ? transition.rollbackPopupAttempts
+                           : transition.forwardPopupAttempts;
+    if(attempts>=4) return PickerNoEffect();
+    ++attempts;
+    transition.popupUnresolvedBeforeIssue=transition.popupMayHaveMoved;
+    transition.popupMayHaveMoved=true;
+    transition.phase=rollback ? PickerPhase::RollbackPopupIssue
+                              : PickerPhase::PopupIssue;
+    return EmitPickerEffect(state,PickerEffectKind::MovePopup);
+}
+
+inline PickerEffect PickerIssueSwitch(PickerState& state,
+                                      bool rollback) noexcept {
+    PickerTransition& transition=state.transition;
+    int& attempts=rollback ? transition.rollbackSwitchAttempts
+                           : transition.forwardSwitchAttempts;
+    if(attempts>=4) return PickerNoEffect();
+    ++attempts;
+    transition.switchUnresolvedBeforeIssue=transition.switchMayHaveChanged;
+    transition.switchMayHaveChanged=true;
+    transition.phase=rollback ? PickerPhase::RollbackSwitchIssue
+                              : PickerPhase::SwitchIssue;
+    return EmitPickerEffect(state,PickerEffectKind::SwitchDesktop);
+}
+
+inline PickerEffect PickerContinueRollbackAfterPopup(
+        PickerState& state) noexcept {
+    if(state.transition.switchMayHaveChanged)
+        return PickerIssueSwitch(state,true);
+    return PickerStartRefresh(state);
+}
+
+inline PickerEffect PickerContinueRollbackAfterTarget(
+        PickerState& state) noexcept {
+    if(state.transition.popupMayHaveMoved)
+        return PickerIssuePopup(state,true);
+    return PickerContinueRollbackAfterPopup(state);
+}
+
+inline PickerEffect PickerBeginRollback(PickerState& state,
+                                        const wchar_t* diagnostic) noexcept {
+    PickerTransition& transition=state.transition;
+    transition.failed=true;
+    PickerAppendDiagnostic(transition,diagnostic);
+    if(transition.targetMayHaveMoved && !transition.targetIdentityUnusable)
+        return PickerIssueTarget(state,true);
+    if(transition.targetMayHaveMoved && transition.targetIdentityUnusable)
+        PickerAppendDiagnostic(
+            transition,L"The target identity cannot be safely rolled back.");
+    return PickerContinueRollbackAfterTarget(state);
+}
+
+inline PickerEffect PickerForwardFailed(PickerState& state,
+                                        const wchar_t* diagnostic) noexcept {
+    return PickerBeginRollback(state,diagnostic);
+}
+
+inline PickerEffect PickerResumeAfterHide(PickerState& state) noexcept {
+    PickerTransition& transition=state.transition;
+    switch(transition.resumeAfterHide){
+    case PickerPhase::RefreshModel:
+    case PickerPhase::FailureReport:
+    case PickerPhase::FocusRestore:
+        PickerAcknowledgeTerminal(transition);
+        return PickerNoEffect();
+    case PickerPhase::RollbackTargetIssue:
+    case PickerPhase::RollbackTargetVerify:
+        if(transition.targetMayHaveMoved &&
+           !transition.targetIdentityUnusable){
+            transition.phase=PickerPhase::RollbackTargetVerify;
+            return EmitPickerEffect(state,PickerEffectKind::ReadTarget);
+        }
+        return PickerContinueRollbackAfterTarget(state);
+    case PickerPhase::RollbackPopupIssue:
+    case PickerPhase::RollbackPopupVerify:
+        if(transition.popupMayHaveMoved){
+            transition.phase=PickerPhase::RollbackPopupVerify;
+            return EmitPickerEffect(state,PickerEffectKind::ReadPopup);
+        }
+        return PickerContinueRollbackAfterPopup(state);
+    case PickerPhase::RollbackSwitchIssue:
+    case PickerPhase::OriginVerify:
+        if(transition.switchMayHaveChanged){
+            transition.phase=PickerPhase::OriginVerify;
+            return EmitPickerEffect(state,PickerEffectKind::ReadCurrent);
+        }
+        return PickerStartRefresh(state);
+    default:
+        break;
+    }
+    return PickerBeginRollback(state,nullptr);
+}
+
+inline PickerEffect AdvancePickerTransition(
+        PickerState& state,const PickerObservation& observation) noexcept {
+    PickerTransition& transition=state.transition;
+    if(observation.generation==0 ||
+       observation.generation!=transition.generation)
+        return PickerNoEffect();
+
+    if(transition.terminalAcknowledged)
+        return PickerNoEffect();
+
+    if(observation.event==PickerEvent::Begin){
+        if(transition.phase!=PickerPhase::Idle ||
+           transition.pendingEffect!=PickerEffectKind::None ||
+           transition.reservationToken.owner!=MoveOwner::Picker ||
+           transition.reservationToken.operationId==0 ||
+           transition.reservationToken.jobId==0 ||
+           !SameIdentity(transition.target,transition.target) ||
+           transition.runtimeKey.empty() ||
+           !SameIdentity(state.activeWindow,transition.target) ||
+           state.selectedIndex<0 ||
+           !GuidEq(state.selectedDesktop,transition.destination) ||
+           !GuidEq(state.currentDesktop,transition.currentOrigin) ||
+           GuidIsZero(transition.targetOrigin) ||
+           GuidIsZero(transition.popupOrigin) ||
+           GuidIsZero(transition.currentOrigin) ||
+           GuidIsZero(transition.destination))
+            return PickerNoEffect();
+        transition.cancelRequested=false;
+        transition.dismissed=false;
+        transition.failed=false;
+        transition.hidePending=false;
+        transition.hideCompleted=false;
+        transition.failureReported=false;
+        transition.focusFailureTerminal=false;
+        transition.targetIdentityUnusable=false;
+        transition.commitCutoffReached=false;
+        transition.suppressFocus=false;
+        transition.terminalAcknowledged=false;
+        transition.forwardTargetAttempts=0;
+        transition.forwardPopupAttempts=0;
+        transition.forwardSwitchAttempts=0;
+        transition.rollbackTargetAttempts=0;
+        transition.rollbackPopupAttempts=0;
+        transition.rollbackSwitchAttempts=0;
+        transition.focusAttempts=0;
+        transition.targetMayHaveMoved=false;
+        transition.popupMayHaveMoved=false;
+        transition.switchMayHaveChanged=false;
+        transition.targetUnresolvedBeforeIssue=false;
+        transition.popupUnresolvedBeforeIssue=false;
+        transition.switchUnresolvedBeforeIssue=false;
+        transition.observedTargetDesktop=transition.targetOrigin;
+        transition.observedPopupDesktop=transition.popupOrigin;
+        transition.observedCurrentDesktop=transition.currentOrigin;
+        transition.observedTargetValidity=PickerReadValidity::Valid;
+        transition.observedPopupValidity=PickerReadValidity::Valid;
+        transition.observedCurrentValidity=PickerReadValidity::Valid;
+        transition.diagnostic.clear();
+        return PickerIssueTarget(state,false);
+    }
+
+    if(observation.event==PickerEvent::CancelRequested){
+        if(transition.phase==PickerPhase::Idle || transition.dismissed)
+            return PickerNoEffect();
+        transition.resumeAfterHide=transition.phase;
+        transition.cancelRequested=true;
+        transition.dismissed=true;
+        transition.failed=true;
+        PickerAppendDiagnostic(transition,L"The picker move was cancelled.");
+        if(observation.unissuedEffectCancelled){
+            if(transition.pendingEffect==PickerEffectKind::MoveTarget)
+                transition.targetMayHaveMoved=
+                    transition.targetUnresolvedBeforeIssue;
+            else if(transition.pendingEffect==PickerEffectKind::MovePopup)
+                transition.popupMayHaveMoved=
+                    transition.popupUnresolvedBeforeIssue;
+            else if(transition.pendingEffect==PickerEffectKind::SwitchDesktop)
+                transition.switchMayHaveChanged=
+                    transition.switchUnresolvedBeforeIssue;
+        }
+        if(((transition.phase==PickerPhase::SaveExactTarget &&
+             transition.commitCutoffReached &&
+             transition.pendingEffect==PickerEffectKind::SaveExactTarget) ||
+            (transition.phase==PickerPhase::RefreshModel &&
+             transition.pendingEffect==PickerEffectKind::Refresh)))
+            return PickerNoEffect();
+        transition.pendingEffect=PickerEffectKind::None;
+        transition.hidePending=true;
+        return EmitPickerEffect(state,PickerEffectKind::Hide);
+    }
+
+    if(!PickerObservationAcknowledges(transition,observation))
+        return PickerNoEffect();
+    const PickerEffectKind acknowledged=transition.pendingEffect;
+    transition.pendingEffect=PickerEffectKind::None;
+
+    if(acknowledged==PickerEffectKind::Hide){
+        if(!transition.hidePending) return PickerNoEffect();
+        transition.hidePending=false;
+        transition.hideCompleted=true;
+        if(transition.commitCutoffReached &&
+           transition.resumeAfterHide!=PickerPhase::RefreshModel &&
+           transition.resumeAfterHide!=PickerPhase::FailureReport &&
+           transition.resumeAfterHide!=PickerPhase::FocusRestore)
+            return PickerStartRefresh(state);
+        return PickerResumeAfterHide(state);
+    }
+
+    switch(transition.phase){
+    case PickerPhase::TargetIssue:
+        if(acknowledged==PickerEffectKind::MoveTarget &&
+           observation.event==PickerEvent::ApiCompleted){
+            if(!observation.apiInvoked ||
+               !PickerIdentityMatches(observation.identity)){
+                if(!observation.apiInvoked)
+                    transition.targetMayHaveMoved=
+                        transition.targetUnresolvedBeforeIssue;
+                if(PickerIdentityIsUnusable(observation.identity))
+                    PickerInvalidateObservedTarget(transition);
+                return PickerForwardFailed(
+                    state,L"The target move was not safely invoked.");
+            }
+            transition.phase=PickerPhase::TargetVerify;
+            return EmitPickerEffect(state,PickerEffectKind::ReadTarget);
+        }
+        break;
+
+    case PickerPhase::TargetVerify:
+        if(acknowledged==PickerEffectKind::ReadTarget &&
+           observation.event==PickerEvent::ReadbackCompleted){
+            if(!PickerIdentityMatches(observation.identity)){
+                if(PickerIdentityIsUnusable(observation.identity))
+                    PickerInvalidateObservedTarget(transition);
+                return PickerForwardFailed(
+                    state,L"The target identity changed during verification.");
+            }
+            transition.observedTargetValidity=observation.targetRead;
+            transition.observedTargetDesktop=observation.actualTargetDesktop;
+            if(PickerReadMatches(observation.targetRead,
+                    observation.actualTargetDesktop,transition.destination)){
+                transition.phase=PickerPhase::IdentityVerifyBeforePopup;
+                return EmitPickerEffect(state,PickerEffectKind::ValidateTarget);
+            }
+            transition.targetMayHaveMoved=
+                !PickerReadMatches(observation.targetRead,
+                    observation.actualTargetDesktop,transition.targetOrigin);
+            if(transition.forwardTargetAttempts<4){
+                return PickerIssueTarget(state,false);
+            }
+            return PickerForwardFailed(
+                state,L"The target did not reach the selected desktop.");
+        }
+        break;
+
+    case PickerPhase::IdentityVerifyBeforePopup:
+        if(acknowledged==PickerEffectKind::ValidateTarget &&
+           observation.event==PickerEvent::EffectCompleted){
+            if(!PickerIdentityMatches(observation.identity)){
+                if(PickerIdentityIsUnusable(observation.identity))
+                    PickerInvalidateObservedTarget(transition);
+                return PickerForwardFailed(
+                    state,L"The target identity changed before moving the picker.");
+            }
+            return PickerIssuePopup(state,false);
+        }
+        break;
+
+    case PickerPhase::PopupIssue:
+        if(acknowledged==PickerEffectKind::MovePopup &&
+           observation.event==PickerEvent::ApiCompleted){
+            if(!observation.apiInvoked){
+                transition.popupMayHaveMoved=
+                    transition.popupUnresolvedBeforeIssue;
+                return PickerForwardFailed(
+                    state,L"The picker move was not invoked.");
+            }
+            transition.phase=PickerPhase::PopupVerify;
+            return EmitPickerEffect(state,PickerEffectKind::ReadPopup);
+        }
+        break;
+
+    case PickerPhase::PopupVerify:
+        if(acknowledged==PickerEffectKind::ReadPopup &&
+           observation.event==PickerEvent::ReadbackCompleted){
+            transition.observedPopupValidity=observation.popupRead;
+            transition.observedPopupDesktop=observation.actualPopupDesktop;
+            if(PickerReadMatches(observation.popupRead,
+                    observation.actualPopupDesktop,transition.destination)){
+                transition.phase=PickerPhase::IdentityVerifyBeforeSwitch;
+                return EmitPickerEffect(state,PickerEffectKind::ValidateTarget);
+            }
+            transition.popupMayHaveMoved=
+                !PickerReadMatches(observation.popupRead,
+                    observation.actualPopupDesktop,transition.currentOrigin);
+            if(transition.forwardPopupAttempts<4){
+                transition.phase=PickerPhase::IdentityVerifyBeforePopup;
+                return EmitPickerEffect(state,PickerEffectKind::ValidateTarget);
+            }
+            return PickerForwardFailed(
+                state,L"The picker did not reach the selected desktop.");
+        }
+        break;
+
+    case PickerPhase::IdentityVerifyBeforeSwitch:
+        if(acknowledged==PickerEffectKind::ValidateTarget &&
+           observation.event==PickerEvent::EffectCompleted){
+            if(!PickerIdentityMatches(observation.identity)){
+                if(PickerIdentityIsUnusable(observation.identity))
+                    PickerInvalidateObservedTarget(transition);
+                return PickerForwardFailed(
+                    state,L"The target identity changed before switching desktops.");
+            }
+            if(PickerReadMatches(transition.observedCurrentValidity,
+                    transition.observedCurrentDesktop,
+                    transition.destination) &&
+               PickerReadMatches(transition.observedPopupValidity,
+                    transition.observedPopupDesktop,
+                    transition.destination)){
+                transition.phase=PickerPhase::SaveExactTarget;
+                transition.commitCutoffReached=true;
+                return EmitPickerEffect(
+                    state,PickerEffectKind::SaveExactTarget);
+            }
+            if(transition.forwardSwitchAttempts>=4)
+                return PickerForwardFailed(
+                    state,L"The desktop switch attempt budget was exhausted.");
+            return PickerIssueSwitch(state,false);
+        }
+        break;
+
+    case PickerPhase::SwitchIssue:
+        if(acknowledged==PickerEffectKind::SwitchDesktop &&
+           observation.event==PickerEvent::ApiCompleted){
+            if(!observation.apiInvoked ||
+               !PickerIdentityMatches(observation.identity)){
+                transition.switchMayHaveChanged=
+                    transition.switchUnresolvedBeforeIssue;
+                if(PickerIdentityIsUnusable(observation.identity))
+                    PickerInvalidateObservedTarget(transition);
+                return PickerForwardFailed(
+                    state,!PickerIdentityMatches(observation.identity)
+                        ? L"The target identity changed before the desktop switch could be invoked."
+                        : L"The desktop switch was not invoked.");
+            }
+            transition.phase=PickerPhase::DestinationVerify;
+            return EmitPickerEffect(state,PickerEffectKind::ReadCurrent);
+        }
+        break;
+
+    case PickerPhase::DestinationVerify:
+        if(acknowledged==PickerEffectKind::ReadCurrent &&
+           observation.event==PickerEvent::ReadbackCompleted){
+            transition.observedCurrentValidity=observation.currentRead;
+            transition.observedCurrentDesktop=observation.actualCurrentDesktop;
+            if(PickerReadMatches(observation.currentRead,
+                    observation.actualCurrentDesktop,transition.destination)){
+                return EmitPickerEffect(state,PickerEffectKind::ReadPopup);
+            }
+            transition.switchMayHaveChanged=!PickerReadMatches(
+                observation.currentRead,observation.actualCurrentDesktop,
+                transition.currentOrigin);
+            if(transition.forwardSwitchAttempts<4){
+                transition.phase=PickerPhase::IdentityVerifyBeforeSwitch;
+                return EmitPickerEffect(state,PickerEffectKind::ValidateTarget);
+            }
+            return PickerForwardFailed(
+                state,L"Windows did not remain on the selected desktop.");
+        }
+        if(acknowledged==PickerEffectKind::ReadPopup &&
+           observation.event==PickerEvent::ReadbackCompleted){
+            transition.observedPopupValidity=observation.popupRead;
+            transition.observedPopupDesktop=observation.actualPopupDesktop;
+            if(PickerReadMatches(observation.popupRead,
+                    observation.actualPopupDesktop,transition.destination)){
+                transition.phase=PickerPhase::SaveExactTarget;
+                transition.commitCutoffReached=true;
+                return EmitPickerEffect(
+                    state,PickerEffectKind::SaveExactTarget);
+            }
+            transition.popupMayHaveMoved=!PickerReadMatches(
+                observation.popupRead,observation.actualPopupDesktop,
+                transition.currentOrigin);
+            if(transition.forwardPopupAttempts<4){
+                transition.phase=PickerPhase::IdentityVerifyBeforePopup;
+                return EmitPickerEffect(state,PickerEffectKind::ValidateTarget);
+            }
+            return PickerForwardFailed(
+                state,L"The picker left the selected desktop after the switch.");
+        }
+        break;
+
+    case PickerPhase::RollbackTargetIssue:
+        if(acknowledged==PickerEffectKind::MoveTarget &&
+           observation.event==PickerEvent::ApiCompleted){
+            if(!PickerIdentityMatches(observation.identity)){
+                if(PickerIdentityIsUnusable(observation.identity))
+                    PickerInvalidateObservedTarget(transition);
+                PickerAppendDiagnostic(
+                    transition,L"The target rollback could not be invoked.");
+                return PickerContinueRollbackAfterTarget(state);
+            }
+            if(!observation.apiInvoked)
+                PickerAppendDiagnostic(
+                    transition,L"The target rollback call was unavailable; its desktop will be read back.");
+            transition.phase=PickerPhase::RollbackTargetVerify;
+            return EmitPickerEffect(state,PickerEffectKind::ReadTarget);
+        }
+        break;
+
+    case PickerPhase::RollbackTargetVerify:
+        if(acknowledged==PickerEffectKind::ReadTarget &&
+           observation.event==PickerEvent::ReadbackCompleted){
+            if(!PickerIdentityMatches(observation.identity)){
+                if(PickerIdentityIsUnusable(observation.identity))
+                    PickerInvalidateObservedTarget(transition);
+                PickerAppendDiagnostic(
+                    transition,L"The target identity was lost during rollback.");
+                return PickerContinueRollbackAfterTarget(state);
+            }
+            transition.observedTargetValidity=observation.targetRead;
+            transition.observedTargetDesktop=observation.actualTargetDesktop;
+            if(PickerReadMatches(observation.targetRead,
+                    observation.actualTargetDesktop,transition.targetOrigin)){
+                transition.targetMayHaveMoved=false;
+                return PickerContinueRollbackAfterTarget(state);
+            }
+            transition.targetMayHaveMoved=true;
+            if(transition.rollbackTargetAttempts<4){
+                return PickerIssueTarget(state,true);
+            }
+            PickerAppendDiagnostic(
+                transition,L"The target remains displaced after rollback.");
+            return PickerContinueRollbackAfterTarget(state);
+        }
+        break;
+
+    case PickerPhase::RollbackPopupIssue:
+        if(acknowledged==PickerEffectKind::MovePopup &&
+           observation.event==PickerEvent::ApiCompleted){
+            if(!observation.apiInvoked){
+                PickerAppendDiagnostic(
+                    transition,L"The picker rollback call was unavailable; its desktop will be read back.");
+            }
+            transition.phase=PickerPhase::RollbackPopupVerify;
+            return EmitPickerEffect(state,PickerEffectKind::ReadPopup);
+        }
+        break;
+
+    case PickerPhase::RollbackPopupVerify:
+        if(acknowledged==PickerEffectKind::ReadPopup &&
+           observation.event==PickerEvent::ReadbackCompleted){
+            transition.observedPopupValidity=observation.popupRead;
+            transition.observedPopupDesktop=observation.actualPopupDesktop;
+            if(PickerReadMatches(observation.popupRead,
+                    observation.actualPopupDesktop,transition.currentOrigin)){
+                transition.popupMayHaveMoved=false;
+                return PickerContinueRollbackAfterPopup(state);
+            }
+            transition.popupMayHaveMoved=true;
+            if(transition.rollbackPopupAttempts<4){
+                return PickerIssuePopup(state,true);
+            }
+            PickerAppendDiagnostic(
+                transition,L"The picker remains displaced after rollback.");
+            transition.suppressFocus=true;
+            return PickerContinueRollbackAfterPopup(state);
+        }
+        break;
+
+    case PickerPhase::RollbackSwitchIssue:
+        if(acknowledged==PickerEffectKind::SwitchDesktop &&
+           observation.event==PickerEvent::ApiCompleted){
+            if(!observation.apiInvoked){
+                PickerAppendDiagnostic(
+                    transition,L"The desktop rollback call was unavailable; the current desktop will be read back.");
+            }
+            transition.phase=PickerPhase::OriginVerify;
+            return EmitPickerEffect(state,PickerEffectKind::ReadCurrent);
+        }
+        break;
+
+    case PickerPhase::OriginVerify:
+        if(acknowledged==PickerEffectKind::ReadCurrent &&
+           observation.event==PickerEvent::ReadbackCompleted){
+            transition.observedCurrentValidity=observation.currentRead;
+            transition.observedCurrentDesktop=observation.actualCurrentDesktop;
+            if(PickerReadMatches(observation.currentRead,
+                    observation.actualCurrentDesktop,transition.currentOrigin)){
+                transition.switchMayHaveChanged=false;
+                transition.phase=PickerPhase::RefreshModel;
+                return EmitPickerEffect(state,PickerEffectKind::Refresh);
+            }
+            transition.switchMayHaveChanged=true;
+            if(transition.rollbackSwitchAttempts<4){
+                return PickerIssueSwitch(state,true);
+            }
+            PickerAppendDiagnostic(
+                transition,L"Windows remains on a displaced desktop after rollback.");
+            transition.suppressFocus=true;
+            return PickerStartRefresh(state);
+        }
+        break;
+
+    case PickerPhase::SaveExactTarget:
+        if(acknowledged==PickerEffectKind::SaveExactTarget &&
+           observation.event==PickerEvent::EffectCompleted){
+            if(observation.saveStatus==PopupSaveStatus::Failed){
+                transition.failed=true;
+                PickerAppendDiagnostic(
+                    transition,PickerSaveFailureDiagnostic(
+                        observation.saveFailure));
+            }
+            if(!PickerIdentityMatches(observation.identity)){
+                PickerInvalidateObservedTarget(transition);
+                transition.failed=true;
+                PickerAppendDiagnostic(
+                    transition,PickerPostSaveIdentityDiagnostic(
+                        observation.saveStatus,observation.identity));
+            }
+            if(transition.dismissed && transition.cancelRequested){
+                transition.resumeAfterHide=PickerPhase::SaveExactTarget;
+                transition.hidePending=true;
+                return EmitPickerEffect(state,PickerEffectKind::Hide);
+            }
+            return PickerStartRefresh(state);
+        }
+        break;
+
+    case PickerPhase::RefreshModel:
+        if(acknowledged==PickerEffectKind::Refresh &&
+           observation.event==PickerEvent::EffectCompleted){
+            if(!observation.apiAccepted){
+                transition.failed=true;
+                PickerAppendDiagnostic(
+                    transition,L"The picker model could not be refreshed.");
+            }
+            if(transition.dismissed){
+                if(transition.cancelRequested &&
+                   !transition.hideCompleted){
+                    transition.resumeAfterHide=PickerPhase::RefreshModel;
+                    transition.hidePending=true;
+                    return EmitPickerEffect(state,PickerEffectKind::Hide);
+                }
+                PickerAcknowledgeTerminal(transition);
+                return PickerNoEffect();
+            }
+            if(transition.failed){
+                transition.phase=PickerPhase::FailureReport;
+                return EmitPickerEffect(state,PickerEffectKind::ReportFailure);
+            }
+            transition.phase=PickerPhase::FocusRestore;
+            ++transition.focusAttempts;
+            return EmitPickerEffect(state,PickerEffectKind::ShowAndFocus);
+        }
+        break;
+
+    case PickerPhase::FailureReport:
+        if(acknowledged==PickerEffectKind::ReportFailure &&
+           observation.event==PickerEvent::EffectCompleted){
+            transition.failureReported=true;
+            if(transition.dismissed || transition.focusFailureTerminal ||
+               transition.suppressFocus){
+                PickerAcknowledgeTerminal(transition);
+                return PickerNoEffect();
+            }
+            transition.phase=PickerPhase::FocusRestore;
+            ++transition.focusAttempts;
+            return EmitPickerEffect(state,PickerEffectKind::ShowAndFocus);
+        }
+        break;
+
+    case PickerPhase::FocusRestore:
+        if(acknowledged==PickerEffectKind::ShowAndFocus &&
+           observation.event==PickerEvent::EffectCompleted){
+            if(observation.popupIsForeground){
+                PickerAcknowledgeTerminal(transition);
+                return PickerNoEffect();
+            }
+            if(transition.focusAttempts<4){
+                ++transition.focusAttempts;
+                return EmitPickerEffect(state,PickerEffectKind::ShowAndFocus);
+            }
+            transition.failed=true;
+            transition.focusFailureTerminal=true;
+            PickerAppendDiagnostic(
+                transition,L"The picker could not regain foreground focus.");
+            transition.phase=PickerPhase::FailureReport;
+            return EmitPickerEffect(state,PickerEffectKind::ReportFailure);
+        }
+        break;
+
+    case PickerPhase::Idle:
+        break;
+    }
+    return PickerNoEffect();
+}
 
 struct PickerTargetCaptureState {
     uintptr_t hwnd=0;
@@ -548,6 +2402,19 @@ inline bool SetPickerSelection(PickerState& state,int index,
     return true;
 }
 
+inline bool PreparePickerRefreshSelectionFromActual(
+        PickerState& state) noexcept {
+    if(!state.transition.failed && !state.transition.cancelRequested)
+        return false;
+    state.selectedDesktop=GUID{};
+    state.selectedIndex=-1;
+    if(state.transition.observedCurrentValidity==
+           PickerReadValidity::Valid &&
+       !GuidIsZero(state.transition.observedCurrentDesktop))
+        state.selectedDesktop=state.transition.observedCurrentDesktop;
+    return true;
+}
+
 inline bool ResolvePickerSelection(PickerState& state,
                                    const std::vector<GUID>& desktops) noexcept {
     if(desktops.empty()){
@@ -613,6 +2480,20 @@ inline bool BuildPickerFilteredIndices(
 
 inline PickerState PreservePickerUi(const PickerState& state){
     return state;
+}
+
+template<class Collect,class Publish>
+inline bool RunPickerLightweightRefresh(
+        PickerState& publishedState,Collect&& collect,
+        Publish&& publish) noexcept {
+    if(publishedState.controlledTransition()) return false;
+    try {
+        auto snapshot=collect();
+        PickerState staged=PreservePickerUi(publishedState);
+        if(!publish(snapshot,staged)) return false;
+        publishedState.swap(staged);
+        return true;
+    } catch(...) { return false; }
 }
 
 inline void SwapPickerState(PickerState& left,PickerState& right) noexcept {

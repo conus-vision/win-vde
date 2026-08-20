@@ -659,7 +659,7 @@ static void test_picker_refresh_preserves_search_scroll_and_identity(){
     const GUID desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
     state.searchText=L"github";
     state.searchActive=true;
-    state.controlledTransition=true;
+    state.transition.phase=PickerPhase::TargetVerify;
     state.currentDesktop=desktop;
     CHECK(SetPickerSelection(state,5,desktop));
     state.activeWindow=IK(10,20,30);
@@ -668,7 +668,7 @@ static void test_picker_refresh_preserves_search_scroll_and_identity(){
     PickerState refreshed=PreservePickerUi(state);
     CHECK(refreshed.searchText==L"github");
     CHECK(refreshed.searchActive);
-    CHECK(refreshed.controlledTransition);
+    CHECK(refreshed.controlledTransition());
     CHECK(IsCurrentDesktop(refreshed,desktop));
     CHECK(IsSelectedDesktop(refreshed,desktop));
     CHECK(refreshed.selectedIndex==5);
@@ -1126,7 +1126,10 @@ static void test_picker_state_whole_object_swap_includes_generation_sentinel(){
     left.activeWindow=IK(11,12,13);
     left.searchText=L"left";
     left.searchActive=true;
-    left.controlledTransition=true;
+    left.transition.phase=PickerPhase::TargetIssue;
+    left.transition.runtimeKey="runtime-left";
+    left.transition.capturedTitle=L"captured title";
+    left.transition.capturedTitleComplete=true;
     left.scrollByDesktop[GuidKey(leftDesktop)]=4;
     left.paintGeneration=101;
     right.currentDesktop=rightDesktop;
@@ -1145,11 +1148,1663 @@ static void test_picker_state_whole_object_swap_includes_generation_sentinel(){
     CHECK(left.paintGeneration==202);
     CHECK(IsCurrentDesktop(right,leftDesktop));
     CHECK(right.selectedIndex==3 && right.searchText==L"left");
-    CHECK(right.searchActive && right.controlledTransition);
+    CHECK(right.searchActive && right.controlledTransition());
+    CHECK(right.transition.runtimeKey=="runtime-left");
+    CHECK(right.transition.capturedTitle==L"captured title");
+    CHECK(right.transition.capturedTitleComplete);
     CHECK(right.scrollByDesktop.at(GuidKey(leftDesktop))==4);
     CHECK(right.paintGeneration==101);
     SwapPickerState(left,right);
     CHECK(left.paintGeneration==101 && right.paintGeneration==202);
+}
+
+static PickerState PickerTransitionFixture(uint64_t generation=41){
+    PickerState state;
+    const GUID origin=G(
+        L"{231A0000-0000-0000-0000-000000000001}");
+    const GUID destination=G(
+        L"{231A0000-0000-0000-0000-000000000002}");
+    state.currentDesktop=origin;
+    CHECK(SetPickerSelection(state,1,destination));
+    state.activeWindow=IK(0x1234,77,9001);
+    state.transition.generation=generation;
+    state.transition.reservationToken.owner=MoveOwner::Picker;
+    state.transition.reservationToken.operationId=generation;
+    state.transition.reservationToken.jobId=generation+1000;
+    state.transition.target=state.activeWindow;
+    state.transition.runtimeKey=RuntimeKey(state.activeWindow);
+    state.transition.pendingRecordId=
+        "{00000000-0000-0000-0000-000000001101}";
+    state.transition.targetOrigin=origin;
+    state.transition.popupOrigin=origin;
+    state.transition.currentOrigin=origin;
+    state.transition.destination=destination;
+    return state;
+}
+
+static PickerObservation PickerObservationFor(
+        const PickerEffect& effect,PickerEvent event){
+    PickerObservation observation;
+    observation.event=event;
+    observation.generation=effect.generation;
+    observation.effectKind=effect.kind;
+    observation.effectSerial=effect.effectSerial;
+    return observation;
+}
+
+static void CheckPickerEffect(const PickerState& state,
+                              const PickerEffect& effect,
+                              PickerEffectKind kind){
+    CHECK(effect.kind==kind);
+    CHECK(effect.generation==state.transition.generation);
+    CHECK(effect.effectSerial!=0);
+    CHECK(state.transition.pendingEffect==kind);
+    CHECK(state.transition.effectSerial==effect.effectSerial);
+    CHECK(state.controlledTransition());
+}
+
+static void test_picker_transition_success_has_exact_verified_effect_order(){
+    PickerState state=PickerTransitionFixture();
+    std::vector<PickerEffectKind> order;
+    auto accept=[&](PickerEffect effect,PickerEffectKind expected){
+        CheckPickerEffect(state,effect,expected);
+        order.push_back(effect.kind);
+        return effect;
+    };
+
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=state.transition.generation;
+    PickerEffect effect=accept(
+        AdvancePickerTransition(state,begin),PickerEffectKind::MoveTarget);
+    CHECK(state.transition.phase==PickerPhase::TargetIssue);
+    CHECK(state.transition.targetMayHaveMoved);
+    CHECK(state.transition.forwardTargetAttempts==1);
+
+    PickerObservation issued=PickerObservationFor(effect,PickerEvent::ApiCompleted);
+    issued.identity=PickerIdentityValidity::Match;
+    issued.apiInvoked=true;
+    issued.apiAccepted=false;
+    effect=accept(AdvancePickerTransition(state,issued),
+                  PickerEffectKind::ReadTarget);
+    CHECK(state.transition.phase==PickerPhase::TargetVerify);
+
+    PickerObservation targetRead=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    targetRead.identity=PickerIdentityValidity::Match;
+    targetRead.targetRead=PickerReadValidity::Valid;
+    targetRead.actualTargetDesktop=state.transition.destination;
+    effect=accept(AdvancePickerTransition(state,targetRead),
+                  PickerEffectKind::ValidateTarget);
+    CHECK(state.transition.phase==PickerPhase::IdentityVerifyBeforePopup);
+
+    PickerObservation validated=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    validated.identity=PickerIdentityValidity::Match;
+    effect=accept(AdvancePickerTransition(state,validated),
+                  PickerEffectKind::MovePopup);
+    issued=PickerObservationFor(effect,PickerEvent::ApiCompleted);
+    issued.apiInvoked=true;
+    issued.apiAccepted=false;
+    effect=accept(AdvancePickerTransition(state,issued),
+                  PickerEffectKind::ReadPopup);
+    CHECK(state.transition.phase==PickerPhase::PopupVerify);
+
+    PickerObservation popupRead=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    popupRead.popupRead=PickerReadValidity::Valid;
+    popupRead.actualPopupDesktop=state.transition.destination;
+    effect=accept(AdvancePickerTransition(state,popupRead),
+                  PickerEffectKind::ValidateTarget);
+    CHECK(state.transition.phase==PickerPhase::IdentityVerifyBeforeSwitch);
+
+    validated=PickerObservationFor(effect,PickerEvent::EffectCompleted);
+    validated.identity=PickerIdentityValidity::Match;
+    effect=accept(AdvancePickerTransition(state,validated),
+                  PickerEffectKind::SwitchDesktop);
+    issued=PickerObservationFor(effect,PickerEvent::ApiCompleted);
+    issued.identity=PickerIdentityValidity::Match;
+    issued.apiInvoked=true;
+    issued.apiAccepted=false;
+    effect=accept(AdvancePickerTransition(state,issued),
+                  PickerEffectKind::ReadCurrent);
+    CHECK(state.transition.phase==PickerPhase::DestinationVerify);
+
+    PickerObservation currentRead=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    currentRead.currentRead=PickerReadValidity::Valid;
+    currentRead.actualCurrentDesktop=state.transition.destination;
+    effect=accept(AdvancePickerTransition(state,currentRead),
+                  PickerEffectKind::ReadPopup);
+    popupRead=PickerObservationFor(effect,PickerEvent::ReadbackCompleted);
+    popupRead.popupRead=PickerReadValidity::Valid;
+    popupRead.actualPopupDesktop=state.transition.destination;
+    effect=accept(AdvancePickerTransition(state,popupRead),
+                  PickerEffectKind::SaveExactTarget);
+    CHECK(state.transition.commitCutoffReached);
+
+    PickerObservation saved=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    saved.identity=PickerIdentityValidity::Match;
+    saved.saveStatus=PopupSaveStatus::Saved;
+    effect=accept(AdvancePickerTransition(state,saved),
+                  PickerEffectKind::Refresh);
+    PickerObservation refreshed=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    refreshed.apiAccepted=true;
+    effect=accept(AdvancePickerTransition(state,refreshed),
+                  PickerEffectKind::ShowAndFocus);
+    PickerObservation focused=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    focused.popupIsForeground=true;
+    const PickerEffect done=AdvancePickerTransition(state,focused);
+    CHECK(done.kind==PickerEffectKind::None);
+    CHECK(state.transition.terminalAcknowledged);
+    CHECK(state.controlledTransition());
+    CHECK(!PickerRuntimeTerminalizationReady(state.transition,false));
+    CHECK(PickerRuntimeTerminalizationReady(state.transition,true));
+    CHECK(DecidePickerTerminalGuardRelease(false,false,false)==
+        PickerTerminalGuardReleaseAction::ResolvedAbsent);
+    CHECK(DecidePickerTerminalGuardRelease(false,false,true)==
+        PickerTerminalGuardReleaseAction::RetryExactOwner);
+    CHECK(DecidePickerTerminalGuardRelease(true,false,true)==
+        PickerTerminalGuardReleaseAction::RetryExactOwner);
+    CHECK(DecidePickerTerminalGuardRelease(true,true,true)==
+        PickerTerminalGuardReleaseAction::ConsumeExact);
+    CHECK(DecidePickerTerminalNoProgressRoute(false,true)==
+        PickerTerminalNoProgressRoute::DelayedTimer);
+    CHECK(DecidePickerTerminalNoProgressRoute(false,false)==
+        PickerTerminalNoProgressRoute::DurableExternalKick);
+    CHECK(DecidePickerTerminalNoProgressRoute(true,true)==
+        PickerTerminalNoProgressRoute::DurableExternalKick);
+    CHECK(FinalizePickerTransition(state));
+    CHECK(state.transition.phase==PickerPhase::Idle);
+    CHECK(!state.controlledTransition());
+
+    const std::vector<PickerEffectKind> expected={
+        PickerEffectKind::MoveTarget,
+        PickerEffectKind::ReadTarget,
+        PickerEffectKind::ValidateTarget,
+        PickerEffectKind::MovePopup,
+        PickerEffectKind::ReadPopup,
+        PickerEffectKind::ValidateTarget,
+        PickerEffectKind::SwitchDesktop,
+        PickerEffectKind::ReadCurrent,
+        PickerEffectKind::ReadPopup,
+        PickerEffectKind::SaveExactTarget,
+        PickerEffectKind::Refresh,
+        PickerEffectKind::ShowAndFocus
+    };
+    CHECK(order==expected);
+    CHECK(state.transition.phase==PickerPhase::Idle);
+    CHECK(!state.transition.targetMayHaveMoved);
+}
+
+static void test_picker_transition_rejects_stale_duplicate_and_wrong_effect_acks(){
+    PickerState state=PickerTransitionFixture(82);
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=82;
+    PickerEffect move=AdvancePickerTransition(state,begin);
+    CheckPickerEffect(state,move,PickerEffectKind::MoveTarget);
+    const PickerPhase phase=state.transition.phase;
+    const uint64_t serial=state.transition.effectSerial;
+
+    PickerObservation stale=PickerObservationFor(
+        move,PickerEvent::ApiCompleted);
+    stale.generation=81;
+    stale.identity=PickerIdentityValidity::Match;
+    stale.apiInvoked=true;
+    CHECK(AdvancePickerTransition(state,stale).kind==PickerEffectKind::None);
+    CHECK(state.transition.phase==phase &&
+          state.transition.effectSerial==serial);
+
+    PickerObservation wrong=PickerObservationFor(
+        move,PickerEvent::ApiCompleted);
+    wrong.effectKind=PickerEffectKind::ReadTarget;
+    wrong.identity=PickerIdentityValidity::Match;
+    wrong.apiInvoked=true;
+    CHECK(AdvancePickerTransition(state,wrong).kind==PickerEffectKind::None);
+    CHECK(state.transition.pendingEffect==PickerEffectKind::MoveTarget);
+
+    PickerObservation accepted=PickerObservationFor(
+        move,PickerEvent::ApiCompleted);
+    accepted.identity=PickerIdentityValidity::Match;
+    accepted.apiInvoked=true;
+    PickerEffect read=AdvancePickerTransition(state,accepted);
+    CheckPickerEffect(state,read,PickerEffectKind::ReadTarget);
+    CHECK(read.effectSerial>move.effectSerial);
+    CHECK(AdvancePickerTransition(state,accepted).kind==PickerEffectKind::None);
+    CHECK(state.transition.pendingEffect==PickerEffectKind::ReadTarget);
+
+    PickerObservation timer;
+    timer.event=PickerEvent::Timer;
+    timer.generation=state.transition.generation;
+    CHECK(AdvancePickerTransition(state,timer).kind==PickerEffectKind::None);
+    CHECK(state.transition.pendingEffect==PickerEffectKind::ReadTarget);
+}
+
+static void test_picker_identity_loss_rolls_back_without_switch_or_save(){
+    PickerState state=PickerTransitionFixture(90);
+    std::vector<PickerEffectKind> effects;
+    auto record=[&](PickerEffect effect){
+        if(effect.kind!=PickerEffectKind::None) effects.push_back(effect.kind);
+        return effect;
+    };
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=90;
+    PickerEffect effect=record(AdvancePickerTransition(state,begin));
+    PickerObservation observation=PickerObservationFor(
+        effect,PickerEvent::ApiCompleted);
+    observation.identity=PickerIdentityValidity::Match;
+    observation.apiInvoked=true;
+    effect=record(AdvancePickerTransition(state,observation));
+    observation=PickerObservationFor(effect,PickerEvent::ReadbackCompleted);
+    observation.identity=PickerIdentityValidity::Match;
+    observation.targetRead=PickerReadValidity::Valid;
+    observation.actualTargetDesktop=state.transition.destination;
+    effect=record(AdvancePickerTransition(state,observation));
+    CHECK(state.transition.phase==PickerPhase::IdentityVerifyBeforePopup);
+
+    observation=PickerObservationFor(effect,PickerEvent::EffectCompleted);
+    observation.identity=PickerIdentityValidity::Lost;
+    effect=record(AdvancePickerTransition(state,observation));
+    CHECK(effect.kind==PickerEffectKind::Refresh);
+    CHECK(state.transition.targetIdentityUnusable);
+    CHECK(state.transition.rollbackTargetAttempts==0);
+    CHECK(state.transition.rollbackPopupAttempts==0);
+    CHECK(state.transition.rollbackSwitchAttempts==0);
+    observation=PickerObservationFor(effect,PickerEvent::EffectCompleted);
+    observation.apiAccepted=true;
+    effect=record(AdvancePickerTransition(state,observation));
+    CHECK(effect.kind==PickerEffectKind::ReportFailure);
+    CHECK(std::count(effects.begin(),effects.end(),
+                     PickerEffectKind::SwitchDesktop)==0);
+    CHECK(std::count(effects.begin(),effects.end(),
+                     PickerEffectKind::SaveExactTarget)==0);
+}
+
+static void test_picker_escape_hides_once_rolls_back_and_never_refocuses(){
+    PickerState state=PickerTransitionFixture(101);
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=101;
+    PickerEffect move=AdvancePickerTransition(state,begin);
+    CHECK(move.kind==PickerEffectKind::MoveTarget);
+
+    PickerObservation cancel;
+    cancel.event=PickerEvent::CancelRequested;
+    cancel.generation=101;
+    PickerEffect hide=AdvancePickerTransition(state,cancel);
+    CheckPickerEffect(state,hide,PickerEffectKind::Hide);
+    CHECK(state.transition.dismissed && state.transition.cancelRequested);
+    CHECK(AdvancePickerTransition(state,cancel).kind==PickerEffectKind::None);
+    PickerObservation hidden=PickerObservationFor(
+        hide,PickerEvent::EffectCompleted);
+    PickerEffect effect=AdvancePickerTransition(state,hidden);
+    CHECK(effect.kind==PickerEffectKind::MoveTarget);
+
+    auto api=[&](PickerEffect current){
+        PickerObservation acknowledged=PickerObservationFor(
+            current,PickerEvent::ApiCompleted);
+        acknowledged.identity=PickerIdentityValidity::Match;
+        acknowledged.apiInvoked=true;
+        acknowledged.apiAccepted=true;
+        return AdvancePickerTransition(state,acknowledged);
+    };
+    auto readTarget=[&](PickerEffect current,const GUID& desktop){
+        PickerObservation acknowledged=PickerObservationFor(
+            current,PickerEvent::ReadbackCompleted);
+        acknowledged.identity=PickerIdentityValidity::Match;
+        acknowledged.targetRead=PickerReadValidity::Valid;
+        acknowledged.actualTargetDesktop=desktop;
+        return AdvancePickerTransition(state,acknowledged);
+    };
+    effect=api(effect);
+    effect=readTarget(effect,state.transition.targetOrigin);
+    CHECK(effect.kind==PickerEffectKind::Refresh);
+    PickerObservation refreshed=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    refreshed.apiAccepted=true;
+    effect=AdvancePickerTransition(state,refreshed);
+    CHECK(effect.kind==PickerEffectKind::None);
+    CHECK(state.transition.terminalAcknowledged);
+    CHECK(FinalizePickerTransition(state));
+    CHECK(state.transition.phase==PickerPhase::Idle);
+    CHECK(!state.controlledTransition());
+}
+
+static void test_picker_rollback_exhaustion_preserves_actual_readbacks(){
+    PickerState state=PickerTransitionFixture(111);
+    state.transition.phase=PickerPhase::TargetVerify;
+    state.transition.pendingEffect=PickerEffectKind::ReadTarget;
+    state.transition.effectSerial=70;
+    state.transition.forwardTargetAttempts=4;
+    state.transition.targetMayHaveMoved=true;
+    state.transition.popupMayHaveMoved=true;
+    state.transition.switchMayHaveChanged=true;
+    const GUID targetActual=G(
+        L"{231A0000-0000-0000-0000-000000000003}");
+    PickerObservation failedRead;
+    failedRead.event=PickerEvent::ReadbackCompleted;
+    failedRead.generation=111;
+    failedRead.effectKind=PickerEffectKind::ReadTarget;
+    failedRead.effectSerial=70;
+    failedRead.identity=PickerIdentityValidity::Match;
+    failedRead.targetRead=PickerReadValidity::Valid;
+    failedRead.actualTargetDesktop=targetActual;
+    PickerEffect effect=AdvancePickerTransition(state,failedRead);
+    CHECK(effect.kind==PickerEffectKind::MoveTarget);
+
+    for(int attempt=0;attempt<4;++attempt){
+        PickerObservation issued=PickerObservationFor(
+            effect,PickerEvent::ApiCompleted);
+        issued.identity=PickerIdentityValidity::Match;
+        issued.apiInvoked=true;
+        issued.apiAccepted=false;
+        effect=AdvancePickerTransition(state,issued);
+        CHECK(effect.kind==PickerEffectKind::ReadTarget);
+        PickerObservation read=PickerObservationFor(
+            effect,PickerEvent::ReadbackCompleted);
+        read.identity=PickerIdentityValidity::Match;
+        read.targetRead=PickerReadValidity::Valid;
+        read.actualTargetDesktop=targetActual;
+        effect=AdvancePickerTransition(state,read);
+        if(attempt<3) CHECK(effect.kind==PickerEffectKind::MoveTarget);
+    }
+    CHECK(effect.kind==PickerEffectKind::MovePopup);
+    for(int attempt=0;attempt<4;++attempt){
+        PickerObservation issued=PickerObservationFor(
+            effect,PickerEvent::ApiCompleted);
+        issued.apiInvoked=true;
+        issued.apiAccepted=false;
+        effect=AdvancePickerTransition(state,issued);
+        PickerObservation read=PickerObservationFor(
+            effect,PickerEvent::ReadbackCompleted);
+        read.popupRead=PickerReadValidity::Valid;
+        read.actualPopupDesktop=state.transition.destination;
+        effect=AdvancePickerTransition(state,read);
+    }
+    CHECK(effect.kind==PickerEffectKind::SwitchDesktop);
+    for(int attempt=0;attempt<4;++attempt){
+        PickerObservation issued=PickerObservationFor(
+            effect,PickerEvent::ApiCompleted);
+        issued.apiInvoked=true;
+        issued.apiAccepted=false;
+        effect=AdvancePickerTransition(state,issued);
+        CHECK(effect.kind==PickerEffectKind::ReadCurrent);
+        PickerObservation current=PickerObservationFor(
+            effect,PickerEvent::ReadbackCompleted);
+        current.currentRead=PickerReadValidity::Valid;
+        current.actualCurrentDesktop=state.transition.destination;
+        effect=AdvancePickerTransition(state,current);
+    }
+    CHECK(effect.kind==PickerEffectKind::Refresh);
+    CHECK(GuidEq(state.transition.observedTargetDesktop,targetActual));
+    CHECK(GuidEq(state.transition.observedPopupDesktop,
+                 state.transition.destination));
+    CHECK(GuidEq(state.transition.observedCurrentDesktop,
+                 state.transition.destination));
+    CHECK(state.transition.failed);
+    CHECK(!state.transition.diagnostic.empty());
+}
+
+static void test_picker_ui_action_gate_and_auto_supersession_are_exact(){
+    PickerState state=PickerTransitionFixture(121);
+    for(PickerUiAction action : {
+            PickerUiAction::CtrlMove,PickerUiAction::PlainSwitch,
+            PickerUiAction::FooterNavigation,PickerUiAction::CloseOrReopen,
+            PickerUiAction::SearchEdit})
+        CHECK(PickerUiActionAllowed(state,action));
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=121;
+    CHECK(AdvancePickerTransition(state,begin).kind==
+          PickerEffectKind::MoveTarget);
+    for(PickerUiAction action : {
+            PickerUiAction::CtrlMove,PickerUiAction::PlainSwitch,
+            PickerUiAction::FooterNavigation,PickerUiAction::CloseOrReopen,
+            PickerUiAction::SearchEdit})
+        CHECK(!PickerUiActionAllowed(state,action));
+
+    CHECK(DecidePickerAutoSupersession(false,false,false)==
+          PickerAutoSupersession::None);
+    CHECK(DecidePickerAutoSupersession(true,false,false)==
+          PickerAutoSupersession::CancelQueued);
+    CHECK(DecidePickerAutoSupersession(true,true,false)==
+          PickerAutoSupersession::WaitForIssuedReadback);
+    CHECK(DecidePickerAutoSupersession(true,false,true)==
+          PickerAutoSupersession::WaitForIssuedReadback);
+}
+
+static void test_picker_observation_kick_survives_post_and_timer_failure_once(){
+    PickerState state=PickerTransitionFixture(131);
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=131;
+    PickerEffect effect=AdvancePickerTransition(state,begin);
+    PickerObservation observation=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    observation.identity=PickerIdentityValidity::Match;
+
+    PickerKickState kick;
+    CHECK(StagePickerObservationKick(kick,observation,true,false,true)==
+          PickerKickRoute::Posted);
+    PickerObservation later=observation;
+    ++later.effectSerial;
+    CHECK(StagePickerObservationKick(kick,later,true,true,true)==
+          PickerKickRoute::PendingPreserved);
+    PickerObservation consumed;
+    CHECK(ConsumePickerObservationKick(kick,consumed));
+    CHECK(consumed.effectSerial==observation.effectSerial);
+    CHECK(!ConsumePickerObservationKick(kick,consumed));
+
+    CHECK(StagePickerObservationKick(kick,observation,false,true,true)==
+          PickerKickRoute::TimerArmed);
+    CHECK(ConsumePickerObservationKick(kick,consumed));
+    CHECK(StagePickerObservationKick(kick,observation,false,false,true)==
+          PickerKickRoute::InlineFallback);
+    CHECK(ConsumePickerObservationKick(kick,consumed));
+    CHECK(StagePickerObservationKick(kick,observation,false,false,false)==
+          PickerKickRoute::Teardown);
+    CHECK(ConsumePickerObservationKick(kick,consumed));
+}
+
+static void test_picker_save_result_and_fresh_generation_callbacks_are_typed(){
+    const WindowIdentityKey identity=IK(0x1234,77,9001);
+    CHECK(PickerFreshRuntimeMatches(identity,91,identity,91));
+    CHECK(!PickerFreshRuntimeMatches(identity,91,identity,90));
+    CHECK(!PickerFreshRuntimeMatches(identity,91,IK(0x1234,77,9002),91));
+    CHECK(PickerHasSafeOriginRecord(false,true));
+    CHECK(PickerHasSafeOriginRecord(true,false));
+    CHECK(!PickerHasSafeOriginRecord(false,false));
+    CHECK(PickerMayReserveStableRecordId(true,true,true));
+    CHECK(!PickerMayReserveStableRecordId(false,true,true));
+    CHECK(!PickerMayReserveStableRecordId(true,false,true));
+    CHECK(!PickerMayReserveStableRecordId(true,true,false));
+    int callbacks=0;
+    PopupSaveResult saved;
+    saved.status=PopupSaveStatus::Saved;
+    saved.app="firefox";
+    CHECK(CompletePickerLifecycleForSave(saved,[&](const std::string& app){
+        CHECK(app=="firefox");
+        ++callbacks;
+    }));
+    CHECK(callbacks==1);
+    PopupSaveResult ordinary;
+    ordinary.status=PopupSaveStatus::NotTracked;
+    CHECK(!CompletePickerLifecycleForSave(ordinary,[&](const std::string&){
+        ++callbacks;
+    }));
+    PopupSaveResult failed;
+    failed.status=PopupSaveStatus::Failed;
+    failed.failure=PopupSaveFailure::StorageUnavailable;
+    failed.app="firefox";
+    CHECK(!CompletePickerLifecycleForSave(failed,[&](const std::string&){
+        ++callbacks;
+    }));
+    CHECK(callbacks==1);
+    CHECK(std::wstring(PickerSaveFailureDiagnostic(
+              PopupSaveFailure::StorageUnavailable)).find(L"unavailable")!=
+          std::wstring::npos);
+
+    PickerState state=PickerTransitionFixture(139);
+    state.transition.phase=PickerPhase::SaveExactTarget;
+    state.transition.commitCutoffReached=true;
+    state.transition.pendingEffect=PickerEffectKind::SaveExactTarget;
+    state.transition.effectSerial=41;
+    PickerEffect save;
+    save.kind=PickerEffectKind::SaveExactTarget;
+    save.generation=139;
+    save.effectSerial=41;
+    PickerObservation saveFailed=PickerObservationFor(
+        save,PickerEvent::EffectCompleted);
+    saveFailed.identity=PickerIdentityValidity::Match;
+    saveFailed.saveStatus=PopupSaveStatus::Failed;
+    saveFailed.saveFailure=PopupSaveFailure::StorageReadOnly;
+    CHECK(AdvancePickerTransition(state,saveFailed).kind==
+          PickerEffectKind::Refresh);
+    CHECK(state.transition.diagnostic==
+          PickerSaveFailureDiagnostic(PopupSaveFailure::StorageReadOnly));
+}
+
+static void test_picker_api_ack_distinguishes_invocation_and_identity_quality(){
+    PickerState state=PickerTransitionFixture(141);
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=141;
+    PickerEffect move=AdvancePickerTransition(state,begin);
+    CHECK(move.kind==PickerEffectKind::MoveTarget);
+    CHECK(state.transition.targetMayHaveMoved);
+    CHECK(state.transition.forwardTargetAttempts==1);
+
+    PickerObservation notInvoked=PickerObservationFor(
+        move,PickerEvent::ApiCompleted);
+    notInvoked.identity=PickerIdentityValidity::Lost;
+    notInvoked.apiInvoked=false;
+    notInvoked.apiAccepted=false;
+    PickerEffect effect=AdvancePickerTransition(state,notInvoked);
+    CHECK(effect.kind==PickerEffectKind::Refresh);
+    CHECK(!state.transition.targetMayHaveMoved);
+    CHECK(state.transition.targetIdentityUnusable);
+
+    state=PickerTransitionFixture(142);
+    begin.generation=142;
+    move=AdvancePickerTransition(state,begin);
+    PickerObservation invoked=PickerObservationFor(
+        move,PickerEvent::ApiCompleted);
+    invoked.identity=PickerIdentityValidity::Match;
+    invoked.apiInvoked=true;
+    invoked.apiAccepted=false;
+    effect=AdvancePickerTransition(state,invoked);
+    CHECK(effect.kind==PickerEffectKind::ReadTarget);
+    CHECK(state.transition.targetMayHaveMoved);
+
+    PickerObservation unknown=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    unknown.identity=PickerIdentityValidity::Indeterminate;
+    unknown.targetRead=PickerReadValidity::Unavailable;
+    effect=AdvancePickerTransition(state,unknown);
+    CHECK(state.transition.targetIdentityUnusable);
+    CHECK(effect.kind==PickerEffectKind::Refresh);
+    CHECK(state.transition.rollbackTargetAttempts==0);
+}
+
+static void test_picker_post_switch_reads_current_then_popup_and_requires_both(){
+    PickerState state=PickerTransitionFixture(151);
+    state.transition.phase=PickerPhase::SwitchIssue;
+    state.transition.forwardSwitchAttempts=1;
+    state.transition.targetMayHaveMoved=true;
+    state.transition.popupMayHaveMoved=true;
+    state.transition.pendingEffect=PickerEffectKind::SwitchDesktop;
+    state.transition.effectSerial=50;
+    PickerObservation switched;
+    switched.event=PickerEvent::ApiCompleted;
+    switched.generation=151;
+    switched.effectKind=PickerEffectKind::SwitchDesktop;
+    switched.effectSerial=50;
+    switched.identity=PickerIdentityValidity::Match;
+    switched.apiInvoked=true;
+    switched.apiAccepted=true;
+    PickerEffect effect=AdvancePickerTransition(state,switched);
+    CHECK(effect.kind==PickerEffectKind::ReadCurrent);
+
+    PickerObservation current=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    current.currentRead=PickerReadValidity::Valid;
+    current.actualCurrentDesktop=state.transition.destination;
+    effect=AdvancePickerTransition(state,current);
+    CHECK(effect.kind==PickerEffectKind::ReadPopup);
+    PickerObservation popup=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    popup.popupRead=PickerReadValidity::Unavailable;
+    effect=AdvancePickerTransition(state,popup);
+    CHECK(effect.kind!=PickerEffectKind::SaveExactTarget);
+    CHECK(state.transition.failed ||
+          state.transition.phase==PickerPhase::IdentityVerifyBeforePopup);
+}
+
+static void test_picker_escape_after_save_emission_is_a_commit_cutoff(){
+    PickerState state=PickerTransitionFixture(161);
+    state.transition.phase=PickerPhase::SaveExactTarget;
+    state.transition.targetMayHaveMoved=true;
+    state.transition.popupMayHaveMoved=true;
+    state.transition.switchMayHaveChanged=true;
+    state.transition.pendingEffect=PickerEffectKind::SaveExactTarget;
+    state.transition.effectSerial=80;
+    state.transition.commitCutoffReached=true;
+    PickerObservation cancel;
+    cancel.event=PickerEvent::CancelRequested;
+    cancel.generation=161;
+    CHECK(AdvancePickerTransition(state,cancel).kind==PickerEffectKind::None);
+    CHECK(state.transition.pendingEffect==PickerEffectKind::SaveExactTarget);
+    PickerEffect save;
+    save.kind=PickerEffectKind::SaveExactTarget;
+    save.generation=161;
+    save.effectSerial=80;
+    PickerObservation saved=PickerObservationFor(
+        save,PickerEvent::EffectCompleted);
+    saved.identity=PickerIdentityValidity::Match;
+    saved.saveStatus=PopupSaveStatus::Saved;
+    PickerEffect hide=AdvancePickerTransition(state,saved);
+    CHECK(hide.kind==PickerEffectKind::Hide);
+    PickerObservation hidden=PickerObservationFor(
+        hide,PickerEvent::EffectCompleted);
+    PickerEffect effect=AdvancePickerTransition(state,hidden);
+    CHECK(effect.kind==PickerEffectKind::Refresh);
+    CHECK(state.transition.phase==PickerPhase::RefreshModel);
+    CHECK(state.transition.rollbackTargetAttempts==0);
+    CHECK(state.transition.rollbackPopupAttempts==0);
+    CHECK(state.transition.rollbackSwitchAttempts==0);
+    PickerObservation refreshed=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    refreshed.apiAccepted=true;
+    CHECK(AdvancePickerTransition(state,refreshed).kind==
+          PickerEffectKind::None);
+    CHECK(state.transition.terminalAcknowledged);
+    CHECK(FinalizePickerTransition(state));
+    CHECK(state.transition.phase==PickerPhase::Idle);
+}
+
+static void test_picker_cancel_discards_only_matching_unissued_non_save_effect(){
+    PickerState state=PickerTransitionFixture(162);
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=162;
+    PickerEffect scheduled=AdvancePickerTransition(state,begin);
+    bool hasScheduled=true;
+    CHECK(DiscardPickerUnissuedEffectForCancel(
+        scheduled,hasScheduled,state.transition));
+    CHECK(!hasScheduled && scheduled.kind==PickerEffectKind::None);
+    PickerObservation cancel;
+    cancel.event=PickerEvent::CancelRequested;
+    cancel.generation=162;
+    cancel.unissuedEffectCancelled=true;
+    PickerEffect hide=AdvancePickerTransition(state,cancel);
+    CHECK(hide.kind==PickerEffectKind::Hide);
+    CHECK(!state.transition.targetMayHaveMoved);
+    PickerEffect refresh=AdvancePickerTransition(
+        state,PickerObservationFor(hide,PickerEvent::EffectCompleted));
+    CHECK(refresh.kind==PickerEffectKind::Refresh);
+
+    state=PickerTransitionFixture(163);
+    state.transition.phase=PickerPhase::SaveExactTarget;
+    state.transition.commitCutoffReached=true;
+    state.transition.pendingEffect=PickerEffectKind::SaveExactTarget;
+    state.transition.effectSerial=81;
+    scheduled.kind=PickerEffectKind::SaveExactTarget;
+    scheduled.generation=163;
+    scheduled.effectSerial=81;
+    hasScheduled=true;
+    CHECK(!DiscardPickerUnissuedEffectForCancel(
+        scheduled,hasScheduled,state.transition));
+    CHECK(hasScheduled && scheduled.kind==PickerEffectKind::SaveExactTarget);
+
+    PickerEffect stale=scheduled;
+    --stale.effectSerial;
+    CHECK(!DiscardPickerUnissuedEffectForCancel(
+        stale,hasScheduled,state.transition));
+    CHECK(hasScheduled);
+
+    state=PickerTransitionFixture(164);
+    state.transition.phase=PickerPhase::RefreshModel;
+    state.transition.pendingEffect=PickerEffectKind::Refresh;
+    state.transition.effectSerial=82;
+    scheduled.kind=PickerEffectKind::Refresh;
+    scheduled.generation=164;
+    scheduled.effectSerial=82;
+    hasScheduled=true;
+    CHECK(!DiscardPickerUnissuedEffectForCancel(
+        scheduled,hasScheduled,state.transition));
+    cancel=PickerObservation{};
+    cancel.event=PickerEvent::CancelRequested;
+    cancel.generation=164;
+    CHECK(AdvancePickerTransition(state,cancel).kind==PickerEffectKind::None);
+    CHECK(state.transition.pendingEffect==PickerEffectKind::Refresh);
+    PickerObservation refreshed=PickerObservationFor(
+        scheduled,PickerEvent::EffectCompleted);
+    refreshed.apiAccepted=true;
+    hide=AdvancePickerTransition(state,refreshed);
+    CHECK(hide.kind==PickerEffectKind::Hide);
+    CHECK(AdvancePickerTransition(
+        state,PickerObservationFor(hide,PickerEvent::EffectCompleted)).kind==
+        PickerEffectKind::None);
+    CHECK(state.transition.terminalAcknowledged);
+
+    scheduled=hide;
+    hasScheduled=true;
+    CHECK(!DiscardPickerUnissuedEffectForCancel(
+        scheduled,hasScheduled,state.transition));
+    CHECK(hasScheduled);
+}
+
+static void test_picker_reservation_filter_and_owner_replacement_are_exact(){
+    FastWin exact;
+    exact.hwnd=reinterpret_cast<HWND>(0x1234);
+    exact.pid=77;
+    exact.processStart=9001;
+    FastWin reused=exact;
+    reused.processStart=9002;
+    std::map<std::string,WindowIdentityKey> pickerReservations;
+    pickerReservations[RuntimeKey(exact)]=IdentityOf(exact);
+    CHECK(PickerReservationBlocks(exact,pickerReservations));
+    CHECK(!PickerReservationBlocks(reused,pickerReservations));
+    CHECK(PickerReservationReplacementAllowed(
+        MoveOwner::AutoReconcile,MoveOwner::Picker));
+    CHECK(!PickerReservationReplacementAllowed(
+        MoveOwner::ManualTray,MoveOwner::Picker));
+    CHECK(!PickerReservationReplacementAllowed(
+        MoveOwner::Picker,MoveOwner::ManualTray));
+    CHECK(!PickerReservationReplacementAllowed(
+        MoveOwner::Picker,MoveOwner::AutoReconcile));
+    CHECK(!PickerReservationReplacementAllowed(
+        MoveOwner::Picker,MoveOwner::Picker));
+}
+
+static void test_picker_raw_edit_and_tab_cache_are_model_generation_scoped(){
+    PickerState state;
+    state.searchActive=true;
+    CHECK(SetPickerSearchText(state,L"GitHub PR",L"github pr"));
+    CHECK(state.searchEditText==L"GitHub PR");
+    CHECK(state.searchText==L"github pr");
+    CHECK(state.searchActive);
+    state.searchActive=false;
+    CHECK(SetPickerSearchText(state,L"GitHub PR",L"github pr"));
+    CHECK(!state.searchActive);
+    state.searchActive=true;
+    CHECK(SetPickerSearchText(state,L"",L""));
+    CHECK(state.searchActive);
+    PickerState preserved=PreservePickerUi(state);
+    CHECK(preserved.searchEditText.empty());
+    CHECK(preserved.searchText.empty());
+    CHECK(preserved.searchActive);
+
+    PickerTabSearchCacheState cache;
+    cache.modelGeneration=7;
+    cache.query=L"github pr";
+    cache.ready=true;
+    CHECK(PickerTabSearchCacheUsable(cache,7,L"github pr"));
+    CHECK(!PickerTabSearchCacheUsable(cache,8,L"github pr"));
+    CHECK(!PickerTabSearchCacheUsable(cache,7,L"mail"));
+    InvalidatePickerTabSearchCache(cache,8);
+    CHECK(cache.modelGeneration==8 && !cache.ready && cache.query.empty());
+
+    CHECK(BeginPickerTabSearchAttempt(cache,901,9,L"tab only"));
+    CHECK(PickerTabSearchAttemptMatches(cache,901,9,L"tab only"));
+    CHECK(!PickerTabSearchCacheUsable(cache,9,L"tab only"));
+    CHECK(MarkPickerTabSearchRetryNeeded(
+        cache,901,9,L"tab only","firefox"));
+    CHECK(CompletePickerTabSearchAttempt(cache,901,9,L"tab only"));
+    CHECK(cache.retryNeeded && !cache.pending && !cache.ready);
+    CHECK(!PickerTabSearchRetryPostNeeded(cache,9,L"tab only"));
+    for(const char* unrelated : {"chrome","edge","other","chrome"}){
+        NotePickerTabSearchRouteFreed(cache,unrelated);
+        CHECK(!PickerTabSearchRetryPostNeeded(cache,9,L"tab only"));
+        CHECK(cache.retryAttempts==0);
+    }
+    NotePickerTabSearchRouteFreed(cache,"firefox");
+    CHECK(PickerTabSearchRetryPostNeeded(cache,9,L"tab only"));
+    CHECK(MarkPickerTabSearchRetryPosted(cache,9,L"tab only"));
+    CHECK(!PickerTabSearchRetryPostNeeded(cache,9,L"tab only"));
+    CHECK(ConsumePickerTabSearchRetryPost(cache,9,L"tab only"));
+    CHECK(BeginPickerTabSearchAttempt(cache,902,9,L"tab only"));
+    CHECK(CompletePickerTabSearchAttempt(cache,902,9,L"tab only"));
+    CHECK(PickerTabSearchCacheUsable(cache,9,L"tab only"));
+
+    CHECK(BeginPickerTabSearchAttempt(cache,1001,10,L"query a"));
+    CHECK(BeginPickerTabSearchAttempt(cache,1002,10,L"query b"));
+    CHECK(BeginPickerTabSearchAttempt(cache,1003,10,L"query a"));
+    CHECK(PickerTabSearchAttemptMatches(cache,1003,10,L"query a"));
+    CHECK(cache.pending);
+    CHECK(MarkPickerTabSearchRetryNeeded(
+        cache,1003,10,L"query a","firefox"));
+    CHECK(!MarkPickerTabSearchRetryNeeded(
+        cache,1001,10,L"query a","firefox",
+        PickerTabSearchRetryTrigger::Immediate));
+    CHECK(!CompletePickerTabSearchAttempt(cache,1001,10,L"query a"));
+    CHECK(cache.pending &&
+          PickerTabSearchAttemptMatches(cache,1003,10,L"query a"));
+    CHECK(!cache.routeFreed);
+    CHECK(CompletePickerTabSearchAttempt(cache,1003,10,L"query a"));
+    CHECK(!PickerTabSearchCacheUsable(cache,10,L"query a"));
+    CHECK(!PickerTabSearchRetryPostNeeded(cache,10,L"query a"));
+    NotePickerTabSearchRouteFreed(cache,"firefox");
+    CHECK(PickerTabSearchRetryPostNeeded(cache,10,L"query a"));
+
+    InvalidatePickerTabSearchCache(cache,11);
+    CHECK(BeginPickerTabSearchAttempt(cache,1101,11,L"capacity"));
+    CHECK(MarkPickerTabSearchRetryNeeded(
+        cache,1101,11,L"capacity","firefox",
+        PickerTabSearchRetryTrigger::AnyRoute));
+    CHECK(CompletePickerTabSearchAttempt(cache,1101,11,L"capacity"));
+    NotePickerTabSearchRouteFreed(cache,"chrome");
+    CHECK(PickerTabSearchRetryPostNeeded(cache,11,L"capacity"));
+
+    InvalidatePickerTabSearchCache(cache,12);
+    CHECK(BeginPickerTabSearchAttempt(cache,1201,12,L"failure"));
+    CHECK(MarkPickerTabSearchRetryNeeded(
+        cache,1201,12,L"failure","firefox",
+        PickerTabSearchRetryTrigger::Immediate));
+    CHECK(CompletePickerTabSearchAttempt(cache,1201,12,L"failure"));
+    CHECK(PickerTabSearchRetryPostNeeded(cache,12,L"failure"));
+    CHECK(MarkPickerTabSearchRetryPosted(cache,12,L"failure"));
+    CHECK(!ConsumePickerTabSearchRetryPostWhenIdle(
+        cache,true,12,L"failure"));
+    CHECK(cache.retryPosted && cache.routeFreed);
+    CHECK(!ConsumePickerTabSearchRetryPostWhenIdle(
+        cache,false,13,L"failure"));
+    CHECK(cache.retryPosted && cache.routeFreed);
+    CHECK(ConsumePickerTabSearchRetryPostWhenIdle(
+        cache,false,12,L"failure"));
+    CHECK(!cache.retryPosted && !cache.routeFreed);
+}
+
+static void test_picker_nonidle_gate_includes_all_tray_mutators(){
+    PickerState state=PickerTransitionFixture(171);
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=171;
+    CHECK(AdvancePickerTransition(state,begin).kind==
+          PickerEffectKind::MoveTarget);
+    for(PickerUiAction action : {
+            PickerUiAction::ManualSave,PickerUiAction::ManualRestore,
+            PickerUiAction::Settings,PickerUiAction::About,
+            PickerUiAction::Help})
+        CHECK(!PickerUiActionAllowed(state,action));
+    CHECK(PickerUiActionAllowed(state,PickerUiAction::TrayExit));
+    CHECK(RoutePickerShutdown(state)==
+          PickerShutdownRoute::CancelThenProceed);
+    PickerState idle;
+    CHECK(RoutePickerShutdown(idle)==PickerShutdownRoute::Proceed);
+
+    int cancels=0,pumps=0;
+    CHECK(RunPickerShutdownDrain(
+        idle,[&](){ ++cancels; },[&](){ ++pumps; }));
+    CHECK(cancels==0 && pumps==0);
+
+    PickerState draining=PickerTransitionFixture(172);
+    draining.transition.phase=PickerPhase::TargetIssue;
+    CHECK(RunPickerShutdownDrain(
+        draining,[&](){ ++cancels; },[&](){
+            ++pumps;
+            draining.transition.pendingEffect=PickerEffectKind::None;
+            draining.transition.terminalAcknowledged=true;
+            CHECK(FinalizePickerTransition(draining));
+        }));
+    CHECK(cancels==1 && pumps==1 && !draining.controlledTransition());
+
+    PickerState blocked=PickerTransitionFixture(173);
+    blocked.transition.phase=PickerPhase::PopupVerify;
+    CHECK(!RunPickerShutdownDrain(
+        blocked,[&](){ ++cancels; },[&](){ ++pumps; }));
+    CHECK(blocked.controlledTransition());
+    CHECK(cancels==2 && pumps==5);
+}
+
+static PickerEffect PickerAckApi(PickerState& state,const PickerEffect& effect,
+                                 bool invoked=true,
+                                 PickerIdentityValidity identity=
+                                     PickerIdentityValidity::Match){
+    PickerObservation observation=PickerObservationFor(
+        effect,PickerEvent::ApiCompleted);
+    observation.identity=identity;
+    observation.apiInvoked=invoked;
+    observation.apiAccepted=false;
+    return AdvancePickerTransition(state,observation);
+}
+
+static PickerEffect PickerAckTarget(PickerState& state,
+                                    const PickerEffect& effect,
+                                    PickerReadValidity validity,
+                                    const GUID& actual,
+                                    PickerIdentityValidity identity=
+                                        PickerIdentityValidity::Match){
+    PickerObservation observation=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    observation.identity=identity;
+    observation.targetRead=validity;
+    observation.actualTargetDesktop=actual;
+    return AdvancePickerTransition(state,observation);
+}
+
+static PickerEffect PickerAckIdentity(PickerState& state,
+                                      const PickerEffect& effect,
+                                      PickerIdentityValidity identity=
+                                          PickerIdentityValidity::Match){
+    PickerObservation observation=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    observation.identity=identity;
+    return AdvancePickerTransition(state,observation);
+}
+
+static void test_picker_forward_attempt_matrix_has_independent_exact_budgets(){
+    PickerState state=PickerTransitionFixture(181);
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=181;
+    PickerEffect effect=AdvancePickerTransition(state,begin);
+    for(int attempt=1;attempt<=4;++attempt){
+        CHECK(effect.kind==PickerEffectKind::MoveTarget);
+        effect=PickerAckApi(state,effect);
+        CHECK(effect.kind==PickerEffectKind::ReadTarget);
+        const GUID actual=attempt==4 ? state.transition.destination
+                                    : state.transition.targetOrigin;
+        effect=PickerAckTarget(
+            state,effect,PickerReadValidity::Valid,actual);
+    }
+    CHECK(effect.kind==PickerEffectKind::ValidateTarget);
+    CHECK(state.transition.forwardTargetAttempts==4);
+
+    effect=PickerAckIdentity(state,effect);
+    for(int attempt=1;attempt<=4;++attempt){
+        CHECK(effect.kind==PickerEffectKind::MovePopup);
+        effect=PickerAckApi(state,effect);
+        CHECK(effect.kind==PickerEffectKind::ReadPopup);
+        PickerObservation popup=PickerObservationFor(
+            effect,PickerEvent::ReadbackCompleted);
+        popup.popupRead=PickerReadValidity::Valid;
+        popup.actualPopupDesktop=attempt==4
+            ? state.transition.destination : state.transition.currentOrigin;
+        effect=AdvancePickerTransition(state,popup);
+        if(attempt<4) effect=PickerAckIdentity(state,effect);
+    }
+    CHECK(effect.kind==PickerEffectKind::ValidateTarget);
+    CHECK(state.transition.forwardPopupAttempts==4);
+
+    effect=PickerAckIdentity(state,effect);
+    for(int attempt=1;attempt<=4;++attempt){
+        CHECK(effect.kind==PickerEffectKind::SwitchDesktop);
+        effect=PickerAckApi(state,effect);
+        CHECK(effect.kind==PickerEffectKind::ReadCurrent);
+        PickerObservation current=PickerObservationFor(
+            effect,PickerEvent::ReadbackCompleted);
+        current.currentRead=PickerReadValidity::Valid;
+        current.actualCurrentDesktop=attempt==4
+            ? state.transition.destination : state.transition.currentOrigin;
+        effect=AdvancePickerTransition(state,current);
+        if(attempt<4) effect=PickerAckIdentity(state,effect);
+    }
+    CHECK(effect.kind==PickerEffectKind::ReadPopup);
+    CHECK(state.transition.forwardSwitchAttempts==4);
+    CHECK(state.transition.rollbackTargetAttempts==0);
+    CHECK(state.transition.rollbackPopupAttempts==0);
+    CHECK(state.transition.rollbackSwitchAttempts==0);
+}
+
+static void test_picker_unavailable_target_read_exhausts_then_uses_rollback_budget(){
+    PickerState state=PickerTransitionFixture(182);
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=182;
+    PickerEffect effect=AdvancePickerTransition(state,begin);
+    for(int attempt=1;attempt<=4;++attempt){
+        effect=PickerAckApi(state,effect);
+        effect=PickerAckTarget(
+            state,effect,PickerReadValidity::Unavailable,GUID{});
+    }
+    CHECK(effect.kind==PickerEffectKind::MoveTarget);
+    CHECK(state.transition.forwardTargetAttempts==4);
+    CHECK(state.transition.rollbackTargetAttempts==1);
+    CHECK(state.transition.targetMayHaveMoved);
+}
+
+static void test_picker_wrong_event_and_serial_never_consume_pending_lane(){
+    const PickerEffectKind kinds[]={
+        PickerEffectKind::MoveTarget,PickerEffectKind::MovePopup,
+        PickerEffectKind::SwitchDesktop,PickerEffectKind::ReadTarget,
+        PickerEffectKind::ReadPopup,PickerEffectKind::ReadCurrent,
+        PickerEffectKind::ValidateTarget,PickerEffectKind::SaveExactTarget,
+        PickerEffectKind::Refresh,PickerEffectKind::ShowAndFocus,
+        PickerEffectKind::Hide,PickerEffectKind::ReportFailure
+    };
+    for(PickerEffectKind kind : kinds){
+        PickerState state=PickerTransitionFixture(190+
+            static_cast<uint64_t>(kind));
+        state.transition.phase=PickerPhase::FocusRestore;
+        state.transition.pendingEffect=kind;
+        state.transition.effectSerial=91;
+        PickerObservation wrong;
+        wrong.event=PickerEvent::Timer;
+        wrong.generation=state.transition.generation;
+        wrong.effectKind=kind;
+        wrong.effectSerial=91;
+        CHECK(AdvancePickerTransition(state,wrong).kind==PickerEffectKind::None);
+        CHECK(state.transition.pendingEffect==kind);
+        wrong.event=PickerEvent::EffectCompleted;
+        wrong.effectSerial=90;
+        CHECK(AdvancePickerTransition(state,wrong).kind==PickerEffectKind::None);
+        CHECK(state.transition.pendingEffect==kind);
+        wrong.effectSerial=91;
+        wrong.generation=state.transition.generation-1;
+        CHECK(AdvancePickerTransition(state,wrong).kind==PickerEffectKind::None);
+        CHECK(state.transition.pendingEffect==kind);
+    }
+}
+
+static void test_picker_cancel_partial_matrix_stops_forward_and_hides_once(){
+    for(unsigned mask=0;mask<8;++mask){
+        PickerState state=PickerTransitionFixture(220+mask);
+        state.transition.phase=PickerPhase::DestinationVerify;
+        state.transition.pendingEffect=PickerEffectKind::ReadPopup;
+        state.transition.effectSerial=60;
+        state.transition.targetMayHaveMoved=(mask&1)!=0;
+        state.transition.popupMayHaveMoved=(mask&2)!=0;
+        state.transition.switchMayHaveChanged=(mask&4)!=0;
+        PickerObservation cancel;
+        cancel.event=PickerEvent::CancelRequested;
+        cancel.generation=state.transition.generation;
+        PickerEffect hide=AdvancePickerTransition(state,cancel);
+        CHECK(hide.kind==PickerEffectKind::Hide);
+        CHECK(AdvancePickerTransition(state,cancel).kind==PickerEffectKind::None);
+        PickerObservation stale;
+        stale.event=PickerEvent::ReadbackCompleted;
+        stale.generation=state.transition.generation;
+        stale.effectKind=PickerEffectKind::ReadPopup;
+        stale.effectSerial=60;
+        CHECK(AdvancePickerTransition(state,stale).kind==PickerEffectKind::None);
+        PickerObservation hidden=PickerObservationFor(
+            hide,PickerEvent::EffectCompleted);
+        PickerEffect rollback=AdvancePickerTransition(state,hidden);
+        const PickerEffectKind expected=(mask&1)
+            ? PickerEffectKind::MoveTarget : (mask&2)
+            ? PickerEffectKind::MovePopup : (mask&4)
+            ? PickerEffectKind::SwitchDesktop : PickerEffectKind::Refresh;
+        CHECK(rollback.kind==expected);
+        CHECK(rollback.kind!=PickerEffectKind::SaveExactTarget);
+        CHECK(rollback.kind!=PickerEffectKind::ShowAndFocus);
+    }
+}
+
+static void test_picker_focus_budget_terminates_without_report_loop(){
+    PickerState state=PickerTransitionFixture(241);
+    state.transition.phase=PickerPhase::FocusRestore;
+    state.transition.focusAttempts=1;
+    state.transition.pendingEffect=PickerEffectKind::ShowAndFocus;
+    state.transition.effectSerial=1;
+    PickerEffect effect;
+    for(int attempt=1;attempt<=4;++attempt){
+        PickerObservation focus;
+        focus.event=PickerEvent::EffectCompleted;
+        focus.generation=241;
+        focus.effectKind=PickerEffectKind::ShowAndFocus;
+        focus.effectSerial=state.transition.effectSerial;
+        focus.popupIsForeground=false;
+        effect=AdvancePickerTransition(state,focus);
+        if(attempt<4) CHECK(effect.kind==PickerEffectKind::ShowAndFocus);
+    }
+    CHECK(effect.kind==PickerEffectKind::ReportFailure);
+    PickerObservation reported=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    CHECK(AdvancePickerTransition(state,reported).kind==PickerEffectKind::None);
+    CHECK(state.transition.terminalAcknowledged);
+    CHECK(state.transition.failureReported);
+    CHECK(AdvancePickerTransition(state,reported).kind==PickerEffectKind::None);
+    CHECK(FinalizePickerTransition(state));
+}
+
+static void test_picker_begin_gate_rejects_incomplete_or_busy_state_atomically(){
+    for(int invalid=0;invalid<13;++invalid){
+        PickerState state=PickerTransitionFixture(251+invalid);
+        if(invalid==0) state.transition.target=WindowIdentityKey{};
+        if(invalid==1) state.transition.targetOrigin=GUID{};
+        if(invalid==2) state.transition.popupOrigin=GUID{};
+        if(invalid==3) state.transition.currentOrigin=GUID{};
+        if(invalid==4) state.transition.destination=GUID{};
+        if(invalid==5) state.transition.reservationToken.jobId=0;
+        if(invalid==6) state.transition.reservationToken.operationId=0;
+        if(invalid==7)
+            state.transition.reservationToken.owner=MoveOwner::ManualTray;
+        if(invalid==8) state.selectedIndex=-1;
+        if(invalid==9) state.selectedDesktop=state.transition.currentOrigin;
+        if(invalid==10) state.currentDesktop=state.transition.destination;
+        if(invalid==11) state.activeWindow=IK(0x1234,77,9002);
+        if(invalid==12) state.transition.runtimeKey.clear();
+        PickerObservation begin;
+        begin.event=PickerEvent::Begin;
+        begin.generation=state.transition.generation;
+        CHECK(AdvancePickerTransition(state,begin).kind==PickerEffectKind::None);
+        CHECK(state.transition.phase==PickerPhase::Idle);
+        CHECK(state.transition.pendingEffect==PickerEffectKind::None);
+    }
+    PickerState busy=PickerTransitionFixture(260);
+    busy.transition.phase=PickerPhase::RefreshModel;
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=260;
+    CHECK(AdvancePickerTransition(busy,begin).kind==PickerEffectKind::None);
+    CHECK(busy.transition.phase==PickerPhase::RefreshModel);
+}
+
+static void test_picker_ui_preservation_prunes_scroll_and_adopts_only_safe_idle_target(){
+    PickerState state;
+    const GUID first=G(L"{231A0000-0000-0000-0000-000000000001}");
+    const GUID second=G(L"{231A0000-0000-0000-0000-000000000002}");
+    state.scrollByDesktop[GuidKey(first)]=4;
+    state.scrollByDesktop[GuidKey(second)]=8;
+    PrunePickerScrollState(state,std::vector<GUID>{second});
+    CHECK(state.scrollByDesktop.size()==1);
+    CHECK(state.scrollByDesktop.at(GuidKey(second))==8);
+
+    const WindowIdentityKey opening=IK(0x1111,1,11);
+    const WindowIdentityKey candidate=IK(0x2222,2,22);
+    state.activeWindow=opening;
+    state.transition.phase=PickerPhase::TargetVerify;
+    CHECK(!AdoptPickerIdleActiveIdentity(
+        state,candidate,0x3333,0x4444,true));
+    CHECK(SameIdentity(state.activeWindow,opening));
+    state.transition.phase=PickerPhase::Idle;
+    CHECK(!AdoptPickerIdleActiveIdentity(
+        state,IK(0x3333,3,33),0x3333,0x4444,true));
+    CHECK(!AdoptPickerIdleActiveIdentity(
+        state,IK(0x4444,4,44),0x3333,0x4444,true));
+    CHECK(!AdoptPickerIdleActiveIdentity(
+        state,candidate,0x3333,0x4444,false));
+    CHECK(AdoptPickerIdleActiveIdentity(
+        state,candidate,0x3333,0x4444,true));
+    CHECK(SameIdentity(state.activeWindow,candidate));
+}
+
+static void test_picker_lightweight_refresh_is_single_snapshot_cache_only(){
+    PickerState state;
+    int snapshots=0,publications=0;
+    CHECK(RunPickerLightweightRefresh(
+        state,
+        [&](){ ++snapshots; return 7; },
+        [&](int snapshot,PickerState& staged){
+            ++publications;
+            staged.paintGeneration=static_cast<uint64_t>(snapshot);
+            return true;
+        }));
+    CHECK(snapshots==1 && publications==1 && state.paintGeneration==7);
+    state.transition.phase=PickerPhase::TargetIssue;
+    CHECK(!RunPickerLightweightRefresh(
+        state,
+        [&](){ ++snapshots; return 8; },
+        [&](int,PickerState&){ ++publications; return true; }));
+    CHECK(snapshots==1 && publications==1);
+}
+
+static void test_picker_later_noninvocation_preserves_prior_unresolved_move(){
+    PickerState state=PickerTransitionFixture(271);
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=271;
+    PickerEffect effect=AdvancePickerTransition(state,begin);
+    effect=PickerAckApi(state,effect);
+    const GUID third=G(
+        L"{231A0000-0000-0000-0000-000000000003}");
+    effect=PickerAckTarget(state,effect,PickerReadValidity::Valid,third);
+    CHECK(effect.kind==PickerEffectKind::MoveTarget);
+    effect=PickerAckApi(state,effect,false,PickerIdentityValidity::Match);
+    CHECK(state.transition.targetMayHaveMoved);
+    CHECK(effect.kind==PickerEffectKind::MoveTarget);
+    CHECK(state.transition.phase==PickerPhase::RollbackTargetIssue);
+}
+
+static void test_picker_popup_recovery_after_fourth_switch_saves_without_fifth(){
+    PickerState state=PickerTransitionFixture(272);
+    state.transition.phase=PickerPhase::DestinationVerify;
+    state.transition.forwardTargetAttempts=1;
+    state.transition.forwardPopupAttempts=1;
+    state.transition.forwardSwitchAttempts=4;
+    state.transition.targetMayHaveMoved=true;
+    state.transition.popupMayHaveMoved=true;
+    state.transition.switchMayHaveChanged=true;
+    state.transition.observedCurrentValidity=PickerReadValidity::Valid;
+    state.transition.observedCurrentDesktop=state.transition.destination;
+    state.transition.pendingEffect=PickerEffectKind::ReadPopup;
+    state.transition.effectSerial=30;
+    PickerObservation missing;
+    missing.event=PickerEvent::ReadbackCompleted;
+    missing.generation=272;
+    missing.effectKind=PickerEffectKind::ReadPopup;
+    missing.effectSerial=30;
+    missing.popupRead=PickerReadValidity::Unavailable;
+    PickerEffect effect=AdvancePickerTransition(state,missing);
+    CHECK(effect.kind==PickerEffectKind::ValidateTarget);
+    effect=PickerAckIdentity(state,effect);
+    CHECK(effect.kind==PickerEffectKind::MovePopup);
+    effect=PickerAckApi(state,effect);
+    PickerObservation popup=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    popup.popupRead=PickerReadValidity::Valid;
+    popup.actualPopupDesktop=state.transition.destination;
+    effect=AdvancePickerTransition(state,popup);
+    CHECK(effect.kind==PickerEffectKind::ValidateTarget);
+    effect=PickerAckIdentity(state,effect);
+    CHECK(effect.kind==PickerEffectKind::SaveExactTarget);
+    CHECK(state.transition.forwardSwitchAttempts==4);
+}
+
+static void test_picker_cancel_during_exhausted_rollback_cannot_strand(){
+    PickerState state=PickerTransitionFixture(273);
+    state.transition.phase=PickerPhase::RollbackTargetVerify;
+    state.transition.rollbackTargetAttempts=4;
+    state.transition.targetMayHaveMoved=true;
+    state.transition.popupMayHaveMoved=true;
+    state.transition.pendingEffect=PickerEffectKind::ReadTarget;
+    state.transition.effectSerial=40;
+    PickerObservation cancel;
+    cancel.event=PickerEvent::CancelRequested;
+    cancel.generation=273;
+    PickerEffect hide=AdvancePickerTransition(state,cancel);
+    CHECK(hide.kind==PickerEffectKind::Hide);
+    PickerObservation hidden=PickerObservationFor(
+        hide,PickerEvent::EffectCompleted);
+    PickerEffect effect=AdvancePickerTransition(state,hidden);
+    CHECK(effect.kind==PickerEffectKind::ReadTarget ||
+          effect.kind==PickerEffectKind::MovePopup ||
+          effect.kind==PickerEffectKind::Refresh);
+    CHECK(effect.kind!=PickerEffectKind::None);
+}
+
+static void test_picker_failed_current_rollback_suppresses_invisible_focus(){
+    PickerState state=PickerTransitionFixture(274);
+    state.transition.phase=PickerPhase::OriginVerify;
+    state.transition.failed=true;
+    state.transition.rollbackSwitchAttempts=4;
+    state.transition.popupMayHaveMoved=false;
+    state.transition.switchMayHaveChanged=true;
+    state.transition.pendingEffect=PickerEffectKind::ReadCurrent;
+    state.transition.effectSerial=50;
+    PickerObservation current;
+    current.event=PickerEvent::ReadbackCompleted;
+    current.generation=274;
+    current.effectKind=PickerEffectKind::ReadCurrent;
+    current.effectSerial=50;
+    current.currentRead=PickerReadValidity::Unavailable;
+    PickerEffect effect=AdvancePickerTransition(state,current);
+    CHECK(effect.kind==PickerEffectKind::Refresh);
+    PickerObservation refreshed=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    refreshed.apiAccepted=true;
+    effect=AdvancePickerTransition(state,refreshed);
+    CHECK(effect.kind==PickerEffectKind::ReportFailure);
+    PickerObservation reported=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    effect=AdvancePickerTransition(state,reported);
+    CHECK(effect.kind==PickerEffectKind::None);
+    CHECK(state.transition.suppressFocus);
+    CHECK(state.transition.terminalAcknowledged);
+}
+
+static void test_picker_effect_serial_exhaustion_becomes_terminal_not_stranded(){
+    PickerState state=PickerTransitionFixture(275);
+    state.transition.effectSerial=(std::numeric_limits<uint64_t>::max)();
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=275;
+    CHECK(AdvancePickerTransition(state,begin).kind==PickerEffectKind::None);
+    CHECK(state.transition.terminalAcknowledged);
+    CHECK(state.transition.failed);
+    CHECK(FinalizePickerTransition(state));
+}
+
+static void test_picker_unknown_identity_never_allows_future_target_api(){
+    PickerState state=PickerTransitionFixture(276);
+    state.transition.phase=PickerPhase::TargetVerify;
+    state.transition.targetMayHaveMoved=true;
+    state.transition.pendingEffect=PickerEffectKind::ReadTarget;
+    state.transition.effectSerial=71;
+    PickerObservation unknown;
+    unknown.event=PickerEvent::ReadbackCompleted;
+    unknown.generation=276;
+    unknown.effectKind=PickerEffectKind::ReadTarget;
+    unknown.effectSerial=71;
+    unknown.identity=PickerIdentityValidity::Unknown;
+    PickerEffect effect=AdvancePickerTransition(state,unknown);
+    CHECK(state.transition.targetIdentityUnusable);
+    CHECK(state.transition.rollbackTargetAttempts==0);
+    CHECK(effect.kind==PickerEffectKind::Refresh);
+}
+
+static void test_picker_cancel_terminal_effects_never_reemit_or_refocus(){
+    struct Case { PickerPhase phase; PickerEffectKind pending; };
+    const Case cases[]={
+        {PickerPhase::RefreshModel,PickerEffectKind::Refresh},
+        {PickerPhase::FailureReport,PickerEffectKind::ReportFailure},
+        {PickerPhase::FocusRestore,PickerEffectKind::ShowAndFocus}
+    };
+    for(size_t index=0;index<3;++index){
+        PickerState state=PickerTransitionFixture(280+index);
+        state.transition.phase=cases[index].phase;
+        state.transition.pendingEffect=cases[index].pending;
+        state.transition.effectSerial=80;
+        PickerObservation cancel;
+        cancel.event=PickerEvent::CancelRequested;
+        cancel.generation=state.transition.generation;
+        PickerEffect hide=AdvancePickerTransition(state,cancel);
+        if(cases[index].pending==PickerEffectKind::Refresh){
+            CHECK(hide.kind==PickerEffectKind::None);
+            PickerEffect refresh;
+            refresh.kind=PickerEffectKind::Refresh;
+            refresh.generation=state.transition.generation;
+            refresh.effectSerial=80;
+            PickerObservation refreshed=PickerObservationFor(
+                refresh,PickerEvent::EffectCompleted);
+            refreshed.apiAccepted=true;
+            hide=AdvancePickerTransition(state,refreshed);
+        }
+        CHECK(hide.kind==PickerEffectKind::Hide);
+        PickerObservation hidden=PickerObservationFor(
+            hide,PickerEvent::EffectCompleted);
+        PickerEffect effect=AdvancePickerTransition(state,hidden);
+        CHECK(effect.kind==PickerEffectKind::None);
+        CHECK(state.transition.terminalAcknowledged);
+        CHECK(state.transition.dismissed);
+        CHECK(FinalizePickerTransition(state));
+    }
+}
+
+static void test_picker_invoked_identity_loss_keeps_unknown_displacement(){
+    PickerState state=PickerTransitionFixture(290);
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=290;
+    PickerEffect move=AdvancePickerTransition(state,begin);
+    PickerObservation lost=PickerObservationFor(
+        move,PickerEvent::ApiCompleted);
+    lost.apiInvoked=true;
+    lost.identity=PickerIdentityValidity::Lost;
+    PickerEffect effect=AdvancePickerTransition(state,lost);
+    CHECK(state.transition.targetMayHaveMoved);
+    CHECK(state.transition.targetIdentityUnusable);
+    CHECK(state.transition.observedTargetValidity==
+          PickerReadValidity::Unavailable);
+    CHECK(GuidIsZero(state.transition.observedTargetDesktop));
+    CHECK(state.transition.rollbackTargetAttempts==0);
+    CHECK(effect.kind==PickerEffectKind::Refresh);
+}
+
+static void test_picker_noninvoked_rollback_apis_still_require_readback(){
+    struct Case {
+        PickerPhase phase;
+        PickerEffectKind api;
+        PickerEffectKind read;
+    };
+    const Case cases[]={
+        {PickerPhase::RollbackTargetIssue,PickerEffectKind::MoveTarget,
+         PickerEffectKind::ReadTarget},
+        {PickerPhase::RollbackPopupIssue,PickerEffectKind::MovePopup,
+         PickerEffectKind::ReadPopup},
+        {PickerPhase::RollbackSwitchIssue,PickerEffectKind::SwitchDesktop,
+         PickerEffectKind::ReadCurrent}
+    };
+    for(size_t index=0;index<3;++index){
+        PickerState state=PickerTransitionFixture(291+index);
+        state.transition.phase=cases[index].phase;
+        state.transition.failed=true;
+        state.transition.targetMayHaveMoved=true;
+        state.transition.popupMayHaveMoved=true;
+        state.transition.switchMayHaveChanged=true;
+        state.transition.pendingEffect=cases[index].api;
+        state.transition.effectSerial=90;
+        PickerObservation api;
+        api.event=PickerEvent::ApiCompleted;
+        api.generation=state.transition.generation;
+        api.effectKind=cases[index].api;
+        api.effectSerial=90;
+        api.identity=PickerIdentityValidity::Match;
+        api.apiInvoked=false;
+        PickerEffect effect=AdvancePickerTransition(state,api);
+        CHECK(effect.kind==cases[index].read);
+        CHECK(state.controlledTransition());
+    }
+}
+
+static void test_picker_cancel_all_displaced_rolls_back_in_exact_order(){
+    PickerState state=PickerTransitionFixture(294);
+    state.transition.phase=PickerPhase::DestinationVerify;
+    state.transition.pendingEffect=PickerEffectKind::ReadPopup;
+    state.transition.effectSerial=100;
+    state.transition.targetMayHaveMoved=true;
+    state.transition.popupMayHaveMoved=true;
+    state.transition.switchMayHaveChanged=true;
+    std::vector<PickerEffectKind> effects;
+    auto record=[&](const PickerEffect& effect){
+        if(effect.kind!=PickerEffectKind::None) effects.push_back(effect.kind);
+        return effect;
+    };
+
+    PickerObservation cancel;
+    cancel.event=PickerEvent::CancelRequested;
+    cancel.generation=state.transition.generation;
+    PickerEffect effect=record(AdvancePickerTransition(state,cancel));
+    CHECK(effect.kind==PickerEffectKind::Hide);
+    effect=record(AdvancePickerTransition(
+        state,PickerObservationFor(effect,PickerEvent::EffectCompleted)));
+    CHECK(effect.kind==PickerEffectKind::MoveTarget);
+
+    PickerObservation api=PickerObservationFor(
+        effect,PickerEvent::ApiCompleted);
+    api.identity=PickerIdentityValidity::Match;
+    api.apiInvoked=true;
+    effect=record(AdvancePickerTransition(state,api));
+    CHECK(effect.kind==PickerEffectKind::ReadTarget);
+    effect=record(PickerAckTarget(
+        state,effect,PickerReadValidity::Valid,
+        state.transition.targetOrigin));
+    CHECK(effect.kind==PickerEffectKind::MovePopup);
+
+    api=PickerObservationFor(effect,PickerEvent::ApiCompleted);
+    api.apiInvoked=true;
+    effect=record(AdvancePickerTransition(state,api));
+    CHECK(effect.kind==PickerEffectKind::ReadPopup);
+    PickerObservation popup=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    popup.popupRead=PickerReadValidity::Valid;
+    popup.actualPopupDesktop=state.transition.currentOrigin;
+    effect=record(AdvancePickerTransition(state,popup));
+    CHECK(effect.kind==PickerEffectKind::SwitchDesktop);
+
+    api=PickerObservationFor(effect,PickerEvent::ApiCompleted);
+    api.apiInvoked=true;
+    effect=record(AdvancePickerTransition(state,api));
+    CHECK(effect.kind==PickerEffectKind::ReadCurrent);
+    PickerObservation current=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    current.currentRead=PickerReadValidity::Valid;
+    current.actualCurrentDesktop=state.transition.currentOrigin;
+    effect=record(AdvancePickerTransition(state,current));
+    CHECK(effect.kind==PickerEffectKind::Refresh);
+
+    PickerObservation refreshed=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    refreshed.apiAccepted=true;
+    effect=record(AdvancePickerTransition(state,refreshed));
+    CHECK(effect.kind==PickerEffectKind::None);
+    CHECK(state.transition.terminalAcknowledged);
+    CHECK(state.transition.dismissed);
+    CHECK(!state.transition.targetMayHaveMoved);
+    CHECK(!state.transition.popupMayHaveMoved);
+    CHECK(!state.transition.switchMayHaveChanged);
+    CHECK(FinalizePickerTransition(state));
+    const std::vector<PickerEffectKind> expected={
+        PickerEffectKind::Hide,
+        PickerEffectKind::MoveTarget,PickerEffectKind::ReadTarget,
+        PickerEffectKind::MovePopup,PickerEffectKind::ReadPopup,
+        PickerEffectKind::SwitchDesktop,PickerEffectKind::ReadCurrent,
+        PickerEffectKind::Refresh
+    };
+    CHECK(effects==expected);
+    CHECK(std::count(effects.begin(),effects.end(),
+                     PickerEffectKind::ShowAndFocus)==0);
+}
+
+static void test_picker_identity_loss_matrix_never_touches_target_again(){
+    {
+        PickerState state=PickerTransitionFixture(295);
+        state.transition.phase=PickerPhase::IdentityVerifyBeforeSwitch;
+        state.transition.pendingEffect=PickerEffectKind::ValidateTarget;
+        state.transition.effectSerial=101;
+        state.transition.targetMayHaveMoved=true;
+        state.transition.popupMayHaveMoved=true;
+        PickerEffect validate;
+        validate.kind=PickerEffectKind::ValidateTarget;
+        validate.generation=295;
+        validate.effectSerial=101;
+        PickerEffect effect=PickerAckIdentity(
+            state,validate,PickerIdentityValidity::Lost);
+        CHECK(state.transition.targetIdentityUnusable);
+        CHECK(state.transition.observedTargetValidity==
+              PickerReadValidity::Unavailable);
+        CHECK(effect.kind==PickerEffectKind::MovePopup);
+        CHECK(effect.kind!=PickerEffectKind::MoveTarget);
+        CHECK(effect.kind!=PickerEffectKind::SwitchDesktop);
+        CHECK(effect.kind!=PickerEffectKind::SaveExactTarget);
+    }
+    {
+        PickerState state=PickerTransitionFixture(296);
+        state.transition.phase=PickerPhase::RollbackTargetVerify;
+        state.transition.pendingEffect=PickerEffectKind::ReadTarget;
+        state.transition.effectSerial=102;
+        state.transition.targetMayHaveMoved=true;
+        state.transition.popupMayHaveMoved=true;
+        PickerEffect read;
+        read.kind=PickerEffectKind::ReadTarget;
+        read.generation=296;
+        read.effectSerial=102;
+        PickerEffect effect=PickerAckTarget(
+            state,read,PickerReadValidity::Unavailable,GUID{},
+            PickerIdentityValidity::Indeterminate);
+        CHECK(state.transition.targetIdentityUnusable);
+        CHECK(state.transition.observedTargetValidity==
+              PickerReadValidity::Unavailable);
+        CHECK(effect.kind==PickerEffectKind::MovePopup);
+        CHECK(effect.kind!=PickerEffectKind::MoveTarget);
+    }
+    {
+        PickerState state=PickerTransitionFixture(297);
+        state.transition.phase=PickerPhase::SaveExactTarget;
+        state.transition.commitCutoffReached=true;
+        state.transition.pendingEffect=PickerEffectKind::SaveExactTarget;
+        state.transition.effectSerial=103;
+        PickerEffect save;
+        save.kind=PickerEffectKind::SaveExactTarget;
+        save.generation=297;
+        save.effectSerial=103;
+        PickerObservation lost=PickerObservationFor(
+            save,PickerEvent::EffectCompleted);
+        lost.identity=PickerIdentityValidity::Lost;
+        lost.saveStatus=PopupSaveStatus::Failed;
+        PickerEffect effect=AdvancePickerTransition(state,lost);
+        CHECK(state.transition.targetIdentityUnusable);
+        CHECK(state.transition.observedTargetValidity==
+              PickerReadValidity::Unavailable);
+        CHECK(effect.kind==PickerEffectKind::Refresh);
+        CHECK(effect.kind!=PickerEffectKind::MoveTarget);
+    }
+}
+
+static void test_picker_popup_and_switch_retry_boundaries_are_exact(){
+    const GUID third=G(
+        L"{231A0000-0000-0000-0000-000000000003}");
+    struct ReadCase {
+        PickerReadValidity validity;
+        int actualKind;
+        int attempts;
+    };
+    const ReadCase cases[]={
+        {PickerReadValidity::Valid,0,1},
+        {PickerReadValidity::Valid,0,4},
+        {PickerReadValidity::Valid,1,1},
+        {PickerReadValidity::Valid,1,4},
+        {PickerReadValidity::Unavailable,2,1},
+        {PickerReadValidity::Unavailable,2,4}
+    };
+    for(size_t index=0;index<6;++index){
+        const ReadCase& test=cases[index];
+        PickerState popupState=PickerTransitionFixture(300+index);
+        popupState.transition.phase=PickerPhase::PopupVerify;
+        popupState.transition.pendingEffect=PickerEffectKind::ReadPopup;
+        popupState.transition.effectSerial=110;
+        popupState.transition.forwardPopupAttempts=test.attempts;
+        PickerEffect read;
+        read.kind=PickerEffectKind::ReadPopup;
+        read.generation=popupState.transition.generation;
+        read.effectSerial=110;
+        PickerObservation popup=PickerObservationFor(
+            read,PickerEvent::ReadbackCompleted);
+        popup.popupRead=test.validity;
+        popup.actualPopupDesktop=test.actualKind==0
+            ? popupState.transition.currentOrigin
+            : test.actualKind==1 ? third : GUID{};
+        PickerEffect popupNext=AdvancePickerTransition(popupState,popup);
+        if(test.attempts<4)
+            CHECK(popupNext.kind==PickerEffectKind::ValidateTarget);
+        else if(test.actualKind==0)
+            CHECK(popupNext.kind==PickerEffectKind::Refresh);
+        else
+            CHECK(popupNext.kind==PickerEffectKind::MovePopup);
+
+        PickerState switchState=PickerTransitionFixture(310+index);
+        switchState.transition.phase=PickerPhase::DestinationVerify;
+        switchState.transition.pendingEffect=PickerEffectKind::ReadCurrent;
+        switchState.transition.effectSerial=111;
+        switchState.transition.forwardSwitchAttempts=test.attempts;
+        read.kind=PickerEffectKind::ReadCurrent;
+        read.generation=switchState.transition.generation;
+        read.effectSerial=111;
+        PickerObservation current=PickerObservationFor(
+            read,PickerEvent::ReadbackCompleted);
+        current.currentRead=test.validity;
+        current.actualCurrentDesktop=test.actualKind==0
+            ? switchState.transition.currentOrigin
+            : test.actualKind==1 ? third : GUID{};
+        PickerEffect switchNext=AdvancePickerTransition(switchState,current);
+        if(test.attempts<4)
+            CHECK(switchNext.kind==PickerEffectKind::ValidateTarget);
+        else if(test.actualKind==0)
+            CHECK(switchNext.kind==PickerEffectKind::Refresh);
+        else
+            CHECK(switchNext.kind==PickerEffectKind::SwitchDesktop);
+    }
+}
+
+static void test_picker_fourth_rollback_readback_and_focus_success_terminate(){
+    {
+        PickerState state=PickerTransitionFixture(320);
+        state.transition.phase=PickerPhase::RollbackTargetVerify;
+        state.transition.pendingEffect=PickerEffectKind::ReadTarget;
+        state.transition.effectSerial=120;
+        state.transition.rollbackTargetAttempts=4;
+        state.transition.targetMayHaveMoved=true;
+        PickerEffect read{PickerEffectKind::ReadTarget,320,120,GUID{}};
+        PickerEffect effect=PickerAckTarget(
+            state,read,PickerReadValidity::Valid,
+            state.transition.targetOrigin);
+        CHECK(!state.transition.targetMayHaveMoved);
+        CHECK(effect.kind==PickerEffectKind::Refresh);
+    }
+    {
+        PickerState state=PickerTransitionFixture(321);
+        state.transition.phase=PickerPhase::RollbackPopupVerify;
+        state.transition.pendingEffect=PickerEffectKind::ReadPopup;
+        state.transition.effectSerial=121;
+        state.transition.rollbackPopupAttempts=4;
+        state.transition.popupMayHaveMoved=true;
+        PickerEffect read{PickerEffectKind::ReadPopup,321,121,GUID{}};
+        PickerObservation popup=PickerObservationFor(
+            read,PickerEvent::ReadbackCompleted);
+        popup.popupRead=PickerReadValidity::Valid;
+        popup.actualPopupDesktop=state.transition.currentOrigin;
+        PickerEffect effect=AdvancePickerTransition(state,popup);
+        CHECK(!state.transition.popupMayHaveMoved);
+        CHECK(effect.kind==PickerEffectKind::Refresh);
+    }
+    {
+        PickerState state=PickerTransitionFixture(322);
+        state.transition.phase=PickerPhase::OriginVerify;
+        state.transition.pendingEffect=PickerEffectKind::ReadCurrent;
+        state.transition.effectSerial=122;
+        state.transition.rollbackSwitchAttempts=4;
+        state.transition.switchMayHaveChanged=true;
+        PickerEffect read{PickerEffectKind::ReadCurrent,322,122,GUID{}};
+        PickerObservation current=PickerObservationFor(
+            read,PickerEvent::ReadbackCompleted);
+        current.currentRead=PickerReadValidity::Valid;
+        current.actualCurrentDesktop=state.transition.currentOrigin;
+        PickerEffect effect=AdvancePickerTransition(state,current);
+        CHECK(!state.transition.switchMayHaveChanged);
+        CHECK(effect.kind==PickerEffectKind::Refresh);
+    }
+    for(int attempt : {1,4}){
+        PickerState state=PickerTransitionFixture(330+attempt);
+        state.transition.phase=PickerPhase::FocusRestore;
+        state.transition.pendingEffect=PickerEffectKind::ShowAndFocus;
+        state.transition.effectSerial=123;
+        state.transition.focusAttempts=attempt;
+        PickerEffect focus{PickerEffectKind::ShowAndFocus,
+                           state.transition.generation,123,GUID{}};
+        PickerObservation foreground=PickerObservationFor(
+            focus,PickerEvent::EffectCompleted);
+        foreground.popupIsForeground=true;
+        CHECK(AdvancePickerTransition(state,foreground).kind==
+              PickerEffectKind::None);
+        CHECK(state.transition.terminalAcknowledged);
+        CHECK(FinalizePickerTransition(state));
+    }
 }
 
 static MoveJob MJ(MoveOwner owner, uint64_t operationId,
@@ -2160,6 +3815,37 @@ static void test_dirty_flush_is_coalesced_bounded_and_retries_without_spin(){
 }
 
 static void test_move_timer_failure_cancels_accepted_work_once(){
+    CHECK(ShouldCancelMoveBeforeIssuedReadback(true,false,false));
+    CHECK(ShouldCancelMoveBeforeIssuedReadback(true,false,true));
+    CHECK(!ShouldCancelMoveBeforeIssuedReadback(true,true,true));
+    CHECK(!ShouldCancelMoveBeforeIssuedReadback(false,true,true));
+
+    // A failed timer arm may discover an already-issued front while a second
+    // job is being queued.  Cancellation stays pending to drive the retry,
+    // but it must not bypass the issued readback or release the exact guard.
+    MoveQueue issuedFront;
+    const MoveJob first=MJ(MoveOwner::AutoReconcile,9801,9802,"issued-first");
+    const MoveJob second=MJ(MoveOwner::AutoReconcile,9803,9804,"queued-second");
+    CHECK(issuedFront.enqueue(first));
+    CHECK(issuedFront.enqueue(second));
+    CHECK(!issuedFront.onIssued(MoveAttemptOutcome::Accepted).completed);
+    CHECK(issuedFront.nextAction()==MoveAction::Verify);
+    bool cancelRequested=true,retireAfterVerify=true,guardProtected=true;
+    CHECK(!ShouldCancelMoveBeforeIssuedReadback(
+        cancelRequested,retireAfterVerify,
+        issuedFront.nextAction()==MoveAction::Verify));
+    IssuedMoveRetirementTracker retirement;
+    CHECK(retirement.observe(true,MoveAttemptOutcome::OnDestination)==
+          IssuedMoveRetirementAction::CancelAfterSafeReadback);
+    CHECK(guardProtected && issuedFront.front() &&
+          issuedFront.front()->token.jobId==first.token.jobId);
+    const MoveResult retired=issuedFront.cancelJob(first.token.jobId);
+    CHECK(retired.completed && retired.terminal==MoveTerminal::Cancelled);
+    CHECK(guardProtected);
+    guardProtected=false;
+    CHECK(!guardProtected && issuedFront.front() &&
+          issuedFront.front()->token.jobId==second.token.jobId);
+
     int armCalls=0,cancelCalls=0;
     CHECK(!ArmMoveWorkOrCancel(true,[&](){ ++armCalls; return false; },
         [&](){ ++cancelCalls; }));
@@ -11922,6 +13608,148 @@ static void test_reconcile_live_preparation_is_ordered_and_search_ready(){
     CHECK(request.sessionWindows && request.sessionWindows->at(1).tabsBlob=="first-tabs");
 }
 
+static void test_picker_accepts_fresh_cache_only_for_exact_session_rows(){
+    ReconcileResult result;
+    result.status=ReconcileResultStatus::Completed;
+    result.app="firefox";
+    result.identityGeneration=141;
+    result.freshness=ReconcileFreshness::Fresh;
+    result.workMode=ReconcileWorkMode::PrepareLiveOnly;
+    result.buildLiveFromInputs=true;
+    result.fastWindows.push_back(SnapshotWindow(
+        14101,14102,14103,L"Matched - Browser",
+        G(L"{231A0000-0000-0000-0000-000000000001}")));
+    result.fastWindows.push_back(SnapshotWindow(
+        14111,14112,14113,L"",
+        G(L"{231A0000-0000-0000-0000-000000000001}")));
+    result.live.resize(2);
+    result.live[0].app="firefox";
+    result.live[0].activeTitle="Matched";
+    result.live[0].activeDomain="matched.test";
+    result.live[0].tabCount=1;
+    result.live[0].counts={{"matched.test",1}};
+    result.live[1].app="firefox";
+    std::shared_ptr<std::vector<WinFp> > sessions(
+        new std::vector<WinFp>(1));
+    sessions->at(0).activeTitle="Matched";
+    sessions->at(0).activeDomain="matched.test";
+    sessions->at(0).tabCount=1;
+    sessions->at(0).counts={{"matched.test",1}};
+    result.sessionWindows=sessions;
+    result.sessionIndexByFast={0,-1};
+
+    const auto usable=[&](size_t index){
+        const WinFp* session=ReconcileSessionForFast(result,index);
+        const LayoutWin& live=result.live[index];
+        const bool associationMatches=session &&
+            live.activeDomain==session->activeDomain &&
+            live.tabCount==session->tabCount &&
+            live.counts==session->counts &&
+            (session->activeTitle.empty() ||
+             live.activeTitle==session->activeTitle);
+        return PickerAcceptedFreshRowUsable(
+            result.freshness==ReconcileFreshness::Fresh,
+            associationMatches,IdentityOf(result.fastWindows[index]),
+            live.app==result.app,live.activeTitle,live.counts);
+    };
+
+    CHECK(usable(0));
+    CHECK(!usable(1));
+
+    // An unmatched nonempty HWND remains a title-only provisional; app-level
+    // Freshness must not promote it to an exact session fingerprint either.
+    result.live[1].activeTitle="Captured title";
+    CHECK(!usable(1));
+
+    // Association alone is not enough when the resulting row is blank, but
+    // a captured fallback title makes the exact associated row matchable.
+    result.sessionIndexByFast[1]=0;
+    sessions->at(0)=WinFp{};
+    CHECK(usable(1));
+    result.live[1].activeTitle.clear();
+    CHECK(!usable(1));
+    sessions->at(0).counts={{"fallback.test",1}};
+    result.live[1].counts={{"fallback.test",1}};
+    CHECK(usable(1));
+}
+
+static void test_unusable_fresh_rows_cannot_corrupt_or_create_records(){
+    CHECK(PickerRowUsesFreshFingerprint(true,true));
+    CHECK(!PickerRowUsesFreshFingerprint(true,false));
+    CHECK(!PickerRowUsesFreshFingerprint(false,true));
+    CHECK(PickerUnboundRowEligibleForReconcilePlan(true,true));
+    CHECK(!PickerUnboundRowEligibleForReconcilePlan(true,false));
+    CHECK(PickerUnboundRowEligibleForReconcilePlan(false,false));
+    CHECK(PickerUnboundPlanUsesFreshness(true,false));
+    CHECK(!PickerUnboundPlanUsesFreshness(true,true));
+
+    const GUID desktop=
+        G(L"{231A0000-0000-0000-0000-000000000001}");
+    LayoutWin existing=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000001421}","firefox",
+        "Good","good.test",2,desktop,1700000000);
+    FastWin fast=SnapshotWindow(
+        14201,14202,14203,L"",desktop);
+    fast.app="firefox";
+    LayoutWin blank;
+    blank.app="firefox";
+    blank.desktop=desktop;
+    LayoutWin committed;
+    std::map<std::string,std::string> provisionalByRuntime;
+    CHECK(CommitBoundRecordRefresh(
+        existing,fast,blank,
+        PickerRowUsesFreshFingerprint(true,false)
+            ? ReconcileFreshness::Fresh
+            : ReconcileFreshness::CachedStale,
+        1700000001,
+        RuntimeKey(fast),provisionalByRuntime,
+        [&](const LayoutWin& desired){ committed=desired; return true; }));
+    CHECK(committed.activeTitle==existing.activeTitle &&
+          committed.activeDomain==existing.activeDomain &&
+          committed.tabCount==existing.tabCount &&
+          committed.counts==existing.counts);
+
+    std::vector<LayoutWin> planLive;
+    if(PickerUnboundRowEligibleForReconcilePlan(true,false))
+        planLive.push_back(blank);
+    const ReconcilePlan plan=PlanAppReconcile(
+        {},planLive,"firefox",1700000001,{},ReconcileFreshness::Fresh);
+    CHECK(plan.newRecords.empty());
+}
+
+static void test_picker_title_only_provisionals_share_reconcile_normalization(){
+    const std::vector<std::wstring> suffixes={L" - Browser"};
+    LayoutWin first,second;
+    first.app=second.app="firefox";
+    first.activeTitle=W2U8(StripReconcileTitleSuffix(
+        L"First - Browser",suffixes));
+    second.activeTitle=W2U8(StripReconcileTitleSuffix(
+        L"Second - Browser",suffixes));
+    CHECK(PickerTitleOnlyProvisionalFieldsUsable(
+        first.app,first.activeTitle));
+    CHECK(PickerTitleOnlyProvisionalFieldsUsable(
+        second.app,second.activeTitle));
+    first.provisional=second.provisional=true;
+    CHECK(first.app=="firefox" && first.activeTitle=="First" &&
+          first.provisional);
+    CHECK(second.app=="firefox" && second.activeTitle=="Second" &&
+          second.provisional);
+
+    first.recordId="{00000000-0000-0000-0000-000000001411}";
+    second.recordId="{00000000-0000-0000-0000-000000001412}";
+    first.desktop=second.desktop=
+        G(L"{231A0000-0000-0000-0000-000000000001}");
+    LayoutWin liveFirst=first,liveSecond=second;
+    liveFirst.provisional=liveSecond.provisional=false;
+    liveFirst.recordId.clear();
+    liveSecond.recordId.clear();
+    const ReconcilePlan plan=PlanAppReconcile(
+        {first,second},{liveFirst,liveSecond},"firefox",1700000000,{},
+        ReconcileFreshness::Fresh);
+    CHECK(!plan.deferred && plan.matches.size()==2 &&
+          plan.newRecords.empty());
+}
+
 static void test_cli_profile_batch_aborts_transactionally_on_first_prep_failure(){
     ReconcileRequest firefox=WorkerPreparedRequest(146,L"Firefox - Browser");
     firefox.app="firefox";
@@ -13899,6 +15727,484 @@ static void test_popup_pending_id_bypasses_title_and_origin_provisional_gates(){
     CHECK(selected=="unchanged" && provisionalCalls==0);
 }
 
+static void test_picker_inflight_accepted_match_reuses_one_exact_saved_id(){
+    const WindowIdentityKey target{0x9407,9407,94007};
+    WindowIdentityKey sibling{0x9408,9408,94008};
+    const std::string savedA=
+        "{00000000-0000-0000-0000-000000009407}";
+    const std::string savedB=
+        "{00000000-0000-0000-0000-000000009408}";
+    std::string selected;
+    bool found=false;
+
+    CHECK(AccumulatePickerAcceptedPlanRecord(
+        target,"firefox",sibling,"firefox",savedB,selected,found)==
+        PickerAcceptedPlanRecordResult::Unrelated);
+    CHECK(!found && selected.empty());
+    CHECK(AccumulatePickerAcceptedPlanRecord(
+        target,"firefox",target,"firefox",savedA,selected,found)==
+        PickerAcceptedPlanRecordResult::Selected);
+    CHECK(found && selected==savedA);
+    CHECK(AccumulatePickerAcceptedPlanRecord(
+        target,"firefox",target,"firefox",savedA,selected,found)==
+        PickerAcceptedPlanRecordResult::Selected);
+    CHECK(found && selected==savedA);
+
+    CHECK(AccumulatePickerAcceptedPlanRecord(
+        target,"firefox",target,"firefox",savedB,selected,found)==
+        PickerAcceptedPlanRecordResult::Rejected);
+    CHECK(found && selected==savedA);
+
+    std::string rejected;
+    bool rejectedFound=false;
+    CHECK(AccumulatePickerAcceptedPlanRecord(
+        target,"firefox",target,"chrome",savedA,rejected,rejectedFound)==
+        PickerAcceptedPlanRecordResult::Rejected);
+    CHECK(!rejectedFound && rejected.empty());
+    CHECK(AccumulatePickerAcceptedPlanRecord(
+        target,"firefox",target,"firefox","",rejected,rejectedFound)==
+        PickerAcceptedPlanRecordResult::Rejected);
+    CHECK(!rejectedFound && rejected.empty());
+
+    // A transient class/image lookup failure leaves the capture app empty.
+    // An already accepted exact plan is still authoritative and atomically
+    // supplies both its canonical app and saved record ID.
+    std::string adoptedApp,adoptedRecord;
+    bool adopted=false;
+    CHECK(AccumulatePickerAcceptedPlanRecordAdoptingApp(
+        target,"",target,"firefox",savedA,
+        adoptedApp,adoptedRecord,adopted)==
+        PickerAcceptedPlanRecordResult::Selected);
+    CHECK(adopted && adoptedApp=="firefox" && adoptedRecord==savedA);
+    CHECK(AccumulatePickerAcceptedPlanRecordAdoptingApp(
+        target,"",target,"chrome",savedB,
+        adoptedApp,adoptedRecord,adopted)==
+        PickerAcceptedPlanRecordResult::Rejected);
+    CHECK(adoptedApp=="firefox" && adoptedRecord==savedA);
+
+    std::string unrelatedApp,unrelatedRecord;
+    bool unrelatedFound=false;
+    CHECK(AccumulatePickerAcceptedPlanRecordAdoptingApp(
+        target,"",sibling,"firefox",savedB,
+        unrelatedApp,unrelatedRecord,unrelatedFound)==
+        PickerAcceptedPlanRecordResult::Unrelated);
+    CHECK(!unrelatedFound && unrelatedApp.empty() &&
+          unrelatedRecord.empty());
+
+    WindowIdentityKey reused=target;
+    ++reused.processStart;
+    CHECK(AccumulatePickerAcceptedPlanRecord(
+        target,"firefox",reused,"firefox",savedA,rejected,rejectedFound)==
+        PickerAcceptedPlanRecordResult::Unrelated);
+    CHECK(!rejectedFound && rejected.empty());
+
+    std::map<std::string,std::string> pending={
+        {RuntimeKey(target),savedB}};
+    std::map<std::string,std::string> staged;
+    CHECK(StagePickerAcceptedPlanPendingAssociation(
+        pending,RuntimeKey(target),savedA,staged));
+    pending.swap(staged);
+
+    // The Picker guard/transition may now be cancelled and released.  The
+    // canonical accepted-plan association must remain independently durable,
+    // so the next explicit move reuses A rather than allocating B again.
+    std::string afterCancel="unchanged";
+    CHECK(SelectPendingPopupRecordId(
+        target,"firefox",pending,
+        [&](const std::string& candidate,const std::string& app,
+            std::string& canonical){
+            if(candidate!=savedA || app!="firefox") return false;
+            canonical=candidate;
+            return true;
+        },afterCancel));
+    CHECK(afterCancel==savedA);
+    CHECK(pending.size()==1 && pending.begin()->second==savedA);
+
+    std::map<std::string,PickerOperationLifetimeClaim> operationClaims;
+    std::map<std::string,PickerOperationLifetimeClaim> stagedClaims;
+    CHECK(StagePickerOperationLifetimeClaim(
+        operationClaims,RuntimeKey(target),savedA,true,stagedClaims));
+    operationClaims.swap(stagedClaims);
+    // The transition/guard can later be fully gone while a slow sibling still
+    // owns the accepted auto operation.  The terminal Picker outcome decides
+    // whether that stale Finish protects A or rearms its displaced restore.
+    CHECK(PickerOperationLifetimeClaimMatches(
+        operationClaims,target,savedA));
+    CHECK(!PickerOperationLifetimeClaimMatches(
+        operationClaims,target,savedB));
+    CHECK(!PickerOperationLifetimeClaimMatches(
+        operationClaims,reused,savedA));
+    // The accepted restore T->A can still have a slow sibling.  Merely
+    // adopting A is not publication: Esc before Save must rearm T instead of
+    // letting the sibling report the operation restored.
+    CHECK(!operationClaims.begin()->second.pickerPublished);
+    CHECK(!MarkPickerOperationLifetimeClaimPublished(
+        operationClaims,RuntimeKey(target),savedB,
+        PopupSaveStatus::Saved,PopupSaveFailure::None));
+    CHECK(!MarkPickerOperationLifetimeClaimPublished(
+        operationClaims,RuntimeKey(reused),savedA,
+        PopupSaveStatus::Saved,PopupSaveFailure::None));
+    CHECK(!PickerOperationLifetimeClaimMustProtect(
+        operationClaims.begin()->second,false));
+    CHECK(DecidePickerOperationLifetimeClaimRelease(
+        operationClaims.begin()->second,false,true)==
+        PickerOperationLifetimeClaimReleaseAction::RearmRestore);
+
+    CHECK(MarkPickerOperationLifetimeClaimPublished(
+        operationClaims,RuntimeKey(target),savedA,
+        PopupSaveStatus::Saved,PopupSaveFailure::None));
+    CHECK(operationClaims.begin()->second.pickerPublished &&
+          operationClaims.begin()->second.pickerEpisodePublished);
+    CHECK(MarkPickerOperationLifetimeClaimPublished(
+        operationClaims,RuntimeKey(target),savedA,
+        PopupSaveStatus::Saved,PopupSaveFailure::None));
+    CHECK(PickerOperationLifetimeClaimMustProtect(
+        operationClaims.begin()->second,false));
+    CHECK(DecidePickerOperationLifetimeClaimRelease(
+        operationClaims.begin()->second,false,true)==
+        PickerOperationLifetimeClaimReleaseAction::ProtectPublished);
+    // A second Picker transition for the same exact A is a new ownership
+    // episode.  It must not inherit P1's Saved bit while a slow sibling keeps
+    // the accepted automatic operation alive.
+    std::map<std::string,PickerOperationLifetimeClaim> repeatedClaims;
+    CHECK(StagePickerOperationLifetimeClaim(
+        operationClaims,RuntimeKey(target),savedA,true,repeatedClaims));
+    operationClaims.swap(repeatedClaims);
+    CHECK(operationClaims.begin()->second.pickerPublished);
+    CHECK(!operationClaims.begin()->second.pickerEpisodePublished);
+    CHECK(!operationClaims.begin()->second.pickerTerminalObserved);
+    CHECK(DecidePickerOperationLifetimeClaimRelease(
+        operationClaims.begin()->second,true,false)==
+        PickerOperationLifetimeClaimReleaseAction::RearmOperation);
+    CHECK(MarkPickerOperationLifetimeClaimTerminalOutcome(
+        operationClaims,RuntimeKey(target),savedA,true));
+    CHECK(DecidePickerOperationLifetimeClaimRelease(
+        operationClaims.begin()->second,true,false)==
+        PickerOperationLifetimeClaimReleaseAction::ProtectPublished);
+    CHECK(DecidePickerOperationLifetimeClaimRelease(
+        operationClaims.begin()->second,true,true)==
+        PickerOperationLifetimeClaimReleaseAction::ProtectPublished);
+    CHECK(StagePickerOperationLifetimeClaim(
+        operationClaims,RuntimeKey(target),savedA,true,repeatedClaims));
+    operationClaims.swap(repeatedClaims);
+    CHECK(MarkPickerOperationLifetimeClaimTerminalOutcome(
+        operationClaims,RuntimeKey(target),savedA,false));
+    CHECK(DecidePickerOperationLifetimeClaimRelease(
+        operationClaims.begin()->second,true,false)==
+        PickerOperationLifetimeClaimReleaseAction::RearmOperation);
+    CHECK(DecidePickerOperationLifetimeClaimRelease(
+        operationClaims.begin()->second,true,true)==
+        PickerOperationLifetimeClaimReleaseAction::RearmOperation);
+
+    std::map<std::string,PickerOperationLifetimeClaim> newClaims;
+    CHECK(StagePickerOperationLifetimeClaim(
+        newClaims,RuntimeKey(target),savedB,false,stagedClaims));
+    newClaims.swap(stagedClaims);
+    // A cancelled/rolled-back Picker never published new C, so the deferred
+    // auto Finish may publish it.  Existence alone is not publication.
+    CHECK(!PickerOperationLifetimeClaimMustProtect(
+        newClaims.begin()->second,false));
+    CHECK(!PickerOperationLifetimeClaimMustProtect(
+        newClaims.begin()->second,true));
+    CHECK(MarkPickerOperationLifetimeClaimTerminalOutcome(
+        newClaims,RuntimeKey(target),savedB,true));
+    CHECK(DecidePickerOperationLifetimeClaimRelease(
+        newClaims.begin()->second,true,false)==
+        PickerOperationLifetimeClaimReleaseAction::ReleaseToPlan);
+
+    // Flush failure happens after the delta/record/binding swap.  It is a
+    // queued Picker publication and must retain ownership against stale auto
+    // completion just like Saved.
+    CHECK(MarkPickerOperationLifetimeClaimPublished(
+        newClaims,RuntimeKey(target),savedB,
+        PopupSaveStatus::Failed,PopupSaveFailure::FlushFailed));
+    CHECK(PickerOperationLifetimeClaimMustProtect(
+        newClaims.begin()->second,true));
+    CHECK(DecidePickerOperationLifetimeClaimRelease(
+        newClaims.begin()->second,true,true)==
+        PickerOperationLifetimeClaimReleaseAction::ProtectPublished);
+
+    std::map<std::string,PickerOperationLifetimeClaim> cancelledClaims;
+    CHECK(StagePickerOperationLifetimeClaim(
+        cancelledClaims,RuntimeKey(target),savedA,true,stagedClaims));
+    cancelledClaims.swap(stagedClaims);
+    CHECK(!MarkPickerOperationLifetimeClaimPublished(
+        cancelledClaims,RuntimeKey(target),savedA,
+        PopupSaveStatus::Failed,PopupSaveFailure::StorageReadOnly));
+    CHECK(DecidePickerOperationLifetimeClaimRelease(
+        cancelledClaims.begin()->second,true,true)==
+        PickerOperationLifetimeClaimReleaseAction::RearmRestore);
+    // A no-restore accepted match is releasable only after the Picker proves
+    // the target returned to its captured origin.  Unknown/partial rollback
+    // must rearm the whole reconcile wave instead of publishing stale success.
+    CHECK(DecidePickerOperationLifetimeClaimRelease(
+        cancelledClaims.begin()->second,true,false)==
+        PickerOperationLifetimeClaimReleaseAction::RearmOperation);
+    CHECK(MarkPickerOperationLifetimeClaimTerminalOutcome(
+        cancelledClaims,RuntimeKey(target),savedA,true));
+    CHECK(DecidePickerOperationLifetimeClaimRelease(
+        cancelledClaims.begin()->second,true,false)==
+        PickerOperationLifetimeClaimReleaseAction::ReleaseToPlan);
+
+    PickerTransition restoredTarget;
+    restoredTarget.targetOrigin=G(
+        L"{231A0000-0000-0000-0000-000000000001}");
+    restoredTarget.observedTargetDesktop=restoredTarget.targetOrigin;
+    restoredTarget.observedTargetValidity=PickerReadValidity::Valid;
+    CHECK(PickerTransitionTargetRestoredToOrigin(restoredTarget));
+    restoredTarget.targetMayHaveMoved=true;
+    CHECK(!PickerTransitionTargetRestoredToOrigin(restoredTarget));
+    restoredTarget.targetMayHaveMoved=false;
+    restoredTarget.targetIdentityUnusable=true;
+    CHECK(!PickerTransitionTargetRestoredToOrigin(restoredTarget));
+
+    CHECK(DecidePickerOperationClaimQueuePublication(false)==
+        PickerOperationClaimQueueAction::RetainClaimAndRearmOperation);
+    CHECK(DecidePickerOperationClaimQueuePublication(true)==
+        PickerOperationClaimQueueAction::EraseClaimAndAwaitMove);
+    CHECK(DecidePickerRearmedMoveArmResult(false)==
+        PickerRearmedMoveArmAction::RearmOperation);
+    CHECK(DecidePickerRearmedMoveArmResult(true)==
+        PickerRearmedMoveArmAction::AwaitMove);
+
+    PickerOperationClaimRearmControl firstThenFailure;
+    CHECK(ObservePickerOperationClaimQueuePublication(
+        firstThenFailure,true)==
+        PickerOperationClaimQueueAction::EraseClaimAndAwaitMove);
+    CHECK(firstThenFailure.moveQueued &&
+          !PickerOperationClaimRearmRequiresRetry(firstThenFailure));
+    CHECK(ObservePickerOperationClaimQueuePublication(
+        firstThenFailure,false)==
+        PickerOperationClaimQueueAction::RetainClaimAndRearmOperation);
+    CHECK(PickerOperationClaimRearmRequiresRetry(firstThenFailure));
+
+    PickerOperationClaimRearmControl armFailure;
+    CHECK(ObservePickerOperationClaimQueuePublication(
+        armFailure,true)==
+        PickerOperationClaimQueueAction::EraseClaimAndAwaitMove);
+    BeginPickerOperationClaimMoveArm(armFailure);
+    CHECK(armFailure.armPending &&
+          PickerOperationClaimRearmRequiresRetry(armFailure));
+    CHECK(CompletePickerOperationClaimMoveArm(armFailure,false)==
+        PickerRearmedMoveArmAction::RearmOperation);
+    CHECK(PickerOperationClaimRearmRequiresRetry(armFailure));
+
+    PickerOperationClaimRearmControl armed;
+    CHECK(ObservePickerOperationClaimQueuePublication(armed,true)==
+        PickerOperationClaimQueueAction::EraseClaimAndAwaitMove);
+    BeginPickerOperationClaimMoveArm(armed);
+    CHECK(CompletePickerOperationClaimMoveArm(armed,true)==
+        PickerRearmedMoveArmAction::AwaitMove);
+    CHECK(!PickerOperationClaimRearmRequiresRetry(armed));
+
+    CHECK(DecidePickerAutoCancelledMoveOwnerAction(false)==
+        PickerAutoCancelledMoveOwnerAction::IgnoreSupersession);
+    CHECK(DecidePickerAutoCancelledMoveOwnerAction(true)==
+        PickerAutoCancelledMoveOwnerAction::RearmOperation);
+
+    // No map iterator may survive FinishAutoOperation: an arm-failure callback
+    // can synchronously erase the previously "next" operation.
+    std::map<uint64_t,int> operationCursor={
+        {101,1},{202,2},{303,3}};
+    auto cursor=PickerOperationCursorNext(operationCursor,false,0);
+    CHECK(cursor!=operationCursor.end() && cursor->first==101);
+    const uint64_t completedOperation=cursor->first;
+    operationCursor.erase(202);
+    cursor=PickerOperationCursorNext(
+        operationCursor,true,completedOperation);
+    CHECK(cursor!=operationCursor.end() && cursor->first==303);
+    operationCursor.erase(303);
+    CHECK(PickerOperationCursorNext(
+        operationCursor,true,completedOperation)==operationCursor.end());
+}
+
+static void test_picker_save_accepts_only_exact_same_generation_late_fresh(){
+    const WindowIdentityKey target{0x9409,9409,94009};
+    WindowIdentityKey reused=target;
+    ++reused.processStart;
+    CHECK(SelectPickerFreshRecordSource(
+        target,71,false,WindowIdentityKey{},0,
+        true,target,71)==PickerFreshRecordSource::AcceptedAfterEntry);
+    CHECK(SelectPickerFreshRecordSource(
+        target,71,false,WindowIdentityKey{},0,
+        true,target,70)==PickerFreshRecordSource::None);
+    CHECK(SelectPickerFreshRecordSource(
+        target,71,false,WindowIdentityKey{},0,
+        true,reused,71)==PickerFreshRecordSource::None);
+    CHECK(SelectPickerFreshRecordSource(
+        target,71,true,target,71,
+        false,WindowIdentityKey{},0)==PickerFreshRecordSource::Reserved);
+    CHECK(SelectPickerFreshRecordSource(
+        target,71,true,target,71,
+        true,target,71)==PickerFreshRecordSource::AcceptedAfterEntry);
+    CHECK(SelectPickerFreshRecordSource(
+        target,0,true,target,0,
+        true,target,0)==PickerFreshRecordSource::None);
+}
+
+static void test_picker_controlled_edit_allows_readback_but_not_mutation(){
+    CHECK(PickerControlledEditMessageAllowed(WM_GETTEXT));
+    CHECK(PickerControlledEditMessageAllowed(WM_GETTEXTLENGTH));
+    CHECK(PickerControlledEditMessageAllowed(WM_PAINT));
+    CHECK(PickerControlledEditMessageAllowed(WM_PRINTCLIENT));
+    CHECK(PickerControlledEditMessageAllowed(WM_SETFOCUS));
+    CHECK(PickerControlledEditMessageAllowed(WM_KILLFOCUS));
+    CHECK(PickerControlledEditMessageAllowed(WM_NCDESTROY));
+    CHECK(!PickerControlledEditMessageAllowed(WM_SETTEXT));
+    CHECK(!PickerControlledEditMessageAllowed(WM_KEYDOWN));
+    CHECK(!PickerControlledEditMessageAllowed(WM_LBUTTONDOWN));
+    CHECK(!PickerControlledEditMessageAllowed(WM_CHAR));
+    CHECK(!PickerControlledEditMessageAllowed(WM_PASTE));
+
+    CHECK(RoutePickerIdleEditInput(
+        WM_KEYDOWN,VK_SPACE,true)==PickerIdleEditInputRoute::Grid);
+    CHECK(RoutePickerIdleEditInput(
+        WM_CHAR,L' ',true)==PickerIdleEditInputRoute::Swallow);
+    CHECK(RoutePickerIdleEditInput(
+        WM_KEYDOWN,VK_SPACE,false)==PickerIdleEditInputRoute::Edit);
+    CHECK(RoutePickerIdleEditInput(
+        WM_CHAR,L' ',false)==PickerIdleEditInputRoute::Edit);
+    CHECK(RoutePickerIdleEditInput(
+        WM_KEYDOWN,VK_RETURN,false)==PickerIdleEditInputRoute::Grid);
+}
+
+static void test_picker_inflight_plan_gate_and_late_handoff_cutoff_are_exact(){
+    CHECK(DecidePickerInFlightPlanEntry(
+        false,false,false,false)==PickerInFlightPlanEntryAction::Allow);
+    CHECK(DecidePickerInFlightPlanEntry(
+        true,false,false,false)==PickerInFlightPlanEntryAction::Wait);
+    CHECK(DecidePickerInFlightPlanEntry(
+        true,true,false,false)==PickerInFlightPlanEntryAction::Allow);
+    CHECK(DecidePickerInFlightPlanEntry(
+        true,true,true,false)==PickerInFlightPlanEntryAction::Wait);
+    CHECK(DecidePickerInFlightPlanEntry(
+        true,true,true,true)==PickerInFlightPlanEntryAction::ReuseAccepted);
+
+    CHECK(DecidePickerLatePlanHandoff(
+        false,false,false)==PickerLatePlanHandoffAction::Ignore);
+    CHECK(DecidePickerLatePlanHandoff(
+        true,true,false)==PickerLatePlanHandoffAction::TransferBeforeSave);
+    CHECK(DecidePickerLatePlanHandoff(
+        true,true,true)==PickerLatePlanHandoffAction::RejectPlan);
+    CHECK(DecidePickerLatePlanHandoff(
+        true,false,false)==PickerLatePlanHandoffAction::RejectPlan);
+
+    RestoreBudgets budgets;
+    const RestoreBudgetKey oldB{"record-b","runtime","desktop"};
+    const RestoreBudgetKey acceptedA{"record-a","runtime","desktop"};
+    budgets.markExhausted(oldB);
+    budgets.markExhausted(acceptedA);
+    bool published=false;
+    CHECK(CommitPickerAcceptedPlanRecordTransfer(
+        [&](){
+            budgets.clearForExplicitRetry("record-a");
+            return true;
+        },[&]() noexcept { published=true; }));
+    CHECK(published && budgets.mayAttempt(acceptedA));
+    CHECK(!budgets.mayAttempt(oldB));
+    published=false;
+    CHECK(!CommitPickerAcceptedPlanRecordTransfer(
+        [](){ return false; },[&]() noexcept { published=true; }));
+    CHECK(!published);
+}
+
+static void test_picker_failure_refresh_selection_uses_actual_readback(){
+    const GUID origin=G(L"{231A0000-0000-0000-0000-000000000031}");
+    const GUID destination=G(L"{231A0000-0000-0000-0000-000000000032}");
+    PickerState state=PickerTransitionFixture(94010);
+    state.currentDesktop=origin;
+    CHECK(SetPickerSelection(state,1,destination));
+    state.transition.failed=true;
+    state.transition.observedCurrentValidity=PickerReadValidity::Valid;
+    state.transition.observedCurrentDesktop=origin;
+    CHECK(PreparePickerRefreshSelectionFromActual(state));
+    CHECK(ResolvePickerSelection(state,{origin,destination}));
+    CHECK(GuidEq(state.currentDesktop,origin));
+    CHECK(GuidEq(state.selectedDesktop,origin));
+    CHECK(state.selectedIndex==0);
+
+    state=PickerTransitionFixture(94011);
+    state.currentDesktop=origin;
+    CHECK(SetPickerSelection(state,1,destination));
+    state.transition.cancelRequested=true;
+    state.transition.observedCurrentValidity=PickerReadValidity::Unavailable;
+    CHECK(PreparePickerRefreshSelectionFromActual(state));
+    CHECK(ResolvePickerSelection(state,{origin,destination}));
+    CHECK(GuidEq(state.selectedDesktop,origin));
+
+    state=PickerTransitionFixture(94012);
+    state.currentDesktop=origin;
+    CHECK(SetPickerSelection(state,1,destination));
+    CHECK(!PreparePickerRefreshSelectionFromActual(state));
+    CHECK(ResolvePickerSelection(state,{origin,destination}));
+    CHECK(GuidEq(state.selectedDesktop,destination));
+}
+
+static void test_picker_post_save_identity_diagnostics_preserve_save_truth(){
+    for(PopupSaveStatus status : {
+            PopupSaveStatus::Saved,PopupSaveStatus::NotTracked}){
+        PickerState state=PickerTransitionFixture(
+            status==PopupSaveStatus::Saved?94013:94014);
+        state.transition.phase=PickerPhase::SaveExactTarget;
+        state.transition.commitCutoffReached=true;
+        state.transition.pendingEffect=PickerEffectKind::SaveExactTarget;
+        state.transition.effectSerial=5;
+        PickerEffect save;
+        save.kind=PickerEffectKind::SaveExactTarget;
+        save.generation=state.transition.generation;
+        save.effectSerial=5;
+        PickerObservation completed=PickerObservationFor(
+            save,PickerEvent::EffectCompleted);
+        completed.identity=PickerIdentityValidity::Lost;
+        completed.saveStatus=status;
+        completed.saveFailure=PopupSaveFailure::None;
+        CHECK(AdvancePickerTransition(state,completed).kind==
+              PickerEffectKind::Refresh);
+        CHECK(state.transition.failed);
+        const std::wstring diagnostic=state.transition.diagnostic;
+        CHECK(diagnostic.find(L"could not be saved")==std::wstring::npos);
+        CHECK(diagnostic.find(L"remains unsaved")==std::wstring::npos);
+        if(status==PopupSaveStatus::Saved)
+            CHECK(diagnostic.find(L"was saved")!=std::wstring::npos);
+        else
+            CHECK(diagnostic.find(L"window identity")!=std::wstring::npos);
+    }
+}
+
+static void test_picker_switch_effect_revalidates_target_at_invocation_boundary(){
+    CHECK(PickerForwardSwitchInvocationAllowed(
+        PickerIdentityValidity::Match,true));
+    CHECK(!PickerForwardSwitchInvocationAllowed(
+        PickerIdentityValidity::Lost,true));
+    CHECK(!PickerForwardSwitchInvocationAllowed(
+        PickerIdentityValidity::Indeterminate,true));
+    CHECK(!PickerForwardSwitchInvocationAllowed(
+        PickerIdentityValidity::Match,false));
+
+    PickerState state=PickerTransitionFixture(94015);
+    state.transition.phase=PickerPhase::SwitchIssue;
+    state.transition.targetMayHaveMoved=true;
+    state.transition.popupMayHaveMoved=true;
+    state.transition.switchMayHaveChanged=true;
+    state.transition.switchUnresolvedBeforeIssue=false;
+    state.transition.pendingEffect=PickerEffectKind::SwitchDesktop;
+    state.transition.effectSerial=6;
+    PickerEffect switchEffect;
+    switchEffect.kind=PickerEffectKind::SwitchDesktop;
+    switchEffect.generation=state.transition.generation;
+    switchEffect.effectSerial=6;
+    PickerObservation lost=PickerObservationFor(
+        switchEffect,PickerEvent::ApiCompleted);
+    lost.identity=PickerIdentityValidity::Lost;
+    lost.apiInvoked=false;
+    const PickerEffect rollback=AdvancePickerTransition(state,lost);
+    CHECK(rollback.kind==PickerEffectKind::MovePopup);
+    CHECK(state.transition.targetIdentityUnusable);
+    CHECK(!state.transition.switchMayHaveChanged);
+    CHECK(!state.transition.commitCutoffReached);
+    CHECK(state.transition.phase==PickerPhase::RollbackPopupIssue);
+}
+
 static void test_popup_post_classification_reuses_pending_id_after_initial_untracked_capture(){
     const std::string savedId=
         "{00000000-0000-0000-0000-000000009405}";
@@ -13906,6 +16212,11 @@ static void test_popup_post_classification_reuses_pending_id_after_initial_untra
         "{00000000-0000-0000-0000-000000009406}";
     std::string selected="sentinel";
     int pendingCalls=0,generatorCalls=0;
+
+    CHECK(PickerTerminalReservationAppAllowed("","firefox"));
+    CHECK(PickerTerminalReservationAppAllowed("firefox","firefox"));
+    CHECK(!PickerTerminalReservationAppAllowed("chrome","firefox"));
+    CHECK(!PickerTerminalReservationAppAllowed("", ""));
 
     // Capture-time class lookup failed, so the generic picker reservation has
     // no record ID.  Terminal identity recapture and classification succeeded:
@@ -13998,6 +16309,42 @@ int main(){
     test_picker_volatile_rows_skip_but_structural_failures_abort();
     test_picker_async_search_joins_by_full_identity();
     test_picker_state_whole_object_swap_includes_generation_sentinel();
+    test_picker_transition_success_has_exact_verified_effect_order();
+    test_picker_transition_rejects_stale_duplicate_and_wrong_effect_acks();
+    test_picker_identity_loss_rolls_back_without_switch_or_save();
+    test_picker_escape_hides_once_rolls_back_and_never_refocuses();
+    test_picker_rollback_exhaustion_preserves_actual_readbacks();
+    test_picker_ui_action_gate_and_auto_supersession_are_exact();
+    test_picker_observation_kick_survives_post_and_timer_failure_once();
+    test_picker_save_result_and_fresh_generation_callbacks_are_typed();
+    test_picker_api_ack_distinguishes_invocation_and_identity_quality();
+    test_picker_post_switch_reads_current_then_popup_and_requires_both();
+    test_picker_escape_after_save_emission_is_a_commit_cutoff();
+    test_picker_cancel_discards_only_matching_unissued_non_save_effect();
+    test_picker_reservation_filter_and_owner_replacement_are_exact();
+    test_picker_raw_edit_and_tab_cache_are_model_generation_scoped();
+    test_picker_nonidle_gate_includes_all_tray_mutators();
+    test_picker_forward_attempt_matrix_has_independent_exact_budgets();
+    test_picker_unavailable_target_read_exhausts_then_uses_rollback_budget();
+    test_picker_wrong_event_and_serial_never_consume_pending_lane();
+    test_picker_cancel_partial_matrix_stops_forward_and_hides_once();
+    test_picker_focus_budget_terminates_without_report_loop();
+    test_picker_begin_gate_rejects_incomplete_or_busy_state_atomically();
+    test_picker_ui_preservation_prunes_scroll_and_adopts_only_safe_idle_target();
+    test_picker_lightweight_refresh_is_single_snapshot_cache_only();
+    test_picker_later_noninvocation_preserves_prior_unresolved_move();
+    test_picker_popup_recovery_after_fourth_switch_saves_without_fifth();
+    test_picker_cancel_during_exhausted_rollback_cannot_strand();
+    test_picker_failed_current_rollback_suppresses_invisible_focus();
+    test_picker_effect_serial_exhaustion_becomes_terminal_not_stranded();
+    test_picker_unknown_identity_never_allows_future_target_api();
+    test_picker_cancel_terminal_effects_never_reemit_or_refocus();
+    test_picker_invoked_identity_loss_keeps_unknown_displacement();
+    test_picker_noninvoked_rollback_apis_still_require_readback();
+    test_picker_cancel_all_displaced_rolls_back_in_exact_order();
+    test_picker_identity_loss_matrix_never_touches_target_again();
+    test_picker_popup_and_switch_retry_boundaries_are_exact();
+    test_picker_fourth_rollback_readback_and_focus_success_terminate();
     test_finalization_runs_once();
     test_window_identity_requires_full_nonzero_process_identity();
     test_snapshot_versions_change_only_for_changed_inputs();
@@ -14021,6 +16368,9 @@ int main(){
     test_final_observation_provisional_map_stages_before_global_publish();
     test_reconcile_worker_is_bounded_coalesced_and_nonblocking();
     test_reconcile_live_preparation_is_ordered_and_search_ready();
+    test_picker_accepts_fresh_cache_only_for_exact_session_rows();
+    test_unusable_fresh_rows_cannot_corrupt_or_create_records();
+    test_picker_title_only_provisionals_share_reconcile_normalization();
     test_cli_profile_batch_aborts_transactionally_on_first_prep_failure();
     test_cli_loads_settings_before_selecting_active_profiles();
     test_cli_save_revalidates_snapshot_and_desktops_before_publish();
@@ -14075,6 +16425,13 @@ int main(){
     test_popup_saved_only_completes_exact_lifecycle_save_generation();
     test_popup_uses_exact_pending_saved_id_before_new_provisional();
     test_popup_pending_id_bypasses_title_and_origin_provisional_gates();
+    test_picker_inflight_accepted_match_reuses_one_exact_saved_id();
+    test_picker_save_accepts_only_exact_same_generation_late_fresh();
+    test_picker_controlled_edit_allows_readback_but_not_mutation();
+    test_picker_inflight_plan_gate_and_late_handoff_cutoff_are_exact();
+    test_picker_failure_refresh_selection_uses_actual_readback();
+    test_picker_post_save_identity_diagnostics_preserve_save_truth();
+    test_picker_switch_effect_revalidates_target_at_invocation_boundary();
     test_popup_post_classification_reuses_pending_id_after_initial_untracked_capture();
     test_validated_touch_rebase_preserves_external_semantics();
     test_etld1();
