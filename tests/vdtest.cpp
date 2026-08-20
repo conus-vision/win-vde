@@ -1609,6 +1609,107 @@ static void test_reconcile_guaranteed_capacity_defers_before_matcher(){
     ResetCountingRecordIdGenerator();
 }
 
+static std::vector<LayoutWin> MissingProjectionCapacityRecords(UnixSeconds now){
+    std::vector<LayoutWin> existing;
+    existing.reserve(MAX_LAYOUT_RECORDS);
+    for(size_t i=0;i<MAX_LAYOUT_RECORDS-1;++i){
+        existing.push_back(ReconcileTestRecord(
+            DeterministicRecordId(40000+i),"firefox","Firefox","ff.example",0,
+            G(L"{231A0000-0000-0000-0000-000000000001}"),now-10));
+    }
+    existing.push_back(ReconcileTestRecord(
+        DeterministicRecordId(45000),"chrome","Old","old.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),
+        now-WINDOW_RETENTION_SECONDS));
+    return existing;
+}
+
+static bool HasRecordId(const std::vector<LayoutWin>& records,
+        const std::string& recordId){
+    for(const LayoutWin& record : records)
+        if(record.recordId==recordId) return true;
+    return false;
+}
+
+static void test_reconcile_projects_mark_missing_expiration_before_capacity(){
+    const UnixSeconds now=2100000000;
+    const size_t oldIndex=MAX_LAYOUT_RECORDS-1;
+    const std::string newId=DeterministicRecordId(MAX_LAYOUT_RECORDS+100);
+    std::vector<LayoutWin> existing=MissingProjectionCapacityRecords(now);
+    const std::vector<LayoutWin> originalExisting=existing;
+    const std::string oldId=existing[oldIndex].recordId;
+    LayoutWin live=MatchRecord("chrome","New","new.example",1,{{"new.example",1}});
+    live.deskIndex=1;
+    live.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+
+    ResetCountingRecordIdGenerator();
+    ResetCountingReconcileMatcher();
+    ReconcilePlan planned=PlanAppReconcile(
+        existing,{live},"chrome",now,{},ReconcileFreshness::Fresh,
+        CountingRecordIdGenerator,CountingReconcileMatcher);
+    CHECK(!planned.deferred);
+    CHECK(planned.matches.empty() && planned.restores.empty());
+    CHECK(planned.missingSavedIndices==std::vector<size_t>({oldIndex}));
+    CHECK(planned.newRecords.size()==1 && planned.newRecords[0].liveIndex==0 &&
+        planned.newRecords[0].recordId==newId);
+    CHECK(CountingReconcileMatcherCalls()==1);
+    CHECK(CountingRecordIdGeneratorCalls()==1);
+    CHECK(SameLayoutWinVectors(existing,originalExisting));
+
+    std::vector<LayoutWin> committed=CommitAppReconcile(
+        existing,{live},planned,{},now);
+    CHECK(committed.size()==MAX_LAYOUT_RECORDS);
+    CHECK(!HasRecordId(committed,oldId));
+    CHECK(HasRecordId(committed,newId));
+
+    ReconcilePlan handcrafted=ValidCommitPlan("chrome",now);
+    handcrafted.missingSavedIndices.push_back(oldIndex);
+    handcrafted.newRecords.push_back(PlannedNewRecord(0,newId));
+    std::vector<LayoutWin> handcraftedCommit=CommitAppReconcile(
+        existing,{live},handcrafted,{},now);
+    CHECK(SameLayoutWinVectors(handcraftedCommit,committed));
+    CHECK(handcraftedCommit.size()==MAX_LAYOUT_RECORDS);
+    CHECK(!HasRecordId(handcraftedCommit,oldId));
+    CHECK(HasRecordId(handcraftedCommit,newId));
+    ResetCountingReconcileMatcher();
+    ResetCountingRecordIdGenerator();
+
+    struct RetainedControl {
+        UnixSeconds lastSeenUtc;
+        UnixSeconds missingSinceUtc;
+    };
+    const RetainedControl controls[]={
+        {now-WINDOW_RETENTION_SECONDS+1,0},
+        {0,0},
+        {now-WINDOW_RETENTION_SECONDS,now-WINDOW_RETENTION_SECONDS+1}
+    };
+    for(const RetainedControl& control : controls){
+        std::vector<LayoutWin> retained=existing;
+        retained[oldIndex].lastSeenUtc=control.lastSeenUtc;
+        retained[oldIndex].missingSinceUtc=control.missingSinceUtc;
+        ResetCountingRecordIdGenerator();
+        ResetCountingReconcileMatcher();
+        ReconcilePlan rejected=PlanAppReconcile(
+            retained,{live},"chrome",now,{},ReconcileFreshness::Fresh,
+            CountingRecordIdGenerator,CountingReconcileMatcher);
+        CHECK(rejected.deferred);
+        CHECK(rejected.matches.empty());
+        CHECK(rejected.restores.empty());
+        CHECK(rejected.newRecords.empty());
+        CHECK(rejected.missingSavedIndices.empty());
+        CHECK(CountingReconcileMatcherCalls()==1);
+        CHECK(CountingRecordIdGeneratorCalls()==0);
+
+        ReconcilePlan manualControl=ValidCommitPlan("chrome",now);
+        manualControl.missingSavedIndices.push_back(oldIndex);
+        manualControl.newRecords.push_back(PlannedNewRecord(0,newId));
+        CHECK(SameLayoutWinVectors(
+            CommitAppReconcile(retained,{live},manualControl,{},now),retained));
+    }
+    ResetCountingReconcileMatcher();
+    ResetCountingRecordIdGenerator();
+}
+
 static void test_reconcile_duplicate_injected_match_ownership_defers_cleanly(){
     const UnixSeconds now=2000001690;
     LayoutWin savedA=ReconcileTestRecord(
@@ -7911,6 +8012,7 @@ int main(){
     test_reconcile_malformed_reserved_id_defers_before_work();
     test_reconcile_reserved_id_cap_is_fail_closed_at_boundary();
     test_reconcile_guaranteed_capacity_defers_before_matcher();
+    test_reconcile_projects_mark_missing_expiration_before_capacity();
     test_reconcile_duplicate_injected_match_ownership_defers_cleanly();
     test_reconcile_rejects_all_malformed_injected_matches();
     test_reconcile_unsupported_app_defers_without_generation();

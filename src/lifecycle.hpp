@@ -44,6 +44,29 @@ using ReconcileMatcher = std::vector<LayoutMatch> (*)(
     double,
     bool*);
 
+inline bool IsExpiredAfterProjectedMarkMissing(
+        const LayoutWin& record, UnixSeconds nowUtc){
+    const UnixSeconds missingSinceUtc=record.missingSinceUtc!=0
+        ? record.missingSinceUtc
+        : (record.lastSeenUtc>0 ? record.lastSeenUtc : nowUtc);
+    return missingSinceUtc>0 && nowUtc>=missingSinceUtc &&
+        nowUtc-missingSinceUtc>=WINDOW_RETENTION_SECONDS;
+}
+
+inline size_t ProjectedRetainedExistingCount(
+        const std::vector<LayoutWin>& existing,
+        const std::vector<bool>& markMissing,
+        UnixSeconds nowUtc){
+    size_t retained=0;
+    for(size_t i=0;i<existing.size();++i){
+        const bool expired=markMissing[i]
+            ? IsExpiredAfterProjectedMarkMissing(existing[i],nowUtc)
+            : IsExpired(existing[i],nowUtc);
+        if(!expired) ++retained;
+    }
+    return retained;
+}
+
 inline ReconcilePlan PlanAppReconcile(
         const std::vector<LayoutWin>& existing,
         const std::vector<LayoutWin>& live,
@@ -104,17 +127,17 @@ inline ReconcilePlan PlanAppReconcile(
         originalIndices.push_back(i);
     }
 
-    size_t retainedExisting=0;
-    for(const LayoutWin& record : existing)
-        if(!IsExpired(record,nowUtc)) ++retainedExisting;
+    size_t fixedRetained=0;
+    for(size_t i=0;i<existing.size();++i)
+        if(!IsExpired(existing[i],nowUtc) &&
+                (existing[i].app!=app || isReserved(i)))
+            ++fixedRetained;
     size_t liveAppCount=0;
     for(const LayoutWin& record : live)
         if(record.app==app) ++liveAppCount;
-    const size_t unavoidableNew=
-        liveAppCount>eligible.size() ? liveAppCount-eligible.size() : 0;
     if(freshness==ReconcileFreshness::Fresh &&
-            (retainedExisting>MAX_LAYOUT_RECORDS ||
-             unavoidableNew>MAX_LAYOUT_RECORDS-retainedExisting))
+            (fixedRetained>MAX_LAYOUT_RECORDS ||
+             liveAppCount>MAX_LAYOUT_RECORDS-fixedRetained))
         return deferredPlan();
 
     const double acceptScore=0.55;
@@ -157,14 +180,21 @@ inline ReconcilePlan PlanAppReconcile(
         size_t newRecordCount=0;
         for(size_t i=0;i<live.size();++i)
             if(live[i].app==app && !matchedLive[i]) ++newRecordCount;
-        if(retainedExisting>MAX_LAYOUT_RECORDS ||
-                newRecordCount>MAX_LAYOUT_RECORDS-retainedExisting)
-            return deferredPlan();
+        std::vector<bool> projectedMissing(existing.size(),false);
+        std::vector<size_t> missingSavedIndices;
         for(size_t i=0;i<existing.size();++i){
-            if(existing[i].app==app && !matchedSaved[i] &&
-                    !isReserved(i) && !IsExpired(existing[i],nowUtc))
-                plan.missingSavedIndices.push_back(i);
+            if(existing[i].app!=app || matchedSaved[i] || isReserved(i) ||
+                    IsExpired(existing[i],nowUtc))
+                continue;
+            projectedMissing[i]=true;
+            missingSavedIndices.push_back(i);
         }
+        const size_t projectedRetained=ProjectedRetainedExistingCount(
+            existing,projectedMissing,nowUtc);
+        if(projectedRetained>MAX_LAYOUT_RECORDS ||
+                newRecordCount>MAX_LAYOUT_RECORDS-projectedRetained)
+            return deferredPlan();
+        plan.missingSavedIndices.swap(missingSavedIndices);
         for(size_t i=0;i<live.size();++i){
             if(live[i].app!=app || matchedLive[i]) continue;
             if(!idGenerator) return deferredPlan();
@@ -246,6 +276,7 @@ inline std::vector<LayoutWin> CommitAppReconcile(
     for(size_t liveIndex : successfulRestoreLiveIndices)
         if(restoreLiveIndices.count(liveIndex)==0) return existing;
 
+    std::vector<bool> projectedMissing(existing.size(),false);
     if(plan.freshness==ReconcileFreshness::CachedStale){
         if(!plan.missingSavedIndices.empty() || !plan.newRecords.empty())
             return existing;
@@ -257,6 +288,7 @@ inline std::vector<LayoutWin> CommitAppReconcile(
                     existing[index].app!=plan.app || IsExpired(existing[index],nowUtc) ||
                     matchedSavedIndices.count(index)!=0)
                 return existing;
+            projectedMissing[index]=true;
         }
 
         std::set<size_t> newLiveIndices;
@@ -274,11 +306,10 @@ inline std::vector<LayoutWin> CommitAppReconcile(
         }
     }
 
-    size_t retainedExisting=0;
-    for(const LayoutWin& record : existing)
-        if(!IsExpired(record,nowUtc)) ++retainedExisting;
-    if(retainedExisting>MAX_LAYOUT_RECORDS ||
-            plan.newRecords.size()>MAX_LAYOUT_RECORDS-retainedExisting)
+    const size_t projectedRetained=ProjectedRetainedExistingCount(
+        existing,projectedMissing,nowUtc);
+    if(projectedRetained>MAX_LAYOUT_RECORDS ||
+            plan.newRecords.size()>MAX_LAYOUT_RECORDS-projectedRetained)
         return existing;
 
     std::vector<LayoutWin> output=existing;
