@@ -1005,30 +1005,487 @@ static void test_fingerprint_key_generic_vs_domain(){
     CHECK(FingerprintKey("explorer",{},"Downloads") != FingerprintKey("explorer",{},"Documents"));
 }
 
-static void test_lc_startup_present_restores(){
-    LcState s; CHECK(LcOnStartup(s, true) == LcAction::StartupRestore);
-    CHECK(s.prevPresent && s.restoredThisAppearance);
+static void test_lc_initial_absence_marks_missing_once(){
+    LcState s;
+    LcDecision first=LcObserve(s,false,0,0,0,0,100);
+    CHECK(first.action==LcAction::MarkMissingFromLastSeen && first.generation!=0);
+    CHECK(s.nextGeneration!=0 && s.nextGeneration!=first.generation);
+    CHECK(LcObserve(s,false,0,0,0,0,101).action==LcAction::None);
 }
-static void test_lc_startup_absent_none(){
-    LcState s; CHECK(LcOnStartup(s, false) == LcAction::None); CHECK(!s.prevPresent);
+static void test_lc_two_stable_present_snapshots_begin_restore(){
+    LcState s;
+    CHECK(LcObserve(s,true,1,11,21,31,100).action==LcAction::None);
+    LcDecision begin=LcObserve(s,true,1,11,21,31,101);
+    CHECK(begin.action==LcAction::BeginRestore && begin.generation!=0);
+    CHECK(s.restoreInFlight && s.inFlightGeneration==begin.generation);
 }
-static void test_lc_launch_then_settle_restores_once(){
-    LcState s; LcOnStartup(s, false);
-    CHECK(LcOnTick(s, true, 4) == LcAction::None);      // appearance tick 1
-    CHECK(LcOnTick(s, true, 4) == LcAction::None);      // 2
-    CHECK(LcOnTick(s, true, 4) == LcAction::None);      // 3
-    CHECK(LcOnTick(s, true, 4) == LcAction::DoRestore); // 4 ⇒ settle reached
-    CHECK(LcOnTick(s, true, 4) == LcAction::AutoSave);  // then periodic autosave
+static void test_lc_stale_restore_completion_is_ignored(){
+    LcState s;
+    LcObserve(s,true,1,11,21,31,100);
+    LcDecision begin=LcObserve(s,true,1,11,21,31,101);
+    LcRestoreCompleted(s,begin.generation+1,LcRestoreOutcome::Success,22,32,102);
+    CHECK(s.restoreInFlight && s.inFlightGeneration==begin.generation);
+    CHECK(s.layoutSignature==21 && s.sessionStampSignature==31);
 }
-static void test_lc_absent_does_not_wipe_and_rearm(){
-    LcState s; LcOnStartup(s, true);
-    CHECK(LcOnTick(s, false, 4) == LcAction::None);     // present->absent: no wipe
-    CHECK(!s.restoredThisAppearance);                  // re-armed
-    CHECK(LcOnTick(s, true, 4) == LcAction::None);      // reappearance restarts settle
+static void test_restore_budget_is_exact_keyed(){
+    RestoreBudgets budgets;
+    RestoreBudgetKey failed{"record","runtime-a","desktop-a"};
+    CHECK(budgets.mayAttempt(failed));
+    budgets.markExhausted(failed);
+    CHECK(!budgets.mayAttempt(failed));
+    CHECK(budgets.mayAttempt(RestoreBudgetKey{"record","runtime-a","desktop-b"}));
 }
-static void test_lc_exit(){
-    LcState s; CHECK(LcOnExit(s, true) == LcAction::FinalSave);
-    CHECK(LcOnExit(s, false) == LcAction::None);
+
+static void test_lc_timeout_is_per_wave_and_survives_clock_rollback(){
+    LcState s;
+    CHECK(LcObserve(s,true,1,10,20,30,1000).action==LcAction::None);
+    CHECK(LcObserve(s,true,1,11,20,30,500).action==LcAction::None);
+    CHECK(LcObserve(s,true,1,12,20,30,20499).action==LcAction::None);
+    LcDecision first=LcObserve(s,true,1,13,20,30,20500);
+    CHECK(first.action==LcAction::BeginRestore && first.generation!=0);
+    LcRestoreCompleted(s,first.generation,LcRestoreOutcome::Success,20,30,21000);
+
+    CHECK(LcObserve(s,true,2,20,20,30,30000).action==LcAction::None);
+    CHECK(LcObserve(s,true,2,21,20,30,49999).action==LcAction::None);
+    LcDecision second=LcObserve(s,true,2,22,20,30,50000);
+    CHECK(second.action==LcAction::BeginRestore && second.generation!=first.generation);
+}
+
+static void test_lc_absence_transitions_mark_once_and_reappearance_rearms(){
+    LcState s;
+    LcDecision initialMissing=LcObserve(s,false,0,0,0,0,0);
+    CHECK(initialMissing.action==LcAction::MarkMissingFromLastSeen &&
+          initialMissing.generation!=0);
+    CHECK(LcObserve(s,false,0,0,0,0,1).action==LcAction::None);
+    CHECK(LcObserve(s,true,1,1,1,1,2).action==LcAction::None);
+    LcDecision first=LcObserve(s,true,1,1,1,1,3);
+    CHECK(first.action==LcAction::BeginRestore);
+    LcRestoreCompleted(s,first.generation,LcRestoreOutcome::Success,1,1,4);
+    LcDecision transitionMissing=LcObserve(s,false,0,0,1,1,5);
+    CHECK(transitionMissing.action==LcAction::MarkMissingFromLastSeen &&
+          transitionMissing.generation!=0 &&
+          transitionMissing.generation!=initialMissing.generation);
+    CHECK(LcObserve(s,false,0,0,1,1,6).action==LcAction::None);
+    CHECK(LcObserve(s,true,1,1,1,1,7).action==LcAction::None);
+    CHECK(LcObserve(s,true,1,1,1,1,8).action==LcAction::BeginRestore);
+}
+
+static void test_lc_exhausted_generation_suppresses_missing_action(){
+    LcState initialAbsent;
+    initialAbsent.nextGeneration=0;
+    LcDecision first=LcObserve(initialAbsent,false,0,0,0,0,0);
+    CHECK(first.action==LcAction::None && first.generation==0);
+    CHECK(initialAbsent.initialized && !initialAbsent.present &&
+          initialAbsent.nextGeneration==0);
+
+    LcState active;
+    active.nextGeneration=UINT64_MAX;
+    LcObserve(active,true,1,10,100,20,0);
+    LcDecision last=LcObserve(active,true,1,10,100,20,1);
+    CHECK(last.action==LcAction::BeginRestore && last.generation==UINT64_MAX &&
+          active.nextGeneration==0);
+    LcDecision suppressed=LcObserve(active,false,0,0,100,20,2);
+    CHECK(suppressed.action==LcAction::None && suppressed.generation==0);
+    CHECK(!active.present && active.restoreInFlight &&
+          active.inFlightGeneration==UINT64_MAX && active.rearmAfterFlight);
+}
+
+static void test_lc_absence_during_flight_clears_rearm_if_still_absent(){
+    LcState s;
+    LcObserve(s,true,1,10,100,20,0);
+    LcDecision active=LcObserve(s,true,1,10,100,20,1);
+    LcDecision missing=LcObserve(s,false,0,0,100,20,2);
+    CHECK(missing.action==LcAction::MarkMissingFromLastSeen &&
+          missing.generation!=0 && s.rearmAfterFlight);
+    CHECK(s.restoreInFlight && s.inFlightGeneration==active.generation);
+    LcRestoreCompleted(s,active.generation,LcRestoreOutcome::Success,100,20,3);
+    CHECK(!s.present && !s.restoreInFlight && !s.restorePending &&
+          !s.rearmAfterFlight);
+    CHECK(LcObserve(s,false,0,0,100,20,4).action==LcAction::None);
+}
+
+static void test_lc_absence_reappearance_during_flight_queues_one_wave(){
+    LcState s;
+    LcObserve(s,true,1,10,100,20,0);
+    LcDecision active=LcObserve(s,true,1,10,100,20,1);
+    LcDecision missing=LcObserve(s,false,0,0,100,20,2);
+    CHECK(missing.action==LcAction::MarkMissingFromLastSeen &&
+          missing.generation!=0 && s.rearmAfterFlight);
+    CHECK(LcObserve(s,true,1,11,100,20,3).action==LcAction::None);
+    CHECK(s.restoreInFlight && s.inFlightGeneration==active.generation &&
+          s.rearmAfterFlight);
+    LcRestoreCompleted(s,active.generation,LcRestoreOutcome::Success,100,20,4);
+    CHECK(s.present && !s.restoreInFlight && s.restorePending &&
+          !s.rearmAfterFlight);
+    CHECK(LcObserve(s,true,1,11,100,20,5).action==LcAction::None);
+    LcDecision rearmed=LcObserve(s,true,1,11,100,20,6);
+    CHECK(rearmed.action==LcAction::BeginRestore &&
+          rearmed.generation!=active.generation);
+}
+
+static void test_lc_firefox_chrome_edge_states_are_independent(){
+    LcState firefox, chrome, edge;
+    CHECK(LcObserve(firefox,true,10,10,10,10,0).action==LcAction::None);
+    CHECK(LcObserve(chrome,true,20,20,20,20,0).action==LcAction::None);
+    CHECK(LcObserve(edge,false,0,0,30,30,0).action==LcAction::MarkMissingFromLastSeen);
+    LcDecision ff=LcObserve(firefox,true,10,10,10,10,1);
+    LcDecision ch=LcObserve(chrome,true,20,20,20,20,1);
+    CHECK(ff.action==LcAction::BeginRestore && ch.action==LcAction::BeginRestore);
+    LcRestoreCompleted(firefox,ff.generation,LcRestoreOutcome::Success,10,10,2);
+    LcRestoreCompleted(chrome,ch.generation,LcRestoreOutcome::Success,20,20,2);
+    CHECK(LcObserve(edge,true,30,30,30,30,3).action==LcAction::None);
+    CHECK(LcObserve(firefox,true,10,10,10,10,3).action==LcAction::None);
+    CHECK(LcObserve(chrome,true,20,20,20,20,3).action==LcAction::None);
+    CHECK(LcObserve(edge,true,30,30,30,30,4).action==LcAction::BeginRestore);
+}
+
+static void test_lc_layout_change_saves_but_restore_inputs_restore_first(){
+    LcState s;
+    LcObserve(s,true,1,1,10,1,0);
+    LcDecision initial=LcObserve(s,true,1,1,10,1,1);
+    LcRestoreCompleted(s,initial.generation,LcRestoreOutcome::Success,10,1,2);
+    LcDecision save=LcObserve(s,true,1,1,11,1,3);
+    CHECK(save.action==LcAction::SaveLayout && save.generation!=0);
+    CHECK(s.saveInFlight && !s.restorePending && !s.restoreInFlight);
+
+    LcState restoreFirst;
+    LcObserve(restoreFirst,true,1,1,10,1,0);
+    LcDecision done=LcObserve(restoreFirst,true,1,1,10,1,1);
+    LcRestoreCompleted(restoreFirst,done.generation,LcRestoreOutcome::Success,10,1,2);
+    CHECK(LcObserve(restoreFirst,true,1,2,11,2,3).action==LcAction::None);
+    CHECK(LcObserve(restoreFirst,true,1,2,11,2,4).action==LcAction::BeginRestore);
+}
+
+static void test_lc_same_hwnd_new_fresh_session_starts_one_wave(){
+    LcState s;
+    LcObserve(s,true,7,70,700,1,0);
+    LcDecision initial=LcObserve(s,true,7,70,700,1,1);
+    LcRestoreCompleted(s,initial.generation,LcRestoreOutcome::Success,700,1,2);
+    CHECK(LcObserve(s,true,7,71,700,2,3).action==LcAction::None);
+    LcDecision refresh=LcObserve(s,true,7,71,700,2,4);
+    CHECK(refresh.action==LcAction::BeginRestore && refresh.generation!=initial.generation);
+    LcRestoreCompleted(s,refresh.generation,LcRestoreOutcome::Success,700,2,5);
+    CHECK(LcObserve(s,true,7,71,700,2,6).action==LcAction::None);
+    CHECK(LcObserve(s,true,7,71,700,2,7).action==LcAction::None);
+}
+
+static void test_lc_inflight_changes_queue_exactly_one_latest_rearm(){
+    LcState s;
+    LcObserve(s,true,1,10,100,1,0);
+    LcDecision first=LcObserve(s,true,1,10,100,1,1);
+    CHECK(LcObserve(s,true,2,20,101,2,2).action==LcAction::None);
+    CHECK(LcObserve(s,true,3,30,102,3,3).action==LcAction::None);
+    CHECK(s.restoreInFlight && s.inFlightGeneration==first.generation && s.rearmAfterFlight);
+    LcRestoreCompleted(s,first.generation,LcRestoreOutcome::Success,101,1,4);
+    CHECK(!s.restoreInFlight && s.restorePending && !s.rearmAfterFlight);
+    CHECK(s.windowSetSignature==3 && s.settleSignature==30 &&
+          s.layoutSignature==102 && s.sessionStampSignature==3);
+    CHECK(LcObserve(s,true,3,30,102,3,5).action==LcAction::None);
+    LcDecision latest=LcObserve(s,true,3,30,102,3,6);
+    CHECK(latest.action==LcAction::BeginRestore && latest.generation!=first.generation);
+    LcRestoreCompleted(s,latest.generation,LcRestoreOutcome::Success,102,3,7);
+    CHECK(LcObserve(s,true,3,30,102,3,8).action==LcAction::None);
+}
+
+static void test_lc_late_and_returning_sibling_each_start_one_wave(){
+    LcState s;
+    LcObserve(s,true,1,10,100,1,0);
+    LcDecision onlyA=LcObserve(s,true,1,10,100,1,1);
+    LcRestoreCompleted(s,onlyA.generation,LcRestoreOutcome::Success,100,1,2);
+
+    CHECK(LcObserve(s,true,3,30,100,1,3).action==LcAction::None); // late B
+    LcDecision withB=LcObserve(s,true,3,30,100,1,4);
+    CHECK(withB.action==LcAction::BeginRestore);
+    LcRestoreCompleted(s,withB.generation,LcRestoreOutcome::Success,100,1,5);
+    CHECK(LcObserve(s,true,1,10,100,1,6).action==LcAction::None); // B disappears
+    LcDecision withoutB=LcObserve(s,true,1,10,100,1,7);
+    CHECK(withoutB.action==LcAction::BeginRestore);
+    LcRestoreCompleted(s,withoutB.generation,LcRestoreOutcome::Success,100,1,8);
+    CHECK(LcObserve(s,true,3,30,100,1,9).action==LcAction::None); // B returns
+    LcDecision returnedB=LcObserve(s,true,3,30,100,1,10);
+    CHECK(returnedB.action==LcAction::BeginRestore);
+    LcRestoreCompleted(s,returnedB.generation,LcRestoreOutcome::Success,100,1,11);
+    CHECK(LcObserve(s,true,3,30,100,1,12).action==LcAction::None);
+}
+
+static void test_lc_generation_max_is_issued_once_then_fails_closed(){
+    LcState s;
+    s.nextGeneration=UINT64_MAX;
+    LcObserve(s,true,1,1,1,1,0);
+    LcDecision last=LcObserve(s,true,1,1,1,1,1);
+    CHECK(last.action==LcAction::BeginRestore && last.generation==UINT64_MAX);
+    CHECK(s.nextGeneration==0);
+    LcRestoreCompleted(s,last.generation,LcRestoreOutcome::Success,1,1,2);
+    LcObserve(s,true,1,2,1,2,3);
+    LcDecision exhausted=LcObserve(s,true,1,2,1,2,4);
+    CHECK(exhausted.action==LcAction::None && exhausted.generation==0);
+    CHECK(!s.restoreInFlight && s.inFlightGeneration==0 &&
+          !s.restorePending && s.nextGeneration==0);
+    const uint64_t completed=s.completedLayoutSignature;
+    LcRestoreCompleted(s,UINT64_MAX,LcRestoreOutcome::Exhausted,999,999,5);
+    CHECK(!s.restoreInFlight && s.inFlightGeneration==0 &&
+          s.completedLayoutSignature==completed);
+    CHECK(LcObserve(s,true,1,2,1,2,6).action==LcAction::None);
+}
+
+static LcDecision lc_begin_initial(LcState& s, uint64_t windowSet,
+                                   uint64_t settle, uint64_t layout,
+                                   uint64_t session, uint64_t now){
+    CHECK(LcObserve(s,true,windowSet,settle,layout,session,now).action==LcAction::None);
+    LcDecision begin=LcObserve(s,true,windowSet,settle,layout,session,now+1);
+    CHECK(begin.action==LcAction::BeginRestore && begin.generation!=0);
+    return begin;
+}
+
+static void test_lc_deferred_retries_three_times_with_exact_backoff(){
+    LcState s;
+    LcDecision wave=lc_begin_initial(s,1,10,100,20,0);
+    uint64_t completedAt=100;
+    for(int attempt=1;attempt<=3;++attempt){
+        LcRestoreCompleted(s,wave.generation,LcRestoreOutcome::Deferred,
+                           100,20,completedAt);
+        CHECK(s.deferredAttempts==attempt);
+        if(attempt==3){
+            CHECK(s.deferredUntilInputChanges && !s.restorePending &&
+                  !s.restoreInFlight && s.retryNotBeforeMs==0);
+            break;
+        }
+        const uint64_t readyAt=completedAt+30000;
+        CHECK(s.restorePending && !s.deferredUntilInputChanges &&
+              s.retryNotBeforeMs==readyAt);
+        CHECK(LcObserve(s,true,1,10,100,20,completedAt+1).action==LcAction::None);
+        CHECK(LcObserve(s,true,1,10,100,20,readyAt-1).action==LcAction::None);
+        wave=LcObserve(s,true,1,10,100,20,readyAt);
+        CHECK(wave.action==LcAction::BeginRestore && wave.generation!=0);
+        completedAt=readyAt+100;
+    }
+    CHECK(LcObserve(s,true,1,10,101,20,1000000).action==LcAction::None);
+    CHECK(s.deferredUntilInputChanges && s.deferredAttempts==3);
+}
+
+static void test_lc_deferred_key_change_resets_for_window_or_session(){
+    for(int changeSession=0;changeSession<2;++changeSession){
+        LcState s;
+        LcDecision wave=lc_begin_initial(s,1,10,100,20,0);
+        uint64_t completedAt=100;
+        for(int attempt=1;attempt<=3;++attempt){
+            LcRestoreCompleted(s,wave.generation,LcRestoreOutcome::Deferred,
+                               100,20,completedAt);
+            if(attempt<3){
+                const uint64_t readyAt=completedAt+30000;
+                LcObserve(s,true,1,10,100,20,completedAt+1);
+                wave=LcObserve(s,true,1,10,100,20,readyAt);
+                CHECK(wave.action==LcAction::BeginRestore);
+                completedAt=readyAt+100;
+            }
+        }
+        const uint64_t changedWindow=changeSession ? 1 : 2;
+        const uint64_t changedSession=changeSession ? 21 : 20;
+        CHECK(LcObserve(s,true,changedWindow,11,100,changedSession,
+                        completedAt+1).action==LcAction::None);
+        CHECK(s.restorePending && !s.deferredUntilInputChanges &&
+              s.deferredAttempts==0 && s.retryNotBeforeMs==0);
+        LcDecision reset=LcObserve(s,true,changedWindow,11,100,changedSession,
+                                   completedAt+2);
+        CHECK(reset.action==LcAction::BeginRestore);
+    }
+}
+
+static void test_lc_deferred_key_change_during_backoff_restarts_settle_now(){
+    for(int changeSession=0;changeSession<2;++changeSession){
+        LcState s;
+        LcDecision first=lc_begin_initial(s,1,10,100,20,0);
+        LcRestoreCompleted(s,first.generation,LcRestoreOutcome::Deferred,
+                           100,20,100);
+        CHECK(s.deferredAttempts==1 && s.retryNotBeforeMs==30100);
+        const uint64_t windowSet=changeSession ? 1 : 2;
+        const uint64_t session=changeSession ? 21 : 20;
+        CHECK(LcObserve(s,true,windowSet,11,100,session,1000).action==LcAction::None);
+        CHECK(s.restorePending && s.deferredAttempts==0 &&
+              s.retryNotBeforeMs==0 && s.stableSnapshots==1);
+        LcDecision reset=LcObserve(s,true,windowSet,11,100,session,1001);
+        CHECK(reset.action==LcAction::BeginRestore && reset.generation!=first.generation);
+    }
+}
+
+static void test_lc_inflight_a_to_b_to_a_history_rearms_deferred_wave(){
+    LcState s;
+    LcDecision first=lc_begin_initial(s,1,10,100,20,0);
+    CHECK(LcObserve(s,true,2,11,100,21,2).action==LcAction::None);
+    CHECK(LcObserve(s,true,1,12,100,20,3).action==LcAction::None);
+    CHECK(s.restoreInFlight && s.inFlightGeneration==first.generation &&
+          s.rearmAfterFlight && s.windowSetSignature==1 &&
+          s.sessionStampSignature==20);
+    LcRestoreCompleted(s,first.generation,LcRestoreOutcome::Deferred,
+                       100,20,100);
+    CHECK(!s.restoreInFlight && s.restorePending && !s.rearmAfterFlight);
+    CHECK(s.deferredAttempts==0 && !s.deferredUntilInputChanges &&
+          s.retryNotBeforeMs==0);
+    CHECK(LcObserve(s,true,1,12,100,20,101).action==LcAction::None);
+    LcDecision rearmed=LcObserve(s,true,1,12,100,20,102);
+    CHECK(rearmed.action==LcAction::BeginRestore &&
+          rearmed.generation!=first.generation);
+}
+
+static void test_lc_deferred_backoff_rebases_after_clock_rollback(){
+    LcState s;
+    LcDecision first=lc_begin_initial(s,1,10,100,20,10000);
+    LcRestoreCompleted(s,first.generation,LcRestoreOutcome::Deferred,
+                       100,20,10100);
+    CHECK(s.retryNotBeforeMs==40100);
+    CHECK(LcObserve(s,true,1,10,100,20,5000).action==LcAction::None);
+    CHECK(s.retryNotBeforeMs==35000);
+    CHECK(LcObserve(s,true,1,10,100,20,34999).action==LcAction::None);
+    CHECK(LcObserve(s,true,1,10,100,20,35000).action==LcAction::BeginRestore);
+}
+
+static void test_lc_deferred_ignores_alternating_completion_session_payload(){
+    LcState s;
+    LcDecision wave=lc_begin_initial(s,1,10,100,20,0);
+    uint64_t completedAt=100;
+    for(int attempt=1;attempt<=3;++attempt){
+        const uint64_t untrustedCompletionSession=attempt%2 ? 99 : 20;
+        LcRestoreCompleted(s,wave.generation,LcRestoreOutcome::Deferred,
+                           100,untrustedCompletionSession,completedAt);
+        CHECK(s.sessionStampSignature==20 && s.deferredAttempts==attempt);
+        CHECK(s.deferredWindowSetSignature==1 &&
+              s.deferredSessionStampSignature==20);
+        if(attempt==3) break;
+        const uint64_t readyAt=completedAt+30000;
+        LcObserve(s,true,1,10,100,20,completedAt+1);
+        wave=LcObserve(s,true,1,10,100,20,readyAt);
+        CHECK(wave.action==LcAction::BeginRestore);
+        completedAt=readyAt+100;
+    }
+    CHECK(s.deferredUntilInputChanges && !s.restorePending &&
+          !s.restoreInFlight && s.retryNotBeforeMs==0);
+    CHECK(LcObserve(s,true,1,10,100,20,1000000).action==LcAction::None);
+}
+
+static void test_lc_all_completion_outcomes_honor_one_queued_rearm(){
+    const LcRestoreOutcome outcomes[]={
+        LcRestoreOutcome::Success,
+        LcRestoreOutcome::Deferred,
+        LcRestoreOutcome::Exhausted
+    };
+    for(LcRestoreOutcome outcome:outcomes){
+        LcState s;
+        LcDecision first=lc_begin_initial(s,1,10,100,20,0);
+        CHECK(LcObserve(s,true,2,11,101,21,2).action==LcAction::None);
+        CHECK(LcObserve(s,true,3,12,102,22,3).action==LcAction::None);
+        LcRestoreCompleted(s,first.generation,outcome,101,20,4);
+        CHECK(!s.restoreInFlight && s.restorePending && !s.rearmAfterFlight);
+        CHECK(s.windowSetSignature==3 && s.sessionStampSignature==22);
+        CHECK(s.deferredAttempts==0 && !s.deferredUntilInputChanges &&
+              s.retryNotBeforeMs==0);
+        CHECK(LcObserve(s,true,3,12,102,22,5).action==LcAction::None);
+        LcDecision latest=LcObserve(s,true,3,12,102,22,6);
+        CHECK(latest.action==LcAction::BeginRestore && latest.generation!=first.generation);
+    }
+}
+
+static void test_lc_exhausted_records_actual_layout_without_save_loop(){
+    LcState s;
+    LcDecision wave=lc_begin_initial(s,1,10,100,20,0);
+    CHECK(LcObserve(s,true,1,10,199,20,2).action==LcAction::None);
+    LcRestoreCompleted(s,wave.generation,LcRestoreOutcome::Exhausted,199,20,3);
+    CHECK(!s.restorePending && !s.restoreInFlight &&
+          s.completedLayoutSignature==199);
+    CHECK(LcObserve(s,true,1,10,199,20,4).action==LcAction::None);
+    CHECK(LcObserve(s,true,1,10,199,20,5).action==LcAction::None);
+}
+
+static void test_lc_explicit_save_completion_is_generation_safe(){
+    LcState s;
+    LcDecision restore=lc_begin_initial(s,1,10,100,20,0);
+    LcRestoreCompleted(s,restore.generation,LcRestoreOutcome::Success,100,20,2);
+    LcDecision save=LcObserve(s,true,1,10,101,20,3);
+    CHECK(save.action==LcAction::SaveLayout && s.saveInFlight);
+
+    LcExplicitSaveCompleted(s,save.generation+1,101,20,4);
+    CHECK(s.saveInFlight && s.saveGeneration==save.generation &&
+          s.completedLayoutSignature==100);
+    s.deferredAttempts=2;
+    s.deferredUntilInputChanges=true;
+    s.deferredWindowSetSignature=1;
+    s.deferredSessionStampSignature=20;
+    s.retryNotBeforeMs=99999;
+    LcExplicitSaveCompleted(s,save.generation,101,20,5);
+    CHECK(!s.saveInFlight && s.saveGeneration==0 &&
+          s.completedLayoutSignature==101);
+    CHECK(s.deferredAttempts==0 && !s.deferredUntilInputChanges &&
+          s.retryNotBeforeMs==0);
+    CHECK(!s.restoreInFlight && s.inFlightGeneration==0);
+    CHECK(LcObserve(s,true,1,10,101,20,6).action==LcAction::None);
+
+    LcDecision newer=LcObserve(s,true,1,10,102,20,7);
+    CHECK(newer.action==LcAction::SaveLayout && newer.generation!=save.generation);
+    LcExplicitSaveCompleted(s,save.generation,102,20,8);
+    CHECK(s.saveInFlight && s.saveGeneration==newer.generation);
+    LcExplicitSaveCompleted(s,newer.generation,102,20,9);
+    CHECK(!s.saveInFlight && s.completedLayoutSignature==102);
+}
+
+static void test_restore_budgets_isolate_siblings_runtime_and_destination(){
+    RestoreBudgets budgets;
+    const RestoreBudgetKey failedA{"record-a","runtime-a","desktop-a"};
+    const RestoreBudgetKey siblingB{"record-b","runtime-b","desktop-a"};
+    const RestoreBudgetKey changedRuntime{"record-a","runtime-a-new","desktop-a"};
+    const RestoreBudgetKey changedDestination{"record-a","runtime-a","desktop-b"};
+    budgets.markExhausted(failedA);
+    CHECK(!budgets.mayAttempt(failedA));
+    CHECK(budgets.mayAttempt(siblingB));
+    CHECK(budgets.mayAttempt(changedRuntime));
+    CHECK(budgets.mayAttempt(changedDestination));
+
+    budgets.markExhausted(siblingB);
+    budgets.clearExact(siblingB); // verified success clears only B
+    CHECK(budgets.mayAttempt(siblingB));
+    CHECK(!budgets.mayAttempt(failedA)); // sibling/session churn cannot reset A
+
+    budgets.markExhausted(changedRuntime);
+    budgets.markExhausted(changedDestination);
+    budgets.markExhausted(siblingB);
+    budgets.clearForExplicitRetry("record-a");
+    CHECK(budgets.mayAttempt(failedA));
+    CHECK(budgets.mayAttempt(changedRuntime));
+    CHECK(budgets.mayAttempt(changedDestination));
+    CHECK(!budgets.mayAttempt(siblingB));
+}
+
+static void test_restore_budgets_prune_only_dead_runtime_identities(){
+    RestoreBudgets budgets;
+    const RestoreBudgetKey liveA{"record-a","runtime-a","desktop"};
+    const RestoreBudgetKey liveB{"record-b","runtime-b","desktop"};
+    const RestoreBudgetKey dead{"record-dead","runtime-dead","desktop"};
+    budgets.markExhausted(liveA);
+    budgets.markExhausted(liveB);
+    budgets.markExhausted(dead);
+    budgets.pruneToLiveIdentities({"runtime-a","runtime-b"});
+    CHECK(!budgets.mayAttempt(liveA));
+    CHECK(!budgets.mayAttempt(liveB));
+    CHECK(budgets.mayAttempt(dead));
+    CHECK(budgets.size()==2);
+    budgets.pruneToLiveIdentities({});
+    CHECK(budgets.size()==0 && budgets.mayAttempt(liveA));
+}
+
+static RestoreBudgetKey numbered_budget_key(int number){
+    const std::string suffix=std::to_string(number);
+    return {"record-"+suffix,"runtime-"+suffix,"desktop"};
+}
+
+static void test_restore_budgets_cap_uses_deterministic_touch_lru(){
+    RestoreBudgets budgets;
+    for(int i=0;i<256;++i) budgets.markExhausted(numbered_budget_key(i));
+    CHECK(budgets.size()==256);
+    CHECK(!budgets.mayAttempt(numbered_budget_key(0))); // refresh oldest
+    budgets.markExhausted(numbered_budget_key(256));
+    CHECK(budgets.size()==256);
+    CHECK(!budgets.mayAttempt(numbered_budget_key(0)));
+    CHECK(budgets.mayAttempt(numbered_budget_key(1)));  // least-recent untouched evicted
+    CHECK(!budgets.mayAttempt(numbered_budget_key(2)));
+    CHECK(!budgets.mayAttempt(numbered_budget_key(256)));
 }
 
 // --- minimal SNSS encoder mirroring the REAL format ---
@@ -6052,11 +6509,33 @@ int main(){
     test_prepare_transitional_records_rejects_negative_last_seen_transactionally();
     test_prepare_transitional_records_id_failure_keeps_prior_bytes();
     test_fingerprint_key_generic_vs_domain();
-    test_lc_startup_present_restores();
-    test_lc_startup_absent_none();
-    test_lc_launch_then_settle_restores_once();
-    test_lc_absent_does_not_wipe_and_rearm();
-    test_lc_exit();
+    test_lc_initial_absence_marks_missing_once();
+    test_lc_two_stable_present_snapshots_begin_restore();
+    test_lc_stale_restore_completion_is_ignored();
+    test_restore_budget_is_exact_keyed();
+    test_lc_timeout_is_per_wave_and_survives_clock_rollback();
+    test_lc_absence_transitions_mark_once_and_reappearance_rearms();
+    test_lc_exhausted_generation_suppresses_missing_action();
+    test_lc_absence_during_flight_clears_rearm_if_still_absent();
+    test_lc_absence_reappearance_during_flight_queues_one_wave();
+    test_lc_firefox_chrome_edge_states_are_independent();
+    test_lc_layout_change_saves_but_restore_inputs_restore_first();
+    test_lc_same_hwnd_new_fresh_session_starts_one_wave();
+    test_lc_inflight_changes_queue_exactly_one_latest_rearm();
+    test_lc_late_and_returning_sibling_each_start_one_wave();
+    test_lc_generation_max_is_issued_once_then_fails_closed();
+    test_lc_deferred_retries_three_times_with_exact_backoff();
+    test_lc_deferred_key_change_resets_for_window_or_session();
+    test_lc_deferred_key_change_during_backoff_restarts_settle_now();
+    test_lc_inflight_a_to_b_to_a_history_rearms_deferred_wave();
+    test_lc_deferred_backoff_rebases_after_clock_rollback();
+    test_lc_deferred_ignores_alternating_completion_session_payload();
+    test_lc_all_completion_outcomes_honor_one_queued_rearm();
+    test_lc_exhausted_records_actual_layout_without_save_loop();
+    test_lc_explicit_save_completion_is_generation_safe();
+    test_restore_budgets_isolate_siblings_runtime_and_destination();
+    test_restore_budgets_prune_only_dead_runtime_identities();
+    test_restore_budgets_cap_uses_deterministic_touch_lru();
     test_bounded_read_exact_limit_and_preallocation_rejection();
     test_session_bounded_reader_binds_bytes_to_exact_aba_handle();
     test_session_bounded_reader_rejects_handle_changes_and_close_failure();
