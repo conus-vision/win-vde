@@ -531,6 +531,40 @@ static void test_footer_hover_event_state_covers_every_reset_path(){
     }
 }
 
+static void test_footer_mousemove_resets_tooltip_only_once_per_transition(){
+    PickerHoverEventState state;
+    int invalidations=0,tooltipResets=0;
+    PickerFooterMouseMoveEffects effects=RoutePickerFooterMouseMove(
+        state,PickerFooterLink::Repository,false);
+    if(effects.invalidateFooter) ++invalidations;
+    if(effects.resetRowTooltip) ++tooltipResets;
+    CHECK(invalidations==1 && tooltipResets==1);
+
+    for(int pixel=0;pixel<20;++pixel){
+        effects=RoutePickerFooterMouseMove(
+            state,PickerFooterLink::Repository,false);
+        if(effects.invalidateFooter) ++invalidations;
+        if(effects.resetRowTooltip) ++tooltipResets;
+    }
+    CHECK(invalidations==1 && tooltipResets==1);
+
+    effects=RoutePickerFooterMouseMove(
+        state,PickerFooterLink::ConusVision,false);
+    if(effects.invalidateFooter) ++invalidations;
+    if(effects.resetRowTooltip) ++tooltipResets;
+    CHECK(invalidations==2 && tooltipResets==2);
+
+    state.rowTooltipActive=true;
+    effects=RoutePickerFooterMouseMove(
+        state,PickerFooterLink::ConusVision,true);
+    if(effects.invalidateFooter) ++invalidations;
+    if(effects.resetRowTooltip) ++tooltipResets;
+    CHECK(invalidations==2 && tooltipResets==3);
+    effects=RoutePickerFooterMouseMove(
+        state,PickerFooterLink::ConusVision,false);
+    CHECK(!effects.invalidateFooter && !effects.resetRowTooltip);
+}
+
 static void test_picker_distinguishes_current_selected_and_active(){
     PickerState state;
     const GUID current=G(L"{231A0000-0000-0000-0000-000000000001}");
@@ -7882,6 +7916,19 @@ static std::string ReadRawFile(const std::wstring& path){
     return read.status==FileReadStatus::Ok ? read.bytes : std::string();
 }
 
+static void test_visible_branding_and_help_retention_are_exact(){
+    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    const std::string retention=
+        "A closed Firefox, Chrome, or Edge window keeps its remembered virtual desktop for 30 days. If it reappears before expiry, VDE restores it before updating the saved layout.";
+    CHECK(!source.empty());
+    CHECK(source.find(retention)!=std::string::npos);
+    CHECK(source.find("a few runs")==std::string::npos);
+    CHECK(source.find("Virtual Desktop Extension")!=std::string::npos);
+    CHECK(source.find("Virtual Desktops Extension")==std::string::npos);
+    CHECK(source.find("Virtual Desktops Extention")==std::string::npos);
+    CHECK(source.find("Virtual Desktop Extention")==std::string::npos);
+}
+
 static void test_session_bounded_reader_binds_bytes_to_exact_aba_handle(){
     LayoutTempDir temp;
     std::wstring live=temp.file(L"live.bin");
@@ -13923,6 +13970,8 @@ int main(){
     test_composite_picker_cache_cannot_omit_footer_state();
     test_footer_first_route_consumes_before_search_and_tiles();
     test_footer_hover_event_state_covers_every_reset_path();
+    test_footer_mousemove_resets_tooltip_only_once_per_transition();
+    test_visible_branding_and_help_retention_are_exact();
     test_picker_distinguishes_current_selected_and_active();
     test_picker_zero_guids_and_partial_identities_never_highlight();
     test_picker_active_identity_rejects_hwnd_reuse();

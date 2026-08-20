@@ -5784,7 +5784,7 @@ L"- Save windows layout: save the current windows to a manual checkpoint file.\r
 L"- Restore saved windows layout: put windows back from that manual checkpoint.\r\n"
 L"- Restore last auto saved layout: put windows back from the rolling automatic layout.\r\n\r\n"
 L"Settings\r\n"
-L"- Auto-save & auto-restore layout: the utility watches your browsers and restores the layout automatically at startup and about 20 seconds after a browser launches. Just closing windows never erases the layout - a window is only forgotten after it has been gone for a few runs, so reopening it restores it.\r\n"
+L"- Auto-save & auto-restore layout: the utility watches your browsers and restores the layout automatically at startup and about 20 seconds after a browser launches. A closed Firefox, Chrome, or Edge window keeps its remembered virtual desktop for 30 days. If it reappears before expiry, VDE restores it before updating the saved layout.\r\n"
 L"- Track these apps: choose which of Firefox, Chrome and Edge to manage.\r\n"
 L"- Start with Windows: launch the utility at sign-in.\r\n\r\n"
 L"Notes\r\n"
@@ -5936,7 +5936,10 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         const PickerFooterLink footerHover=HitCurrentPickerFooterLink(
             g_picker,g_pickerPaintCache.generation,
             g_pickerPaintCache.footer.layout,pt);
-        if(UpdatePickerFooterHoverEvent(g_pickerHoverState,footerHover)){
+        const PickerFooterMouseMoveEffects footerEffects=
+            RoutePickerFooterMouseMove(
+                g_pickerHoverState,footerHover,g_lastHoverRow!=-1);
+        if(footerEffects.invalidateFooter){
             if(cacheReady)
                 InvalidateRect(hwnd,
                     &g_pickerPaintCache.footer.layout.footer,FALSE);
@@ -5944,7 +5947,8 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                 InvalidateRect(hwnd,nullptr,FALSE);
         }
         if(PickerFooterSuppressesRowHover(footerHover)){
-            ResetPickerHoverTooltip();
+            if(footerEffects.resetRowTooltip)
+                ResetPickerHoverTooltip();
             TRACKMOUSEEVENT tme={sizeof(tme)};
             tme.dwFlags=TME_LEAVE;
             tme.hwndTrack=hwnd;

@@ -334,6 +334,25 @@ inline bool UpdatePickerFooterHoverEvent(
     return changed;
 }
 
+struct PickerFooterMouseMoveEffects {
+    bool invalidateFooter=false;
+    bool resetRowTooltip=false;
+};
+
+inline PickerFooterMouseMoveEffects RoutePickerFooterMouseMove(
+        PickerHoverEventState& state,PickerFooterLink next,
+        bool activeRowTooltip) noexcept {
+    const bool hadRowTooltip=
+        activeRowTooltip || state.rowTooltipActive;
+    PickerFooterMouseMoveEffects effects;
+    effects.invalidateFooter=
+        UpdatePickerFooterHoverEvent(state,next);
+    effects.resetRowTooltip=
+        PickerFooterSuppressesRowHover(next) &&
+        (effects.invalidateFooter || hadRowTooltip);
+    return effects;
+}
+
 inline void ResetPickerHoverEventState(
         PickerHoverEventState& state,
         PickerHoverResetReason reason) noexcept {
