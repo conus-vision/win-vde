@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <map>
 #include <set>
@@ -28,6 +29,17 @@ struct LayoutRevision {
     unsigned long long mtime=0;
     uint64_t contentHash=0;
     bool exists=false;
+};
+
+enum class LayoutRevisionReadStatus {
+    Missing,
+    Present,
+    Unavailable
+};
+
+struct LayoutRevisionReadResult {
+    LayoutRevisionReadStatus status=LayoutRevisionReadStatus::Unavailable;
+    LayoutRevision revision;
 };
 
 struct LayoutLoadResult {
@@ -88,9 +100,22 @@ struct RecordDelta {
     uint64_t causalGeneration=0;
 };
 
+struct ValidatedRecordTouch {
+    std::string recordId;
+    UnixSeconds lastSeenUtc=0;
+    uint64_t causalGeneration=0;
+};
+
 struct RebaseResult {
     std::vector<LayoutWin> records;
     std::set<std::string> deferredConflictRecordIds;
+    std::set<std::string> appliedDeleteRecordIds;
+};
+
+struct RecordDeltaRebasePreparation {
+    std::map<std::string,RecordDelta> deltas;
+    std::set<std::string> deferredRecordIds;
+    std::set<std::string> satisfiedRecordIds;
 };
 
 inline bool SameRecordForDelta(const LayoutWin& left,const LayoutWin& right){
@@ -99,7 +124,21 @@ inline bool SameRecordForDelta(const LayoutWin& left,const LayoutWin& right){
         left.activeTitle==right.activeTitle &&
         left.activeDomain==right.activeDomain && left.tabCount==right.tabCount &&
         left.counts==right.counts && left.lastSeenUtc==right.lastSeenUtc &&
-        left.missingSinceUtc==right.missingSinceUtc;
+        left.missingSinceUtc==right.missingSinceUtc &&
+        left.provisional==right.provisional;
+}
+
+inline bool RecordDeltaAlreadySatisfiedBy(
+        const LayoutWin& latest,const LayoutWin& desired){
+    return latest.recordId==desired.recordId && latest.app==desired.app &&
+        latest.deskIndex==desired.deskIndex &&
+        GuidEq(latest.desktop,desired.desktop) &&
+        latest.activeTitle==desired.activeTitle &&
+        latest.activeDomain==desired.activeDomain &&
+        latest.tabCount==desired.tabCount && latest.counts==desired.counts &&
+        latest.lastSeenUtc>=desired.lastSeenUtc &&
+        latest.missingSinceUtc==desired.missingSinceUtc &&
+        latest.provisional==desired.provisional;
 }
 
 inline UnixSeconds RecordSemanticTimestamp(const LayoutWin& record){
@@ -147,6 +186,522 @@ inline void EraseRecord(std::vector<LayoutWin>& records,size_t position,
 
 } // namespace layout_store_delta_detail
 
+struct DeferredRecordConflict {
+    LayoutRevision adoptedRevision;
+    bool adoptedRecordPresent=false;
+    LayoutWin adoptedRecord;
+};
+
+enum class RecordDeltaStageResult {
+    Accepted,
+    DeferredConflict,
+    Invalid,
+    AllocationFailure
+};
+
+inline bool BuildDeferredRecordConflicts(
+        const std::set<std::string>& recordIds,
+        const std::vector<LayoutWin>& adoptedRecords,
+        const LayoutRevision& adoptedRevision,
+        std::map<std::string,DeferredRecordConflict>& output){
+    try {
+        std::map<std::string,DeferredRecordConflict> staged;
+        std::map<std::string,size_t> recordIndex;
+        layout_store_delta_detail::BuildRecordIndex(adoptedRecords,recordIndex);
+        for(const std::string& recordId : recordIds){
+            DeferredRecordConflict conflict;
+            conflict.adoptedRevision=adoptedRevision;
+            std::string canonical;
+            if(layout_store_delta_detail::CanonicalRecordId(recordId,canonical)){
+                const auto found=recordIndex.find(canonical);
+                if(found!=recordIndex.end()){
+                    conflict.adoptedRecordPresent=true;
+                    conflict.adoptedRecord=adoptedRecords[found->second];
+                }
+            }
+            staged.emplace(recordId,std::move(conflict));
+        }
+        output.swap(staged);
+        return true;
+    } catch(...) { return false; }
+}
+
+struct RebasedAutoLayoutPublication {
+    std::vector<LayoutWin> records;
+    std::vector<DeskRec> desktops;
+    LayoutRevision revision;
+    std::map<std::string,RecordDelta> deltas;
+    std::map<std::string,ValidatedRecordTouch> touches;
+    std::map<std::string,DeferredRecordConflict> conflicts;
+};
+
+inline void SwapLayoutRevisionNoThrow(
+        LayoutRevision& left,LayoutRevision& right) noexcept {
+    left.sourcePath.swap(right.sourcePath);
+    std::swap(left.size,right.size);
+    std::swap(left.mtime,right.mtime);
+    std::swap(left.contentHash,right.contentHash);
+    std::swap(left.exists,right.exists);
+}
+
+inline void CommitPublishedLayoutRevisionNoThrow(
+        LayoutRevision& current,LayoutRevision& published) noexcept {
+    SwapLayoutRevisionNoThrow(current,published);
+}
+
+enum class CapturedLayoutPublishResult {
+    FailedBeforePublish,
+    PublishedNeedsRetry,
+    Succeeded
+};
+
+template<class Write,class CommitPending,class CommitSuccess>
+inline CapturedLayoutPublishResult PublishLayoutWithCapturedRevision(
+        Write&& write,CommitPending&& commitPending,
+        CommitSuccess&& commitSuccess) noexcept {
+    LayoutRevision published;
+    bool succeeded=false;
+    try { succeeded=write(published); }
+    catch(...) { succeeded=false; }
+    if(!succeeded){
+        if(!published.exists)
+            return CapturedLayoutPublishResult::FailedBeforePublish;
+        try { commitPending(published); }
+        catch(...) { return CapturedLayoutPublishResult::FailedBeforePublish; }
+        return CapturedLayoutPublishResult::PublishedNeedsRetry;
+    }
+    if(!published.exists)
+        return CapturedLayoutPublishResult::FailedBeforePublish;
+    try { commitSuccess(published); }
+    catch(...) { return CapturedLayoutPublishResult::PublishedNeedsRetry; }
+    return CapturedLayoutPublishResult::Succeeded;
+}
+
+struct RebasedPublicationNoFault {
+    void operator()() const noexcept {}
+};
+
+template<class BeforePublish>
+inline bool BuildRebasedAutoLayoutPublication(
+        const std::vector<LayoutWin>& adoptedRecords,
+        const std::vector<DeskRec>& adoptedDesktops,
+        const LayoutRevision& adoptedRevision,
+        const std::set<std::string>& deferredRecordIds,
+        const std::map<std::string,RecordDelta>& residualDeltas,
+        const std::map<std::string,ValidatedRecordTouch>& residualTouches,
+        RebasedAutoLayoutPublication& output,
+        BeforePublish beforePublish){
+    try {
+        RebasedAutoLayoutPublication staged;
+        staged.records=adoptedRecords;
+        staged.desktops=adoptedDesktops;
+        staged.revision=adoptedRevision;
+        staged.deltas=residualDeltas;
+        staged.touches=residualTouches;
+        if(!BuildDeferredRecordConflicts(
+                deferredRecordIds,staged.records,staged.revision,
+                staged.conflicts)) return false;
+        beforePublish();
+        output.records.swap(staged.records);
+        output.desktops.swap(staged.desktops);
+        SwapLayoutRevisionNoThrow(output.revision,staged.revision);
+        output.deltas.swap(staged.deltas);
+        output.touches.swap(staged.touches);
+        output.conflicts.swap(staged.conflicts);
+        return true;
+    } catch(...) { return false; }
+}
+
+inline bool BuildRebasedAutoLayoutPublication(
+        const std::vector<LayoutWin>& adoptedRecords,
+        const std::vector<DeskRec>& adoptedDesktops,
+        const LayoutRevision& adoptedRevision,
+        const std::set<std::string>& deferredRecordIds,
+        const std::map<std::string,RecordDelta>& residualDeltas,
+        const std::map<std::string,ValidatedRecordTouch>& residualTouches,
+        RebasedAutoLayoutPublication& output){
+    return BuildRebasedAutoLayoutPublication(
+        adoptedRecords,adoptedDesktops,adoptedRevision,deferredRecordIds,
+        residualDeltas,residualTouches,output,RebasedPublicationNoFault());
+}
+
+template<class BeforePublish>
+inline bool BuildRebasedAutoLayoutPublication(
+        const std::vector<LayoutWin>& adoptedRecords,
+        const std::vector<DeskRec>& adoptedDesktops,
+        const LayoutRevision& adoptedRevision,
+        const std::set<std::string>& deferredRecordIds,
+        RebasedAutoLayoutPublication& output,
+        BeforePublish beforePublish){
+    return BuildRebasedAutoLayoutPublication(
+        adoptedRecords,adoptedDesktops,adoptedRevision,deferredRecordIds,
+        std::map<std::string,RecordDelta>(),
+        std::map<std::string,ValidatedRecordTouch>(),output,beforePublish);
+}
+
+inline bool BuildRebasedAutoLayoutPublication(
+        const std::vector<LayoutWin>& adoptedRecords,
+        const std::vector<DeskRec>& adoptedDesktops,
+        const LayoutRevision& adoptedRevision,
+        const std::set<std::string>& deferredRecordIds,
+        RebasedAutoLayoutPublication& output){
+    return BuildRebasedAutoLayoutPublication(
+        adoptedRecords,adoptedDesktops,adoptedRevision,deferredRecordIds,
+        std::map<std::string,RecordDelta>(),
+        std::map<std::string,ValidatedRecordTouch>(),output,
+        RebasedPublicationNoFault());
+}
+
+inline bool DeferredRecordConflictsBlockPublish(
+        const std::map<std::string,DeferredRecordConflict>& conflicts,
+        const LayoutRevision& currentRevision){
+    for(const auto& item : conflicts)
+        if(SameRevision(item.second.adoptedRevision,currentRevision)) return true;
+    return false;
+}
+
+inline RecordDeltaStageResult StageRecordDeltaMutation(
+        const std::vector<LayoutWin>& records,
+        const std::map<std::string,RecordDelta>& deltas,
+        const std::map<std::string,DeferredRecordConflict>& conflicts,
+        const RecordDelta& candidate,
+        bool causalGenerationAccepted,
+        std::vector<LayoutWin>& stagedRecords,
+        std::map<std::string,RecordDelta>& stagedDeltas,
+        std::map<std::string,DeferredRecordConflict>& stagedConflicts){
+    std::string recordId;
+    if(!layout_store_delta_detail::CanonicalRecordId(
+            candidate.record.recordId,recordId) ||
+       candidate.changedUtc<=0 || candidate.causalGeneration==0 ||
+       (candidate.kind==RecordDeltaKind::ExpireDelete)!=candidate.erase ||
+       (!candidate.erase && !layout_store_delta_detail::ValidDeltaRecord(
+            candidate.record,recordId)))
+        return RecordDeltaStageResult::Invalid;
+
+    const auto conflict=conflicts.find(recordId);
+    if(conflict!=conflicts.end()){
+        const DeferredRecordConflict& adopted=conflict->second;
+        const bool upsert=candidate.kind==RecordDeltaKind::ExplicitUpsert ||
+            candidate.kind==RecordDeltaKind::ValidatedRuntimeUpsert;
+        const bool sameBasePresence=
+            candidate.baseRecordPresent==adopted.adoptedRecordPresent;
+        const bool sameBase=!candidate.baseRecordPresent ||
+            SameRecordForDelta(candidate.baseRecord,adopted.adoptedRecord);
+        const bool sameApp=!adopted.adoptedRecordPresent ||
+            candidate.record.app==adopted.adoptedRecord.app;
+        const UnixSeconds adoptedTimestamp=adopted.adoptedRecordPresent
+            ? RecordSemanticTimestamp(adopted.adoptedRecord) : 0;
+        if(!upsert || candidate.erase || !causalGenerationAccepted ||
+           !adopted.adoptedRecordPresent ||
+           !SameRevision(candidate.baseRevision,adopted.adoptedRevision) ||
+           !sameBasePresence || !sameBase || !sameApp ||
+           candidate.changedUtc<=adoptedTimestamp)
+            return RecordDeltaStageResult::DeferredConflict;
+    }
+
+    try {
+        std::vector<LayoutWin> nextRecords=records;
+        std::map<std::string,RecordDelta> nextDeltas=deltas;
+        std::map<std::string,DeferredRecordConflict> nextConflicts=conflicts;
+        RecordDelta next=candidate;
+        if(conflict!=conflicts.end()){
+            next.baseRevision=conflict->second.adoptedRevision;
+            next.baseRecordPresent=conflict->second.adoptedRecordPresent;
+            next.baseRecord=conflict->second.adoptedRecord;
+            nextDeltas[recordId]=next;
+            nextConflicts.erase(recordId);
+        } else {
+            const auto prior=nextDeltas.find(recordId);
+            if(prior==nextDeltas.end()) nextDeltas[recordId]=next;
+            else prior->second=ChainRecordDelta(prior->second,next);
+        }
+
+        size_t recordPosition=nextRecords.size();
+        for(size_t index=0;index<nextRecords.size();++index){
+            std::string existingId;
+            if(layout_store_delta_detail::CanonicalRecordId(
+                    nextRecords[index].recordId,existingId) &&
+               existingId==recordId){
+                recordPosition=index;
+                break;
+            }
+        }
+        if(candidate.erase){
+            if(recordPosition<nextRecords.size())
+                nextRecords.erase(nextRecords.begin()+
+                    static_cast<std::ptrdiff_t>(recordPosition));
+        } else if(recordPosition<nextRecords.size()){
+            nextRecords[recordPosition]=candidate.record;
+        } else {
+            if(nextRecords.size()>=MAX_LAYOUT_RECORDS)
+                return RecordDeltaStageResult::Invalid;
+            nextRecords.push_back(candidate.record);
+        }
+        stagedRecords.swap(nextRecords);
+        stagedDeltas.swap(nextDeltas);
+        stagedConflicts.swap(nextConflicts);
+        return RecordDeltaStageResult::Accepted;
+    } catch(...) { return RecordDeltaStageResult::AllocationFailure; }
+}
+
+enum class FinalCheckpointFaultPoint {
+    InitialCopies,
+    RecordIndexes,
+    EraseDelta,
+    UpsertDelta,
+    ValidatedTouches,
+    FinalRecords,
+    Publish
+};
+
+struct FinalCheckpointMutationState {
+    std::vector<LayoutWin> records;
+    std::map<std::string,RecordDelta> deltas;
+    std::map<std::string,ValidatedRecordTouch> touches;
+    std::map<std::string,DeferredRecordConflict> conflicts;
+    std::map<std::string,std::string> provisionalRecordByRuntime;
+};
+
+inline bool SameFinalCheckpointSemantic(const LayoutWin& left,
+                                        const LayoutWin& right){
+    return left.recordId==right.recordId && left.app==right.app &&
+        left.deskIndex==right.deskIndex && GuidEq(left.desktop,right.desktop) &&
+        left.activeTitle==right.activeTitle &&
+        left.activeDomain==right.activeDomain && left.tabCount==right.tabCount &&
+        left.counts==right.counts &&
+        left.missingSinceUtc==right.missingSinceUtc &&
+        left.provisional==right.provisional;
+}
+
+inline bool BuildFinalCheckpointMutation(
+        const std::vector<LayoutWin>& beforeRecords,
+        const std::vector<LayoutWin>& finalRecords,
+        const std::map<std::string,RecordDelta>& currentDeltas,
+        const std::map<std::string,ValidatedRecordTouch>& currentTouches,
+        const std::map<std::string,DeferredRecordConflict>& currentConflicts,
+        const std::vector<ValidatedRecordTouch>& checkpointTouches,
+        const std::map<std::string,std::string>& finalProvisionalByRuntime,
+        const LayoutRevision& revision,UnixSeconds nowUtc,
+        uint64_t checkpointGeneration,FinalCheckpointMutationState& output,
+        const std::function<void(FinalCheckpointFaultPoint)>& injectFault){
+    if(nowUtc<=0 || checkpointGeneration==0 ||
+       beforeRecords.size()>MAX_LAYOUT_RECORDS ||
+       finalRecords.size()>MAX_LAYOUT_RECORDS ||
+       finalProvisionalByRuntime.size()>MAX_LAYOUT_RECORDS) return false;
+    try {
+        if(injectFault) injectFault(FinalCheckpointFaultPoint::InitialCopies);
+        std::vector<LayoutWin> stagedRecords=beforeRecords;
+        std::map<std::string,RecordDelta> stagedDeltas=currentDeltas;
+        std::map<std::string,ValidatedRecordTouch> stagedTouches=currentTouches;
+        std::map<std::string,DeferredRecordConflict> stagedConflicts=
+            currentConflicts;
+        std::map<std::string,std::string> stagedProvisional=
+            finalProvisionalByRuntime;
+
+        if(injectFault) injectFault(FinalCheckpointFaultPoint::RecordIndexes);
+        std::map<std::string,LayoutWin> beforeById,afterById;
+        for(const LayoutWin& record : beforeRecords){
+            std::string id;
+            if(!layout_store_delta_detail::CanonicalRecordId(record.recordId,id) ||
+               !layout_store_delta_detail::ValidDeltaRecord(record,id) ||
+               !beforeById.emplace(id,record).second) return false;
+        }
+        for(const LayoutWin& record : finalRecords){
+            std::string id;
+            if(!layout_store_delta_detail::CanonicalRecordId(record.recordId,id) ||
+               !layout_store_delta_detail::ValidDeltaRecord(record,id) ||
+               !afterById.emplace(id,record).second) return false;
+        }
+
+        for(const auto& item : beforeById){
+            if(afterById.count(item.first)!=0) continue;
+            if(injectFault) injectFault(FinalCheckpointFaultPoint::EraseDelta);
+            RecordDelta candidate;
+            candidate.kind=RecordDeltaKind::ExpireDelete;
+            candidate.erase=true;
+            candidate.record=item.second;
+            candidate.baseRevision=revision;
+            candidate.baseRecordPresent=true;
+            candidate.baseRecord=item.second;
+            candidate.changedUtc=nowUtc;
+            candidate.causalGeneration=checkpointGeneration;
+            std::vector<LayoutWin> records;
+            std::map<std::string,RecordDelta> deltas;
+            std::map<std::string,DeferredRecordConflict> conflicts;
+            if(StageRecordDeltaMutation(
+                    stagedRecords,stagedDeltas,stagedConflicts,candidate,true,
+                    records,deltas,conflicts)!=RecordDeltaStageResult::Accepted)
+                return false;
+            stagedRecords.swap(records);
+            stagedDeltas.swap(deltas);
+            stagedConflicts.swap(conflicts);
+            stagedTouches.erase(item.first);
+        }
+        for(const auto& item : afterById){
+            const auto before=beforeById.find(item.first);
+            if(before!=beforeById.end() &&
+               SameFinalCheckpointSemantic(before->second,item.second)) continue;
+            if(injectFault) injectFault(FinalCheckpointFaultPoint::UpsertDelta);
+            RecordDelta candidate;
+            candidate.kind=RecordDeltaKind::ExplicitUpsert;
+            if(before!=beforeById.end() &&
+               before->second.missingSinceUtc==0 &&
+               item.second.missingSinceUtc!=0)
+                candidate.kind=RecordDeltaKind::MissingMark;
+            candidate.record=item.second;
+            candidate.baseRevision=revision;
+            candidate.baseRecordPresent=before!=beforeById.end();
+            if(before!=beforeById.end()) candidate.baseRecord=before->second;
+            candidate.changedUtc=nowUtc;
+            candidate.causalGeneration=checkpointGeneration;
+            std::vector<LayoutWin> records;
+            std::map<std::string,RecordDelta> deltas;
+            std::map<std::string,DeferredRecordConflict> conflicts;
+            if(StageRecordDeltaMutation(
+                    stagedRecords,stagedDeltas,stagedConflicts,candidate,true,
+                    records,deltas,conflicts)!=RecordDeltaStageResult::Accepted)
+                return false;
+            stagedRecords.swap(records);
+            stagedDeltas.swap(deltas);
+            stagedConflicts.swap(conflicts);
+        }
+
+        if(injectFault) injectFault(FinalCheckpointFaultPoint::ValidatedTouches);
+        for(const ValidatedRecordTouch& touch : checkpointTouches){
+            if(touch.recordId.empty() || touch.lastSeenUtc<=0 ||
+               touch.causalGeneration==0 || afterById.count(touch.recordId)==0)
+                return false;
+            auto found=stagedTouches.find(touch.recordId);
+            if(found==stagedTouches.end() ||
+               found->second.lastSeenUtc<touch.lastSeenUtc)
+                stagedTouches[touch.recordId]=touch;
+        }
+
+        if(injectFault) injectFault(FinalCheckpointFaultPoint::FinalRecords);
+        stagedRecords=finalRecords;
+        FinalCheckpointMutationState staged;
+        staged.records.swap(stagedRecords);
+        staged.deltas.swap(stagedDeltas);
+        staged.touches.swap(stagedTouches);
+        staged.conflicts.swap(stagedConflicts);
+        staged.provisionalRecordByRuntime.swap(stagedProvisional);
+        if(injectFault) injectFault(FinalCheckpointFaultPoint::Publish);
+        output.records.swap(staged.records);
+        output.deltas.swap(staged.deltas);
+        output.touches.swap(staged.touches);
+        output.conflicts.swap(staged.conflicts);
+        output.provisionalRecordByRuntime.swap(
+            staged.provisionalRecordByRuntime);
+        return true;
+    } catch(...) { return false; }
+}
+
+inline bool BuildFinalCheckpointMutation(
+        const std::vector<LayoutWin>& beforeRecords,
+        const std::vector<LayoutWin>& finalRecords,
+        const std::map<std::string,RecordDelta>& currentDeltas,
+        const std::map<std::string,ValidatedRecordTouch>& currentTouches,
+        const std::map<std::string,DeferredRecordConflict>& currentConflicts,
+        const std::vector<ValidatedRecordTouch>& checkpointTouches,
+        const LayoutRevision& revision,UnixSeconds nowUtc,
+        uint64_t checkpointGeneration,FinalCheckpointMutationState& output,
+        const std::function<void(FinalCheckpointFaultPoint)>& injectFault){
+    const std::map<std::string,std::string> noProvisional;
+    return BuildFinalCheckpointMutation(
+        beforeRecords,finalRecords,currentDeltas,currentTouches,currentConflicts,
+        checkpointTouches,noProvisional,revision,nowUtc,checkpointGeneration,
+        output,injectFault);
+}
+
+inline bool BuildFinalCheckpointMutation(
+        const std::vector<LayoutWin>& beforeRecords,
+        const std::vector<LayoutWin>& finalRecords,
+        const std::map<std::string,RecordDelta>& currentDeltas,
+        const std::map<std::string,ValidatedRecordTouch>& currentTouches,
+        const std::map<std::string,DeferredRecordConflict>& currentConflicts,
+        const std::vector<ValidatedRecordTouch>& checkpointTouches,
+        const std::map<std::string,std::string>& finalProvisionalByRuntime,
+        const LayoutRevision& revision,UnixSeconds nowUtc,
+        uint64_t checkpointGeneration,FinalCheckpointMutationState& output){
+    return BuildFinalCheckpointMutation(
+        beforeRecords,finalRecords,currentDeltas,currentTouches,currentConflicts,
+        checkpointTouches,finalProvisionalByRuntime,revision,nowUtc,
+        checkpointGeneration,output,
+        std::function<void(FinalCheckpointFaultPoint)>());
+}
+
+inline bool BuildFinalCheckpointMutation(
+        const std::vector<LayoutWin>& beforeRecords,
+        const std::vector<LayoutWin>& finalRecords,
+        const std::map<std::string,RecordDelta>& currentDeltas,
+        const std::map<std::string,ValidatedRecordTouch>& currentTouches,
+        const std::map<std::string,DeferredRecordConflict>& currentConflicts,
+        const std::vector<ValidatedRecordTouch>& checkpointTouches,
+        const LayoutRevision& revision,UnixSeconds nowUtc,
+        uint64_t checkpointGeneration,FinalCheckpointMutationState& output){
+    return BuildFinalCheckpointMutation(
+        beforeRecords,finalRecords,currentDeltas,currentTouches,currentConflicts,
+        checkpointTouches,revision,nowUtc,checkpointGeneration,output,
+        std::function<void(FinalCheckpointFaultPoint)>());
+}
+
+inline bool PrepareRecordDeltasForRebase(
+        const std::vector<LayoutWin>& latest,
+        const std::map<std::string,RecordDelta>& pending,
+        const std::map<std::string,uint64_t>& currentCausalGenerations,
+        RecordDeltaRebasePreparation& output) noexcept {
+    try {
+        RecordDeltaRebasePreparation staged;
+        std::map<std::string,size_t> recordIndex;
+        layout_store_delta_detail::BuildRecordIndex(latest,recordIndex);
+        for(const auto& item : pending){
+            const RecordDelta& delta=item.second;
+            if(delta.kind!=RecordDeltaKind::ValidatedRuntimeUpsert){
+                staged.deltas.insert(item);
+                continue;
+            }
+
+            std::string canonical,baseCanonical;
+            bool valid=layout_store_delta_detail::CanonicalRecordId(
+                    item.first,canonical) &&
+                !delta.erase && delta.changedUtc>0 &&
+                delta.causalGeneration!=0 &&
+                layout_store_delta_detail::ValidDeltaRecord(
+                    delta.record,canonical);
+            if(valid && delta.baseRecordPresent)
+                valid=layout_store_delta_detail::CanonicalRecordId(
+                        delta.baseRecord.recordId,baseCanonical) &&
+                    baseCanonical==canonical;
+            if(!valid){
+                staged.deferredRecordIds.insert(item.first);
+                continue;
+            }
+
+            const auto record=recordIndex.find(canonical);
+            if(record!=recordIndex.end() &&
+               RecordDeltaAlreadySatisfiedBy(
+                   latest[record->second],delta.record)){
+                // The durable candidate (or a later external revision) has
+                // already applied this mutation.  Retire it without requiring
+                // a runtime binding that may legitimately have disappeared.
+                staged.satisfiedRecordIds.insert(item.first);
+                continue;
+            }
+
+            const auto generation=currentCausalGenerations.find(item.first);
+            if(generation!=currentCausalGenerations.end() &&
+               generation->second==delta.causalGeneration)
+                staged.deltas.insert(item);
+            else
+                staged.deferredRecordIds.insert(item.first);
+        }
+        output.deltas.swap(staged.deltas);
+        output.deferredRecordIds.swap(staged.deferredRecordIds);
+        output.satisfiedRecordIds.swap(staged.satisfiedRecordIds);
+        return true;
+    } catch(...) { return false; }
+}
+
 inline RebaseResult RebaseRecordDeltas(
         const std::vector<LayoutWin>& latest,
         const LayoutRevision& latestRevision,
@@ -182,11 +737,14 @@ inline RebaseResult RebaseRecordDeltas(
 
         auto found=recordIndex.find(deltaId);
         const bool latestPresent=found!=recordIndex.end();
+        const bool alreadySatisfied=!erase && latestPresent &&
+            RecordDeltaAlreadySatisfiedBy(
+                result.records[found->second],delta.record);
         const bool baseUnchanged=SameRevision(delta.baseRevision,latestRevision) ||
             (latestPresent==delta.baseRecordPresent &&
              (!latestPresent || SameRecordForDelta(
                 result.records[found->second],delta.baseRecord)));
-        bool apply=baseUnchanged;
+        bool apply=baseUnchanged || alreadySatisfied;
         if(!apply && erase){
             apply=!latestPresent || IsExpired(result.records[found->second],nowUtc);
         } else if(!apply &&
@@ -202,7 +760,9 @@ inline RebaseResult RebaseRecordDeltas(
             result.deferredConflictRecordIds.insert(item.first);
             continue;
         }
+        if(alreadySatisfied) continue;
         if(erase){
+            result.appliedDeleteRecordIds.insert(item.first);
             if(latestPresent)
                 layout_store_delta_detail::EraseRecord(
                     result.records,found->second,recordIndex);
@@ -217,15 +777,23 @@ inline RebaseResult RebaseRecordDeltas(
     return result;
 }
 
-struct ValidatedRecordTouch {
-    std::string recordId;
-    UnixSeconds lastSeenUtc=0;
-    uint64_t causalGeneration=0;
-};
+inline bool PrepareValidatedTouchesForRebase(
+        const std::map<std::string,ValidatedRecordTouch>& pending,
+        const std::set<std::string>& appliedDeleteRecordIds,
+        std::map<std::string,ValidatedRecordTouch>& output) noexcept {
+    try {
+        std::map<std::string,ValidatedRecordTouch> staged=pending;
+        for(const std::string& recordId : appliedDeleteRecordIds)
+            staged.erase(recordId);
+        output.swap(staged);
+        return true;
+    } catch(...) { return false; }
+}
 
 struct TouchRebaseResult {
     std::vector<LayoutWin> records;
     std::set<std::string> deferredRecordIds;
+    std::set<std::string> satisfiedRecordIds;
 };
 
 inline TouchRebaseResult ReapplyValidatedTouches(
@@ -239,12 +807,9 @@ inline TouchRebaseResult ReapplyValidatedTouches(
     for(const auto& item : touches){
         const ValidatedRecordTouch& touch=item.second;
         std::string canonical;
-        auto generation=currentCausalGenerations.find(item.first);
         if(item.first!=touch.recordId ||
            !layout_store_delta_detail::CanonicalRecordId(item.first,canonical) ||
-           touch.lastSeenUtc<=0 || touch.causalGeneration==0 ||
-           generation==currentCausalGenerations.end() ||
-           generation->second!=touch.causalGeneration){
+           touch.lastSeenUtc<=0 || touch.causalGeneration==0){
             result.deferredRecordIds.insert(item.first);
             continue;
         }
@@ -254,10 +819,70 @@ inline TouchRebaseResult ReapplyValidatedTouches(
             continue;
         }
         LayoutWin& record=result.records[found->second];
+        if(record.lastSeenUtc>=touch.lastSeenUtc &&
+           record.missingSinceUtc==0){
+            result.satisfiedRecordIds.insert(item.first);
+            continue;
+        }
+        const auto generation=currentCausalGenerations.find(item.first);
+        if(generation==currentCausalGenerations.end() ||
+           generation->second!=touch.causalGeneration){
+            result.deferredRecordIds.insert(item.first);
+            continue;
+        }
         record.lastSeenUtc=(std::max)(record.lastSeenUtc,touch.lastSeenUtc);
         record.missingSinceUtc=0;
     }
     return result;
+}
+
+struct RebasedResidualJournal {
+    std::map<std::string,RecordDelta> deltas;
+    std::map<std::string,ValidatedRecordTouch> touches;
+};
+
+inline bool BuildRebasedResidualJournal(
+        const std::map<std::string,RecordDelta>& originalDeltas,
+        const std::map<std::string,ValidatedRecordTouch>& originalTouches,
+        const RecordDeltaRebasePreparation& prepared,
+        const RebaseResult& rebased,const TouchRebaseResult& touched,
+        const std::vector<LayoutWin>& adoptedDiskRecords,
+        const LayoutRevision& adoptedRevision,
+        RebasedResidualJournal& output) noexcept {
+    try {
+        RebasedResidualJournal staged;
+        staged.deltas=originalDeltas;
+        staged.touches=originalTouches;
+        for(const std::string& recordId : rebased.appliedDeleteRecordIds)
+            staged.touches.erase(recordId);
+        for(const std::string& recordId : prepared.satisfiedRecordIds)
+            staged.deltas.erase(recordId);
+        for(const std::string& recordId : touched.satisfiedRecordIds)
+            staged.touches.erase(recordId);
+
+        std::map<std::string,size_t> diskIndex;
+        layout_store_delta_detail::BuildRecordIndex(
+            adoptedDiskRecords,diskIndex);
+        for(const auto& item : prepared.deltas){
+            if(rebased.deferredConflictRecordIds.count(item.first)!=0)
+                continue;
+            std::string canonical;
+            if(!layout_store_delta_detail::CanonicalRecordId(
+                    item.first,canonical)) return false;
+            RecordDelta aligned=item.second;
+            aligned.baseRevision=adoptedRevision;
+            const auto found=diskIndex.find(canonical);
+            aligned.baseRecordPresent=found!=diskIndex.end();
+            if(aligned.baseRecordPresent)
+                aligned.baseRecord=adoptedDiskRecords[found->second];
+            else
+                aligned.baseRecord=LayoutWin();
+            staged.deltas[item.first]=aligned;
+        }
+        output.deltas.swap(staged.deltas);
+        output.touches.swap(staged.touches);
+        return true;
+    } catch(...) { return false; }
 }
 
 namespace layout_store_detail {
@@ -267,6 +892,89 @@ inline uint64_t HashLayoutBytes(const std::string& bytes){
     for(unsigned char byte : bytes){ hash^=(uint64_t)byte; hash*=1099511628211ULL; }
     return hash;
 }
+
+} // namespace layout_store_detail
+
+struct LayoutPublishCandidate {
+    std::wstring sourcePath;
+    unsigned long long size=0;
+    uint64_t contentHash=0;
+    bool armed=false;
+};
+
+enum class LayoutPublishCandidateObservation {
+    NotArmed,
+    RetainedUnavailable,
+    Adopted,
+    ClearedMismatch
+};
+
+inline void SwapLayoutPublishCandidateNoThrow(
+        LayoutPublishCandidate& left,
+        LayoutPublishCandidate& right) noexcept {
+    left.sourcePath.swap(right.sourcePath);
+    std::swap(left.size,right.size);
+    std::swap(left.contentHash,right.contentHash);
+    std::swap(left.armed,right.armed);
+}
+
+inline void ClearLayoutPublishCandidateNoThrow(
+        LayoutPublishCandidate& candidate) noexcept {
+    LayoutPublishCandidate empty;
+    SwapLayoutPublishCandidateNoThrow(candidate,empty);
+}
+
+inline bool BuildLayoutPublishCandidate(
+        const std::wstring& path,const std::string& bytes,
+        LayoutPublishCandidate& output) noexcept {
+    if(path.empty() ||
+       static_cast<unsigned long long>(bytes.size())>MAX_LAYOUT_FILE_BYTES)
+        return false;
+    try {
+        LayoutPublishCandidate staged;
+        staged.sourcePath=path;
+        staged.size=static_cast<unsigned long long>(bytes.size());
+        staged.contentHash=layout_store_detail::HashLayoutBytes(bytes);
+        staged.armed=true;
+        SwapLayoutPublishCandidateNoThrow(output,staged);
+        return true;
+    } catch(...) { return false; }
+}
+
+inline bool LayoutPublishCandidateMatchesRevision(
+        const LayoutPublishCandidate& candidate,
+        const LayoutRevision& revision) noexcept {
+    return candidate.armed && revision.exists &&
+        candidate.sourcePath==revision.sourcePath &&
+        candidate.size==revision.size &&
+        candidate.contentHash==revision.contentHash;
+}
+
+inline LayoutPublishCandidateObservation ObserveLayoutPublishCandidateNoThrow(
+        LayoutPublishCandidate& candidate,LayoutRevisionReadStatus status,
+        LayoutRevision& observed,LayoutRevision& current) noexcept {
+    if(!candidate.armed)
+        return LayoutPublishCandidateObservation::NotArmed;
+    if(status==LayoutRevisionReadStatus::Unavailable)
+        return LayoutPublishCandidateObservation::RetainedUnavailable;
+    const bool matches=status==LayoutRevisionReadStatus::Present &&
+        LayoutPublishCandidateMatchesRevision(candidate,observed);
+    ClearLayoutPublishCandidateNoThrow(candidate);
+    if(!matches)
+        return LayoutPublishCandidateObservation::ClearedMismatch;
+    CommitPublishedLayoutRevisionNoThrow(current,observed);
+    return LayoutPublishCandidateObservation::Adopted;
+}
+
+inline bool AdoptMatchingLayoutPublishCandidateNoThrow(
+        LayoutPublishCandidate& candidate,LayoutRevision& observed,
+        LayoutRevision& current) noexcept {
+    return ObserveLayoutPublishCandidateNoThrow(
+        candidate,LayoutRevisionReadStatus::Present,observed,current)==
+        LayoutPublishCandidateObservation::Adopted;
+}
+
+namespace layout_store_detail {
 
 inline DWORD LastErrorOr(DWORD fallback){
     DWORD error=GetLastError();
@@ -324,7 +1032,8 @@ inline bool ReadExactBytes(const std::wstring& path,const LayoutFsOps& ops,std::
 }
 
 inline bool VerifyExactFile(const std::wstring& path,const std::string& expected,
-        const LayoutFsOps& ops,std::string* errorOut){
+        const LayoutFsOps& ops,std::string* errorOut,
+        LayoutRevision* revisionOut=nullptr){
     std::string actual;
     LayoutRevision revision;
     std::string readError;
@@ -337,6 +1046,7 @@ inline bool VerifyExactFile(const std::wstring& path,const std::string& expected
         if(errorOut) *errorOut="verification mismatch for "+W2U8(path);
         return false;
     }
+    if(revisionOut) SwapLayoutRevisionNoThrow(*revisionOut,revision);
     return true;
 }
 
@@ -1308,13 +2018,37 @@ inline bool TryRecoverSoleTemp(const std::wstring& path,UnixSeconds nowUtc,const
 
 } // namespace layout_store_detail
 
-inline LayoutRevision ReadLayoutRevisionLocked(const std::wstring& path,const LayoutFsOps& ops){
-    LayoutRevision revision;
-    revision.sourcePath=path;
+inline LayoutRevisionReadResult ReadLayoutRevisionObservationLocked(
+        const std::wstring& path,const LayoutFsOps& ops){
+    LayoutRevisionReadResult result;
+    result.revision.sourcePath=path;
     FileReadMetadata metadata;
     FileReadResult read=ReadFileBytesBoundedWithMetadata(path,MAX_LAYOUT_FILE_BYTES,ops,&metadata);
-    if(read.status==FileReadStatus::Ok) return layout_store_detail::RevisionFromRead(path,metadata,read.bytes);
-    revision.exists=read.status!=FileReadStatus::Missing;
+    if(read.status==FileReadStatus::Ok){
+        LayoutRevision revision=
+            layout_store_detail::RevisionFromRead(path,metadata,read.bytes);
+        SwapLayoutRevisionNoThrow(result.revision,revision);
+        result.status=LayoutRevisionReadStatus::Present;
+    } else if(read.status==FileReadStatus::Missing){
+        result.status=LayoutRevisionReadStatus::Missing;
+    } else {
+        result.revision.exists=true;
+        result.status=LayoutRevisionReadStatus::Unavailable;
+    }
+    return result;
+}
+
+inline LayoutRevisionReadResult ReadLayoutRevisionObservationLocked(
+        const std::wstring& path){
+    LayoutFsOps ops;
+    return ReadLayoutRevisionObservationLocked(path,ops);
+}
+
+inline LayoutRevision ReadLayoutRevisionLocked(const std::wstring& path,const LayoutFsOps& ops){
+    LayoutRevisionReadResult observed=
+        ReadLayoutRevisionObservationLocked(path,ops);
+    LayoutRevision revision;
+    SwapLayoutRevisionNoThrow(revision,observed.revision);
     return revision;
 }
 
@@ -1324,7 +2058,8 @@ inline LayoutRevision ReadLayoutRevisionLocked(const std::wstring& path){
 }
 
 inline bool AtomicWriteText(const std::wstring& path,const std::string& data,std::string* errorOut,
-        bool preserveExistingBackup,const LayoutFsOps& ops){
+        bool preserveExistingBackup,const LayoutFsOps& ops,
+        LayoutRevision* publishedRevision=nullptr){
     using namespace layout_store_detail;
     if((unsigned long long)data.size()>MAX_LAYOUT_FILE_BYTES)
         return SetFailure(errorOut,"layout data exceeds the 16 MiB limit");
@@ -1337,6 +2072,22 @@ inline bool AtomicWriteText(const std::wstring& path,const std::string& data,std
     const std::wstring promotionMarker=previousBackup+L".promote";
     const std::wstring displaced=path+L".displaced";
     std::string queryError;
+    LayoutRevision internalPublished;
+    if(publishedRevision)
+        SwapLayoutRevisionNoThrow(*publishedRevision,internalPublished);
+    LayoutRevision* capturedPublished=
+        publishedRevision ? publishedRevision : &internalPublished;
+    auto verifyPublished=[&]()->bool {
+        return VerifyExactFile(
+            path,data,ops,&queryError,capturedPublished);
+    };
+    auto finishSuccess=[&]()->bool {
+        if(!capturedPublished->exists && !verifyPublished())
+            return SetFailure(errorOut,
+                "final published revision verification failed: "+queryError);
+        if(errorOut) errorOut->clear();
+        return true;
+    };
     PathState primaryState=QueryPath(path,ops,&queryError);
     if(primaryState==PathState::Unavailable) return SetFailure(errorOut,queryError);
 
@@ -1395,8 +2146,7 @@ inline bool AtomicWriteText(const std::wstring& path,const std::string& data,std
                     preservedRollback,ops,requestAlreadyPublished,&queryError))
                 return SetFailure(errorOut,queryError);
             if(requestAlreadyPublished){
-                if(errorOut) errorOut->clear();
-                return true;
+                return finishSuccess();
             }
         } else {
             if(!ResolveDisplacedWithoutPrimary(displaced,preservedBackup,preservedRollback,ops,
@@ -1415,7 +2165,7 @@ inline bool AtomicWriteText(const std::wstring& path,const std::string& data,std
 
     if(primaryState==PathState::File && priorPrimary==data){
         if(preserveExistingBackup){
-            if(!VerifyExactFile(path,data,ops,&queryError) ||
+            if(!verifyPublished() ||
                !VerifyCaptured(preservedBackup,ops,&queryError) ||
                !VerifyCaptured(preservedRollback,ops,&queryError))
                 return SetFailure(errorOut,"idempotent recovery verification failed: "+queryError);
@@ -1429,17 +2179,16 @@ inline bool AtomicWriteText(const std::wstring& path,const std::string& data,std
             if(!PromoteRollbackChecked(rollback,backup,previousBackup,oldRollback,oldBackup,
                     ops,&queryError))
                 return SetFailure(errorOut,queryError);
-            if(!VerifyExactFile(path,data,ops,&queryError) ||
+            if(!verifyPublished() ||
                !VerifyExactFile(backup,oldRollback.bytes,ops,&queryError))
                 return SetFailure(errorOut,"idempotent promotion verification failed: "+queryError);
             if(!CleanupStagedPriorBackup(previousBackup,oldBackup,ops,&queryError))
                 return SetFailure(errorOut,queryError);
-        } else if(!VerifyExactFile(path,data,ops,&queryError) ||
+        } else if(!verifyPublished() ||
                   !VerifyCaptured(oldBackup,ops,&queryError)){
             return SetFailure(errorOut,"idempotent write verification failed: "+queryError);
         }
-        if(errorOut) errorOut->clear();
-        return true;
+        return finishSuccess();
     }
 
     const std::wstring& writePath=primaryState==PathState::Missing ? tempStage : temp;
@@ -1457,7 +2206,7 @@ inline bool AtomicWriteText(const std::wstring& path,const std::string& data,std
         if(!ops.moveFile(temp,path,MOVEFILE_WRITE_THROUGH))
             return SetFailure(errorOut,Win32Failure("MoveFileExW first layout publish failed",
                 LastErrorOr(ERROR_UNABLE_TO_MOVE_REPLACEMENT)));
-        if(!VerifyExactFile(path,data,ops,&queryError)) return SetFailure(errorOut,queryError);
+        if(!verifyPublished()) return SetFailure(errorOut,queryError);
         PathState committedState=QueryPath(temp,ops,&queryError);
         if(committedState==PathState::Unavailable)
             return SetFailure(errorOut,"cannot verify committed temporary consumption: "+queryError);
@@ -1467,7 +2216,7 @@ inline bool AtomicWriteText(const std::wstring& path,const std::string& data,std
            !VerifyCaptured(preservedRollback,ops,&queryError))
             return SetFailure(errorOut,queryError);
         if(displacedCleanupPending.exists){
-            if(!VerifyExactFile(path,data,ops,&queryError) ||
+            if(!verifyPublished() ||
                !VerifyCaptured(displacedCleanupPending,ops,&queryError) ||
                !VerifyCaptured(preservedBackup,ops,&queryError) ||
                !VerifyCaptured(preservedRollback,ops,&queryError))
@@ -1475,13 +2224,12 @@ inline bool AtomicWriteText(const std::wstring& path,const std::string& data,std
                     "survivor verification failed before displaced cleanup: "+queryError);
             if(!DeleteArtifactChecked(displaced,"displaced artifact after first publish",ops,errorOut))
                 return false;
-            if(!VerifyExactFile(path,data,ops,&queryError) ||
+            if(!verifyPublished() ||
                !VerifyCaptured(preservedBackup,ops,&queryError) ||
                !VerifyCaptured(preservedRollback,ops,&queryError))
                 return SetFailure(errorOut,"survivor verification failed after displaced cleanup: "+queryError);
         }
-        if(errorOut) errorOut->clear();
-        return true;
+        return finishSuccess();
     }
 
     if(preserveExistingBackup){
@@ -1495,7 +2243,7 @@ inline bool AtomicWriteText(const std::wstring& path,const std::string& data,std
             return SetFailure(errorOut,Win32Failure("ReplaceFileW recovery publish failed",replaceError)+
                 "; "+recovery);
         }
-        if(!VerifyExactFile(path,data,ops,&queryError)) return SetFailure(errorOut,queryError);
+        if(!verifyPublished()) return SetFailure(errorOut,queryError);
         if(!VerifyCaptured(preservedBackup,ops,&queryError) ||
            !VerifyCaptured(preservedRollback,ops,&queryError))
             return SetFailure(errorOut,queryError);
@@ -1507,12 +2255,11 @@ inline bool AtomicWriteText(const std::wstring& path,const std::string& data,std
             return SetFailure(errorOut,"cannot verify displaced cleanup: "+queryError);
         if(displacedState!=PathState::Missing)
             return SetFailure(errorOut,"DeleteFileW reported success but displaced artifact remains");
-        if(!VerifyExactFile(path,data,ops,&queryError) ||
+        if(!verifyPublished() ||
            !VerifyCaptured(preservedBackup,ops,&queryError) ||
            !VerifyCaptured(preservedRollback,ops,&queryError))
             return SetFailure(errorOut,"survivor verification failed after displaced cleanup: "+queryError);
-        if(errorOut) errorOut->clear();
-        return true;
+        return finishSuccess();
     }
 
     if(!StagePriorBackup(backup,previousBackup,oldBackup,ops,&queryError))
@@ -1526,26 +2273,36 @@ inline bool AtomicWriteText(const std::wstring& path,const std::string& data,std
         return SetFailure(errorOut,Win32Failure("ReplaceFileW layout publish failed",replaceError)+
             "; "+recovery);
     }
+    // Attempt to capture the exact durable primary before later promotion or
+    // cleanup.  A transient verification fault must not strand the prior
+    // primary in rollback, so finish the mandatory promotion and report the
+    // earlier fault afterward.  A later successful verification still gives
+    // the caller a revision it can adopt while retaining dirty retry state.
+    const bool initialPublishedVerificationFailed=!verifyPublished();
     if(!EnsurePromotionMarker(rollback,promotionMarker,priorPrimary,ops,errorOut)) return false;
     if(!ops.moveFile(rollback,backup,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))
         return SetFailure(errorOut,Win32Failure("MoveFileExW rollback-to-backup promotion failed",
             LastErrorOr(ERROR_ACCESS_DENIED)));
-    if(!VerifyExactFile(path,data,ops,&queryError)) return SetFailure(errorOut,queryError);
+    if(!verifyPublished()) return SetFailure(errorOut,queryError);
     if(!VerifyExactFile(backup,priorPrimary,ops,&queryError)) return SetFailure(errorOut,queryError);
     if(!DeleteArtifactChecked(promotionMarker,"rollback-promotion marker",ops,errorOut)) return false;
-    if(!VerifyExactFile(path,data,ops,&queryError) ||
+    if(!verifyPublished() ||
        !VerifyExactFile(backup,priorPrimary,ops,&queryError))
         return SetFailure(errorOut,"survivor verification failed after promotion staging cleanup: "+queryError);
     if(!CleanupStagedPriorBackup(previousBackup,oldBackup,ops,&queryError))
         return SetFailure(errorOut,queryError);
-    if(errorOut) errorOut->clear();
-    return true;
+    if(initialPublishedVerificationFailed)
+        return SetFailure(errorOut,
+            "initial published revision verification failed");
+    return finishSuccess();
 }
 
 inline bool AtomicWriteText(const std::wstring& path,const std::string& data,
-        std::string* errorOut=nullptr,bool preserveExistingBackup=false){
+        std::string* errorOut=nullptr,bool preserveExistingBackup=false,
+        LayoutRevision* publishedRevision=nullptr){
     LayoutFsOps ops;
-    return AtomicWriteText(path,data,errorOut,preserveExistingBackup,ops);
+    return AtomicWriteText(
+        path,data,errorOut,preserveExistingBackup,ops,publishedRevision);
 }
 
 inline LayoutLoadResult LoadLayoutWithBackupLocked(const std::wstring& path,UnixSeconds nowUtc,

@@ -39,10 +39,25 @@ struct FinalizationState {
     }
 };
 
+enum class AutoRuntimeStartResult {
+    Ready,
+    WaitingForRetry,
+    MonitorUnavailable,
+    LoadUnavailable,
+    InitializationUnavailable,
+    HeartbeatUnavailable
+};
+
 struct AutoLoadRetryState {
+    enum : unsigned { kMaxAlternateMonitorRetries=4 };
+
     bool loaded=false;
+    bool layoutPrepared=false;
+    bool initialized=false;
+    bool monitorStarted=false;
     bool heartbeatStarted=false;
     unsigned retryAttempt=0;
+    unsigned alternateMonitorRetries=0;
     unsigned initializationCount=0;
     uint64_t lastAttemptMs=0;
     uint64_t nextAttemptMs=0;
@@ -60,10 +75,49 @@ struct AutoLoadRetryState {
             ? (std::numeric_limits<uint64_t>::max)() : nowMs+delay;
     }
 
-    void succeeded(){
-        if(!loaded) ++initializationCount;
-        loaded=true;
+    bool monitorFailed(uint64_t nowMs){
+        loaded=false;
+        monitorStarted=false;
+        failed(nowMs);
+        if(alternateMonitorRetries>=kMaxAlternateMonitorRetries) return false;
+        ++alternateMonitorRetries;
+        return true;
+    }
+
+    void monitorSucceeded(){
+        monitorStarted=true;
+        alternateMonitorRetries=0;
+    }
+
+    void layoutSucceeded(){
+        layoutPrepared=true;
+        clearBackoff();
+    }
+
+    void initializationSucceeded(){
+        if(!initialized){
+            initialized=true;
+            if(initializationCount!=(std::numeric_limits<unsigned>::max)())
+                ++initializationCount;
+        }
+        loaded=layoutPrepared && initialized && monitorStarted &&
+            heartbeatStarted;
+        if(loaded) clearBackoff();
+    }
+
+    void heartbeatFailed(uint64_t nowMs){
+        loaded=false;
+        heartbeatStarted=false;
+        failed(nowMs);
+    }
+
+    void heartbeatSucceeded(){
         heartbeatStarted=true;
+        loaded=layoutPrepared && initialized && monitorStarted;
+        if(loaded) clearBackoff();
+    }
+
+    void clearBackoff(){
         retryAttempt=0;
         lastAttemptMs=0;
         nextAttemptMs=0;
@@ -71,12 +125,67 @@ struct AutoLoadRetryState {
 
     void reset(){
         loaded=false;
+        layoutPrepared=false;
+        initialized=false;
+        monitorStarted=false;
         heartbeatStarted=false;
         retryAttempt=0;
+        alternateMonitorRetries=0;
         lastAttemptMs=0;
         nextAttemptMs=0;
     }
 };
+
+template<class ArmMonitor,class LoadLayout,class Initialize,
+         class ArmHeartbeat,class PostMonitorRetry>
+inline AutoRuntimeStartResult AdvanceAutoRuntimeStart(
+        AutoLoadRetryState& state,uint64_t nowMs,ArmMonitor armMonitor,
+        LoadLayout loadLayout,Initialize initialize,
+        ArmHeartbeat armHeartbeat,PostMonitorRetry postMonitorRetry) noexcept {
+    if(state.loaded) return AutoRuntimeStartResult::Ready;
+    if(!state.monitorStarted){
+        bool started=false;
+        try { started=armMonitor(); } catch(...) { started=false; }
+        if(!started){
+            const bool post=state.monitorFailed(nowMs);
+            if(post){
+                try { (void)postMonitorRetry(); } catch(...) {}
+            }
+            return AutoRuntimeStartResult::MonitorUnavailable;
+        }
+        state.monitorSucceeded();
+    }
+    if(!state.due(nowMs)) return AutoRuntimeStartResult::WaitingForRetry;
+    if(!state.layoutPrepared){
+        bool prepared=false;
+        try { prepared=loadLayout(); } catch(...) { prepared=false; }
+        if(!prepared){
+            state.failed(nowMs);
+            return AutoRuntimeStartResult::LoadUnavailable;
+        }
+        state.layoutSucceeded();
+    }
+    if(!state.heartbeatStarted){
+        bool started=false;
+        try { started=armHeartbeat(); } catch(...) { started=false; }
+        if(!started){
+            state.heartbeatFailed(nowMs);
+            return AutoRuntimeStartResult::HeartbeatUnavailable;
+        }
+        state.heartbeatSucceeded();
+    }
+    if(!state.initialized){
+        bool initialized=false;
+        try { initialized=initialize(); } catch(...) { initialized=false; }
+        if(!initialized){
+            state.failed(nowMs);
+            return AutoRuntimeStartResult::InitializationUnavailable;
+        }
+        state.initializationSucceeded();
+    }
+    return state.loaded ? AutoRuntimeStartResult::Ready
+                        : AutoRuntimeStartResult::WaitingForRetry;
+}
 
 class OperationAppProfiles {
 public:
@@ -95,6 +204,46 @@ public:
 private:
     std::vector<AppProfile> profiles_;
 };
+
+struct SettingsRuntimeSnapshot {
+    unsigned hotkeyVk=0;
+    unsigned hotkeyMods=0;
+    bool autoFix=false;
+    bool runAtLogon=false;
+    bool firefox=true;
+    bool chrome=true;
+    bool edge=true;
+};
+
+inline bool SettingsProfilesChanged(
+        const SettingsRuntimeSnapshot& current,
+        const SettingsRuntimeSnapshot& requested) noexcept {
+    return current.firefox!=requested.firefox ||
+        current.chrome!=requested.chrome || current.edge!=requested.edge;
+}
+
+template<class Checkpoint,class CancelAutoRuntime>
+inline bool ApplySettingsRuntimeTransaction(
+        SettingsRuntimeSnapshot& current,
+        const SettingsRuntimeSnapshot& requested,
+        Checkpoint checkpoint,CancelAutoRuntime cancelAutoRuntime) noexcept {
+    const bool profilesChanged=SettingsProfilesChanged(current,requested);
+    const bool autoChanged=current.autoFix!=requested.autoFix || profilesChanged;
+    const bool mustCheckpoint=current.autoFix &&
+        (!requested.autoFix || profilesChanged);
+    if(mustCheckpoint){
+        bool saved=false;
+        try { saved=checkpoint(); } catch(...) { saved=false; }
+        if(!saved) return false;
+    }
+    if(autoChanged){
+        bool cancelled=false;
+        try { cancelled=cancelAutoRuntime(); } catch(...) { cancelled=false; }
+        if(!cancelled) return false;
+    }
+    current=requested;
+    return true;
+}
 
 enum class CheckpointReason {
     Heartbeat, SettingsChange, QueryEndSession, Finalize
@@ -1044,6 +1193,35 @@ inline bool RunFailureAtomicMoveSetup(Setup setup,Rollback rollback){
     return false;
 }
 
+template<class StageSuccessor,class PublishGuard,class CancelDisplaced,
+         class RollbackSuccessor>
+inline bool RunSuccessorFirstReservationHandoff(
+        StageSuccessor stageSuccessor,PublishGuard publishGuard,
+        CancelDisplaced cancelDisplaced,
+        RollbackSuccessor rollbackSuccessor) noexcept {
+    static_assert(noexcept(publishGuard()),
+        "reservation handoff guard publication must be no-throw");
+    bool staged=false;
+    try { staged=stageSuccessor(); }
+    catch(...) { staged=false; }
+    if(!staged){
+        try { rollbackSuccessor(); }
+        catch(...) {}
+        return false;
+    }
+
+    // This is the point of no return: all successor owner/runtime/queue state
+    // is already visible, so the inherited guard can be swapped without a
+    // reservation-free interval.  Cancellation is intentionally last.
+    publishGuard();
+    try { cancelDisplaced(); }
+    catch(...) {
+        // The successor remains committed and keeps the stable origin guard.
+        // Production cancellation retains retry state for the displaced job.
+    }
+    return true;
+}
+
 inline bool BindReservationToProvisionalOrigin(
         const LayoutWin& origin,std::string& reservationRecordId) noexcept {
     try {
@@ -1257,6 +1435,38 @@ inline ReconcilePlan PlanAppReconcile(
     }
 
     if(freshness==ReconcileFreshness::Fresh){
+        std::vector<size_t> unmatchedProvisionals;
+        std::vector<size_t> unmatchedLive;
+        for(size_t i=0;i<existing.size();++i)
+            if(existing[i].app==app && existing[i].provisional &&
+               !IsExpired(existing[i],nowUtc) && !isReserved(i) &&
+               !matchedSaved[i])
+                unmatchedProvisionals.push_back(i);
+        for(size_t i=0;i<live.size();++i)
+            if(live[i].app==app && !matchedLive[i])
+                unmatchedLive.push_back(i);
+        if(!unmatchedProvisionals.empty() && !unmatchedLive.empty()){
+            if(unmatchedProvisionals.size()!=1 || unmatchedLive.size()!=1)
+                return deferredPlan();
+            LayoutMatch adopted;
+            adopted.savedIndex=unmatchedProvisionals[0];
+            adopted.liveIndex=unmatchedLive[0];
+            adopted.score=1.0;
+            plan.matches.push_back(adopted);
+            matchedSaved[adopted.savedIndex]=true;
+            matchedLive[adopted.liveIndex]=true;
+            if(!GuidEq(existing[adopted.savedIndex].desktop,
+                       live[adopted.liveIndex].desktop)){
+                RestoreRequest restore;
+                restore.savedIndex=adopted.savedIndex;
+                restore.liveIndex=adopted.liveIndex;
+                restore.destination=existing[adopted.savedIndex].desktop;
+                plan.restores.push_back(restore);
+            }
+        }
+    }
+
+    if(freshness==ReconcileFreshness::Fresh){
         size_t newRecordCount=0;
         for(size_t i=0;i<live.size();++i)
             if(live[i].app==app && !matchedLive[i]) ++newRecordCount;
@@ -1405,6 +1615,7 @@ inline std::vector<LayoutWin> CommitAppReconcile(
             record.activeDomain=live[match.liveIndex].activeDomain;
             record.tabCount=live[match.liveIndex].tabCount;
             record.counts=live[match.liveIndex].counts;
+            record.provisional=false;
         }
         record.recordId=recordId;
         MarkSeen(record,nowUtc);
@@ -1436,7 +1647,6 @@ struct FinalWindowObservation {
     std::string provisionalRecordId;
     bool desktopValid=false;
     bool fingerprintFresh=false;
-    bool allowTitleFallback=false;
     bool reserved=false;
     LayoutWin provisionalOriginRecord;
     bool hasProvisionalOriginRecord=false;
@@ -1447,6 +1657,26 @@ struct FinalAppObservation {
     FinalProfileQuality quality=FinalProfileQuality::Incomplete;
     std::vector<FinalWindowObservation> windows;
 };
+
+template<class Build>
+inline bool StageFinalObservationsAndProvisionals(
+        const std::map<std::string,std::string>& currentProvisionals,
+        std::vector<FinalAppObservation>& observationsOut,
+        std::map<std::string,std::string>& provisionalsOut,
+        Build&& build) noexcept {
+    if(currentProvisionals.size()>MAX_LAYOUT_RECORDS) return false;
+    try {
+        std::map<std::string,std::string> stagedProvisionals=
+            currentProvisionals;
+        std::vector<FinalAppObservation> stagedObservations;
+        if(!build(stagedProvisionals,stagedObservations) ||
+           stagedObservations.size()>3 ||
+           stagedProvisionals.size()>MAX_LAYOUT_RECORDS) return false;
+        observationsOut.swap(stagedObservations);
+        provisionalsOut.swap(stagedProvisionals);
+        return true;
+    } catch(...) { return false; }
+}
 
 struct FinalSnapshotResult {
     bool valid=false;
@@ -1463,7 +1693,8 @@ inline bool SameRecord(const LayoutWin& left,const LayoutWin& right){
         left.activeTitle==right.activeTitle &&
         left.activeDomain==right.activeDomain && left.tabCount==right.tabCount &&
         left.counts==right.counts && left.lastSeenUtc==right.lastSeenUtc &&
-        left.missingSinceUtc==right.missingSinceUtc;
+        left.missingSinceUtc==right.missingSinceUtc &&
+        left.provisional==right.provisional;
 }
 
 inline bool CanonicalId(const std::string& value,std::string& canonical){
@@ -1562,7 +1793,7 @@ inline FinalSnapshotResult CommitFinalSnapshotRecords(
                 chooseExisting(window.pendingRecordId,MatchKind::Pending);
             if(matchKind==MatchKind::None)
                 chooseExisting(window.provisionalRecordId,MatchKind::Provisional);
-            if(matchKind==MatchKind::None && window.allowTitleFallback &&
+            if(matchKind==MatchKind::None &&
                !window.observed.activeTitle.empty()){
                 std::string only;
                 size_t matches=0;
@@ -1587,6 +1818,7 @@ inline FinalSnapshotResult CommitFinalSnapshotRecords(
                 }
                 if(!window.hasProvisionalOriginRecord) continue;
                 LayoutWin provisional=window.provisionalOriginRecord;
+                provisional.provisional=true;
                 std::string canonical;
                 if(!final_snapshot_detail::ValidRecord(provisional,&canonical) ||
                    provisional.app!=appObservation.app) return result;
@@ -1626,6 +1858,7 @@ inline FinalSnapshotResult CommitFinalSnapshotRecords(
             if(!window.desktopValid || GuidIsZero(window.observed.desktop)) continue;
             LayoutWin added=window.observed;
             added.recordId=window.provisionalRecordId;
+            added.provisional=true;
             std::string canonical;
             if(!final_snapshot_detail::ValidRecord(added,&canonical) ||
                occupiedIds.count(canonical)) return result;
@@ -1955,6 +2188,33 @@ inline LcDecision LcObserve(LcState& state,
         return {LcAction::SaveLayout, state.saveGeneration};
     }
     return {};
+}
+
+template<class Observe>
+inline bool PrepareInitialLifecycleStates(
+        const std::vector<AppProfile>& profiles,
+        const std::map<std::string,AppFastSnapshot>& snapshots,
+        uint64_t nowMs,std::map<std::string,LcState>& statesOut,
+        std::map<std::string,uint64_t>& signaturesOut,
+        Observe observe) noexcept {
+    try {
+        std::map<std::string,LcState> states;
+        std::map<std::string,uint64_t> signatures;
+        for(const AppProfile& profile : profiles){
+            const auto found=snapshots.find(profile.id);
+            if(found==snapshots.end() ||
+               !FastSnapshotCanObserve(found->second) ||
+               found->second.windows.empty()) continue;
+            LcState state;
+            observe(profile.id,state,found->second,nowMs);
+            if(!state.initialized ||
+               !states.emplace(profile.id,std::move(state)).second ||
+               !signatures.emplace(profile.id,0).second) return false;
+        }
+        statesOut.swap(states);
+        signaturesOut.swap(signatures);
+        return true;
+    } catch(...) { return false; }
 }
 
 inline void LcRestoreCompleted(LcState& state,

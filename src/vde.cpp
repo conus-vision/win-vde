@@ -84,6 +84,7 @@ static const bool SWITCH_AFTER_MOVE = false;    // переключаться н
 #define TIMER_HEARTBEAT 4
 #define TIMER_AUTO_FLUSH 5
 #define WM_MOVE_CANCEL_RETRY (WM_APP + 14)
+#define WM_AUTO_TIMER_RETRY (WM_APP + 15)
 #define MONITOR_INTERVAL_MS 5000
 #define MOVE_VERIFY_INTERVAL_MS 150
 #define AUTO_FLUSH_INTERVAL_MS 500
@@ -174,6 +175,10 @@ struct AutoRestoreOperation {
 struct PickerMoveOperation {
     uint64_t operationId=0;
     std::set<uint64_t> liveJobIds;
+    std::string app;
+    uint64_t lifecycleSaveGeneration=0;
+    uint64_t lifecycleLayoutSignature=0;
+    uint64_t lifecycleSessionSignature=0;
     bool completionReported=false;
 };
 
@@ -253,9 +258,10 @@ static bool g_heartbeatTimerArmed=false;
 static bool g_moveCancellationPending=false;
 static unsigned g_moveCancellationPostRetries=0;
 static LayoutRevision g_autoRevision;
+static LayoutPublishCandidate g_pendingAutoPublishCandidate;
 static std::map<std::string,RecordDelta> g_dirtyRecordDeltas;
 static std::map<std::string,ValidatedRecordTouch> g_validatedTouches;
-static std::set<std::string> g_deferredConflictRecordIds;
+static std::map<std::string,DeferredRecordConflict> g_deferredRecordConflicts;
 static uint64_t g_nextSessionRequestId=0;
 static uint64_t g_nextOperationId=0;
 static uint64_t g_nextMoveJobId=0;
@@ -482,7 +488,9 @@ static BOOL CALLBACK EnumFastWindow(HWND hwnd,LPARAM parameter){
     try {
         if(!(GetWindowLongPtrW(hwnd,GWL_STYLE)&WS_VISIBLE)) return TRUE;
         wchar_t className[64]={0};
-        if(GetClassNameW(hwnd,className,64)<=0) return TRUE;
+        const int classLength=GetClassNameW(hwnd,className,64);
+        if(!AcceptFastClassNameRead(
+                classLength,*context.profiles,*context.snapshots)) return TRUE;
         bool trackedClass=false;
         for(const AppProfile& profile : *context.profiles)
             if(std::find(profile.classNames.begin(),profile.classNames.end(),className)!=
@@ -595,19 +603,24 @@ static bool CaptureGenericWindowIdentity(const WindowIdentityKey& expected,
     return true;
 }
 
-static bool IsTrackedBrowserWindow(const WindowIdentityKey& expected,
-                                   std::string* appOut){
-    ProcessSnapshot process;
-    if(!CaptureGenericWindowIdentity(expected,&process)) return false;
-    HWND hwnd=reinterpret_cast<HWND>(expected.hwnd);
-    wchar_t className[64]={0};
-    if(GetClassNameW(hwnd,className,64)<=0) return false;
-    std::vector<AppProfile> profiles=ActiveProfiles();
-    const AppProfile* profile=ClassifyBrowserCandidate(
-        className,process.image,profiles);
-    if(!profile) return false;
-    if(appOut) *appOut=profile->id;
-    return true;
+static PopupBrowserClassification ClassifyTrackedBrowserWindow(
+        const WindowIdentityKey& expected,std::string& appOut) noexcept {
+    try {
+        ProcessSnapshot process;
+        if(!CaptureGenericWindowIdentity(expected,&process) ||
+           process.image.empty()) return PopupBrowserClassification::Failed;
+        HWND hwnd=reinterpret_cast<HWND>(expected.hwnd);
+        wchar_t className[64]={0};
+        if(GetClassNameW(hwnd,className,64)<=0)
+            return PopupBrowserClassification::Failed;
+        std::vector<AppProfile> profiles=ActiveProfiles();
+        const AppProfile* profile=ClassifyBrowserCandidate(
+            className,process.image,profiles);
+        if(!profile) return PopupBrowserClassification::NotTracked;
+        std::string app=profile->id;
+        appOut.swap(app);
+        return PopupBrowserClassification::Tracked;
+    } catch(...) { return PopupBrowserClassification::Failed; }
 }
 // ============================ snapshot storage ================================
 static UnixSeconds UtcNowSeconds(){
@@ -689,7 +702,7 @@ static void MarkAutoDirty(bool schedule=true){
     if(schedule) ScheduleAutoFlush();
 }
 
-static void QueueRecordDelta(RecordDeltaKind kind,const LayoutWin* before,
+static bool QueueRecordDelta(RecordDeltaKind kind,const LayoutWin* before,
                              const LayoutWin& desired,bool erase,
                              UnixSeconds changedUtc,uint64_t causalGeneration);
 
@@ -724,16 +737,16 @@ static bool LoadAutoLayout(){
     }
     g_autoDesktops.swap(desktops);
     g_autoRecords.swap(records);
-    g_autoLoaded=true;
     g_autoWritesAllowed=loaded.writesAllowed;
-    g_autoRevision=loaded.revision;
+    SwapLayoutRevisionNoThrow(g_autoRevision,loaded.revision);
     g_preserveBackupOnNextWrite=loaded.status==LayoutLoadStatus::Recovered;
     g_autoDirty=loaded.status==LayoutLoadStatus::Recovered ||
                 loaded.status==LayoutLoadStatus::CorruptPreserved ||
                 ((loaded.status==LayoutLoadStatus::Valid) && loaded.sourceVersion<4);
     g_dirtyRecordDeltas.clear();
     g_validatedTouches.clear();
-    g_deferredConflictRecordIds.clear();
+    g_deferredRecordConflicts.clear();
+    ClearLayoutPublishCandidateNoThrow(g_pendingAutoPublishCandidate);
     g_dirtyFlush.clearDirty();
     if(g_autoDirty) g_dirtyFlush.markDirty(MonotonicNowMs());
     if(!expiredRecords.empty()){
@@ -767,7 +780,7 @@ static const LayoutWin* FindAutoRecord(const std::string& recordId){
     return nullptr;
 }
 
-static void QueueRecordDelta(RecordDeltaKind kind,const LayoutWin* before,
+static bool QueueRecordDelta(RecordDeltaKind kind,const LayoutWin* before,
                              const LayoutWin& desired,bool erase,
                              UnixSeconds changedUtc,uint64_t causalGeneration){
     RecordDelta next;
@@ -779,13 +792,27 @@ static void QueueRecordDelta(RecordDeltaKind kind,const LayoutWin* before,
     if(before) next.baseRecord=*before;
     next.changedUtc=changedUtc;
     next.causalGeneration=causalGeneration;
-    auto found=g_dirtyRecordDeltas.find(desired.recordId);
-    if(found==g_dirtyRecordDeltas.end()) g_dirtyRecordDeltas[desired.recordId]=next;
-    else found->second=ChainRecordDelta(found->second,next);
-    g_deferredConflictRecordIds.erase(desired.recordId);
-    g_dirtyFlush.setConflict(!g_deferredConflictRecordIds.empty(),
+    const bool causalAccepted=kind==RecordDeltaKind::ExplicitUpsert ||
+        kind==RecordDeltaKind::ValidatedRuntimeUpsert;
+    std::vector<LayoutWin> stagedRecords;
+    std::map<std::string,RecordDelta> stagedDeltas;
+    std::map<std::string,DeferredRecordConflict> stagedConflicts;
+    const RecordDeltaStageResult result=StageRecordDeltaMutation(
+        g_autoRecords,g_dirtyRecordDeltas,g_deferredRecordConflicts,next,
+        causalAccepted,stagedRecords,stagedDeltas,stagedConflicts);
+    if(result!=RecordDeltaStageResult::Accepted){
+        g_dirtyFlush.setConflict(!g_deferredRecordConflicts.empty(),
+                                 MonotonicNowMs());
+        if(result==RecordDeltaStageResult::DeferredConflict) MarkAutoDirty();
+        return false;
+    }
+    g_autoRecords.swap(stagedRecords);
+    g_dirtyRecordDeltas.swap(stagedDeltas);
+    g_deferredRecordConflicts.swap(stagedConflicts);
+    g_dirtyFlush.setConflict(!g_deferredRecordConflicts.empty(),
                              MonotonicNowMs());
     MarkAutoDirty();
+    return true;
 }
 
 static bool PersistAutoLayout(){
@@ -793,15 +820,31 @@ static bool PersistAutoLayout(){
     ScopedLayoutLock lock;
     if(!lock.acquired()){ g_autoDirty=true; return false; }
     const std::wstring path=LayoutPath(false);
-    LayoutRevision current=ReadLayoutRevisionLocked(path);
-    if(SameRevision(current,g_autoRevision) &&
-       !g_deferredConflictRecordIds.empty()){
+    LayoutRevisionReadResult currentRead=
+        ReadLayoutRevisionObservationLocked(path);
+    LayoutRevision& current=currentRead.revision;
+    const LayoutPublishCandidateObservation candidateObservation=
+        ObserveLayoutPublishCandidateNoThrow(
+            g_pendingAutoPublishCandidate,currentRead.status,current,
+            g_autoRevision);
+    if(currentRead.status==LayoutRevisionReadStatus::Unavailable ||
+       candidateObservation==
+           LayoutPublishCandidateObservation::RetainedUnavailable){
+        g_autoDirty=true;
+        return false;
+    }
+    const bool adoptedArmedCandidate=candidateObservation==
+        LayoutPublishCandidateObservation::Adopted;
+    const LayoutRevision& observedRevision=adoptedArmedCandidate
+        ? g_autoRevision : current;
+    if(DeferredRecordConflictsBlockPublish(
+            g_deferredRecordConflicts,observedRevision)){
         g_autoDirty=true;
         g_dirtyFlush.setConflict(true,MonotonicNowMs());
         return false;
     }
 
-    if(!SameRevision(current,g_autoRevision)){
+    if(!adoptedArmedCandidate && !SameRevision(current,g_autoRevision)){
         LayoutLoadResult latest=LoadLayoutWithBackupLocked(path,UtcNowSeconds());
         if(!latest.usable()){
             g_autoDirty=true;
@@ -810,36 +853,54 @@ static bool PersistAutoLayout(){
         g_preserveBackupOnNextWrite=PreserveExistingBackupForPublish(
             g_preserveBackupOnNextWrite,latest.status);
         const std::map<std::string,uint64_t> causal=CurrentCausalGenerations();
-        std::map<std::string,RecordDelta> validDeltas;
-        std::set<std::string> nextConflicts;
-        for(const auto& entry : g_dirtyRecordDeltas){
-            const RecordDelta& delta=entry.second;
-            if(delta.kind==RecordDeltaKind::ExplicitUpsert ||
-               delta.kind==RecordDeltaKind::ExpireDelete ||
-               delta.kind==RecordDeltaKind::MissingMark){
-                validDeltas.insert(entry);
-                continue;
-            }
-            auto generation=causal.find(entry.first);
-            if(generation!=causal.end() && generation->second==delta.causalGeneration)
-                validDeltas.insert(entry);
-            else
-                nextConflicts.insert(entry.first);
+        RecordDeltaRebasePreparation preparedDeltas;
+        if(!PrepareRecordDeltasForRebase(
+                latest.wins,g_dirtyRecordDeltas,causal,preparedDeltas)){
+            g_autoDirty=true;
+            return false;
         }
+        std::set<std::string> nextConflicts;
+        nextConflicts.swap(preparedDeltas.deferredRecordIds);
         RebaseResult rebased=RebaseRecordDeltas(
-            latest.wins,latest.revision,validDeltas,UtcNowSeconds());
+            latest.wins,latest.revision,preparedDeltas.deltas,UtcNowSeconds());
         nextConflicts.insert(
             rebased.deferredConflictRecordIds.begin(),
             rebased.deferredConflictRecordIds.end());
+        std::map<std::string,ValidatedRecordTouch> touchesForRebase;
+        if(!PrepareValidatedTouchesForRebase(
+                g_validatedTouches,rebased.appliedDeleteRecordIds,
+                touchesForRebase)){
+            g_autoDirty=true;
+            return false;
+        }
         TouchRebaseResult touched=ReapplyValidatedTouches(
-            rebased.records,g_validatedTouches,causal);
+            rebased.records,touchesForRebase,causal);
         nextConflicts.insert(
             touched.deferredRecordIds.begin(),touched.deferredRecordIds.end());
-        g_autoRecords.swap(touched.records);
-        g_autoDesktops.swap(latest.desks);
-        std::swap(g_autoRevision,latest.revision);
-        g_deferredConflictRecordIds.swap(nextConflicts);
-        if(!g_deferredConflictRecordIds.empty()){
+        RebasedResidualJournal residual;
+        if(!BuildRebasedResidualJournal(
+                g_dirtyRecordDeltas,g_validatedTouches,preparedDeltas,
+                rebased,touched,latest.wins,latest.revision,residual)){
+            g_autoDirty=true;
+            return false;
+        }
+        RebasedAutoLayoutPublication publication;
+        if(!BuildRebasedAutoLayoutPublication(
+                touched.records,latest.desks,latest.revision,nextConflicts,
+                residual.deltas,residual.touches,publication)){
+            g_autoDirty=true;
+            return false;
+        }
+        // All adopted-disk metadata is staged against the same B snapshot.
+        // Publication is a no-throw group of swaps; no failure can expose a
+        // new revision with conflict metadata copied from the old A state.
+        g_autoRecords.swap(publication.records);
+        g_autoDesktops.swap(publication.desktops);
+        SwapLayoutRevisionNoThrow(g_autoRevision,publication.revision);
+        g_dirtyRecordDeltas.swap(publication.deltas);
+        g_validatedTouches.swap(publication.touches);
+        g_deferredRecordConflicts.swap(publication.conflicts);
+        if(!g_deferredRecordConflicts.empty()){
             g_autoDirty=true;
             g_dirtyFlush.setConflict(true,MonotonicNowMs());
             return false;
@@ -860,30 +921,53 @@ static bool PersistAutoLayout(){
         ReportStorageError(L"Automatic layout validation failed; the previous copy was kept.");
         return false;
     }
-    if(!AtomicWriteText(path,text,&error,g_preserveBackupOnNextWrite)){
+    LayoutPublishCandidate candidate;
+    if(!BuildLayoutPublishCandidate(path,text,candidate)){
+        g_autoDirty=true;
+        ReportStorageError(L"Automatic layout publication could not be prepared in memory; the previous copy was kept.");
+        return false;
+    }
+    SwapLayoutPublishCandidateNoThrow(
+        g_pendingAutoPublishCandidate,candidate);
+    const CapturedLayoutPublishResult published=
+      PublishLayoutWithCapturedRevision(
+        [&](LayoutRevision& revision){
+            return AtomicWriteText(
+                path,text,&error,g_preserveBackupOnNextWrite,&revision);
+        },
+        [&](LayoutRevision& revision) noexcept {
+            // The primary already contains this exact candidate, but a later
+            // backup/cleanup step failed.  Adopt only its verified revision;
+            // retain records, deltas and dirty state so the next idempotent
+            // attempt settles storage without rebasing against our own write.
+            CommitPublishedLayoutRevisionNoThrow(g_autoRevision,revision);
+            ClearLayoutPublishCandidateNoThrow(
+                g_pendingAutoPublishCandidate);
+            g_autoDirty=true;
+        },
+        [&](LayoutRevision& revision) noexcept {
+            g_autoRecords.swap(checkedRecords);
+            g_autoDesktops.swap(desktops);
+            CommitPublishedLayoutRevisionNoThrow(g_autoRevision,revision);
+            g_preserveBackupOnNextWrite=false;
+            g_dirtyRecordDeltas.clear();
+            g_validatedTouches.clear();
+            g_deferredRecordConflicts.clear();
+            ClearLayoutPublishCandidateNoThrow(
+                g_pendingAutoPublishCandidate);
+            g_autoDirty=false;
+        });
+    if(published!=CapturedLayoutPublishResult::Succeeded){
         g_autoDirty=true;
         ReportStorageError(L"Could not save the automatic layout; the previous copy was kept.");
         return false;
     }
-    LayoutRevision published=ReadLayoutRevisionLocked(path);
-    if(!published.exists){
-        g_autoDirty=true;
-        return false;
-    }
-    g_autoRecords.swap(checkedRecords);
-    g_autoDesktops.swap(desktops);
-    g_autoRevision=published;
-    g_preserveBackupOnNextWrite=false;
-    g_dirtyRecordDeltas.clear();
-    g_validatedTouches.clear();
-    g_deferredConflictRecordIds.clear();
-    g_autoDirty=false;
     return true;
 }
 
 static bool FlushAutoLayout(bool force){
     const uint64_t now=MonotonicNowMs();
-    g_dirtyFlush.setConflict(!g_deferredConflictRecordIds.empty(),now);
+    g_dirtyFlush.setConflict(!g_deferredRecordConflicts.empty(),now);
     const DirtyFlushResult result=g_dirtyFlush.flush(
         now,force,[](){ return PersistAutoLayout(); });
     if(result==DirtyFlushResult::Succeeded ||
@@ -984,7 +1068,8 @@ static bool SameRecordSemantic(const LayoutWin& left,const LayoutWin& right){
         left.activeTitle==right.activeTitle &&
         left.activeDomain==right.activeDomain && left.tabCount==right.tabCount &&
         left.counts==right.counts &&
-        left.missingSinceUtc==right.missingSinceUtc;
+        left.missingSinceUtc==right.missingSinceUtc &&
+        left.provisional==right.provisional;
 }
 
 static void RememberValidatedTouch(const LayoutWin& record,
@@ -1004,15 +1089,18 @@ static bool UpsertAutoRecord(const LayoutWin& desired,RecordDeltaKind kind,
     for(LayoutWin& current : g_autoRecords){
         if(current.recordId!=desired.recordId) continue;
         const LayoutWin before=current;
-        current=desired;
-        RememberValidatedTouch(current,causalGeneration);
-        if(!SameRecordSemantic(before,current))
-            QueueRecordDelta(kind,&before,current,false,changedUtc,causalGeneration);
+        if(!SameRecordSemantic(before,desired)){
+            if(!QueueRecordDelta(kind,&before,desired,false,changedUtc,
+                                 causalGeneration)) return false;
+        } else {
+            current=desired;
+        }
+        RememberValidatedTouch(desired,causalGeneration);
         return true;
     }
     if(g_autoRecords.size()>=MAX_LAYOUT_RECORDS) return false;
-    QueueRecordDelta(kind,nullptr,desired,false,changedUtc,causalGeneration);
-    g_autoRecords.push_back(desired);
+    if(!QueueRecordDelta(kind,nullptr,desired,false,changedUtc,
+                         causalGeneration)) return false;
     RememberValidatedTouch(desired,causalGeneration);
     return true;
 }
@@ -1022,12 +1110,147 @@ static bool EraseAutoRecord(const LayoutWin& previous,RecordDeltaKind kind,
     for(size_t index=0;index<g_autoRecords.size();++index){
         if(g_autoRecords[index].recordId!=previous.recordId) continue;
         const LayoutWin before=g_autoRecords[index];
-        QueueRecordDelta(kind,&before,before,true,changedUtc,causalGeneration);
-        g_autoRecords.erase(g_autoRecords.begin()+static_cast<std::ptrdiff_t>(index));
+        if(!QueueRecordDelta(kind,&before,before,true,changedUtc,
+                             causalGeneration)) return false;
         g_validatedTouches.erase(previous.recordId);
         return true;
     }
     return false;
+}
+
+static bool PersistPickerMovedWindow(const MoveResult& result,
+                                     const MoveRuntimeBinding& runtime,
+                                     const std::string& app){
+    try {
+        const WindowIdentityKey identity=IdentityOf(runtime.window);
+        const std::string runtimeKey=RuntimeKey(identity);
+        auto reserved=g_reservedAutoIdentities.find(runtimeKey);
+        if(reserved==g_reservedAutoIdentities.end() ||
+           !SameMoveToken(reserved->second.token,result.token) ||
+           !SameIdentity(reserved->second.identity,identity) ||
+           app.empty() || GuidIsZero(runtime.destination)) return false;
+
+        const int deskIndex=GetDesktopIndexByGuid(runtime.destination);
+        if(deskIndex<0) return false;
+        const UnixSeconds nowUtc=UtcNowSeconds();
+        if(nowUtc<=0 || result.token.operationId==0) return false;
+
+        std::string recordId;
+        if(!SelectPopupPersistRecordId(
+                reserved->second.recordId,
+                [&](std::string& selected){
+                    return SelectPendingPopupRecordId(
+                        identity,app,g_pendingRecordByRuntime,
+                        [&](const std::string& candidate,
+                            const std::string& candidateApp,
+                            std::string& canonical){
+                            GUID parsed{};
+                            if(!ParseNonzeroLayoutGuid(
+                                    candidate,parsed,&canonical)) return false;
+                            for(const LayoutWin& saved : g_autoRecords){
+                                GUID savedGuid{};
+                                std::string savedCanonical;
+                                if(ParseNonzeroLayoutGuid(
+                                        saved.recordId,savedGuid,
+                                        &savedCanonical) &&
+                                   savedCanonical==canonical &&
+                                   saved.app==candidateApp) return true;
+                            }
+                            return false;
+                        },selected);
+                },
+                [&](std::string& selected){
+                    selected=NewRecordId();
+                    return !selected.empty();
+                },recordId)) return false;
+        GUID parsedId{};
+        std::string canonicalId;
+        if(!ParseNonzeroLayoutGuid(recordId,parsedId,&canonicalId)) return false;
+        recordId.swap(canonicalId);
+
+        const LayoutWin* before=nullptr;
+        for(const LayoutWin& current : g_autoRecords)
+            if(current.recordId==recordId){ before=&current; break; }
+        if(before && before->app!=app) return false;
+
+        LayoutWin desired;
+        if(before) desired=*before;
+        else if(reserved->second.hasProvisionalOriginRecord &&
+                reserved->second.provisionalOriginRecord.recordId==recordId &&
+                reserved->second.provisionalOriginRecord.app==app)
+            desired=reserved->second.provisionalOriginRecord;
+        else {
+            desired.recordId=recordId;
+            desired.app=app;
+            desired.activeTitle=W2U8(runtime.window.title);
+            desired.provisional=true;
+        }
+        desired.recordId=recordId;
+        desired.app=app;
+        desired.desktop=runtime.destination;
+        desired.deskIndex=deskIndex;
+        if(!before) desired.provisional=true;
+        MarkSeen(desired,nowUtc);
+
+        RecordDelta delta;
+        delta.kind=RecordDeltaKind::ExplicitUpsert;
+        delta.record=desired;
+        delta.baseRevision=g_autoRevision;
+        delta.baseRecordPresent=before!=nullptr;
+        if(before) delta.baseRecord=*before;
+        delta.changedUtc=nowUtc;
+        delta.causalGeneration=result.token.operationId;
+        std::vector<LayoutWin> stagedRecords;
+        std::map<std::string,RecordDelta> stagedDeltas;
+        std::map<std::string,DeferredRecordConflict> stagedConflicts;
+        if(StageRecordDeltaMutation(
+                g_autoRecords,g_dirtyRecordDeltas,g_deferredRecordConflicts,
+                delta,true,stagedRecords,stagedDeltas,stagedConflicts)!=
+           RecordDeltaStageResult::Accepted) return false;
+
+        std::map<std::string,ValidatedRecordTouch> stagedTouches=
+            g_validatedTouches;
+        ValidatedRecordTouch touch;
+        touch.recordId=recordId;
+        touch.lastSeenUtc=desired.lastSeenUtc;
+        touch.causalGeneration=result.token.operationId;
+        auto previousTouch=stagedTouches.find(recordId);
+        if(previousTouch==stagedTouches.end() ||
+           previousTouch->second.lastSeenUtc<touch.lastSeenUtc)
+            stagedTouches[recordId]=touch;
+
+        std::map<std::string,RuntimeRecordBinding> stagedBindings=
+            g_recordByRuntime;
+        RuntimeRecordBinding binding;
+        binding.app=app;
+        binding.recordId=recordId;
+        binding.identity=identity;
+        binding.causalGeneration=result.token.operationId;
+        stagedBindings[runtimeKey]=binding;
+        std::map<std::string,std::string> stagedPending=
+            g_pendingRecordByRuntime;
+        std::map<std::string,std::string> stagedProvisional=
+            g_provisionalRecordByRuntime;
+        stagedPending.erase(runtimeKey);
+        stagedProvisional.erase(runtimeKey);
+
+        // Staging may allocate.  Recheck the full HWND/PID/process-start
+        // identity at the no-throw publication boundary so a reused HWND can
+        // never inherit the browser record prepared for its predecessor.
+        if(RecaptureGenericWindowIdentity(identity)!=
+           WindowIdentityRecapture::Match) return false;
+        g_autoRecords.swap(stagedRecords);
+        g_dirtyRecordDeltas.swap(stagedDeltas);
+        g_deferredRecordConflicts.swap(stagedConflicts);
+        g_validatedTouches.swap(stagedTouches);
+        g_recordByRuntime.swap(stagedBindings);
+        g_pendingRecordByRuntime.swap(stagedPending);
+        g_provisionalRecordByRuntime.swap(stagedProvisional);
+        g_dirtyFlush.setConflict(!g_deferredRecordConflicts.empty(),
+                                 MonotonicNowMs());
+        MarkAutoDirty(false);
+        return FlushAutoLayout(true);
+    } catch(...) { return false; }
 }
 
 static void MarkAppMissingFromLastSeen(const std::string& app,UnixSeconds nowUtc,
@@ -1044,7 +1267,6 @@ static void MarkAppMissingFromLastSeen(const std::string& app,UnixSeconds nowUtc
         } else if(!SameRecordSemantic(before,after)){
             QueueRecordDelta(RecordDeltaKind::MissingMark,&before,after,false,
                              nowUtc,causalGeneration);
-            g_autoRecords[index-1]=after;
         }
     }
 }
@@ -1130,9 +1352,9 @@ static std::set<std::string> UpdateBoundRecords(
             desired.counts=live[index].counts;
         }
         MarkSeen(desired,nowUtc);
+        if(!UpsertAutoRecord(desired,RecordDeltaKind::ValidatedRuntimeUpsert,
+                             nowUtc,snapshot.generation)) continue;
         binding->second.causalGeneration=snapshot.generation;
-        UpsertAutoRecord(desired,RecordDeltaKind::ValidatedRuntimeUpsert,
-                         nowUtc,snapshot.generation);
         reserved.insert(desired.recordId);
         g_pendingRecordByRuntime.erase(runtime);
     }
@@ -1184,11 +1406,41 @@ static bool SaveObservedApp(const std::string& app,
 
     bool semanticChanged=false;
     try {
+        std::vector<LayoutWin> nextRecords=g_autoRecords;
         std::map<std::string,RecordDelta> nextDeltas=g_dirtyRecordDeltas;
         std::map<std::string,ValidatedRecordTouch> nextTouches=
             g_validatedTouches;
-        std::set<std::string> nextConflicts=g_deferredConflictRecordIds;
+        std::map<std::string,DeferredRecordConflict> nextConflicts=
+            g_deferredRecordConflicts;
         for(const BoundSaveUpdate& update : saved.updates){
+            if(update.semanticChanged){
+                RecordDelta next;
+                next.kind=RecordDeltaKind::ValidatedRuntimeUpsert;
+                next.record=update.after;
+                next.baseRevision=g_autoRevision;
+                next.baseRecordPresent=true;
+                next.baseRecord=update.before;
+                next.changedUtc=nowUtc;
+                next.causalGeneration=update.causalGeneration;
+                std::vector<LayoutWin> stagedRecords;
+                std::map<std::string,RecordDelta> stagedDeltas;
+                std::map<std::string,DeferredRecordConflict> stagedConflicts;
+                if(StageRecordDeltaMutation(
+                        nextRecords,nextDeltas,nextConflicts,next,true,
+                        stagedRecords,stagedDeltas,stagedConflicts)!=
+                   RecordDeltaStageResult::Accepted)
+                    return false;
+                nextRecords.swap(stagedRecords);
+                nextDeltas.swap(stagedDeltas);
+                nextConflicts.swap(stagedConflicts);
+                semanticChanged=true;
+            } else {
+                for(LayoutWin& record : nextRecords)
+                    if(record.recordId==update.after.recordId){
+                        record=update.after;
+                        break;
+                    }
+            }
             ValidatedRecordTouch touch;
             touch.recordId=update.after.recordId;
             touch.lastSeenUtc=update.after.lastSeenUtc;
@@ -1197,27 +1449,12 @@ static bool SaveObservedApp(const std::string& app,
             if(priorTouch==nextTouches.end() ||
                priorTouch->second.lastSeenUtc<touch.lastSeenUtc)
                 nextTouches[touch.recordId]=touch;
-            if(!update.semanticChanged) continue;
-            semanticChanged=true;
-            RecordDelta next;
-            next.kind=RecordDeltaKind::ValidatedRuntimeUpsert;
-            next.record=update.after;
-            next.baseRevision=g_autoRevision;
-            next.baseRecordPresent=true;
-            next.baseRecord=update.before;
-            next.changedUtc=nowUtc;
-            next.causalGeneration=update.causalGeneration;
-            auto prior=nextDeltas.find(update.after.recordId);
-            if(prior==nextDeltas.end())
-                nextDeltas[update.after.recordId]=next;
-            else prior->second=ChainRecordDelta(prior->second,next);
-            nextConflicts.erase(update.after.recordId);
         }
-        g_autoRecords.swap(saved.records);
+        g_autoRecords.swap(nextRecords);
         g_autoDesktops.swap(desktops);
         g_dirtyRecordDeltas.swap(nextDeltas);
         g_validatedTouches.swap(nextTouches);
-        g_deferredConflictRecordIds.swap(nextConflicts);
+        g_deferredRecordConflicts.swap(nextConflicts);
     } catch(...) { return false; }
 
     for(const BoundSaveObservation& observed : observations){
@@ -1230,7 +1467,7 @@ static bool SaveObservedApp(const std::string& app,
         }
     }
     needsReconcile=saved.needsReconcile;
-    g_dirtyFlush.setConflict(!g_deferredConflictRecordIds.empty(),
+    g_dirtyFlush.setConflict(!g_deferredRecordConflicts.empty(),
                              MonotonicNowMs());
     if(semanticChanged) MarkAutoDirty();
     return true;
@@ -1997,11 +2234,64 @@ static void DispatchMoveOwnerResult(const MoveResult& result,bool hadRuntime,
         auto operation=g_pickerOperations.find(result.token.operationId);
         if(operation==g_pickerOperations.end() ||
            operation->second.liveJobIds.erase(result.token.jobId)==0) return;
+        PopupPersistenceResult persistence=PopupPersistenceResult::NotTracked;
+        std::string persistedApp;
+        if(result.terminal==MoveTerminal::Succeeded){
+            if(!hadRuntime){
+                persistence=PopupPersistenceResult::IdentityIndeterminate;
+            } else {
+                const WindowIdentityKey expected=IdentityOf(runtime.window);
+                persistence=CompletePopupMovePersistence(
+                    expected,
+                    [](const WindowIdentityKey& identity){
+                        return RecaptureGenericWindowIdentity(identity);
+                    },
+                    [&](const WindowIdentityKey& identity){
+                        return ClassifyTrackedBrowserWindow(identity,persistedApp);
+                    },
+                    [](){
+                        if(!g_autoLoaded)
+                            return PopupPersistenceReadiness::Unavailable;
+                        if(!g_autoWritesAllowed || !g_autoFix || g_degraded)
+                            return PopupPersistenceReadiness::ReadOnly;
+                        return PopupPersistenceReadiness::Ready;
+                    },
+                    [&](){
+                        return PersistPickerMovedWindow(
+                            result,runtime,persistedApp);
+                    });
+            }
+        }
+        if(persistence==PopupPersistenceResult::Saved &&
+           operation->second.app==persistedApp){
+            CompletePopupLifecycleAfterPersistence(persistence,[&]{
+                auto lifecycle=g_lifecycleByApp.find(operation->second.app);
+                if(lifecycle!=g_lifecycleByApp.end())
+                    LcExplicitSaveCompleted(
+                        lifecycle->second,
+                        operation->second.lifecycleSaveGeneration,
+                        operation->second.lifecycleLayoutSignature,
+                        operation->second.lifecycleSessionSignature,
+                        MonotonicNowMs());
+            });
+        }
         if(operation->second.liveJobIds.empty()){
-            const bool report=!operation->second.completionReported &&
-                result.terminal!=MoveTerminal::Succeeded;
+            const bool mayReport=!operation->second.completionReported;
             g_pickerOperations.erase(operation);
-            if(report) Balloon(L"The window could not be moved to that desktop.");
+            if(!mayReport) return;
+            if(result.terminal!=MoveTerminal::Succeeded)
+                Balloon(L"The window could not be moved to that desktop.");
+            else if(persistence==PopupPersistenceResult::IdentityLost ||
+                    persistence==PopupPersistenceResult::IdentityIndeterminate)
+                Balloon(L"The window moved, but its identity changed before the browser layout could be saved.");
+            else if(persistence==PopupPersistenceResult::ClassificationFailed)
+                Balloon(L"The window moved, but browser classification failed and its layout was not saved.");
+            else if(persistence==PopupPersistenceResult::StorageUnavailable)
+                Balloon(L"The window moved, but automatic layout storage is unavailable and the destination was not saved.");
+            else if(persistence==PopupPersistenceResult::StorageReadOnly)
+                Balloon(L"The window moved, but automatic layout storage is read-only or disabled and the destination was not saved.");
+            else if(persistence==PopupPersistenceResult::SaveFailed)
+                Balloon(L"The window moved, but its browser destination could not be saved; the change remains pending for retry.");
         }
     }
 }
@@ -2303,12 +2593,15 @@ static void HandleReconcileResult(std::unique_ptr<ReconcileResult> result){
        operation->second.reconcileMode!=result->workMode) return;
     operation->second.reconcilePending=false;
     g_reconcileDeadlines.complete(operationId);
-    if(result->status!=ReconcileResultStatus::Completed ||
-       result->app!=operation->second.app ||
-       result->identityGeneration!=operation->second.identityGeneration ||
-       result->contentGeneration!=operation->second.contentGeneration ||
-       result->sessionRequestId!=operation->second.sessionRequestId ||
-       result->sessionDataGeneration!=operation->second.sessionDataGeneration){
+    ReconcileResultConsumerKey expected;
+    expected.operationId=operationId;
+    expected.app=operation->second.app;
+    expected.workMode=operation->second.reconcileMode;
+    expected.identityGeneration=operation->second.identityGeneration;
+    expected.contentGeneration=operation->second.contentGeneration;
+    expected.sessionRequestId=operation->second.sessionRequestId;
+    expected.sessionDataGeneration=operation->second.sessionDataGeneration;
+    if(!ReconcileResultIsCurrent(*result,expected)){
         CancelAutoOperation(operationId,true);
         return;
     }
@@ -2417,7 +2710,8 @@ static void HandleReconcileResult(std::unique_ptr<ReconcileResult> result){
 
 static std::vector<FinalAppObservation> BuildFinalObservations(
         const std::map<std::string,AppFastSnapshot>& snapshots,
-        UnixSeconds nowUtc){
+        UnixSeconds nowUtc,
+        std::map<std::string,std::string>& provisionalRecordByRuntime){
     std::vector<FinalAppObservation> observations;
     const std::vector<AppProfile> allProfiles=BuiltinProfiles(true,true,true);
     observations.reserve(allProfiles.size());
@@ -2454,17 +2748,15 @@ static std::vector<FinalAppObservation> BuildFinalObservations(
             auto pending=g_pendingRecordByRuntime.find(runtime);
             if(pending!=g_pendingRecordByRuntime.end())
                 window.pendingRecordId=pending->second;
-            auto provisional=g_provisionalRecordByRuntime.find(runtime);
-            if(provisional==g_provisionalRecordByRuntime.end()){
+            auto provisional=provisionalRecordByRuntime.find(runtime);
+            if(provisional==provisionalRecordByRuntime.end()){
                 std::string id=NewRecordId();
                 GUID parsed{};
                 if(ParseNonzeroLayoutGuid(id,parsed)){
-                    g_provisionalRecordByRuntime[runtime]=id;
+                    provisionalRecordByRuntime[runtime]=id;
                     window.provisionalRecordId=id;
                 }
             } else window.provisionalRecordId=provisional->second;
-            window.allowTitleFallback=window.pendingRecordId.empty() &&
-                window.boundRecordId.empty();
             auto reservation=g_reservedAutoIdentities.find(runtime);
             if(reservation!=g_reservedAutoIdentities.end() &&
                SameIdentity(reservation->second.identity,IdentityOf(fast))){
@@ -2488,60 +2780,78 @@ static bool CommitFinalSnapshots(
         const std::map<std::string,AppFastSnapshot>& snapshots){
     const UnixSeconds nowUtc=UtcNowSeconds();
     const uint64_t checkpointGeneration=TakeNonzeroId(g_nextOperationId);
-    PruneStaleRuntimeState(snapshots);
     std::vector<FinalAppObservation> observations;
-    try { observations=BuildFinalObservations(snapshots,nowUtc); }
-    catch(...) { return false; }
-    FinalSnapshotResult finalResult=
-        CommitFinalSnapshotRecords(g_autoRecords,observations,nowUtc);
+    std::map<std::string,std::string> stagedProvisional;
+    if(!StageFinalObservationsAndProvisionals(
+            g_provisionalRecordByRuntime,observations,stagedProvisional,
+            [&](std::map<std::string,std::string>& provisionals,
+                std::vector<FinalAppObservation>& stagedObservations){
+                stagedObservations=BuildFinalObservations(
+                    snapshots,nowUtc,provisionals);
+                return true;
+            })) return false;
+    FinalSnapshotResult finalResult;
+    try {
+        finalResult=CommitFinalSnapshotRecords(
+            g_autoRecords,observations,nowUtc);
+    } catch(...) { return false; }
     if(!finalResult.valid) return false;
 
-    const std::vector<LayoutWin> beforeRecords=g_autoRecords;
-    std::map<std::string,LayoutWin> beforeById,afterById;
-    for(const LayoutWin& record : beforeRecords) beforeById[record.recordId]=record;
-    for(const LayoutWin& record : finalResult.records) afterById[record.recordId]=record;
-    for(const auto& entry : beforeById){
-        if(afterById.count(entry.first)!=0) continue;
-        QueueRecordDelta(RecordDeltaKind::ExpireDelete,&entry.second,
-                         entry.second,true,nowUtc,checkpointGeneration);
-    }
-    for(const auto& entry : afterById){
-        auto before=beforeById.find(entry.first);
-        if(before==beforeById.end()){
-            QueueRecordDelta(RecordDeltaKind::ExplicitUpsert,nullptr,
-                             entry.second,false,nowUtc,checkpointGeneration);
-        } else if(!SameRecordSemantic(before->second,entry.second)){
-            const RecordDeltaKind kind=
-                before->second.missingSinceUtc==0 &&
-                entry.second.missingSinceUtc!=0
-                    ? RecordDeltaKind::MissingMark
-                    : RecordDeltaKind::ExplicitUpsert;
-            QueueRecordDelta(kind,&before->second,entry.second,false,nowUtc,
-                             checkpointGeneration);
+    FinalCheckpointMutationState staged;
+    std::map<std::string,RuntimeRecordBinding> stagedBindings;
+    try {
+        std::vector<ValidatedRecordTouch> touches;
+        touches.reserve(g_recordByRuntime.size());
+        for(const auto& entry : g_recordByRuntime){
+            auto record=std::find_if(finalResult.records.begin(),
+                finalResult.records.end(),[&](const LayoutWin& candidate){
+                    return candidate.recordId==entry.second.recordId;
+                });
+            if(record==finalResult.records.end()) continue;
+            ValidatedRecordTouch touch;
+            touch.recordId=record->recordId;
+            touch.lastSeenUtc=record->lastSeenUtc;
+            touch.causalGeneration=entry.second.causalGeneration;
+            if(touch.causalGeneration!=0) touches.push_back(std::move(touch));
         }
-    }
-    g_autoRecords=finalResult.records;
-    for(const auto& entry : g_recordByRuntime){
-        const LayoutWin* record=FindAutoRecord(entry.second.recordId);
-        if(record) RememberValidatedTouch(*record,entry.second.causalGeneration);
-    }
-    for(const auto& provisional : g_provisionalRecordByRuntime){
-        const LayoutWin* record=FindAutoRecord(provisional.second);
-        if(!record) continue;
-        auto observationsByApp=snapshots.find(record->app);
-        if(observationsByApp==snapshots.end()) continue;
-        for(const FastWin& fast : observationsByApp->second.windows)
-            if(RuntimeKey(fast)==provisional.first){
-                RuntimeRecordBinding binding;
-                binding.app=record->app;
-                binding.recordId=record->recordId;
-                binding.identity=IdentityOf(fast);
-                binding.causalGeneration=observationsByApp->second.generation;
-                g_recordByRuntime[provisional.first]=binding;
-                break;
-            }
-    }
+        if(!BuildFinalCheckpointMutation(
+                g_autoRecords,finalResult.records,g_dirtyRecordDeltas,
+                g_validatedTouches,g_deferredRecordConflicts,touches,
+                stagedProvisional,g_autoRevision,nowUtc,
+                checkpointGeneration,staged))
+            return false;
+
+        stagedBindings=g_recordByRuntime;
+        for(const auto& provisional : staged.provisionalRecordByRuntime){
+            auto record=std::find_if(staged.records.begin(),staged.records.end(),
+                [&](const LayoutWin& candidate){
+                    return candidate.recordId==provisional.second;
+                });
+            if(record==staged.records.end()) continue;
+            auto observationsByApp=snapshots.find(record->app);
+            if(observationsByApp==snapshots.end()) continue;
+            for(const FastWin& fast : observationsByApp->second.windows)
+                if(RuntimeKey(fast)==provisional.first){
+                    RuntimeRecordBinding binding;
+                    binding.app=record->app;
+                    binding.recordId=record->recordId;
+                    binding.identity=IdentityOf(fast);
+                    binding.causalGeneration=observationsByApp->second.generation;
+                    stagedBindings[provisional.first]=std::move(binding);
+                    break;
+                }
+        }
+    } catch(...) { return false; }
+
+    g_autoRecords.swap(staged.records);
+    g_dirtyRecordDeltas.swap(staged.deltas);
+    g_validatedTouches.swap(staged.touches);
+    g_deferredRecordConflicts.swap(staged.conflicts);
+    g_recordByRuntime.swap(stagedBindings);
+    g_provisionalRecordByRuntime.swap(
+        staged.provisionalRecordByRuntime);
     MarkAutoDirty(false);
+    PruneStaleRuntimeState(snapshots);
     return true;
 }
 
@@ -2554,9 +2864,11 @@ static bool ExecuteCheckpoint(CheckpointReason){
 }
 
 static bool CheckpointAutoLayout(CheckpointReason reason){
-    return g_checkpointController.dispatch(reason,g_autoFix && !g_degraded,
-        g_autoLoaded,!g_reservedAutoIdentities.empty(),
-        [](CheckpointReason current){ return ExecuteCheckpoint(current); });
+    try {
+        return g_checkpointController.dispatch(reason,g_autoFix && !g_degraded,
+            g_autoLoaded,!g_reservedAutoIdentities.empty(),
+            [](CheckpointReason current){ return ExecuteCheckpoint(current); });
+    } catch(...) { return false; }
 }
 
 static void FinalizeAutoLayout(){
@@ -2564,15 +2876,59 @@ static void FinalizeAutoLayout(){
 }
 
 static bool TryLoadAutoLayoutAndInitialize(){
-    if(!MigrateLegacyLayout() || !LoadAutoLayout()) return false;
-    g_autoLoadRetry.succeeded();
-    g_lifecycleByApp.clear();
-    ObserveFastSnapshots(CollectFastSnapshots());
-    if(SetTimer(g_main,TIMER_HEARTBEAT,HEARTBEAT_INTERVAL_MS,nullptr))
-        g_heartbeatTimerArmed=true;
-    else
-        ReportStorageError(L"Automatic heartbeat timer could not be started; final checkpoints remain enabled.");
-    return true;
+    const uint64_t nowMs=MonotonicNowMs();
+    const AutoRuntimeStartResult result=AdvanceAutoRuntimeStart(
+        g_autoLoadRetry,nowMs,
+        [](){
+            return g_main &&
+                SetTimer(g_main,TIMER_MONITOR,MONITOR_INTERVAL_MS,nullptr)!=0;
+        },
+        [](){ return MigrateLegacyLayout() && LoadAutoLayout(); },
+        [](){
+            try {
+                const std::vector<AppProfile> profiles=ActiveProfiles();
+                const std::map<std::string,AppFastSnapshot> snapshots=
+                    CollectFastSnapshots(profiles);
+                return PrepareInitialLifecycleStates(
+                    profiles,snapshots,MonotonicNowMs(),g_lifecycleByApp,
+                    g_lastFreshSessionSignature,
+                    [](const std::string&,LcState& state,
+                       const AppFastSnapshot& snapshot,uint64_t nowMs){
+                        (void)LcObserve(state,true,
+                            snapshot.windowSetSignature,
+                            snapshot.settleSignature,
+                            snapshot.layoutSignature,0,nowMs);
+                    });
+            } catch(...) { return false; }
+        },
+        [](){
+            g_heartbeatTimerArmed=g_main &&
+                SetTimer(g_main,TIMER_HEARTBEAT,
+                         HEARTBEAT_INTERVAL_MS,nullptr)!=0;
+            return g_heartbeatTimerArmed;
+        },
+        [](){
+            return g_main &&
+                PostMessageW(g_main,WM_AUTO_TIMER_RETRY,0,0)!=FALSE;
+        });
+    if(result==AutoRuntimeStartResult::Ready){
+        g_autoLoaded=true;
+        if(g_autoDirty) ScheduleAutoFlush();
+        return true;
+    }
+    if(g_autoLoadRetry.layoutPrepared){
+        g_autoLoaded=false;
+        KillTimer(g_main,TIMER_AUTO_FLUSH);
+        g_flushTimerArmed=false;
+        g_flushTimerDueMs=0;
+    }
+    if(result==AutoRuntimeStartResult::MonitorUnavailable)
+        ReportStorageError(L"Automatic monitoring could not be started; startup will retry without publishing loaded state.");
+    else if(result==AutoRuntimeStartResult::HeartbeatUnavailable)
+        ReportStorageError(L"Automatic heartbeat timer could not be started; startup will retry without publishing loaded state.");
+    else if(result==AutoRuntimeStartResult::InitializationUnavailable)
+        ReportStorageError(L"Automatic layout initialization could not complete; startup will retry.");
+    return false;
 }
 
 static void ResetAutoRuntimeState(){
@@ -2604,7 +2960,8 @@ static void ResetAutoRuntimeState(){
     g_lastFreshSessionSignature.clear();
     g_dirtyRecordDeltas.clear();
     g_validatedTouches.clear();
-    g_deferredConflictRecordIds.clear();
+    g_deferredRecordConflicts.clear();
+    ClearLayoutPublishCandidateNoThrow(g_pendingAutoPublishCandidate);
     g_autoDirty=false;
     g_dirtyFlush.clearDirty();
     g_flushTimerArmed=false;
@@ -2627,8 +2984,11 @@ struct ReservationHandoff {
     std::string runtimeKey;
     ReservedAutoIdentity installed;
     ReservedAutoIdentity displaced;
+    ReservedAutoIdentity publishValue;
     MoveResult rollbackResult;
+    ReservedAutoIdentity* guardSlot=nullptr;
     bool hadDisplaced=false;
+    bool committed=false;
     bool active=false;
 };
 
@@ -2645,6 +3005,7 @@ static void SwapLayoutWinNoThrow(LayoutWin& left,LayoutWin& right) noexcept {
     left.counts.swap(right.counts);
     std::swap(left.lastSeenUtc,right.lastSeenUtc);
     std::swap(left.missingSinceUtc,right.missingSinceUtc);
+    std::swap(left.provisional,right.provisional);
 }
 
 static void SwapReservedAutoIdentityNoThrow(
@@ -2689,55 +3050,59 @@ static bool BeginReservationHandoff(
             if(installed.app.empty()) installed.app=prior->second.app;
         }
         next.installed=installed;
-        if(!PrepareCancelledMoveResult(next.installed.token,runtimeKey,
-                                       next.installed.recordId,
-                                       next.rollbackResult)) return false;
         if(prior==g_reservedAutoIdentities.end()){
-            next.active=true;
-            handoff=next;
-            if(!g_reservedAutoIdentities.emplace(runtimeKey,installed).second)
+            if(!PrepareCancelledMoveResult(next.installed.token,runtimeKey,
+                                           next.installed.recordId,
+                                           next.rollbackResult)) return false;
+            handoff=std::move(next);
+            auto inserted=g_reservedAutoIdentities.emplace(runtimeKey,installed);
+            if(!inserted.second)
                 return false;
+            handoff.guardSlot=&inserted.first->second;
+            handoff.active=true;
             return true;
         }
         next.displaced=prior->second;
-        MoveResult displacedFallback;
-        if(!PrepareCancelledMoveResult(next.displaced.token,runtimeKey,
-                                       next.displaced.recordId,
-                                       displacedFallback)) return false;
+        next.publishValue=installed;
+        next.guardSlot=&prior->second;
         next.hadDisplaced=true;
         next.active=true;
-        handoff=next;
-        SwapReservedAutoIdentityNoThrow(prior->second,installed);
-        // The successor guard is visible before the old queue entry is
-        // physically cancelled.  The old exact-token terminal therefore
-        // cannot erase protection even if its COM Issue may still land.
-        MoveResult removed;
-        try {
-            removed=g_moveQueue.cancelJob(next.displaced.token.jobId);
-        } catch(...) {
-            // cancelJob is transactional.  Restore the old token without a
-            // reservation-free interval if its allocation failed.
-            SwapReservedAutoIdentityNoThrow(prior->second,installed);
-            handoff.active=false;
-            return false;
-        }
-        if(!removed.completed) removed=std::move(displacedFallback);
-        DispatchMoveResult(removed);
+        handoff=std::move(next);
         return true;
     } catch(...) { return false; }
 }
 
+static void PublishReservationHandoff(ReservationHandoff& handoff) noexcept {
+    if(!handoff.active || handoff.committed) return;
+    if(handoff.hadDisplaced && handoff.guardSlot)
+        SwapReservedAutoIdentityNoThrow(
+            *handoff.guardSlot,handoff.publishValue);
+    handoff.committed=true;
+}
+
+static void CancelDisplacedReservationHandoff(ReservationHandoff& handoff){
+    if(!handoff.active || !handoff.committed) return;
+    handoff.active=false;
+    if(handoff.hadDisplaced)
+        CancelMoveJobOrDefer(handoff.displaced.token.jobId);
+}
+
 static void RollbackReservationHandoff(ReservationHandoff& handoff){
-    if(!handoff.active) return;
+    if(!handoff.active || handoff.committed) return;
+    if(handoff.hadDisplaced){
+        // Nothing has been published yet: the displaced issued job, owner,
+        // runtime, and exact stable-origin guard remain untouched.
+        handoff.active=false;
+        return;
+    }
     auto current=g_reservedAutoIdentities.find(handoff.runtimeKey);
     if(current==g_reservedAutoIdentities.end() ||
        !SameMoveToken(current->second.token,handoff.installed.token)){
         handoff.active=false;
         return;
     }
-    // The displaced job was already retired.  Its stable origin protection
-    // was inherited by the installed token, so consume any deferred
-    // heartbeat while that successor guard is still visible, then erase it.
+    // No move was enqueued, but a deferred checkpoint may have observed this
+    // new guard.  Consume it once while the captured origin remains visible.
     ConsumeCheckpointAndReleaseMoveReservation(handoff.rollbackResult);
     handoff.active=false;
 }
@@ -2826,11 +3191,16 @@ static void FinishManualSave(uint64_t operationId){
         fail(L"Manual layout storage is busy; the previous checkpoint was kept.");
         return;
     }
-    LayoutLoadResult prior=LoadLayoutWithBackupLocked(
-        LayoutPath(true),UtcNowSeconds());
-    if(prior.status==LayoutLoadStatus::Unavailable ||
-       !AtomicWriteText(LayoutPath(true),bytes,&error,
-                        prior.status==LayoutLoadStatus::Recovered)){
+    const bool published=PublishManualSnapshotIfCurrent(
+        operation.snapshots,current,operation.desktops,currentDesktops,bytes,
+        [&](const std::string& checkedBytes){
+            LayoutLoadResult prior=LoadLayoutWithBackupLocked(
+                LayoutPath(true),UtcNowSeconds());
+            return prior.status!=LayoutLoadStatus::Unavailable &&
+                AtomicWriteText(LayoutPath(true),checkedBytes,&error,
+                                prior.status==LayoutLoadStatus::Recovered);
+        });
+    if(!published){
         fail(L"Manual layout write failed; the previous checkpoint was kept.");
         return;
     }
@@ -3316,10 +3686,9 @@ static bool QueueManualMove(ManualMoveOperation& operation,
     ReservationHandoff handoff;
     bool insertedProvisional=false;
     bool insertedRuntime=false;
-    bool enqueued=false;
     bool insertedLiveJob=false;
     bool incrementedOutstanding=false;
-    const bool completed=RunFailureAtomicMoveSetup([&]{
+    const bool completed=RunSuccessorFirstReservationHandoff([&]{
         if(!BeginReservationHandoff(runtimeKey,reservation,handoff))
             return false;
         job.recordId=handoff.installed.recordId;
@@ -3335,23 +3704,23 @@ static bool QueueManualMove(ManualMoveOperation& operation,
         ++operation.outstanding;
         incrementedOutstanding=true;
         if(!g_moveQueue.enqueue(job)) return false;
-        enqueued=true;
         return true;
+    },[&]() noexcept {
+        PublishReservationHandoff(handoff);
     },[&]{
-        if(enqueued){
-            try { g_moveQueue.cancelJob(job.token.jobId); } catch(...) {}
-        }
-        if(insertedLiveJob) operation.liveJobIds.erase(job.token.jobId);
-        if(incrementedOutstanding && operation.outstanding>0)
-            --operation.outstanding;
-        if(insertedRuntime) g_moveRuntime.erase(job.token.jobId);
-        RollbackReservationHandoff(handoff);
+        CancelDisplacedReservationHandoff(handoff);
+    },[&]{
         if(insertedProvisional){
             auto provisional=g_provisionalRecordByRuntime.find(runtimeKey);
             if(provisional!=g_provisionalRecordByRuntime.end() &&
                provisional->second==handoff.installed.recordId)
                 g_provisionalRecordByRuntime.erase(provisional);
         }
+        if(insertedLiveJob) operation.liveJobIds.erase(job.token.jobId);
+        if(incrementedOutstanding && operation.outstanding>0)
+            --operation.outstanding;
+        if(insertedRuntime) g_moveRuntime.erase(job.token.jobId);
+        RollbackReservationHandoff(handoff);
     });
     if(!completed) return false;
     return true;
@@ -4108,6 +4477,19 @@ static void Commit(int idx){
 
     PickerMoveOperation operation;
     operation.operationId=TakeNonzeroId(g_nextOperationId);
+    if(tracked){
+        operation.app=fast.app;
+        auto lifecycle=g_lifecycleByApp.find(fast.app);
+        if(lifecycle!=g_lifecycleByApp.end() &&
+           lifecycle->second.saveInFlight){
+            operation.lifecycleSaveGeneration=
+                lifecycle->second.saveGeneration;
+            operation.lifecycleLayoutSignature=
+                lifecycle->second.layoutSignature;
+            operation.lifecycleSessionSignature=
+                lifecycle->second.sessionStampSignature;
+        }
+    }
     MoveJob job;
     job.token.owner=MoveOwner::Picker;
     job.token.operationId=operation.operationId;
@@ -4126,29 +4508,62 @@ static void Commit(int idx){
        SameIdentity(bound->second.identity,IdentityOf(fast))){
         reservation.recordId=bound->second.recordId;
         job.recordId=bound->second.recordId;
-    } else if(tracked && titleComplete && g_autoLoaded &&
-              g_autoWritesAllowed && !GuidIsZero(fast.desktop)){
+    } else {
         std::string recordId;
-        auto provisional=g_provisionalRecordByRuntime.find(runtimeKey);
-        if(provisional==g_provisionalRecordByRuntime.end()){
-            recordId=NewRecordId();
-            GUID parsed{};
-            if(ParseNonzeroLayoutGuid(recordId,parsed))
-                provisionalNeedsInsert=true;
-            else recordId.clear();
-        } else recordId=provisional->second;
-        if(!recordId.empty()){
+        const PopupReservationRecordSource recordSource=
+            SelectPopupReservationRecord(
+                tracked,g_autoLoaded && g_autoWritesAllowed,titleComplete,
+                !GuidIsZero(fast.desktop),
+                [&](std::string& selected){
+                    return SelectPendingPopupRecordId(
+                        IdentityOf(fast),fast.app,g_pendingRecordByRuntime,
+                        [&](const std::string& candidate,
+                            const std::string& app,std::string& canonical){
+                            GUID parsed{};
+                            if(!ParseNonzeroLayoutGuid(
+                                    candidate,parsed,&canonical)) return false;
+                            for(const LayoutWin& saved : g_autoRecords){
+                                GUID savedGuid{};
+                                std::string savedCanonical;
+                                if(ParseNonzeroLayoutGuid(
+                                        saved.recordId,savedGuid,
+                                        &savedCanonical) &&
+                                   savedCanonical==canonical &&
+                                   saved.app==app) return true;
+                            }
+                            return false;
+                        },selected);
+                },
+                [&](std::string& selected){
+                    auto provisional=
+                        g_provisionalRecordByRuntime.find(runtimeKey);
+                    if(provisional!=g_provisionalRecordByRuntime.end()){
+                        selected=provisional->second;
+                        return true;
+                    }
+                    selected=NewRecordId();
+                    GUID parsed{};
+                    if(!ParseNonzeroLayoutGuid(selected,parsed)){
+                        selected.clear();
+                        return false;
+                    }
+                    provisionalNeedsInsert=true;
+                    return true;
+                },recordId);
+        if(recordSource!=PopupReservationRecordSource::None){
             reservation.recordId=recordId;
             job.recordId=recordId;
-            LayoutWin origin;
-            origin.recordId=recordId;
-            origin.app=fast.app;
-            origin.desktop=fast.desktop;
-            origin.deskIndex=SnapshotDesktopIndex(fast.desktop);
-            origin.activeTitle=W2U8(fast.title);
-            MarkSeen(origin,UtcNowSeconds());
-            reservation.provisionalOriginRecord=origin;
-            reservation.hasProvisionalOriginRecord=true;
+            if(recordSource==PopupReservationRecordSource::Provisional){
+                LayoutWin origin;
+                origin.recordId=recordId;
+                origin.app=fast.app;
+                origin.desktop=fast.desktop;
+                origin.deskIndex=SnapshotDesktopIndex(fast.desktop);
+                origin.activeTitle=W2U8(fast.title);
+                MarkSeen(origin,UtcNowSeconds());
+                reservation.provisionalOriginRecord=origin;
+                reservation.hasProvisionalOriginRecord=true;
+            }
         }
     }
     if(!reservation.recordId.empty())
@@ -4160,8 +4575,7 @@ static void Commit(int idx){
     bool insertedProvisional=false;
     bool insertedPickerOperation=false;
     bool insertedRuntime=false;
-    bool enqueued=false;
-    const bool queued=RunFailureAtomicMoveSetup([&]{
+    const bool queued=RunSuccessorFirstReservationHandoff([&]{
         if(!BeginReservationHandoff(runtimeKey,reservation,handoff))
             return false;
         job.recordId=handoff.installed.recordId;
@@ -4177,21 +4591,21 @@ static void Commit(int idx){
         if(!g_moveRuntime.emplace(job.token.jobId,runtime).second) return false;
         insertedRuntime=true;
         if(!g_moveQueue.enqueue(job)) return false;
-        enqueued=true;
         return true;
+    },[&]() noexcept {
+        PublishReservationHandoff(handoff);
     },[&]{
-        if(enqueued){
-            try { g_moveQueue.cancelJob(job.token.jobId); } catch(...) {}
-        }
-        if(insertedRuntime) g_moveRuntime.erase(job.token.jobId);
-        if(insertedPickerOperation) g_pickerOperations.erase(operation.operationId);
-        RollbackReservationHandoff(handoff);
+        CancelDisplacedReservationHandoff(handoff);
+    },[&]{
         if(insertedProvisional){
             auto provisional=g_provisionalRecordByRuntime.find(runtimeKey);
             if(provisional!=g_provisionalRecordByRuntime.end() &&
                provisional->second==handoff.installed.recordId)
                 g_provisionalRecordByRuntime.erase(provisional);
         }
+        if(insertedRuntime) g_moveRuntime.erase(job.token.jobId);
+        if(insertedPickerOperation) g_pickerOperations.erase(operation.operationId);
+        RollbackReservationHandoff(handoff);
     });
     if(!queued){
         return;
@@ -4283,10 +4697,7 @@ static bool ApplyHotkey(){
 }
 static void ApplyAutoFix(){
     if(g_autoFix && !g_degraded){
-        if(!g_autoLoaded && !TryLoadAutoLayoutAndInitialize())
-            g_autoLoadRetry.failed(MonotonicNowMs());
-        if(!SetTimer(g_main,TIMER_MONITOR,MONITOR_INTERVAL_MS,nullptr))
-            ReportStorageError(L"Automatic monitoring could not be started.");
+        TryLoadAutoLayoutAndInitialize();
         return;
     }
     KillTimer(g_main,TIMER_HEARTBEAT);
@@ -4379,20 +4790,42 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             const bool newFirefox=IsDlgButtonChecked(hwnd,IDC_APP_FF)==BST_CHECKED;
             const bool newChrome=IsDlgButtonChecked(hwnd,IDC_APP_CR)==BST_CHECKED;
             const bool newEdge=IsDlgButtonChecked(hwnd,IDC_APP_ED)==BST_CHECKED;
-            const bool profileChanged=newFirefox!=g_appFirefox ||
-                newChrome!=g_appChrome || newEdge!=g_appEdge;
-            if(g_autoFix && (!newAutoFix || profileChanged) &&
-               !CheckpointAutoLayout(CheckpointReason::SettingsChange)){
+            SettingsRuntimeSnapshot currentSettings;
+            currentSettings.hotkeyVk=g_hotVk;
+            currentSettings.hotkeyMods=g_hotMods;
+            currentSettings.autoFix=g_autoFix;
+            currentSettings.runAtLogon=GetRunAtLogon();
+            currentSettings.firefox=g_appFirefox;
+            currentSettings.chrome=g_appChrome;
+            currentSettings.edge=g_appEdge;
+            SettingsRuntimeSnapshot requestedSettings=currentSettings;
+            requestedSettings.hotkeyVk=newHotVk;
+            requestedSettings.hotkeyMods=newHotMods;
+            requestedSettings.autoFix=newAutoFix;
+            requestedSettings.runAtLogon=newRunAtLogon;
+            requestedSettings.firefox=newFirefox;
+            requestedSettings.chrome=newChrome;
+            requestedSettings.edge=newEdge;
+            if(!ApplySettingsRuntimeTransaction(
+                    currentSettings,requestedSettings,
+                    [](){
+                        return CheckpointAutoLayout(
+                            CheckpointReason::SettingsChange);
+                    },
+                    [](){
+                        try { ResetAutoRuntimeState(); return true; }
+                        catch(...) { return false; }
+                    })){
                 MessageBoxW(hwnd,L"The current automatic layout could not be saved. Settings were not changed; retry after storage becomes available.",APP_NAME,MB_ICONWARNING);
                 return 0;
             }
-            if(profileChanged) ResetAutoRuntimeState();
-            g_hotVk=newHotVk; g_hotMods=newHotMods;
-            g_autoFix=newAutoFix;
-            g_appFirefox=newFirefox;
-            g_appChrome=newChrome;
-            g_appEdge=newEdge;
-            SetRunAtLogon(newRunAtLogon);
+            g_hotVk=currentSettings.hotkeyVk;
+            g_hotMods=currentSettings.hotkeyMods;
+            g_autoFix=currentSettings.autoFix;
+            g_appFirefox=currentSettings.firefox;
+            g_appChrome=currentSettings.chrome;
+            g_appEdge=currentSettings.edge;
+            SetRunAtLogon(currentSettings.runAtLogon);
             SaveSettings();
             bool ok=ApplyHotkey();
             ApplyAutoFix();
@@ -4646,6 +5079,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                 ReportStorageError(L"Cancelled window moves remain protected; cancellation will retry on the next move request.");
         }
         return 0;
+    case WM_AUTO_TIMER_RETRY:
+        if(g_autoFix && !g_degraded && !g_autoLoadRetry.loaded)
+            TryLoadAutoLayoutAndInitialize();
+        return 0;
     case WM_TIMER:
         if(wp==TIMER_HEARTBEAT){
             CheckpointAutoLayout(CheckpointReason::Heartbeat);
@@ -4671,10 +5108,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                     KillTimer(hwnd,TIMER_MONITOR);
                 return 0;
             }
-            if(!g_autoLoaded){
-                if(g_autoLoadRetry.due(nowMs) &&
-                   !TryLoadAutoLayoutAndInitialize())
-                    g_autoLoadRetry.failed(nowMs);
+            if(!g_autoLoadRetry.loaded){
+                if(!g_autoLoadRetry.monitorStarted ||
+                   g_autoLoadRetry.due(nowMs))
+                    TryLoadAutoLayoutAndInitialize();
                 return 0;
             }
             ObserveFastSnapshots(CollectFastSnapshots());

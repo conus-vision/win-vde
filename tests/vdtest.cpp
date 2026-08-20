@@ -656,6 +656,80 @@ static void test_issued_reservation_transfer_has_no_checkpoint_gap(){
     CHECK(heartbeatCalls==1);
 }
 
+static void test_successor_handoff_publishes_before_issued_displaced_cancel(){
+    MoveQueue queue;
+    MoveJob displaced=MJ(MoveOwner::AutoReconcile,6151,6152,"same-runtime");
+    MoveJob successor=MJ(MoveOwner::Picker,6161,6162,"same-runtime");
+    CHECK(queue.enqueue(displaced));
+    CHECK(!queue.onIssued(MoveAttemptOutcome::Accepted).completed);
+    CHECK(queue.nextAction()==MoveAction::Verify);
+
+    MoveToken visibleGuard=displaced.token;
+    bool displacedOwnerAlive=true,successorOwner=false,successorRuntime=false;
+    bool successorQueued=false,displacedRetiring=false;
+    int cancellationCalls=0,rollbackCalls=0;
+
+    // Owner publication failure is entirely pre-commit.  The issued job,
+    // owner, and old guard remain byte-for-byte intact.
+    CHECK(!RunSuccessorFirstReservationHandoff([&](){
+        successorRuntime=true;
+        return false;
+    },[&]() noexcept {
+        visibleGuard=successor.token;
+    },[&](){ ++cancellationCalls; },[&](){
+        ++rollbackCalls;
+        successorRuntime=false;
+    }));
+    CHECK(rollbackCalls==1 && cancellationCalls==0 && !successorRuntime);
+    CHECK(displacedOwnerAlive && SameMoveToken(visibleGuard,displaced.token));
+    CHECK(queue.front() && SameMoveToken(queue.front()->token,displaced.token) &&
+          queue.nextAction()==MoveAction::Verify);
+
+    // A failed final enqueue has the same property: cancellation is not even
+    // requested until the successor is wholly published.
+    CHECK(!RunSuccessorFirstReservationHandoff([&](){
+        successorRuntime=true;
+        successorOwner=true;
+        return false; // injected enqueue=false
+    },[&]() noexcept {
+        visibleGuard=successor.token;
+    },[&](){ ++cancellationCalls; },[&](){
+        ++rollbackCalls;
+        successorOwner=false;
+        successorRuntime=false;
+    }));
+    CHECK(rollbackCalls==2 && cancellationCalls==0 && !successorOwner &&
+          !successorRuntime && SameMoveToken(visibleGuard,displaced.token));
+    CHECK(queue.front() && SameMoveToken(queue.front()->token,displaced.token) &&
+          queue.nextAction()==MoveAction::Verify);
+
+    std::vector<std::string> events;
+    CHECK(RunSuccessorFirstReservationHandoff([&](){
+        events.push_back("owner");
+        successorOwner=true;
+        successorRuntime=true;
+        CHECK(queue.enqueue(successor));
+        successorQueued=true;
+        events.push_back("enqueue");
+        return true;
+    },[&]() noexcept {
+        CHECK(successorOwner && successorRuntime && successorQueued);
+        visibleGuard=successor.token;
+        events.push_back("guard");
+    },[&](){
+        ++cancellationCalls;
+        CHECK(SameMoveToken(visibleGuard,successor.token));
+        CHECK(queue.front() && SameMoveToken(queue.front()->token,displaced.token));
+        CHECK(queue.nextAction()==MoveAction::Verify);
+        displacedRetiring=true;
+        events.push_back("cancel");
+    },[&](){ ++rollbackCalls; }));
+    CHECK((events==std::vector<std::string>{"owner","enqueue","guard","cancel"}));
+    CHECK(cancellationCalls==1 && rollbackCalls==2 && displacedRetiring);
+    CHECK(displacedOwnerAlive && successorOwner && successorRuntime &&
+          successorQueued && SameMoveToken(visibleGuard,successor.token));
+}
+
 static void test_issued_reservation_rollback_waits_for_terminal_ack(){
     CHECK(MoveCancellationDispositionFor(false,true)==
           MoveCancellationDisposition::CancelImmediately);
@@ -1534,6 +1608,122 @@ static LayoutWin StrictV4Record(){
     return w;
 }
 
+static void test_layout_provisional_marker_roundtrips_strict_v4(){
+    LayoutWin provisional=StrictV4Record();
+    provisional.provisional=true;
+    const std::string marker="P\t"+provisional.recordId+"\n";
+
+    const std::string serialized=SerializeLayout({}, {provisional});
+    CHECK(serialized.find(marker)!=std::string::npos);
+    CHECK(serialized.find(marker)==serialized.rfind(marker));
+
+    std::vector<DeskRec> desks;
+    std::vector<LayoutWin> records;
+    std::string error="stale";
+    int sourceVersion=0;
+    CHECK(ParseLayout(serialized,desks,records,1800000000,&error,
+                      &sourceVersion));
+    CHECK(error.empty() && sourceVersion==4);
+    CHECK(records.size()==1 && records[0].provisional);
+    CHECK(records.size()==1 && records[0].recordId==provisional.recordId);
+}
+
+static void test_layout_noncanonical_record_id_is_published_canonically(){
+    const std::string raw="abcdefab-cdef-abcd-efab-cdefabcdefab";
+    const std::string marker="{abcdefab-cdef-abcd-efab-cdefabcdefab}";
+    const std::string canonical=
+        "{ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB}";
+    const std::string data="# VDE snapshot v4\n"+
+        V4Line("{231A0000-0000-0000-0000-000000000001}",
+               raw.c_str(),"1700000000","0")+
+        "P\t"+marker+"\n";
+    std::vector<DeskRec> desks;
+    std::vector<LayoutWin> records;
+    std::string error;
+    int sourceVersion=0;
+    CHECK(ParseLayout(data,desks,records,1800000000,&error,&sourceVersion));
+    CHECK(error.empty() && sourceVersion==4 && records.size()==1);
+    CHECK(records.size()==1 && records[0].recordId==canonical &&
+          records[0].provisional);
+    const std::string serialized=SerializeLayout(desks,records);
+    CHECK(serialized.find("W\tfirefox\t"+canonical+"\t")!=
+          std::string::npos);
+    CHECK(serialized.find("P\t"+canonical+"\n")!=std::string::npos);
+    CHECK(serialized.find(raw)==std::string::npos);
+}
+
+static void test_v4_provisional_extension_preserves_base_window_row(){
+    LayoutWin ordinary=StrictV4Record();
+    LayoutWin provisional=ordinary;
+    provisional.provisional=true;
+    const std::string ordinaryBytes=SerializeLayout({}, {ordinary});
+    const std::string provisionalBytes=SerializeLayout({}, {provisional});
+    const size_t ordinaryWindow=ordinaryBytes.find("W\t");
+    const size_t ordinaryEnd=ordinaryBytes.find('\n',ordinaryWindow);
+    const size_t provisionalWindow=provisionalBytes.find("W\t");
+    const size_t provisionalEnd=provisionalBytes.find('\n',provisionalWindow);
+    CHECK(ordinaryWindow!=std::string::npos &&
+          provisionalWindow!=std::string::npos);
+    CHECK(ordinaryBytes.substr(ordinaryWindow,ordinaryEnd-ordinaryWindow)==
+          provisionalBytes.substr(
+              provisionalWindow,provisionalEnd-provisionalWindow));
+    CHECK(ordinaryBytes.find("\nP\t")==std::string::npos);
+    CHECK(provisionalBytes.find("\nP\t"+ordinary.recordId+"\n")!=
+          std::string::npos);
+
+    std::vector<DeskRec> desks;
+    std::vector<LayoutWin> records;
+    CHECK(ParseLayout(ordinaryBytes,desks,records,1800000000));
+    CHECK(records.size()==1 && !records[0].provisional);
+    CHECK(ParseLayout(provisionalBytes,desks,records,1800000000));
+    CHECK(records.size()==1 && records[0].provisional);
+}
+
+static void test_layout_provisional_marker_is_strict_and_transactional(){
+    const std::string desktop=
+        "{231A0000-0000-0000-0000-000000000001}";
+    const std::string recordId=
+        "{00000000-0000-0000-0000-000000000101}";
+    const std::string window=V4Line(
+        desktop.c_str(),recordId.c_str(),"1700000000","0");
+    const std::vector<std::string> invalid={
+        "# VDE snapshot v4\nP\t"+recordId+"\n"+window,
+        "# VDE snapshot v4\n"+window+"P\t"+recordId+"\textra\n",
+        "# VDE snapshot v4\n"+window+
+            "P\t{00000000-0000-0000-0000-000000000102}\n",
+        "# VDE snapshot v4\n"+window+"P\t"+recordId+"\nP\t"+
+            recordId+"\n"
+    };
+    for(const std::string& data : invalid){
+        DeskRec sentinelDesk{};
+        sentinelDesk.index=77;
+        LayoutWin sentinel=StrictV4Record();
+        sentinel.activeTitle="sentinel";
+        std::vector<DeskRec> desks={sentinelDesk};
+        std::vector<LayoutWin> records={sentinel};
+        std::string error;
+        CHECK(!ParseLayout(data,desks,records,1800000000,&error));
+        CHECK(!error.empty());
+        CHECK(desks.size()==1 && desks[0].index==77);
+        CHECK(records.size()==1 && records[0].activeTitle=="sentinel");
+        CHECK(!records[0].provisional);
+    }
+}
+
+static void test_layout_legacy_migration_never_invents_provisional_marker(){
+    const std::string data = "# VDE snapshot v3\n"
+        "W\tfirefox\t0\t{231A0000-0000-0000-0000-000000000001}\t" +
+        b64enc("Inbox")+"\tmail.example\t1\tmail.example:1\t0\n";
+    std::vector<DeskRec> desks;
+    std::vector<LayoutWin> records;
+    std::string error;
+    int sourceVersion=0;
+    CHECK(ParseLayout(data,desks,records,1800000000,&error,&sourceVersion));
+    CHECK(error.empty() && sourceVersion==3 && records.size()==1);
+    CHECK(records.size()==1 && !records[0].provisional);
+    CHECK(SerializeLayout(desks,records).find("\nP\t")==std::string::npos);
+}
+
 static void test_retention_expiration_boundaries(){
     const UnixSeconds now=1700000000;
     LayoutWin w=OldStyleRecord();
@@ -2233,7 +2423,8 @@ static bool SameLayoutWinFields(const LayoutWin& left, const LayoutWin& right){
         left.activeTitle==right.activeTitle && left.activeDomain==right.activeDomain &&
         left.tabCount==right.tabCount && left.counts==right.counts &&
         left.lastSeenUtc==right.lastSeenUtc &&
-        left.missingSinceUtc==right.missingSinceUtc;
+        left.missingSinceUtc==right.missingSinceUtc &&
+        left.provisional==right.provisional;
 }
 
 static bool SameLayoutWinVectors(const std::vector<LayoutWin>& left,
@@ -2278,6 +2469,155 @@ static RestoreRequest PlannedRestore(size_t savedIndex, size_t liveIndex,
     request.liveIndex=liveIndex;
     request.destination=destination;
     return request;
+}
+
+static LayoutWin PersistedProvisionalRecord(
+        const std::string& recordId,const GUID& desktop,UnixSeconds lastSeenUtc){
+    LayoutWin record;
+    record.recordId=recordId;
+    record.app="firefox";
+    record.deskIndex=1;
+    record.desktop=desktop;
+    record.lastSeenUtc=lastSeenUtc;
+    record.provisional=true;
+    return record;
+}
+
+static void test_layout_provisional_companions_do_not_consume_record_cap(){
+    const GUID desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    std::vector<LayoutWin> records;
+    records.reserve(MAX_LAYOUT_RECORDS);
+    for(size_t i=0;i<MAX_LAYOUT_RECORDS;++i){
+        LayoutWin record=ReconcileTestRecord(
+            DeterministicRecordId(14000+i),"firefox","Provisional",
+            "provisional.example",1,desktop,1700000000);
+        record.provisional=true;
+        records.push_back(record);
+    }
+    std::string bytes;
+    std::string error="stale";
+    CHECK(BuildCheckedLayoutSnapshot({},records,1700000000,bytes,&error));
+    CHECK(error.empty());
+
+    std::vector<DeskRec> parsedDesks;
+    std::vector<LayoutWin> parsedRecords;
+    int sourceVersion=0;
+    CHECK(ParseLayout(bytes,parsedDesks,parsedRecords,1800000000,&error,
+                      &sourceVersion));
+    CHECK(error.empty() && sourceVersion==4);
+    CHECK(parsedRecords.size()==MAX_LAYOUT_RECORDS);
+    CHECK(parsedRecords.size()==MAX_LAYOUT_RECORDS &&
+          parsedRecords.front().provisional && parsedRecords.back().provisional);
+
+    LayoutWin overflow=records.back();
+    overflow.recordId=DeterministicRecordId(14000+MAX_LAYOUT_RECORDS);
+    const std::string overflowSnapshot=SerializeLayout({}, {overflow});
+    const std::string overflowBody=overflowSnapshot.substr(
+        std::string("# VDE snapshot v4\n").size());
+    DeskRec sentinelDesk{};
+    sentinelDesk.index=77;
+    LayoutWin sentinel=StrictV4Record();
+    sentinel.activeTitle="sentinel";
+    parsedDesks={sentinelDesk};
+    parsedRecords={sentinel};
+    CHECK(!ParseLayout(bytes+overflowBody,parsedDesks,parsedRecords,
+                       1800000000,&error));
+    CHECK(!error.empty());
+    CHECK(parsedDesks.size()==1 && parsedDesks[0].index==77);
+    CHECK(parsedRecords.size()==1 &&
+          parsedRecords[0].activeTitle=="sentinel");
+}
+
+static void test_fresh_reconcile_adopts_one_persisted_provisional_with_same_id(){
+    const UnixSeconds now=2000000050;
+    const GUID desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    LayoutWin saved=PersistedProvisionalRecord(
+        "{00000000-0000-0000-0000-000000000391}",desktop,now-50);
+    LayoutWin live=MatchRecord(
+        "firefox","fresh identity","fresh.example",2,
+        {{"fresh.example",2}});
+    live.deskIndex=1;
+    live.desktop=desktop;
+    ResetCountingRecordIdGenerator();
+
+    ReconcilePlan plan=PlanAppReconcile(
+        {saved},{live},"firefox",now,{},ReconcileFreshness::Fresh,
+        CountingRecordIdGenerator);
+
+    CHECK(!plan.deferred);
+    CHECK(plan.matches.size()==1 && plan.matches[0].savedIndex==0 &&
+          plan.matches[0].liveIndex==0);
+    CHECK(plan.newRecords.empty() && plan.missingSavedIndices.empty());
+    CHECK(CountingRecordIdGeneratorCalls()==0);
+    std::vector<LayoutWin> committed=CommitAppReconcile(
+        {saved},{live},plan,{},now);
+    CHECK(committed.size()==1 && committed[0].recordId==saved.recordId);
+    CHECK(committed.size()==1 && !committed[0].provisional);
+    CHECK(committed.size()==1 && committed[0].activeTitle==live.activeTitle &&
+          committed[0].counts==live.counts);
+    ResetCountingRecordIdGenerator();
+}
+
+static void test_fresh_reconcile_clears_multiple_matched_provisionals(){
+    const UnixSeconds now=2000000060;
+    const GUID desktopA=G(L"{231A0000-0000-0000-0000-000000000001}");
+    const GUID desktopB=G(L"{231A0000-0000-0000-0000-000000000002}");
+    LayoutWin savedA=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000000392}","firefox","Alpha",
+        "alpha.example",1,desktopA,now-50);
+    LayoutWin savedB=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000000393}","firefox","Beta",
+        "beta.example",2,desktopB,now-50);
+    savedA.provisional=true;
+    savedB.provisional=true;
+    LayoutWin liveA=savedA;
+    LayoutWin liveB=savedB;
+    liveA.recordId.clear();
+    liveB.recordId.clear();
+    liveA.provisional=false;
+    liveB.provisional=false;
+
+    ReconcilePlan plan=PlanAppReconcile(
+        {savedA,savedB},{liveB,liveA},"firefox",now);
+    CHECK(!plan.deferred && plan.matches.size()==2);
+    CHECK(plan.newRecords.empty() && plan.missingSavedIndices.empty());
+    std::vector<LayoutWin> committed=CommitAppReconcile(
+        {savedA,savedB},{liveB,liveA},plan,{},now);
+    CHECK(committed.size()==2);
+    CHECK(committed.size()==2 && committed[0].recordId==savedA.recordId &&
+          committed[1].recordId==savedB.recordId);
+    CHECK(committed.size()==2 && !committed[0].provisional &&
+          !committed[1].provisional);
+}
+
+static void test_fresh_reconcile_defers_ambiguous_provisional_adoption(){
+    const UnixSeconds now=2000000070;
+    const GUID desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    const std::pair<size_t,size_t> cardinalities[]={{1,2},{2,1},{2,2}};
+    for(const auto& cardinality : cardinalities){
+        std::vector<LayoutWin> saved;
+        std::vector<LayoutWin> live;
+        for(size_t i=0;i<cardinality.first;++i)
+            saved.push_back(PersistedProvisionalRecord(
+                DeterministicRecordId(9300+i),desktop,now-50));
+        for(size_t i=0;i<cardinality.second;++i){
+            LayoutWin observed=MatchRecord(
+                "firefox",("Live "+std::to_string(i)).c_str(),
+                ("live"+std::to_string(i)+".example").c_str(),1,{});
+            observed.deskIndex=1;
+            observed.desktop=desktop;
+            live.push_back(observed);
+        }
+        ResetCountingRecordIdGenerator();
+        ReconcilePlan plan=PlanAppReconcile(
+            saved,live,"firefox",now,{},ReconcileFreshness::Fresh,
+            CountingRecordIdGenerator);
+        CHECK(plan.deferred);
+        CHECK(plan.matches.empty() && plan.restores.empty());
+        CHECK(plan.newRecords.empty() && plan.missingSavedIndices.empty());
+        CHECK(CountingRecordIdGeneratorCalls()==0);
+    }
+    ResetCountingRecordIdGenerator();
 }
 
 static void test_failed_chrome_restore_retains_saved_destination_and_marks_seen(){
@@ -7423,6 +7763,145 @@ static void test_atomic_write_first_and_two_successful_writes(){
     CHECK(!RawFileExists(primary+L".rollback"));
 }
 
+static void test_durable_write_captures_revision_without_post_publish_read(){
+    LayoutTempDir temp;
+    const std::wstring primary=temp.file(L"layout.txt");
+    const std::string bytes=ValidLayoutBytes("captured-revision");
+    std::string error;
+    LayoutFsOps ops;
+    const auto realRead=ops.readFile;
+    bool atomicReturned=false;
+    int readsAfterAtomicReturn=0;
+    ops.readFile=[&](HANDLE handle,void* buffer,DWORD requested,
+                     DWORD& read)->BOOL {
+        if(atomicReturned){
+            ++readsAfterAtomicReturn;
+            throw std::bad_alloc();
+        }
+        return realRead(handle,buffer,requested,read);
+    };
+    LayoutRevision current;
+    current.sourcePath=L"old-revision";
+    current.exists=true;
+    bool dirty=true;
+    bool pendingPublication=false;
+    CHECK(PublishLayoutWithCapturedRevision(
+        [&](LayoutRevision& published){
+            const bool wrote=AtomicWriteText(
+                primary,bytes,&error,false,ops,&published);
+            atomicReturned=wrote;
+            return wrote;
+        },
+        [&](LayoutRevision&) noexcept { pendingPublication=true; },
+        [&](LayoutRevision& published) noexcept {
+            CommitPublishedLayoutRevisionNoThrow(current,published);
+            dirty=false;
+        })==CapturedLayoutPublishResult::Succeeded);
+    CHECK(atomicReturned && error.empty() && !dirty && !pendingPublication);
+    CHECK(readsAfterAtomicReturn==0);
+    const LayoutRevision actual=ReadLayoutRevisionLocked(primary);
+    CHECK(SameRevision(current,actual));
+    CHECK(ReadRawFile(primary)==bytes);
+}
+
+static void test_durable_publish_exception_adopts_revision_then_retries(){
+    LayoutTempDir temp;
+    const std::wstring primary=temp.file(L"layout.txt");
+    const std::string prior=ValidLayoutBytes("prior-captured");
+    const std::string next=ValidLayoutBytes("next-captured");
+    std::string error;
+    CHECK(AtomicWriteText(primary,prior,&error));
+    LayoutRevision current=ReadLayoutRevisionLocked(primary);
+    bool dirty=true,pendingAdopted=false;
+    LayoutFsOps throwingOps;
+    throwingOps.deleteFile=[](const std::wstring&)->BOOL {
+        throw std::bad_alloc();
+    };
+    const CapturedLayoutPublishResult first=
+        PublishLayoutWithCapturedRevision(
+            [&](LayoutRevision& published){
+                return AtomicWriteText(
+                    primary,next,&error,true,throwingOps,&published);
+            },
+            [&](LayoutRevision& published) noexcept {
+                pendingAdopted=true;
+                CommitPublishedLayoutRevisionNoThrow(current,published);
+            },
+            [&](LayoutRevision&) noexcept { dirty=false; });
+    CHECK(first==CapturedLayoutPublishResult::PublishedNeedsRetry);
+    CHECK(pendingAdopted && dirty && ReadRawFile(primary)==next);
+    CHECK(SameRevision(current,ReadLayoutRevisionLocked(primary)));
+
+    const CapturedLayoutPublishResult retry=
+        PublishLayoutWithCapturedRevision(
+            [&](LayoutRevision& published){
+                return AtomicWriteText(
+                    primary,next,&error,true,&published);
+            },
+            [&](LayoutRevision& published) noexcept {
+                CommitPublishedLayoutRevisionNoThrow(current,published);
+            },
+            [&](LayoutRevision& published) noexcept {
+                CommitPublishedLayoutRevisionNoThrow(current,published);
+                dirty=false;
+            });
+    CHECK(retry==CapturedLayoutPublishResult::Succeeded);
+    CHECK(!dirty && SameRevision(current,ReadLayoutRevisionLocked(primary)));
+}
+
+static void test_first_post_publish_verify_throw_recovers_from_armed_candidate(){
+    LayoutTempDir temp;
+    const std::wstring primary=temp.file(L"layout.txt");
+    const std::string prior=ValidLayoutBytes("candidate-prior");
+    const std::string next=ValidLayoutBytes("candidate-next");
+    std::string error;
+    CHECK(AtomicWriteText(primary,prior,&error));
+    LayoutRevision current=ReadLayoutRevisionLocked(primary);
+    const LayoutRevision priorRevision=current;
+    LayoutPublishCandidate candidate;
+    CHECK(BuildLayoutPublishCandidate(primary,next,candidate));
+    CHECK(candidate.armed);
+
+    LayoutFsOps ops;
+    const auto realOpen=ops.openFile;
+    int primaryReadOpens=0;
+    ops.openFile=[&](const std::wstring& opened,DWORD access,DWORD share,
+                     DWORD creation,DWORD flags)->HANDLE {
+        if(opened==primary && creation==OPEN_EXISTING &&
+           ++primaryReadOpens==2) throw std::bad_alloc();
+        return realOpen(opened,access,share,creation,flags);
+    };
+    LayoutRevision uncaptured;
+    bool returned=false;
+    try {
+        returned=AtomicWriteText(
+            primary,next,&error,true,ops,&uncaptured);
+    } catch(...) { returned=false; }
+    CHECK(!returned && !uncaptured.exists);
+    CHECK(ReadRawFile(primary)==next);
+
+    LayoutRevision unavailable;
+    unavailable.sourcePath=primary;
+    unavailable.exists=true;
+    CHECK(ObserveLayoutPublishCandidateNoThrow(
+              candidate,LayoutRevisionReadStatus::Unavailable,
+              unavailable,current)==
+          LayoutPublishCandidateObservation::RetainedUnavailable);
+    CHECK(candidate.armed && SameRevision(current,priorRevision));
+
+    LayoutRevision exact=ReadLayoutRevisionLocked(primary);
+    CHECK(ObserveLayoutPublishCandidateNoThrow(
+              candidate,LayoutRevisionReadStatus::Present,exact,current)==
+          LayoutPublishCandidateObservation::Adopted);
+    CHECK(!candidate.armed &&
+          SameRevision(current,ReadLayoutRevisionLocked(primary)));
+
+    LayoutRevision retried;
+    CHECK(AtomicWriteText(primary,next,&error,true,&retried));
+    CommitPublishedLayoutRevisionNoThrow(current,retried);
+    CHECK(SameRevision(current,ReadLayoutRevisionLocked(primary)));
+}
+
 static void test_atomic_write_rejects_oversize_without_touching_destination(){
     LayoutTempDir temp;
     std::wstring primary=temp.file(L"layout.txt");
@@ -9553,6 +10032,18 @@ static void test_fast_snapshot_versions_are_order_independent_and_quality_aware(
     CHECK(reordered.identityGeneration==first.identityGeneration);
     CHECK(reordered.generation>first.generation);
 
+    AppFastSnapshot desktopOnly=reordered;
+    desktopOnly.windows[0].desktop=
+        G(L"{231A0000-0000-0000-0000-000000000003}");
+    FinalizeFastSnapshot("firefox",91,tracker,desktopOnly);
+    CHECK(desktopOnly.identityGeneration==reordered.identityGeneration);
+    CHECK(desktopOnly.generation>reordered.generation);
+
+    AppFastSnapshot configOnly=desktopOnly;
+    FinalizeFastSnapshot("firefox",92,tracker,configOnly);
+    CHECK(configOnly.identityGeneration>desktopOnly.identityGeneration);
+    CHECK(configOnly.generation>configOnly.identityGeneration);
+
     AppFastSnapshot incomplete=reordered;
     incomplete.enumerationComplete=false;
     FinalizeFastSnapshot("firefox",91,tracker,incomplete);
@@ -9648,6 +10139,140 @@ static void test_rebase_same_id_newer_validated_upsert_wins(){
     CHECK(result.records.size()==1 && SameLayoutWinFields(result.records[0],local));
 }
 
+static void test_durable_candidate_delta_is_satisfied_by_external_unrelated_revision(){
+    LayoutRevision memoryRevision=RebaseRevision(L"layout",13);
+    LayoutRevision capturedRevision=RebaseRevision(L"layout",14);
+    const LayoutRevision externalRevision=RebaseRevision(L"layout",15);
+    LayoutWin base=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009013}","firefox","base","a.test",1,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),100);
+    LayoutWin desired=base;
+    desired.activeTitle="durable-C";
+    desired.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+    desired.deskIndex=2;
+    desired.lastSeenUtc=300;
+    const RecordDelta delta=RebaseUpsert(
+        base,desired,memoryRevision,300,77);
+    const std::map<std::string,RecordDelta> retainedDirty={
+        {desired.recordId,delta}};
+    ValidatedRecordTouch touch;
+    touch.recordId=desired.recordId;
+    touch.lastSeenUtc=desired.lastSeenUtc;
+    touch.causalGeneration=77;
+
+    // C was durable, but the cleanup path retained the A-based journal while
+    // adopting C.  An external D then preserves our row and adds another ID.
+    CommitPublishedLayoutRevisionNoThrow(memoryRevision,capturedRevision);
+    LayoutWin external=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009014}","chrome","external-D","d.test",4,
+        G(L"{231A0000-0000-0000-0000-000000000004}"),301);
+    const std::vector<std::map<std::string,uint64_t> > causalStates={
+        {{touch.recordId,77}},
+        {},
+        {{touch.recordId,88}}
+    };
+    for(int newerTouch=0;newerTouch<2;++newerTouch){
+        LayoutWin diskDesired=desired;
+        diskDesired.lastSeenUtc+=newerTouch;
+        for(const auto& causal : causalStates){
+            RecordDeltaRebasePreparation prepared;
+            CHECK(PrepareRecordDeltasForRebase(
+                {diskDesired,external},retainedDirty,causal,prepared));
+            CHECK(prepared.deltas.empty());
+            CHECK(prepared.deferredRecordIds.empty());
+
+            RebaseResult rebased=RebaseRecordDeltas(
+                {diskDesired,external},externalRevision,
+                prepared.deltas,400);
+            CHECK(rebased.deferredConflictRecordIds.empty());
+            CHECK(rebased.records.size()==2);
+            CHECK(SameLayoutWinFields(rebased.records[0],diskDesired));
+            CHECK(SameLayoutWinFields(rebased.records[1],external));
+
+            TouchRebaseResult touched=ReapplyValidatedTouches(
+                rebased.records,{{touch.recordId,touch}},causal);
+            CHECK(touched.deferredRecordIds.empty());
+            CHECK(touched.records.size()==2);
+            CHECK(SameLayoutWinFields(touched.records[0],diskDesired));
+            CHECK(SameLayoutWinFields(touched.records[1],external));
+        }
+    }
+
+    RecordDeltaRebasePreparation blocked;
+    CHECK(PrepareRecordDeltasForRebase(
+        {base,external},retainedDirty,{},blocked));
+    CHECK(blocked.deltas.empty());
+    CHECK(blocked.deferredRecordIds.count(desired.recordId)==1);
+
+    // Publish D and its residual journal as one transaction.  A forced write
+    // failure after adoption must not leave the old A base behind.  A later
+    // MissingMark then rebases cleanly over unrelated external F.
+    const std::map<std::string,ValidatedRecordTouch> retainedTouches={
+        {touch.recordId,touch}};
+    RecordDeltaRebasePreparation prepared;
+    CHECK(PrepareRecordDeltasForRebase(
+        {desired,external},retainedDirty,{},prepared));
+    CHECK(prepared.satisfiedRecordIds.count(desired.recordId)==1);
+    RebaseResult rebased=RebaseRecordDeltas(
+        {desired,external},externalRevision,prepared.deltas,400);
+    TouchRebaseResult touched=ReapplyValidatedTouches(
+        rebased.records,retainedTouches,{});
+    CHECK(touched.satisfiedRecordIds.count(desired.recordId)==1);
+    RebasedResidualJournal residual;
+    CHECK(BuildRebasedResidualJournal(
+        retainedDirty,retainedTouches,prepared,rebased,touched,
+        {desired,external},externalRevision,residual));
+    CHECK(residual.deltas.empty() && residual.touches.empty());
+
+    RebasedAutoLayoutPublication publication;
+    CHECK(BuildRebasedAutoLayoutPublication(
+        touched.records,{},externalRevision,{},residual.deltas,
+        residual.touches,publication));
+    std::vector<LayoutWin> inMemory={base};
+    std::map<std::string,RecordDelta> journal=retainedDirty;
+    std::map<std::string,ValidatedRecordTouch> touchJournal=retainedTouches;
+    std::map<std::string,DeferredRecordConflict> conflicts;
+    inMemory.swap(publication.records);
+    journal.swap(publication.deltas);
+    touchJournal.swap(publication.touches);
+    SwapLayoutRevisionNoThrow(memoryRevision,publication.revision);
+    conflicts.swap(publication.conflicts);
+    CHECK(SameRevision(memoryRevision,externalRevision));
+    CHECK(journal.empty() && touchJournal.empty() && conflicts.empty());
+
+    LayoutWin missing=inMemory[0];
+    missing.missingSinceUtc=500;
+    RecordDelta missingDelta;
+    missingDelta.kind=RecordDeltaKind::MissingMark;
+    missingDelta.record=missing;
+    missingDelta.baseRevision=memoryRevision;
+    missingDelta.baseRecordPresent=true;
+    missingDelta.baseRecord=inMemory[0];
+    missingDelta.changedUtc=500;
+    missingDelta.causalGeneration=88;
+    std::vector<LayoutWin> stagedRecords;
+    std::map<std::string,RecordDelta> stagedDeltas;
+    std::map<std::string,DeferredRecordConflict> stagedConflicts;
+    CHECK(StageRecordDeltaMutation(
+        inMemory,journal,conflicts,missingDelta,true,
+        stagedRecords,stagedDeltas,stagedConflicts)==
+        RecordDeltaStageResult::Accepted);
+    CHECK(SameRevision(
+        stagedDeltas.at(missing.recordId).baseRevision,externalRevision));
+
+    LayoutWin externalF=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009015}","edge","external-F","f.test",5,
+        G(L"{231A0000-0000-0000-0000-000000000005}"),501);
+    const LayoutRevision revisionF=RebaseRevision(L"layout",16);
+    RebaseResult overF=RebaseRecordDeltas(
+        {desired,external,externalF},revisionF,stagedDeltas,600);
+    CHECK(overF.deferredConflictRecordIds.empty());
+    CHECK(overF.records.size()==3);
+    CHECK(overF.records[0].missingSinceUtc==500);
+    CHECK(SameLayoutWinFields(overF.records[1],external));
+    CHECK(SameLayoutWinFields(overF.records[2],externalF));
+}
+
 static void test_rebase_tied_or_older_upsert_and_stale_tombstone_defer(){
     LayoutRevision baseRevision=RebaseRevision(L"layout",21);
     LayoutRevision latestRevision=RebaseRevision(L"layout",22);
@@ -9741,6 +10366,334 @@ static void test_record_delta_chaining_preserves_first_disk_base(){
     CHECK(SameLayoutWinFields(chained.baseRecord,diskBase));
     CHECK(SameLayoutWinFields(chained.record,secondDesired));
     CHECK(chained.changedUtc==300 && chained.causalGeneration==4);
+}
+
+static void test_deferred_conflict_survives_repeated_publish_until_newer_causal_upsert(){
+    const LayoutRevision baseRevision=RebaseRevision(L"layout",51);
+    const LayoutRevision adoptedRevision=RebaseRevision(L"layout",52);
+    LayoutWin base=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009051}","firefox","base","a.test",1,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),100);
+    LayoutWin disk=base;
+    disk.activeTitle="disk";
+    disk.lastSeenUtc=250;
+    LayoutWin stale=base;
+    stale.activeTitle="stale";
+    stale.lastSeenUtc=250;
+    std::map<std::string,RecordDelta> dirty;
+    dirty[base.recordId]=RebaseUpsert(base,stale,baseRevision,250,11);
+
+    const RebaseResult first=RebaseRecordDeltas(
+        {disk},adoptedRevision,dirty,300);
+    CHECK(first.records.size()==1 && SameLayoutWinFields(first.records[0],disk));
+    CHECK(first.deferredConflictRecordIds.count(base.recordId)==1);
+
+    std::map<std::string,DeferredRecordConflict> conflicts;
+    CHECK(BuildDeferredRecordConflicts(
+        first.deferredConflictRecordIds,first.records,adoptedRevision,conflicts));
+    int serializations=0,writes=0;
+    auto persist=[&](){
+        if(DeferredRecordConflictsBlockPublish(conflicts,adoptedRevision))
+            return false;
+        ++serializations;
+        ++writes;
+        return true;
+    };
+    CHECK(!persist());
+    CHECK(!persist());
+    CHECK(serializations==0 && writes==0);
+
+    const std::vector<LayoutWin> adoptedRecords=first.records;
+    const std::map<std::string,RecordDelta> originalDirty=dirty;
+    const std::map<std::string,DeferredRecordConflict> originalConflicts=conflicts;
+    std::vector<LayoutWin> stagedRecords;
+    std::map<std::string,RecordDelta> stagedDirty;
+    std::map<std::string,DeferredRecordConflict> stagedConflicts;
+
+    RecordDelta tied=RebaseUpsert(
+        disk,stale,adoptedRevision,250,12);
+    CHECK(StageRecordDeltaMutation(
+        adoptedRecords,dirty,conflicts,tied,true,
+        stagedRecords,stagedDirty,stagedConflicts)==
+        RecordDeltaStageResult::DeferredConflict);
+    CHECK(stagedRecords.empty() && stagedDirty.empty() && stagedConflicts.empty());
+    CHECK(SameLayoutWinFields(adoptedRecords[0],disk));
+    CHECK(SameLayoutWinFields(dirty.at(base.recordId).record,
+                              originalDirty.at(base.recordId).record));
+    CHECK(SameRevision(conflicts.at(base.recordId).adoptedRevision,
+                       originalConflicts.at(base.recordId).adoptedRevision));
+    CHECK(DeferredRecordConflictsBlockPublish(conflicts,adoptedRevision));
+
+    RecordDelta older=tied;
+    older.changedUtc=249;
+    CHECK(StageRecordDeltaMutation(
+        adoptedRecords,dirty,conflicts,older,true,
+        stagedRecords,stagedDirty,stagedConflicts)==
+        RecordDeltaStageResult::DeferredConflict);
+    RecordDelta destructive=tied;
+    destructive.kind=RecordDeltaKind::ExpireDelete;
+    destructive.erase=true;
+    CHECK(StageRecordDeltaMutation(
+        adoptedRecords,dirty,conflicts,destructive,true,
+        stagedRecords,stagedDirty,stagedConflicts)==
+        RecordDeltaStageResult::DeferredConflict);
+
+    LayoutWin unrelated=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009052}","chrome","other","b.test",2,
+        G(L"{231A0000-0000-0000-0000-000000000002}"),251);
+    RecordDelta unrelatedDelta;
+    unrelatedDelta.kind=RecordDeltaKind::ExplicitUpsert;
+    unrelatedDelta.record=unrelated;
+    unrelatedDelta.baseRevision=adoptedRevision;
+    unrelatedDelta.changedUtc=251;
+    unrelatedDelta.causalGeneration=14;
+    CHECK(StageRecordDeltaMutation(
+        adoptedRecords,dirty,conflicts,unrelatedDelta,true,
+        stagedRecords,stagedDirty,stagedConflicts)==
+        RecordDeltaStageResult::Accepted);
+    CHECK(stagedRecords.size()==2 && stagedConflicts.size()==1);
+    CHECK(DeferredRecordConflictsBlockPublish(
+        stagedConflicts,adoptedRevision));
+
+    LayoutWin newer=disk;
+    newer.activeTitle="newer";
+    newer.lastSeenUtc=251;
+    RecordDelta accepted=RebaseUpsert(
+        disk,newer,adoptedRevision,251,13);
+    CHECK(StageRecordDeltaMutation(
+        adoptedRecords,dirty,conflicts,accepted,false,
+        stagedRecords,stagedDirty,stagedConflicts)==
+        RecordDeltaStageResult::DeferredConflict);
+    CHECK(StageRecordDeltaMutation(
+        adoptedRecords,dirty,conflicts,accepted,true,
+        stagedRecords,stagedDirty,stagedConflicts)==
+        RecordDeltaStageResult::Accepted);
+    CHECK(stagedRecords.size()==1 && SameLayoutWinFields(stagedRecords[0],newer));
+    CHECK(stagedConflicts.empty());
+    CHECK(stagedDirty.size()==1);
+    const RecordDelta& replacement=stagedDirty.at(base.recordId);
+    CHECK(SameRevision(replacement.baseRevision,adoptedRevision));
+    CHECK(replacement.baseRecordPresent &&
+          SameLayoutWinFields(replacement.baseRecord,disk));
+    CHECK(SameLayoutWinFields(replacement.record,newer));
+    CHECK(!DeferredRecordConflictsBlockPublish(
+        stagedConflicts,adoptedRevision));
+}
+
+static void test_rebased_publication_captures_adopted_disk_before_any_swap(){
+    const LayoutRevision adoptedRevision=RebaseRevision(L"layout-B",62);
+    LayoutWin adopted=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009061}","firefox","disk-B","b.test",2,
+        G(L"{231A0000-0000-0000-0000-000000000002}"),620);
+    DeskRec desktop;
+    desktop.index=2;
+    desktop.guid=adopted.desktop;
+    desktop.name=L"B";
+    RebasedAutoLayoutPublication publication;
+    CHECK(BuildRebasedAutoLayoutPublication(
+        {adopted},{desktop},adoptedRevision,{adopted.recordId},publication));
+    CHECK(publication.records.size()==1 &&
+          SameLayoutWinFields(publication.records[0],adopted));
+    CHECK(publication.desktops.size()==1 &&
+          GuidEq(publication.desktops[0].guid,desktop.guid));
+    CHECK(SameRevision(publication.revision,adoptedRevision));
+    CHECK(publication.conflicts.size()==1);
+    const DeferredRecordConflict& conflict=
+        publication.conflicts.find(adopted.recordId)->second;
+    CHECK(conflict.adoptedRecordPresent &&
+          SameLayoutWinFields(conflict.adoptedRecord,adopted));
+    CHECK(SameRevision(conflict.adoptedRevision,adoptedRevision));
+
+    RebasedAutoLayoutPublication sentinel=publication;
+    sentinel.records[0].activeTitle="sentinel";
+    CHECK(!BuildRebasedAutoLayoutPublication(
+        {adopted},{desktop},adoptedRevision,{adopted.recordId},sentinel,
+        [](){ throw std::bad_alloc(); }));
+    CHECK(sentinel.records[0].activeTitle=="sentinel");
+    CHECK(SameRevision(sentinel.revision,adoptedRevision));
+}
+
+static void test_durable_publish_commits_revision_without_copy_or_rewrite(){
+    LayoutRevision current=RebaseRevision(L"layout-A",71);
+    LayoutRevision published=RebaseRevision(L"layout-B",72);
+    const LayoutRevision expected=published;
+    bool dirty=true;
+    int writes=0;
+    auto persist=[&]{
+        if(!dirty) return true;
+        ++writes;
+        CommitPublishedLayoutRevisionNoThrow(current,published);
+        dirty=false;
+        return true;
+    };
+    CHECK(noexcept(CommitPublishedLayoutRevisionNoThrow(current,published)));
+    CHECK(persist());
+    CHECK(SameRevision(current,expected));
+    CHECK(!dirty && writes==1);
+    CHECK(persist());
+    CHECK(writes==1);
+}
+
+static void test_final_checkpoint_mutation_is_transactional_across_fault_matrix(){
+    const LayoutRevision revision=RebaseRevision(L"layout",61);
+    const UnixSeconds now=2000000600;
+    LayoutWin kept=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009061}","firefox","old","a.test",1,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-100);
+    LayoutWin erased=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009062}","chrome","gone","b.test",2,
+        G(L"{231A0000-0000-0000-0000-000000000002}"),now-100);
+    LayoutWin changed=kept;
+    changed.activeTitle="new";
+    changed.lastSeenUtc=now;
+    LayoutWin added=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009063}","firefox","added","c.test",3,
+        G(L"{231A0000-0000-0000-0000-000000000003}"),now);
+    ValidatedRecordTouch touch;
+    touch.recordId=changed.recordId;
+    touch.lastSeenUtc=now;
+    touch.causalGeneration=61;
+
+    FinalCheckpointMutationState sentinel;
+    sentinel.records.push_back(erased);
+    RecordDelta sentinelDelta=RebaseUpsert(
+        erased,erased,revision,now-1,60);
+    sentinel.deltas[erased.recordId]=sentinelDelta;
+    sentinel.touches[erased.recordId]=touch;
+    sentinel.provisionalRecordByRuntime["sentinel-runtime"]=erased.recordId;
+    const std::map<std::string,std::string> finalProvisional={
+        {"new-runtime",added.recordId}};
+    const std::vector<FinalCheckpointFaultPoint> faults={
+        FinalCheckpointFaultPoint::InitialCopies,
+        FinalCheckpointFaultPoint::RecordIndexes,
+        FinalCheckpointFaultPoint::EraseDelta,
+        FinalCheckpointFaultPoint::UpsertDelta,
+        FinalCheckpointFaultPoint::ValidatedTouches,
+        FinalCheckpointFaultPoint::FinalRecords,
+        FinalCheckpointFaultPoint::Publish
+    };
+    for(FinalCheckpointFaultPoint failedAt : faults){
+        FinalCheckpointMutationState output=sentinel;
+        CHECK(!BuildFinalCheckpointMutation(
+            {kept,erased},{changed,added},{}, {}, {}, {touch},
+            finalProvisional,revision,now,61,output,
+            [&](FinalCheckpointFaultPoint point){
+                if(point==failedAt) throw std::bad_alloc();
+            }));
+        CHECK(output.records.size()==1 &&
+              SameLayoutWinFields(output.records[0],erased));
+        CHECK(output.deltas.size()==1 &&
+              output.deltas.count(erased.recordId)==1);
+        CHECK(output.touches.size()==1 &&
+              output.touches.count(erased.recordId)==1);
+        CHECK(output.provisionalRecordByRuntime.size()==1 &&
+              output.provisionalRecordByRuntime.count("sentinel-runtime")==1);
+    }
+
+    FinalCheckpointMutationState staged;
+    CHECK(BuildFinalCheckpointMutation(
+        {kept,erased},{changed,added},{}, {}, {}, {touch},finalProvisional,
+        revision,now,61,staged));
+    CHECK(staged.records.size()==2 &&
+          SameLayoutWinFields(staged.records[0],changed) &&
+          SameLayoutWinFields(staged.records[1],added));
+    CHECK(staged.deltas.size()==3);
+    CHECK(staged.deltas.at(erased.recordId).erase);
+    CHECK(SameLayoutWinFields(staged.deltas.at(changed.recordId).record,changed));
+    CHECK(SameLayoutWinFields(staged.deltas.at(added.recordId).record,added));
+    CHECK(staged.touches.size()==1 &&
+          staged.touches.at(changed.recordId).causalGeneration==61);
+    CHECK(staged.provisionalRecordByRuntime==finalProvisional);
+}
+
+static void test_expire_delete_discards_validated_touch_before_external_rebase(){
+    const LayoutRevision revisionA=RebaseRevision(L"layout",64);
+    const LayoutRevision revisionD=RebaseRevision(L"layout",65);
+    const UnixSeconds now=2000000650;
+    LayoutWin erased=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009064}","firefox","gone","a.test",1,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-100);
+    ValidatedRecordTouch staleTouch;
+    staleTouch.recordId=erased.recordId;
+    staleTouch.lastSeenUtc=now-50;
+    staleTouch.causalGeneration=64;
+    const std::map<std::string,ValidatedRecordTouch> originalTouches={
+        {erased.recordId,staleTouch}};
+
+    FinalCheckpointMutationState checkpoint;
+    CHECK(BuildFinalCheckpointMutation(
+        {erased},{},{},originalTouches,{}, {}, {},revisionA,now,64,checkpoint));
+    CHECK(checkpoint.records.empty());
+    CHECK(checkpoint.deltas.size()==1 &&
+          checkpoint.deltas.at(erased.recordId).erase);
+    CHECK(checkpoint.touches.count(erased.recordId)==0);
+
+    LayoutWin external=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009065}","chrome","external-D","d.test",2,
+        G(L"{231A0000-0000-0000-0000-000000000002}"),now);
+    RecordDeltaRebasePreparation prepared;
+    CHECK(PrepareRecordDeltasForRebase(
+        {erased,external},checkpoint.deltas,{},prepared));
+    RebaseResult rebased=RebaseRecordDeltas(
+        {erased,external},revisionD,prepared.deltas,now+1);
+    CHECK(rebased.deferredConflictRecordIds.empty());
+    CHECK(rebased.appliedDeleteRecordIds.count(erased.recordId)==1);
+    CHECK(rebased.records.size()==1 &&
+          SameLayoutWinFields(rebased.records[0],external));
+
+    std::map<std::string,ValidatedRecordTouch> touchesForRebase;
+    CHECK(PrepareValidatedTouchesForRebase(
+        originalTouches,rebased.appliedDeleteRecordIds,touchesForRebase));
+    CHECK(touchesForRebase.empty());
+    TouchRebaseResult touched=ReapplyValidatedTouches(
+        rebased.records,touchesForRebase,{});
+    CHECK(touched.deferredRecordIds.empty());
+
+    RebasedResidualJournal residual;
+    CHECK(BuildRebasedResidualJournal(
+        checkpoint.deltas,originalTouches,prepared,rebased,touched,
+        {erased,external},revisionD,residual));
+    CHECK(residual.touches.count(erased.recordId)==0);
+}
+
+static void test_final_observation_provisional_map_stages_before_global_publish(){
+    const std::map<std::string,std::string> current={
+        {"old-runtime","{00000000-0000-0000-0000-000000009071}"}};
+    std::map<std::string,std::string> outputMap={
+        {"sentinel-runtime","{00000000-0000-0000-0000-000000009072}"}};
+    FinalAppObservation sentinel;
+    sentinel.app="sentinel";
+    std::vector<FinalAppObservation> output={sentinel};
+    CHECK(!StageFinalObservationsAndProvisionals(
+        current,output,outputMap,
+        [](std::map<std::string,std::string>& staged,
+           std::vector<FinalAppObservation>& observations)->bool {
+            staged["new-runtime"]=
+                "{00000000-0000-0000-0000-000000009073}";
+            FinalAppObservation app;
+            app.app="firefox";
+            observations.push_back(app);
+            throw std::bad_alloc();
+        }));
+    CHECK(current.size()==1 && current.count("old-runtime")==1);
+    CHECK(output.size()==1 && output[0].app=="sentinel");
+    CHECK(outputMap.size()==1 && outputMap.count("sentinel-runtime")==1);
+
+    CHECK(StageFinalObservationsAndProvisionals(
+        current,output,outputMap,
+        [](std::map<std::string,std::string>& staged,
+           std::vector<FinalAppObservation>& observations)->bool {
+            staged["new-runtime"]=
+                "{00000000-0000-0000-0000-000000009073}";
+            FinalAppObservation app;
+            app.app="firefox";
+            observations.push_back(app);
+            return true;
+        }));
+    CHECK(current.size()==1 && current.count("old-runtime")==1);
+    CHECK(output.size()==1 && output[0].app=="firefox");
+    CHECK(outputMap.size()==2 && outputMap.count("old-runtime")==1 &&
+          outputMap.count("new-runtime")==1);
 }
 
 struct ReconcileResultSink {
@@ -10000,6 +10953,49 @@ static void test_cli_save_revalidates_snapshot_and_desktops_before_publish(){
         G(L"{231A0000-0000-0000-0000-000000000002}");
     CHECK(!CliCheckpointInputsStillCurrent(
         captured,current,desktops,changedDesktops));
+}
+
+static void test_manual_save_incomplete_snapshot_keeps_prior_bytes_without_write(){
+    const GUID desktop=G(L"{231A0000-0000-0000-0000-000000009401}");
+    const std::vector<DeskRec> desktops={{0,desktop,L"one"}};
+    SnapshotVersionTracker tracker;
+    AppFastSnapshot capturedSnapshot;
+    capturedSnapshot.windows.push_back(
+        SnapshotWindow(9401,9402,9403,L"",desktop));
+    FinalizeFastSnapshot("firefox",1,tracker,capturedSnapshot);
+    std::map<std::string,AppFastSnapshot> captured={
+        {"firefox",capturedSnapshot}};
+    std::map<std::string,AppFastSnapshot> current=captured;
+    std::string manualBytes="prior-manual-layout-bytes";
+    const std::string candidate="new-checked-v4-bytes";
+    int writes=0;
+    auto write=[&](const std::string& bytes){
+        ++writes;
+        manualBytes=bytes;
+        return true;
+    };
+
+    current["firefox"].enumerationComplete=false;
+    CHECK(!PublishManualSnapshotIfCurrent(
+        captured,current,desktops,desktops,candidate,write));
+    CHECK(writes==0 && manualBytes=="prior-manual-layout-bytes");
+
+    current=captured;
+    current["firefox"].desktopLookupsComplete=false;
+    current["firefox"].windows[0].desktop=GUID{};
+    CHECK(!PublishManualSnapshotIfCurrent(
+        captured,current,desktops,desktops,candidate,write));
+    CHECK(writes==0 && manualBytes=="prior-manual-layout-bytes");
+
+    std::vector<DeskRec> changedDesktops=desktops;
+    changedDesktops[0].guid=G(L"{231A0000-0000-0000-0000-000000009402}");
+    CHECK(!PublishManualSnapshotIfCurrent(
+        captured,captured,desktops,changedDesktops,candidate,write));
+    CHECK(writes==0 && manualBytes=="prior-manual-layout-bytes");
+
+    CHECK(PublishManualSnapshotIfCurrent(
+        captured,captured,desktops,desktops,candidate,write));
+    CHECK(writes==1 && manualBytes==candidate);
 }
 
 static void test_cli_status_keeps_fast_rows_when_fingerprints_unavailable(){
@@ -10352,6 +11348,51 @@ static void test_posted_reconcile_results_are_drained(){
     CHECK(DestroyWindow(window)!=FALSE);
 }
 
+static void test_reconcile_consumer_ignores_stale_content_generation(){
+    ReconcileResultConsumerKey expected;
+    expected.operationId=9301;
+    expected.app="firefox";
+    expected.workMode=ReconcileWorkMode::Plan;
+    expected.identityGeneration=9302;
+    expected.contentGeneration=9303;
+    expected.sessionRequestId=9304;
+    expected.sessionDataGeneration=9305;
+
+    ReconcileResult result;
+    result.status=ReconcileResultStatus::Completed;
+    result.operationId=expected.operationId;
+    result.app=expected.app;
+    result.workMode=expected.workMode;
+    result.identityGeneration=expected.identityGeneration;
+    result.contentGeneration=expected.contentGeneration;
+    result.sessionRequestId=expected.sessionRequestId;
+    result.sessionDataGeneration=expected.sessionDataGeneration;
+    int mutations=0;
+    auto stale=[&](const ReconcileResult& candidate){
+        const int before=mutations;
+        CHECK(!ConsumeReconcileResultIfCurrent(
+            candidate,expected,[&](){ ++mutations; }));
+        CHECK(mutations==before);
+    };
+    ReconcileResult changed=result;
+    changed.operationId++;
+    stale(changed);
+    changed=result; changed.app="chrome"; stale(changed);
+    changed=result; changed.workMode=ReconcileWorkMode::PrepareLiveOnly; stale(changed);
+    changed=result; changed.identityGeneration++; stale(changed);
+    changed=result; changed.contentGeneration++; stale(changed);
+    changed=result; changed.sessionRequestId++; stale(changed);
+    changed=result; changed.sessionDataGeneration++; stale(changed);
+    changed=result; changed.status=ReconcileResultStatus::Superseded; stale(changed);
+
+    CHECK(ConsumeReconcileResultIfCurrent(
+        result,expected,[&](){ ++mutations; }));
+    CHECK(mutations==1);
+    CHECK(!ConsumeReconcileResultIfCurrent(
+        result,expected,[&](){ ++mutations; throw std::bad_alloc(); }));
+    CHECK(mutations==2);
+}
+
 static FinalWindowObservation FinalObserved(const char* app,const char* title,
         const GUID& desktop,const std::string& provisionalId){
     FinalWindowObservation observation;
@@ -10381,6 +11422,23 @@ static void test_final_snapshot_captures_immediately_opened_new_window(){
     CHECK(GuidEq(result.records[0].desktop,opened.observed.desktop));
     CHECK(result.records[0].lastSeenUtc==now &&
           result.records[0].missingSinceUtc==0);
+}
+
+static void test_final_snapshot_marks_unbound_additions_provisional_independent_of_title(){
+    const UnixSeconds now=1700001500;
+    FinalWindowObservation opened=FinalObserved(
+        "firefox","already titled",
+        G(L"{231A0000-0000-0000-0000-000000000002}"),
+        "{00000000-0000-0000-0000-000000009206}");
+    FinalAppObservation app;
+    app.app="firefox";
+    app.quality=FinalProfileQuality::Complete;
+    app.windows.push_back(opened);
+
+    FinalSnapshotResult result=CommitFinalSnapshotRecords({}, {app}, now);
+
+    CHECK(result.valid && result.records.size()==1);
+    CHECK(result.records[0].provisional);
 }
 
 static void test_final_snapshot_failed_reappeared_keeps_destination_and_adds_sibling(){
@@ -10466,6 +11524,33 @@ static void test_final_snapshot_failed_desktop_lookup_preserves_saved_guid(){
     CHECK(result.records[0].lastSeenUtc==now);
 }
 
+static void test_final_snapshot_stale_pending_uses_unique_title_and_preserves_destination(){
+    const UnixSeconds now=1700005500;
+    LayoutWin saved=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009246}","firefox","stable","a.test",4,
+        G(L"{231A0000-0000-0000-0000-000000000004}"),now-20);
+    FinalWindowObservation observed=FinalObserved(
+        "firefox","stable",
+        G(L"{231A0000-0000-0000-0000-000000000009}"),
+        "{00000000-0000-0000-0000-000000009248}");
+    observed.pendingRecordId=
+        "{00000000-0000-0000-0000-000000009247}";
+    observed.fingerprintFresh=true;
+    FinalAppObservation app;
+    app.app="firefox";
+    app.quality=FinalProfileQuality::Complete;
+    app.windows.push_back(observed);
+
+    FinalSnapshotResult result=CommitFinalSnapshotRecords({saved},{app},now);
+
+    CHECK(result.valid && result.records.size()==1);
+    CHECK(result.records[0].recordId==saved.recordId);
+    CHECK(GuidEq(result.records[0].desktop,saved.desktop));
+    CHECK(result.records[0].deskIndex==saved.deskIndex);
+    CHECK(result.records[0].lastSeenUtc==now);
+    CHECK(result.records[0].missingSinceUtc==0);
+}
+
 static void test_final_snapshot_reservations_preserve_bound_and_provisional_origin(){
     const UnixSeconds now=1700006000;
     LayoutWin bound=ReconcileTestRecord(
@@ -10497,11 +11582,276 @@ static void test_final_snapshot_reservations_preserve_bound_and_provisional_orig
     CHECK(result.valid && result.records.size()==2);
     CHECK(SameLayoutWinFields(result.records[0],bound));
     CHECK(result.records[1].recordId==unboundMove.provisionalRecordId);
+    CHECK(result.records[1].provisional);
     CHECK(GuidEq(result.records[1].desktop,
                  unboundMove.provisionalOriginRecord.desktop));
     FinalSnapshotResult repeated=CommitFinalSnapshotRecords(
         result.records,{app},now+1);
     CHECK(repeated.valid && repeated.records.size()==2);
+}
+
+static void test_initial_partial_enumeration_suppresses_lifecycle_missing_and_write(){
+    const UnixSeconds now=1700006500;
+    LayoutWin saved=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009261}","firefox","saved","a.test",1,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-50);
+    AppFastSnapshot partial;
+    partial.windows.push_back(SnapshotWindow(
+        9261,9262,9263,L"",saved.desktop)); // empty title itself is valid
+    partial.enumerationComplete=false;       // EnumWindows failed after it
+    partial.desktopLookupsComplete=true;
+    SnapshotVersionTracker tracker;
+    FinalizeFastSnapshot("firefox",1,tracker,partial);
+
+    LcState lifecycle;
+    std::vector<LayoutWin> records={saved};
+    int lifecycleCalls=0,missingCalls=0,writeCalls=0;
+    auto monitorTick=[&](){
+        if(!FastSnapshotCanObserve(partial)) return;
+        ++lifecycleCalls;
+        LcDecision decision=LcObserve(lifecycle,!partial.windows.empty(),
+            partial.windowSetSignature,partial.settleSignature,
+            partial.layoutSignature,0,0);
+        if(decision.action==LcAction::MarkMissingFromLastSeen) ++missingCalls;
+        if(decision.action==LcAction::SaveLayout) ++writeCalls;
+    };
+    monitorTick();
+    CHECK(lifecycleCalls==0 && missingCalls==0 && writeCalls==0);
+    CHECK(records.size()==1 && SameLayoutWinFields(records[0],saved));
+
+    FinalAppObservation incomplete;
+    incomplete.app="firefox";
+    incomplete.quality=FinalProfileQuality::Incomplete;
+    FinalSnapshotResult final=CommitFinalSnapshotRecords(records,{incomplete},now);
+    CHECK(final.valid && final.records.size()==1 &&
+          SameLayoutWinFields(final.records[0],saved));
+    CHECK(final.changedRecordIds.empty() && final.erasedRecordIds.empty());
+}
+
+static void test_bound_a_save_then_unbound_b_reconcile_never_moves_a(){
+    const UnixSeconds now=1700006600;
+    const GUID originA=G(L"{231A0000-0000-0000-0000-000000000001}");
+    const GUID movedA=G(L"{231A0000-0000-0000-0000-000000000002}");
+    const GUID destinationB=G(L"{231A0000-0000-0000-0000-000000000003}");
+    LayoutWin savedA=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009271}","firefox","A","a.test",0,
+        originA,now-100);
+    LayoutWin savedB=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009272}","firefox","B","b.test",2,
+        destinationB,now-100);
+    BoundSaveObservation observedA;
+    observedA.window=SnapshotWindow(9271,9272,9273,L"A",movedA);
+    observedA.hasBinding=true;
+    observedA.expectedIdentity=IdentityOf(observedA.window);
+    observedA.recordId=savedA.recordId;
+    observedA.deskIndex=1;
+    observedA.causalGeneration=9274;
+    BoundSaveObservation unboundB;
+    unboundB.window=SnapshotWindow(9275,9276,9277,L"B",originA);
+    unboundB.deskIndex=0;
+
+    SaveObservedAppResult saved=ApplyObservedBoundRecords(
+        {savedA,savedB},"firefox",{observedA,unboundB},true,now);
+    CHECK(saved.valid && saved.needsReconcile && saved.updates.size()==1);
+    CHECK(GuidEq(saved.records[0].desktop,movedA));
+
+    LayoutWin liveB=savedB;
+    liveB.desktop=originA;
+    liveB.deskIndex=0;
+    liveB.lastSeenUtc=now;
+    ReconcilePlan plan=PlanAppReconcile(
+        saved.records,{liveB},"firefox",now,{savedA.recordId},
+        ReconcileFreshness::Fresh);
+    CHECK(!plan.deferred && plan.restores.size()==1);
+    CHECK(plan.restores[0].savedIndex==1 && plan.restores[0].liveIndex==0);
+    for(const RestoreRequest& restore : plan.restores)
+        CHECK(restore.savedIndex!=0);
+    CHECK(plan.newRecords.empty());
+}
+
+static void test_query_end_destroy_full_final_snapshot_chains(){
+    const UnixSeconds now=1700006700;
+    const GUID first=G(L"{231A0000-0000-0000-0000-000000000001}");
+    const GUID second=G(L"{231A0000-0000-0000-0000-000000000002}");
+    const std::vector<DeskRec> desks={{0,first,L"one"},{1,second,L"two"}};
+
+    auto run=[&](std::vector<LayoutWin> initial,
+                 const std::vector<FinalAppObservation>& observations,
+                 const std::vector<LayoutWin>& expected){
+        CheckpointController controller;
+        std::vector<LayoutWin> current=initial;
+        std::string bytes;
+        int writes=0;
+        auto checkpoint=[&](CheckpointReason){
+            FinalSnapshotResult committed=CommitFinalSnapshotRecords(
+                current,observations,now);
+            CHECK(committed.valid);
+            if(!committed.valid) return false;
+            current=committed.records;
+            bytes=SerializeLayout(desks,current);
+            ++writes;
+            return true;
+        };
+        CHECK(controller.dispatch(
+            CheckpointReason::QueryEndSession,true,true,false,checkpoint));
+        CHECK(!controller.finalization.finished && writes==1);
+        CHECK(controller.dispatch(
+            CheckpointReason::Finalize,true,true,false,checkpoint));
+        CHECK(controller.finalization.finished && writes==2);
+        const std::string afterEnd=bytes;
+        CHECK(controller.dispatch(
+            CheckpointReason::Finalize,true,true,false,checkpoint));
+        CHECK(writes==2 && bytes==afterEnd);
+        CHECK(bytes==SerializeLayout(desks,expected));
+    };
+
+    FinalWindowObservation opened=FinalObserved(
+        "firefox","opened",second,
+        "{00000000-0000-0000-0000-000000009281}");
+    FinalAppObservation openedApp;
+    openedApp.app="firefox";
+    openedApp.quality=FinalProfileQuality::Complete;
+    openedApp.windows={opened};
+    LayoutWin expectedOpened=opened.observed;
+    expectedOpened.recordId=opened.provisionalRecordId;
+    expectedOpened.lastSeenUtc=now;
+    expectedOpened.missingSinceUtc=0;
+    expectedOpened.provisional=true;
+    run({}, {openedApp}, {expectedOpened});
+
+    LayoutWin moved=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009282}","firefox","moved","a.test",0,
+        first,now-100);
+    FinalWindowObservation movedObservation=FinalObserved(
+        "firefox","moved",second,"");
+    movedObservation.boundRecordId=moved.recordId;
+    movedObservation.fingerprintFresh=false;
+    FinalAppObservation movedApp;
+    movedApp.app="firefox";
+    movedApp.quality=FinalProfileQuality::Complete;
+    movedApp.windows={movedObservation};
+    LayoutWin expectedMoved=moved;
+    expectedMoved.desktop=second;
+    expectedMoved.deskIndex=1;
+    expectedMoved.lastSeenUtc=now;
+    expectedMoved.missingSinceUtc=0;
+    run({moved},{movedApp},{expectedMoved});
+
+    LayoutWin absent=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009283}","firefox","absent","b.test",0,
+        first,now-100);
+    FinalAppObservation emptyApp;
+    emptyApp.app="firefox";
+    emptyApp.quality=FinalProfileQuality::Complete;
+    LayoutWin expectedAbsent=absent;
+    expectedAbsent.missingSinceUtc=absent.lastSeenUtc;
+    run({absent},{emptyApp},{expectedAbsent});
+
+    CheckpointController retry;
+    int finalizeCalls=0;
+    CHECK(retry.dispatch(CheckpointReason::QueryEndSession,true,true,false,
+        [](CheckpointReason){ return true; }));
+    CHECK(!retry.dispatch(CheckpointReason::Finalize,true,true,false,
+        [&](CheckpointReason){ ++finalizeCalls; return false; }));
+    CHECK(!retry.finalization.finished);
+    CHECK(retry.dispatch(CheckpointReason::Finalize,true,true,false,
+        [&](CheckpointReason){ ++finalizeCalls; return true; }));
+    CHECK(finalizeCalls==2 && retry.finalization.finished);
+}
+
+static void test_issued_move_heartbeat_then_session_end_preserves_origin_and_sibling(){
+    const UnixSeconds now=1700006800;
+    const GUID origin=G(L"{231A0000-0000-0000-0000-000000000001}");
+    const GUID target=G(L"{231A0000-0000-0000-0000-000000000002}");
+    LayoutWin sibling=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009291}","firefox","sibling","s.test",0,
+        origin,now-100);
+    LayoutWin provisional=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009292}","firefox","new","",0,
+        origin,now);
+    provisional.provisional=true;
+
+    MoveJob issued=MJ(MoveOwner::Picker,9291,9292,"issued-runtime");
+    issued.recordId=provisional.recordId;
+    issued.destination=target;
+    MoveQueue queue;
+    CHECK(queue.enqueue(issued));
+    CHECK(!queue.onIssued(MoveAttemptOutcome::Accepted).completed);
+    CHECK(queue.nextAction()==MoveAction::Verify);
+    MoveReservation reservation;
+    reservation.token=issued.token;
+    reservation.identity={0x9293,9294,9295};
+    reservation.originDesktop=origin;
+    reservation.provisionalOriginRecord=provisional;
+    reservation.hasProvisionalOriginRecord=true;
+    MoveReservationBook reservations;
+    CHECK(reservations.reserve(reservation)==MoveReservationUpdate::Inserted);
+
+    FinalWindowObservation siblingObserved=FinalObserved(
+        "firefox","sibling",target,"");
+    siblingObserved.boundRecordId=sibling.recordId;
+    FinalWindowObservation moving=FinalObserved(
+        "firefox","new",target,provisional.recordId);
+    moving.reserved=true;
+    moving.hasProvisionalOriginRecord=true;
+    moving.provisionalOriginRecord=provisional;
+    FinalAppObservation app;
+    app.app="firefox";
+    app.quality=FinalProfileQuality::Complete;
+    app.windows={siblingObserved,moving};
+
+    CheckpointController checkpoint;
+    int checkpointCalls=0;
+    std::vector<LayoutWin> persisted;
+    auto save=[&](CheckpointReason){
+        MoveReservation visible;
+        CHECK(reservations.lookup(reservation.identity,visible));
+        CHECK(queue.nextAction()==MoveAction::Verify);
+        FinalSnapshotResult result=CommitFinalSnapshotRecords({sibling},{app},now);
+        CHECK(result.valid);
+        persisted=result.records;
+        ++checkpointCalls;
+        return result.valid;
+    };
+    CHECK(checkpoint.dispatch(
+        CheckpointReason::Heartbeat,true,true,true,save));
+    CHECK(checkpoint.heartbeatDeferred && checkpointCalls==0);
+    CHECK(checkpoint.dispatch(
+        CheckpointReason::QueryEndSession,true,true,true,save));
+    CHECK(checkpointCalls==1 && persisted.size()==2);
+    CHECK(GuidEq(persisted[0].desktop,target));
+    CHECK(persisted[1].recordId==provisional.recordId &&
+          persisted[1].provisional && GuidEq(persisted[1].desktop,origin));
+    CHECK(queue.nextAction()==MoveAction::Verify && reservations.size()==1);
+}
+
+static void test_manual_restore_keeps_fixture_bytes_and_reports_once(){
+    LayoutTempDir temp;
+    const std::wstring path=temp.file(L"manual-restore.vde");
+    const std::string prior="manual-layout-byte-for-byte-sentinel";
+    CHECK(WriteRawFile(path,prior));
+
+    MoveOperationDispatcher dispatcher;
+    const MoveToken first{MoveOwner::ManualTray,9391,9392,0};
+    const MoveToken second{MoveOwner::ManualTray,9391,9393,1};
+    const MoveToken third{MoveOwner::ManualTray,9391,9394,2};
+    CHECK(dispatcher.begin(MoveOwner::ManualTray,9391,{first,second,third}));
+    MoveOperationSummary summary;
+    int reports=0;
+    auto deliver=[&](const MoveToken& token,MoveTerminal terminal){
+        MoveDispatchDisposition disposition=dispatcher.dispatch(
+            TerminalMoveResult(token,terminal),summary);
+        if(disposition==MoveDispatchDisposition::OperationCompleted) ++reports;
+        return disposition;
+    };
+    CHECK(deliver(first,MoveTerminal::Succeeded)==MoveDispatchDisposition::Accepted);
+    CHECK(deliver(second,MoveTerminal::PermanentFailure)==MoveDispatchDisposition::Accepted);
+    CHECK(deliver(third,MoveTerminal::Exhausted)==
+          MoveDispatchDisposition::OperationCompleted);
+    CHECK(reports==1 && summary.succeeded==1 &&
+          summary.permanentFailures==1 && summary.exhausted==1);
+    CHECK(deliver(third,MoveTerminal::Exhausted)==MoveDispatchDisposition::Stale);
+    CHECK(reports==1 && ReadRawFile(path)==prior);
 }
 
 static void test_auto_load_retry_uses_capped_backoff_and_initializes_once(){
@@ -10514,11 +11864,189 @@ static void test_auto_load_retry_uses_capped_backoff_and_initializes_once(){
     for(unsigned attempt=0;attempt<8;++attempt)
         state.failed(state.nextAttemptMs);
     CHECK(state.nextAttemptMs-state.lastAttemptMs==60000);
-    state.succeeded();
-    CHECK(state.loaded && state.initializationCount==1 && state.heartbeatStarted);
-    CHECK(!state.due(UINT64_MAX));
-    state.succeeded();
-    CHECK(state.initializationCount==1);
+}
+
+static void test_corrective_initial_observation_is_transactional_before_async_work(){
+    std::vector<AppProfile> profiles;
+    profiles.push_back(sessionTestProfile("firefox"));
+    profiles.push_back(sessionTestProfile("chrome",AppProfile::CHROMIUM));
+    SnapshotVersionTracker tracker;
+    std::map<std::string,AppFastSnapshot> snapshots;
+    AppFastSnapshot firefox;
+    firefox.windows.push_back(SnapshotWindow(
+        11,101,1001,L"A",G(L"{231A0000-0000-0000-0000-000000000001}")));
+    FinalizeFastSnapshot("firefox",1,tracker,firefox);
+    snapshots["firefox"]=firefox;
+    AppFastSnapshot chrome;
+    chrome.windows.push_back(SnapshotWindow(
+        22,202,2002,L"B",G(L"{231A0000-0000-0000-0000-000000000002}")));
+    FinalizeFastSnapshot("chrome",2,tracker,chrome);
+    snapshots["chrome"]=chrome;
+
+    std::map<std::string,LcState> lifecycle;
+    lifecycle["prior"].initialized=true;
+    std::map<std::string,uint64_t> signatures;
+    signatures["prior"]=77;
+    std::vector<std::string> stagedApps;
+    int preparedApps=0;
+    const bool first=PrepareInitialLifecycleStates(
+        profiles,snapshots,500,lifecycle,signatures,
+        [&](const std::string& app,LcState& state,
+            const AppFastSnapshot& snapshot,uint64_t nowMs){
+            ++preparedApps;
+            const LcDecision decision=LcObserve(
+                state,true,snapshot.windowSetSignature,
+                snapshot.settleSignature,snapshot.layoutSignature,0,nowMs);
+            CHECK(decision.action==LcAction::None);
+            stagedApps.push_back(app);
+            if(app=="chrome") throw 7;
+        });
+    CHECK(!first && preparedApps==2);
+    CHECK(lifecycle.size()==1 && lifecycle.count("prior")==1 &&
+          signatures.size()==1 && signatures["prior"]==77);
+    // The first attempt staged A locally, but no owner/route/wave was
+    // published, so a hypothetical late generation cannot match anything.
+    CHECK((stagedApps==std::vector<std::string>{"firefox","chrome"}));
+    CHECK(lifecycle.count("firefox")==0);
+
+    stagedApps.clear();
+    CHECK(PrepareInitialLifecycleStates(
+        profiles,snapshots,600,lifecycle,signatures,
+        [&](const std::string& app,LcState& state,
+            const AppFastSnapshot& snapshot,uint64_t nowMs){
+            const LcDecision decision=LcObserve(
+                state,true,snapshot.windowSetSignature,
+                snapshot.settleSignature,snapshot.layoutSignature,0,nowMs);
+            CHECK(decision.action==LcAction::None);
+            stagedApps.push_back(app);
+        }));
+    CHECK(lifecycle.size()==2 && signatures.size()==2 &&
+          lifecycle.count("firefox")==1 && lifecycle.count("chrome")==1 &&
+          lifecycle.count("prior")==0);
+
+    std::map<std::string,uint64_t> routes;
+    std::vector<std::string> owners;
+    LcState& state=lifecycle["firefox"];
+    const AppFastSnapshot& current=snapshots["firefox"];
+    const LcDecision wave=LcObserve(
+        state,true,current.windowSetSignature,current.settleSignature,
+        current.layoutSignature,0,601);
+    if(wave.action==LcAction::BeginRestore){
+        routes["firefox"]=wave.generation;
+        owners.push_back("firefox");
+    }
+    const LcDecision duplicate=LcObserve(
+        state,true,current.windowSetSignature,current.settleSignature,
+        current.layoutSignature,0,602);
+    CHECK(wave.action==LcAction::BeginRestore && wave.generation!=0);
+    CHECK(duplicate.action==LcAction::None && routes.size()==1 &&
+          routes["firefox"]==wave.generation && owners.size()==1);
+}
+
+static void test_corrective_monitor_arm_failure_backs_off_before_loading(){
+    AutoLoadRetryState state;
+    int monitorAttempts=0,loadAttempts=0,initializations=0;
+    int heartbeatAttempts=0,alternatePosts=0;
+    bool monitorAvailable=false;
+    const auto attempt=[&](uint64_t nowMs){
+        return AdvanceAutoRuntimeStart(state,nowMs,
+            [&](){ ++monitorAttempts; return monitorAvailable; },
+            [&](){ ++loadAttempts; return true; },
+            [&](){ ++initializations; return true; },
+            [&](){ ++heartbeatAttempts; return true; },
+            [&](){ ++alternatePosts; return true; });
+    };
+
+    CHECK(attempt(100)==AutoRuntimeStartResult::MonitorUnavailable);
+    CHECK(!state.loaded && !state.monitorStarted &&
+          !state.layoutPrepared && !state.heartbeatStarted);
+    CHECK(state.nextAttemptMs==1100 && alternatePosts==1);
+    CHECK(loadAttempts==0 && initializations==0 && heartbeatAttempts==0);
+
+    monitorAvailable=true;
+    CHECK(attempt(100)==AutoRuntimeStartResult::WaitingForRetry);
+    CHECK(state.monitorStarted && !state.loaded && loadAttempts==0);
+    CHECK(attempt(1099)==AutoRuntimeStartResult::WaitingForRetry);
+    CHECK(loadAttempts==0);
+    CHECK(attempt(1100)==AutoRuntimeStartResult::Ready);
+    CHECK(state.loaded && state.heartbeatStarted &&
+          loadAttempts==1 && initializations==1 && heartbeatAttempts==1);
+}
+
+static void test_corrective_monitor_alternate_rearm_is_bounded(){
+    AutoLoadRetryState state;
+    int monitorAttempts=0,alternatePosts=0;
+    const auto attempt=[&](){
+        return AdvanceAutoRuntimeStart(state,0,
+            [&](){ ++monitorAttempts; return false; },
+            [](){ return true; },[](){ return true; },
+            [](){ return true; },
+            [&](){ ++alternatePosts; return true; });
+    };
+    for(unsigned index=0;
+        index<AutoLoadRetryState::kMaxAlternateMonitorRetries+3;++index)
+        CHECK(attempt()==AutoRuntimeStartResult::MonitorUnavailable);
+    CHECK(alternatePosts==
+          static_cast<int>(AutoLoadRetryState::kMaxAlternateMonitorRetries));
+    CHECK(monitorAttempts==
+          static_cast<int>(AutoLoadRetryState::kMaxAlternateMonitorRetries+3));
+    CHECK(!state.loaded && !state.monitorStarted);
+}
+
+static void test_corrective_failed_monitor_retry_post_remains_unready(){
+    AutoLoadRetryState state;
+    int postAttempts=0;
+    const AutoRuntimeStartResult result=AdvanceAutoRuntimeStart(
+        state,50,[](){ return false; },[](){ return true; },
+        [](){ return true; },[](){ return true; },
+        [&](){ ++postAttempts; return false; });
+    CHECK(result==AutoRuntimeStartResult::MonitorUnavailable);
+    CHECK(postAttempts==1 && !state.loaded && !state.monitorStarted &&
+          !state.layoutPrepared && !state.initialized &&
+          !state.heartbeatStarted);
+    CHECK(state.nextAttemptMs==1050 && !state.due(1049));
+}
+
+static void test_corrective_unavailable_load_then_heartbeat_retry_initializes_once(){
+    AutoLoadRetryState state;
+    std::string bytes="prior-valid-bytes";
+    int monitorStarts=0,loadAttempts=0,initializations=0;
+    int heartbeatAttempts=0,heartbeatStarts=0,alternatePosts=0;
+    const auto attempt=[&](uint64_t nowMs){
+        return AdvanceAutoRuntimeStart(state,nowMs,
+            [&](){ ++monitorStarts; return true; },
+            [&](){
+                ++loadAttempts;
+                if(loadAttempts<3) return false;
+                bytes="new-valid-bytes";
+                return true;
+            },
+            [&](){ ++initializations; return true; },
+            [&](){
+                ++heartbeatAttempts;
+                if(heartbeatAttempts==1) return false;
+                ++heartbeatStarts;
+                return true;
+            },
+            [&](){ ++alternatePosts; return true; });
+    };
+
+    CHECK(attempt(0)==AutoRuntimeStartResult::LoadUnavailable);
+    CHECK(bytes=="prior-valid-bytes" && loadAttempts==1);
+    CHECK(attempt(999)==AutoRuntimeStartResult::WaitingForRetry);
+    CHECK(loadAttempts==1 && bytes=="prior-valid-bytes");
+    CHECK(attempt(1000)==AutoRuntimeStartResult::LoadUnavailable);
+    CHECK(loadAttempts==2 && bytes=="prior-valid-bytes");
+    CHECK(attempt(3000)==AutoRuntimeStartResult::HeartbeatUnavailable);
+    CHECK(bytes=="new-valid-bytes" && state.layoutPrepared &&
+          !state.initialized && !state.loaded && !state.heartbeatStarted);
+    CHECK(initializations==0 && heartbeatAttempts==1);
+    CHECK(attempt(3999)==AutoRuntimeStartResult::WaitingForRetry);
+    CHECK(loadAttempts==3 && initializations==0 && heartbeatAttempts==1);
+    CHECK(attempt(4000)==AutoRuntimeStartResult::Ready);
+    CHECK(state.loaded && state.heartbeatStarted &&
+          monitorStarts==1 && loadAttempts==3 && initializations==1 &&
+          heartbeatAttempts==2 && heartbeatStarts==1 && alternatePosts==0);
 }
 
 static void test_checkpoint_controller_heartbeat_and_session_end_chain(){
@@ -10570,6 +12098,67 @@ static void test_settings_checkpoint_rejects_enabled_unloaded_and_preserves_stat
     CHECK(!accepted);
     CHECK(checkpointCalls==0);
     CHECK(recoveryPending && settingEnabled);
+}
+
+static void test_settings_transaction_rolls_back_and_cancels_only_auto_owner(){
+    SettingsRuntimeSnapshot current;
+    current.hotkeyVk='D';
+    current.hotkeyMods=MOD_CONTROL|MOD_ALT;
+    current.autoFix=true;
+    current.runAtLogon=false;
+    current.firefox=true;
+    current.chrome=true;
+    current.edge=false;
+    SettingsRuntimeSnapshot requested=current;
+    requested.hotkeyVk='K';
+    requested.hotkeyMods=MOD_SHIFT;
+    requested.autoFix=false;
+    requested.runAtLogon=true;
+    requested.chrome=false;
+
+    bool dialogOpen=true,autoOperation=true,manualOperation=true;
+    bool pickerOperation=true,moveTimerArmed=true;
+    int checkpoints=0,cancellations=0;
+    CHECK(!ApplySettingsRuntimeTransaction(current,requested,
+        [&](){ ++checkpoints; return false; },
+        [&](){ ++cancellations; autoOperation=false; return true; }));
+    CHECK(checkpoints==1 && cancellations==0 && dialogOpen);
+    CHECK(current.hotkeyVk=='D' && current.hotkeyMods==(MOD_CONTROL|MOD_ALT) &&
+          current.autoFix && !current.runAtLogon && current.firefox &&
+          current.chrome && !current.edge);
+    CHECK(autoOperation && manualOperation && pickerOperation && moveTimerArmed);
+
+    CHECK(ApplySettingsRuntimeTransaction(current,requested,
+        [&](){ ++checkpoints; return true; },
+        [&](){
+            ++cancellations;
+            autoOperation=false;
+            return true;
+        }));
+    CHECK(checkpoints==2 && cancellations==1 && !autoOperation);
+    CHECK(manualOperation && pickerOperation && moveTimerArmed);
+    CHECK(current.hotkeyVk=='K' && current.hotkeyMods==MOD_SHIFT &&
+          !current.autoFix && current.runAtLogon && current.firefox &&
+          !current.chrome && !current.edge);
+
+    SettingsRuntimeSnapshot enabled=current;
+    enabled.autoFix=true;
+    enabled.chrome=true;
+    int loadStarts=0;
+    CHECK(ApplySettingsRuntimeTransaction(current,enabled,
+        [&](){ ++checkpoints; return true; },
+        [&](){ ++cancellations; return true; }));
+    if(current.autoFix) ++loadStarts;
+    CHECK(current.autoFix && current.chrome && loadStarts==1);
+    CHECK(checkpoints==2); // enabling a disabled snapshot needs no save
+
+    SettingsRuntimeSnapshot disabled=current;
+    disabled.autoFix=false;
+    CHECK(ApplySettingsRuntimeTransaction(current,disabled,
+        [&](){ ++checkpoints; return true; },
+        [&](){ ++cancellations; return true; }));
+    CHECK(!current.autoFix && checkpoints==3); // disable only after checkpoint
+    CHECK(manualOperation && pickerOperation && moveTimerArmed);
 }
 
 static void test_checkpoint_reservation_defers_one_heartbeat_but_not_final(){
@@ -10654,6 +12243,236 @@ static void test_browser_classifier_requires_enabled_class_and_exact_executable_
     CHECK(firefox && firefox->id=="firefox");
 }
 
+static void test_class_lookup_failure_marks_enabled_profiles_incomplete_but_empty_title_is_valid(){
+    const std::vector<AppProfile> profiles=BuiltinProfiles(true,true,false);
+    std::map<std::string,AppFastSnapshot> snapshots;
+    snapshots["firefox"];
+    snapshots["chrome"];
+    FastWin emptyTitle=SnapshotWindow(
+        931,9301,93001,L"",
+        G(L"{231A0000-0000-0000-0000-000000000001}"));
+    emptyTitle.app="firefox";
+    snapshots["firefox"].windows.push_back(emptyTitle);
+
+    CHECK(AcceptFastClassNameRead(18,profiles,snapshots));
+    CHECK(snapshots["firefox"].enumerationComplete);
+    CHECK(snapshots["chrome"].enumerationComplete);
+    CHECK(snapshots["firefox"].windows.size()==1 &&
+          snapshots["firefox"].windows[0].title.empty());
+
+    CHECK(!AcceptFastClassNameRead(0,profiles,snapshots));
+    CHECK(!snapshots["firefox"].enumerationComplete);
+    CHECK(!snapshots["chrome"].enumerationComplete);
+    CHECK(snapshots["firefox"].windows.size()==1 &&
+          snapshots["firefox"].windows[0].title.empty());
+}
+
+static void test_popup_persistence_recaptures_before_classification_and_reports_storage(){
+    const WindowIdentityKey captured{0x941,9401,94001};
+    int recaptures=0,classifications=0,readinessChecks=0,writes=0;
+    auto lostRecapture=[&](const WindowIdentityKey& expected){
+        ++recaptures;
+        CHECK(SameIdentity(expected,captured));
+        return WindowIdentityRecapture::Lost; // same HWND/PID, reused process start
+    };
+    auto classify=[&](const WindowIdentityKey&){
+        ++classifications;
+        return PopupBrowserClassification::Tracked;
+    };
+    auto readiness=[&](){
+        ++readinessChecks;
+        return PopupPersistenceReadiness::Ready;
+    };
+    auto persist=[&](){ ++writes; return true; };
+
+    CHECK(CompletePopupMovePersistence(
+              captured,lostRecapture,classify,readiness,persist)==
+          PopupPersistenceResult::IdentityLost);
+    CHECK(recaptures==1 && classifications==0 && readinessChecks==0 && writes==0);
+
+    auto matchingRecapture=[&](const WindowIdentityKey&){
+        ++recaptures;
+        return WindowIdentityRecapture::Match;
+    };
+    CHECK(CompletePopupMovePersistence(
+              captured,matchingRecapture,
+              [&](const WindowIdentityKey&){
+                  ++classifications;
+                  return PopupBrowserClassification::NotTracked;
+              },readiness,persist)==PopupPersistenceResult::NotTracked);
+    CHECK(recaptures==2 && classifications==1 && readinessChecks==0 && writes==0);
+
+    CHECK(CompletePopupMovePersistence(
+              captured,matchingRecapture,classify,
+              [&](){
+                  ++readinessChecks;
+                  return PopupPersistenceReadiness::Unavailable;
+              },persist)==PopupPersistenceResult::StorageUnavailable);
+    CHECK(recaptures==3 && classifications==2 && readinessChecks==1 && writes==0);
+
+    CHECK(CompletePopupMovePersistence(
+              captured,matchingRecapture,classify,
+              [&](){
+                  ++readinessChecks;
+                  return PopupPersistenceReadiness::ReadOnly;
+              },persist)==PopupPersistenceResult::StorageReadOnly);
+    CHECK(recaptures==4 && classifications==3 && readinessChecks==2 && writes==0);
+
+    CHECK(CompletePopupMovePersistence(
+              captured,matchingRecapture,classify,readiness,persist)==
+          PopupPersistenceResult::Saved);
+    CHECK(recaptures==5 && classifications==4 && readinessChecks==3 && writes==1);
+    CHECK(CompletePopupMovePersistence(
+              captured,matchingRecapture,classify,readiness,[&](){ ++writes; return false; })==
+          PopupPersistenceResult::SaveFailed);
+    CHECK(recaptures==6 && classifications==5 && readinessChecks==4 && writes==2);
+}
+
+static void test_popup_saved_only_completes_exact_lifecycle_save_generation(){
+    LcState state;
+    state.saveInFlight=true;
+    state.saveGeneration=91;
+    state.saveRequestedLayoutSignature=901;
+    int completions=0;
+    const auto complete=[&](uint64_t generation){
+        return CompletePopupLifecycleAfterPersistence(
+            PopupPersistenceResult::Saved,[&]{
+                ++completions;
+                LcExplicitSaveCompleted(state,generation,902,903,904);
+            });
+    };
+    const PopupPersistenceResult failures[]={
+        PopupPersistenceResult::NotTracked,
+        PopupPersistenceResult::IdentityLost,
+        PopupPersistenceResult::IdentityIndeterminate,
+        PopupPersistenceResult::ClassificationFailed,
+        PopupPersistenceResult::StorageUnavailable,
+        PopupPersistenceResult::StorageReadOnly,
+        PopupPersistenceResult::SaveFailed
+    };
+    for(PopupPersistenceResult result : failures){
+        CHECK(!CompletePopupLifecycleAfterPersistence(result,[&]{
+            ++completions;
+            LcExplicitSaveCompleted(state,91,902,903,904);
+        }));
+    }
+    CHECK(completions==0 && state.saveInFlight && state.saveGeneration==91);
+    CHECK(complete(90));
+    CHECK(completions==1 && state.saveInFlight && state.saveGeneration==91);
+    CHECK(complete(91));
+    CHECK(completions==2 && !state.saveInFlight && state.saveGeneration==0);
+}
+
+static void test_popup_uses_exact_pending_saved_id_before_new_provisional(){
+    const WindowIdentityKey identity{0x942,9402,94002};
+    const std::string savedId=
+        "{00000000-0000-0000-0000-000000009402}";
+    const std::map<std::string,std::string> pending={
+        {RuntimeKey(identity),savedId}};
+    std::string selected="sentinel";
+    int validations=0;
+    auto validate=[&](const std::string& candidate,
+                      const std::string& app,std::string& canonical){
+        ++validations;
+        if(candidate!=savedId || app!="firefox") return false;
+        canonical=candidate;
+        return true;
+    };
+    CHECK(SelectPendingPopupRecordId(
+        identity,"firefox",pending,validate,selected));
+    CHECK(selected==savedId && validations==1);
+
+    WindowIdentityKey reused=identity;
+    ++reused.processStart;
+    selected="unchanged";
+    CHECK(!SelectPendingPopupRecordId(
+        reused,"firefox",pending,validate,selected));
+    CHECK(selected=="unchanged" && validations==1);
+    CHECK(!SelectPendingPopupRecordId(
+        identity,"chrome",pending,validate,selected));
+    CHECK(selected=="unchanged" && validations==2);
+}
+
+static void test_popup_pending_id_bypasses_title_and_origin_provisional_gates(){
+    const std::string savedId=
+        "{00000000-0000-0000-0000-000000009403}";
+    for(int failure=0;failure<2;++failure){
+        int pendingCalls=0,provisionalCalls=0;
+        std::string selected="sentinel";
+        const bool titleComplete=failure!=0;
+        const bool originDesktopValid=failure!=1;
+        const PopupReservationRecordSource source=
+            SelectPopupReservationRecord(
+                true,true,titleComplete,originDesktopValid,
+                [&](std::string& output){
+                    ++pendingCalls;
+                    output=savedId;
+                    return true;
+                },
+                [&](std::string& output){
+                    ++provisionalCalls;
+                    output="{00000000-0000-0000-0000-000000009404}";
+                    return true;
+                },selected);
+        CHECK(source==PopupReservationRecordSource::Pending);
+        CHECK(selected==savedId && pendingCalls==1 && provisionalCalls==0);
+    }
+
+    int provisionalCalls=0;
+    std::string selected="unchanged";
+    CHECK(SelectPopupReservationRecord(
+        true,true,false,true,
+        [](std::string&){ return false; },
+        [&](std::string&){ ++provisionalCalls; return true; },selected)==
+        PopupReservationRecordSource::None);
+    CHECK(selected=="unchanged" && provisionalCalls==0);
+    CHECK(SelectPopupReservationRecord(
+        true,true,true,false,
+        [](std::string&){ return false; },
+        [&](std::string&){ ++provisionalCalls; return true; },selected)==
+        PopupReservationRecordSource::None);
+    CHECK(selected=="unchanged" && provisionalCalls==0);
+}
+
+static void test_popup_post_classification_reuses_pending_id_after_initial_untracked_capture(){
+    const std::string savedId=
+        "{00000000-0000-0000-0000-000000009405}";
+    const std::string generatedId=
+        "{00000000-0000-0000-0000-000000009406}";
+    std::string selected="sentinel";
+    int pendingCalls=0,generatorCalls=0;
+
+    // Capture-time class lookup failed, so the generic picker reservation has
+    // no record ID.  Terminal identity recapture and classification succeeded:
+    // the exact runtime's saved pending ID must win before allocation.
+    CHECK(SelectPopupPersistRecordId(
+        "",
+        [&](std::string& output){
+            ++pendingCalls;
+            output=savedId;
+            return true;
+        },
+        [&](std::string& output){
+            ++generatorCalls;
+            output=generatedId;
+            return true;
+        },selected));
+    CHECK(selected==savedId && pendingCalls==1 && generatorCalls==0);
+
+    // A reused process-start cannot select the old runtime's pending row; the
+    // terminal path instead creates one new ID and never steals savedId.
+    selected="sentinel";
+    CHECK(SelectPopupPersistRecordId(
+        "",
+        [&](std::string&){ ++pendingCalls; return false; },
+        [&](std::string& output){
+            ++generatorCalls;
+            output=generatedId;
+            return true;
+        },selected));
+    CHECK(selected==generatedId && pendingCalls==2 && generatorCalls==1);
+}
+
 static void test_validated_touch_rebase_preserves_external_semantics(){
     LayoutWin disk=ReconcileTestRecord(
         "{00000000-0000-0000-0000-000000009301}","firefox","external","a.test",8,
@@ -10690,14 +12509,22 @@ int main(){
     test_resolve_saved_desktop_uses_guid_only();
     test_rebase_merges_different_ids_and_preserves_external_records();
     test_rebase_same_id_newer_validated_upsert_wins();
+    test_durable_candidate_delta_is_satisfied_by_external_unrelated_revision();
     test_rebase_tied_or_older_upsert_and_stale_tombstone_defer();
     test_rebase_expiry_delete_requires_latest_independently_expired();
     test_record_delta_chaining_preserves_first_disk_base();
+    test_deferred_conflict_survives_repeated_publish_until_newer_causal_upsert();
+    test_rebased_publication_captures_adopted_disk_before_any_swap();
+    test_durable_publish_commits_revision_without_copy_or_rewrite();
+    test_final_checkpoint_mutation_is_transactional_across_fault_matrix();
+    test_expire_delete_discards_validated_touch_before_external_rebase();
+    test_final_observation_provisional_map_stages_before_global_publish();
     test_reconcile_worker_is_bounded_coalesced_and_nonblocking();
     test_reconcile_live_preparation_is_ordered_and_search_ready();
     test_cli_profile_batch_aborts_transactionally_on_first_prep_failure();
     test_cli_loads_settings_before_selecting_active_profiles();
     test_cli_save_revalidates_snapshot_and_desktops_before_publish();
+    test_manual_save_incomplete_snapshot_keeps_prior_bytes_without_write();
     test_cli_status_keeps_fast_rows_when_fingerprints_unavailable();
     test_reconcile_copied_text_budget_covers_every_owned_string();
     test_reconcile_worker_prepares_live_inputs_off_thread_and_coalesces();
@@ -10708,19 +12535,39 @@ int main(){
     test_reconcile_worker_rejects_invalid_or_oversized_requests();
     test_reconcile_plan_distinguishes_complexity_deferral();
     test_posted_reconcile_results_are_drained();
+    test_reconcile_consumer_ignores_stale_content_generation();
     test_final_snapshot_captures_immediately_opened_new_window();
+    test_final_snapshot_marks_unbound_additions_provisional_independent_of_title();
     test_final_snapshot_failed_reappeared_keeps_destination_and_adds_sibling();
     test_final_snapshot_zero_live_marks_and_prunes_from_last_seen();
     test_final_snapshot_incomplete_profile_is_byte_preserved();
     test_final_snapshot_failed_desktop_lookup_preserves_saved_guid();
+    test_final_snapshot_stale_pending_uses_unique_title_and_preserves_destination();
     test_final_snapshot_reservations_preserve_bound_and_provisional_origin();
+    test_initial_partial_enumeration_suppresses_lifecycle_missing_and_write();
+    test_bound_a_save_then_unbound_b_reconcile_never_moves_a();
+    test_query_end_destroy_full_final_snapshot_chains();
+    test_issued_move_heartbeat_then_session_end_preserves_origin_and_sibling();
+    test_manual_restore_keeps_fixture_bytes_and_reports_once();
     test_auto_load_retry_uses_capped_backoff_and_initializes_once();
+    test_corrective_initial_observation_is_transactional_before_async_work();
+    test_corrective_monitor_arm_failure_backs_off_before_loading();
+    test_corrective_monitor_alternate_rearm_is_bounded();
+    test_corrective_failed_monitor_retry_post_remains_unready();
+    test_corrective_unavailable_load_then_heartbeat_retry_initializes_once();
     test_checkpoint_controller_heartbeat_and_session_end_chain();
     test_checkpoint_failed_end_is_retryable_at_destroy();
     test_settings_checkpoint_rejects_enabled_unloaded_and_preserves_state();
+    test_settings_transaction_rolls_back_and_cancels_only_auto_owner();
     test_checkpoint_reservation_defers_one_heartbeat_but_not_final();
     test_tray_instance_scope_is_gui_only_and_covers_work_lifetime();
     test_browser_classifier_requires_enabled_class_and_exact_executable_basename();
+    test_class_lookup_failure_marks_enabled_profiles_incomplete_but_empty_title_is_valid();
+    test_popup_persistence_recaptures_before_classification_and_reports_storage();
+    test_popup_saved_only_completes_exact_lifecycle_save_generation();
+    test_popup_uses_exact_pending_saved_id_before_new_provisional();
+    test_popup_pending_id_bypasses_title_and_origin_provisional_gates();
+    test_popup_post_classification_reuses_pending_id_after_initial_untracked_capture();
     test_validated_touch_rebase_preserves_external_semantics();
     test_etld1();
     test_b64();
@@ -10743,6 +12590,7 @@ int main(){
     test_move_operation_dispatcher_cancellation_completes_each_job_once();
     test_move_reservation_replacement_requires_exact_terminal_token();
     test_issued_reservation_transfer_has_no_checkpoint_gap();
+    test_successor_handoff_publishes_before_issued_displaced_cancel();
     test_issued_reservation_rollback_waits_for_terminal_ack();
     test_async_session_route_protects_manual_work_and_retires_once();
     test_async_session_route_timeout_and_cancel_are_exact();
@@ -10836,6 +12684,12 @@ int main(){
     test_post_message_exception_deletes_heap_result();
     test_layout_serializes_v4_header();
     test_layout_roundtrip_v4();
+    test_layout_provisional_marker_roundtrips_strict_v4();
+    test_layout_noncanonical_record_id_is_published_canonically();
+    test_v4_provisional_extension_preserves_base_window_row();
+    test_layout_provisional_marker_is_strict_and_transactional();
+    test_layout_legacy_migration_never_invents_provisional_marker();
+    test_layout_provisional_companions_do_not_consume_record_cap();
     test_layout_parse_v2();
     test_layout_rejects_invalid_desktop_guid_transactionally();
     test_layout_rejects_progid_as_desktop_guid();
@@ -10855,6 +12709,9 @@ int main(){
     test_retention_prune_preserves_order_duplicates_and_input();
     test_startup_expiry_partitions_every_app_transactionally();
     test_reconcile_restores_saved_a_and_creates_new_b();
+    test_fresh_reconcile_adopts_one_persisted_provisional_with_same_id();
+    test_fresh_reconcile_clears_multiple_matched_provisionals();
+    test_fresh_reconcile_defers_ambiguous_provisional_adoption();
     test_expired_reappearance_is_new_not_restored();
     test_cached_stale_edge_preserves_match_and_defers_unmatched();
     test_failed_chrome_restore_retains_saved_destination_and_marks_seen();
@@ -10972,6 +12829,9 @@ int main(){
     test_fresh_diagnostic_copy_revalidates_primary_before_recovery();
     test_diagnostic_source_reverify_transient_failure_retries_without_growth();
     test_atomic_write_first_and_two_successful_writes();
+    test_durable_write_captures_revision_without_post_publish_read();
+    test_durable_publish_exception_adopts_revision_then_retries();
+    test_first_post_publish_verify_throw_recovers_from_armed_candidate();
     test_atomic_write_rejects_oversize_without_touching_destination();
     test_atomic_write_faults_keep_old_or_recovery_bytes();
     test_preexisting_rollback_promotion_failure_never_touches_primary();

@@ -25,6 +25,35 @@ enum class WindowIdentityRecapture {
     Indeterminate
 };
 
+enum class PopupBrowserClassification {
+    Tracked,
+    NotTracked,
+    Failed
+};
+
+enum class PopupPersistenceReadiness {
+    Ready,
+    Unavailable,
+    ReadOnly
+};
+
+enum class PopupPersistenceResult {
+    Saved,
+    NotTracked,
+    IdentityLost,
+    IdentityIndeterminate,
+    ClassificationFailed,
+    StorageUnavailable,
+    StorageReadOnly,
+    SaveFailed
+};
+
+enum class PopupReservationRecordSource {
+    None,
+    Pending,
+    Provisional
+};
+
 struct FastWin {
     std::string app;
     HWND hwnd = nullptr;
@@ -60,6 +89,52 @@ inline bool SameIdentity(const WindowIdentityKey& left,
            left.processStart == right.processStart;
 }
 
+template<class Recapture,class Classify,class Readiness,class Persist>
+inline PopupPersistenceResult CompletePopupMovePersistence(
+        const WindowIdentityKey& expected,Recapture&& recapture,
+        Classify&& classify,Readiness&& readiness,Persist&& persist) noexcept {
+    WindowIdentityRecapture identity=WindowIdentityRecapture::Indeterminate;
+    try { identity=recapture(expected); }
+    catch(...) { return PopupPersistenceResult::IdentityIndeterminate; }
+    if(identity==WindowIdentityRecapture::Lost)
+        return PopupPersistenceResult::IdentityLost;
+    if(identity!=WindowIdentityRecapture::Match)
+        return PopupPersistenceResult::IdentityIndeterminate;
+
+    PopupBrowserClassification browser=PopupBrowserClassification::Failed;
+    try { browser=classify(expected); }
+    catch(...) { return PopupPersistenceResult::ClassificationFailed; }
+    if(browser==PopupBrowserClassification::NotTracked)
+        return PopupPersistenceResult::NotTracked;
+    if(browser!=PopupBrowserClassification::Tracked)
+        return PopupPersistenceResult::ClassificationFailed;
+
+    PopupPersistenceReadiness storage=PopupPersistenceReadiness::Unavailable;
+    try { storage=readiness(); }
+    catch(...) { return PopupPersistenceResult::StorageUnavailable; }
+    if(storage==PopupPersistenceReadiness::Unavailable)
+        return PopupPersistenceResult::StorageUnavailable;
+    if(storage==PopupPersistenceReadiness::ReadOnly)
+        return PopupPersistenceResult::StorageReadOnly;
+    if(storage!=PopupPersistenceReadiness::Ready)
+        return PopupPersistenceResult::StorageUnavailable;
+
+    try {
+        return persist() ? PopupPersistenceResult::Saved
+                         : PopupPersistenceResult::SaveFailed;
+    } catch(...) { return PopupPersistenceResult::SaveFailed; }
+}
+
+template<class Complete>
+inline bool CompletePopupLifecycleAfterPersistence(
+        PopupPersistenceResult result,Complete&& complete) noexcept {
+    if(result!=PopupPersistenceResult::Saved) return false;
+    try {
+        complete();
+        return true;
+    } catch(...) { return false; }
+}
+
 inline bool operator<(const WindowIdentityKey& left,
                       const WindowIdentityKey& right){
     if(left.hwnd != right.hwnd) return left.hwnd < right.hwnd;
@@ -75,6 +150,67 @@ inline std::string RuntimeKey(const WindowIdentityKey& key){
 
 inline std::string RuntimeKey(const FastWin& window){
     return RuntimeKey(IdentityOf(window));
+}
+
+template<class Validate>
+inline bool SelectPendingPopupRecordId(
+        const WindowIdentityKey& identity,const std::string& app,
+        const std::map<std::string,std::string>& pending,
+        Validate&& validate,std::string& output) noexcept {
+    if(identity.hwnd==0 || identity.pid==0 || identity.processStart==0 ||
+       app.empty()) return false;
+    try {
+        const auto found=pending.find(RuntimeKey(identity));
+        if(found==pending.end()) return false;
+        std::string canonical;
+        if(!validate(found->second,app,canonical) || canonical.empty())
+            return false;
+        output.swap(canonical);
+        return true;
+    } catch(...) { return false; }
+}
+
+template<class SelectPending,class SelectProvisional>
+inline PopupReservationRecordSource SelectPopupReservationRecord(
+        bool tracked,bool persistenceReady,bool titleComplete,
+        bool originDesktopValid,SelectPending&& selectPending,
+        SelectProvisional&& selectProvisional,
+        std::string& output) noexcept {
+    if(!tracked || !persistenceReady)
+        return PopupReservationRecordSource::None;
+    try {
+        std::string selected;
+        if(selectPending(selected) && !selected.empty()){
+            output.swap(selected);
+            return PopupReservationRecordSource::Pending;
+        }
+        if(!titleComplete || !originDesktopValid)
+            return PopupReservationRecordSource::None;
+        selected.clear();
+        if(!selectProvisional(selected) || selected.empty())
+            return PopupReservationRecordSource::None;
+        output.swap(selected);
+        return PopupReservationRecordSource::Provisional;
+    } catch(...) { return PopupReservationRecordSource::None; }
+}
+
+template<class SelectPending,class Generate>
+inline bool SelectPopupPersistRecordId(
+        const std::string& reservedRecordId,SelectPending&& selectPending,
+        Generate&& generate,std::string& output) noexcept {
+    try {
+        std::string selected;
+        if(!reservedRecordId.empty()){
+            selected=reservedRecordId;
+        } else {
+            if(!selectPending(selected) || selected.empty()){
+                selected.clear();
+                if(!generate(selected) || selected.empty()) return false;
+            }
+        }
+        output.swap(selected);
+        return true;
+    } catch(...) { return false; }
 }
 
 inline std::wstring ExecutableBaseName(const std::wstring& image){
@@ -104,6 +240,18 @@ inline const Profile* ClassifyBrowserCandidate(
             return &profile;
     }
     return nullptr;
+}
+
+template<class Profile>
+inline bool AcceptFastClassNameRead(
+        int copiedCharacters,const std::vector<Profile>& enabledProfiles,
+        std::map<std::string,AppFastSnapshot>& snapshots) noexcept {
+    if(copiedCharacters>0) return true;
+    for(const Profile& profile : enabledProfiles){
+        const auto found=snapshots.find(profile.id);
+        if(found!=snapshots.end()) found->second.enumerationComplete=false;
+    }
+    return false;
 }
 
 class SnapshotSignatureBuilder {

@@ -34,6 +34,7 @@ struct LayoutWin {
     std::string activeTitle, activeDomain; int tabCount=0;
     std::map<std::string,int> counts;
     UnixSeconds lastSeenUtc=0, missingSinceUtc=0;
+    bool provisional=false;
 };
 
 inline int ResolveSavedDesktop(const LayoutWin& saved,
@@ -601,6 +602,11 @@ inline bool AreLayoutCountsSerializable(const std::map<std::string,int>& counts)
 }
 
 inline std::string SerializeLayout(const std::vector<DeskRec>& desks, const std::vector<LayoutWin>& wins){
+    // v4's finalized schema permits one optional P companion immediately
+    // after its W record.  The W row remains the same 11-field record, so
+    // snapshots without provisional state are byte-compatible.  P was added
+    // before v4 shipped; downgrade to earlier development-only v4 readers is
+    // intentionally unsupported rather than silently losing provisional IDs.
     std::string out = "# VDE snapshot v4\n";
     for(const auto& d : desks){
         out += "D\t"; out += std::to_string(d.index); out += "\t";
@@ -613,6 +619,9 @@ inline std::string SerializeLayout(const std::vector<DeskRec>& desks, const std:
         out += w.activeDomain; out += "\t"; out += std::to_string(w.tabCount); out += "\t";
         out += CountsToStr(w.counts); out += "\t"; out += std::to_string(w.lastSeenUtc); out += "\t";
         out += std::to_string(w.missingSinceUtc); out += "\n";
+        if(w.provisional){
+            out += "P\t"; out += w.recordId; out += "\n";
+        }
     }
     return out;
 }
@@ -655,6 +664,8 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
     std::set<std::string> recordIds;
     int version = 0;
     bool headerSeen = false, recordsSeen = false;
+    bool provisionalMarkerAllowed = false;
+    std::string provisionalMarkerRecordId;
     size_t recordCount = 0, lineNumber = 0, pos = 0;
 
     auto fail = [&](const std::string& message)->bool {
@@ -682,7 +693,7 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
         GUID id{}; std::string idKey;
         if(!ParseNonzeroLayoutGuid(generated,id,&idKey)) return failLine("generated an invalid record ID");
         if(!recordIds.insert(idKey).second) return failLine("generated a duplicate record ID");
-        record.recordId = generated;
+        record.recordId = idKey;
         return true;
     };
 
@@ -709,9 +720,28 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
 
         if(!headerSeen) return failLine("record appears before snapshot header");
         recordsSeen = true;
-        if(++recordCount > MAX_LAYOUT_RECORDS) return failLine("snapshot record limit exceeded");
         std::vector<std::string> col = splitTabs(line);
         if(col.empty()) return failLine("empty record");
+
+        if(col[0]=="P"){
+            if(version!=4) return failLine("provisional marker requires v4");
+            if(col.size()!=2)
+                return failLine("provisional marker must have exactly 2 fields");
+            GUID id{};
+            std::string canonicalId;
+            if(!ParseNonzeroLayoutGuid(col[1],id,&canonicalId))
+                return failLine("invalid provisional record ID");
+            if(!provisionalMarkerAllowed || wins.empty() ||
+               canonicalId!=provisionalMarkerRecordId)
+                return failLine("provisional marker must immediately follow its window record");
+            wins.back().provisional=true;
+            provisionalMarkerAllowed=false;
+            continue;
+        }
+
+        provisionalMarkerAllowed=false;
+        if(++recordCount > MAX_LAYOUT_RECORDS)
+            return failLine("snapshot record limit exceeded");
 
         if(col[0]=="D"){
             if(col.size()!=4) return failLine("desktop record must have exactly 4 fields");
@@ -728,6 +758,7 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
         if(col[0]!="W") return failLine("unknown record type");
         LayoutWin w;
         std::string title;
+        std::string parsedRecordId;
         if(version==4){
             if(col.size()!=11) return failLine("v4 window record must have exactly 11 fields");
             w.app = col[1];
@@ -735,7 +766,12 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
             GUID id{}; std::string idKey;
             if(!ParseNonzeroLayoutGuid(col[2], id, &idKey)) return failLine("invalid record ID");
             if(!recordIds.insert(idKey).second) return failLine("duplicate record ID");
-            w.recordId = col[2];
+            // v4 accepts every syntactically valid GUID spelling but
+            // normalizes it at the parse boundary.  All runtime maps,
+            // provisional companions, deltas, and future serialization then
+            // share one stable record key representation.
+            w.recordId = idKey;
+            parsedRecordId = idKey;
             if(!ParseIntStrict(col[3], w.deskIndex)) return failLine("invalid window desktop index");
             if(!ParseNonzeroLayoutGuid(col[4], w.desktop)) return failLine("invalid window desktop GUID");
             if(!b64decStrict(col[5], title)) return failLine("invalid window title encoding");
@@ -781,6 +817,10 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
             w.lastSeenUtc = migrationNow;
         }
         wins.push_back(w);
+        if(version==4){
+            provisionalMarkerAllowed=true;
+            provisionalMarkerRecordId=parsedRecordId;
+        }
     }
 
     if(!headerSeen) return fail("missing or empty snapshot header");

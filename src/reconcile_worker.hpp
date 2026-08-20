@@ -150,6 +150,21 @@ inline bool CliCheckpointInputsStillCurrent(
     return true;
 }
 
+template<class Write>
+inline bool PublishManualSnapshotIfCurrent(
+        const std::map<std::string,AppFastSnapshot>& captured,
+        const std::map<std::string,AppFastSnapshot>& current,
+        const std::vector<DeskRec>& capturedDesktops,
+        const std::vector<DeskRec>& currentDesktops,
+        const std::string& checkedBytes,
+        Write&& write) noexcept {
+    if(checkedBytes.empty() ||
+       !CliCheckpointInputsStillCurrent(
+            captured,current,capturedDesktops,currentDesktops)) return false;
+    try { return write(checkedBytes); }
+    catch(...) { return false; }
+}
+
 struct CliStatusRow {
     FastWin window;
     int deskIndex=-1;
@@ -344,6 +359,42 @@ struct ReconcileResult {
     std::vector<int> sessionIndexByFast;
     ReconcilePlan plan;
 };
+
+struct ReconcileResultConsumerKey {
+    uint64_t operationId=0;
+    std::string app;
+    ReconcileWorkMode workMode=ReconcileWorkMode::Plan;
+    uint64_t identityGeneration=0;
+    uint64_t contentGeneration=0;
+    uint64_t sessionRequestId=0;
+    uint64_t sessionDataGeneration=0;
+};
+
+inline bool ReconcileResultIsCurrent(
+        const ReconcileResult& result,
+        const ReconcileResultConsumerKey& expected) noexcept {
+    return result.status==ReconcileResultStatus::Completed &&
+        expected.operationId!=0 && result.operationId==expected.operationId &&
+        !expected.app.empty() && result.app==expected.app &&
+        result.workMode==expected.workMode &&
+        expected.identityGeneration!=0 &&
+        result.identityGeneration==expected.identityGeneration &&
+        expected.contentGeneration!=0 &&
+        result.contentGeneration==expected.contentGeneration &&
+        expected.sessionRequestId!=0 &&
+        result.sessionRequestId==expected.sessionRequestId &&
+        expected.sessionDataGeneration!=0 &&
+        result.sessionDataGeneration==expected.sessionDataGeneration;
+}
+
+template<class Apply>
+inline bool ConsumeReconcileResultIfCurrent(
+        const ReconcileResult& result,
+        const ReconcileResultConsumerKey& expected,Apply&& apply) noexcept {
+    if(!ReconcileResultIsCurrent(result,expected)) return false;
+    try { apply(); return true; }
+    catch(...) { return false; }
+}
 
 inline const WinFp* ReconcileSessionForFast(
         const ReconcileResult& result,size_t fastIndex) noexcept {
