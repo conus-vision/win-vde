@@ -203,35 +203,33 @@ static void test_move_queue_enqueue_validates_identity_state_and_copies_guid(){
     CHECK(queue.front()!=nullptr && queue.front()->token.jobId==1101);
 }
 
-static void test_move_queue_capacity_is_exact_and_rejection_is_transactional(){
+static void test_move_queue_allows_bounded_auto_with_manual_and_picker_jobs(){
     MoveQueue queue;
-    bool acceptedAll=true;
-    for(size_t i=0;i+1<MAX_MOVE_QUEUE_JOBS;++i){
+    const size_t autoJobCount=4096;
+    bool acceptedAllAuto=true;
+    for(size_t i=0;i<autoJobCount;++i){
         MoveJob job=MJ(MoveOwner::AutoReconcile,151,1501+i,"");
         job.recordId.clear();
-        if(!queue.enqueue(job)) acceptedAll=false;
+        if(!queue.enqueue(job)) acceptedAllAuto=false;
     }
-    CHECK(acceptedAll);
-    CHECK(!queue.empty());
+    CHECK(acceptedAllAuto);
     CHECK(queue.front()!=nullptr && queue.front()->token.jobId==1501);
 
-    MoveJob invalid=MJ(MoveOwner::AutoReconcile,0,999999,"invalid");
-    MoveJob duplicate=MJ(MoveOwner::Picker,999,1501,"duplicate");
-    CHECK(!queue.enqueue(invalid));
-    CHECK(!queue.enqueue(duplicate));
-    MoveJob exact=MJ(MoveOwner::AutoReconcile,151,
-                     1501+MAX_MOVE_QUEUE_JOBS-1,"");
-    exact.recordId.clear();
-    CHECK(queue.enqueue(exact));
-
-    MoveJob overflow=MJ(
-        MoveOwner::ManualTray,152,1501+MAX_MOVE_QUEUE_JOBS,"overflow");
-    CHECK(!queue.enqueue(overflow));
+    MoveJob manual=MJ(MoveOwner::ManualTray,152,1000001,"shared-runtime");
+    MoveJob picker=MJ(MoveOwner::Picker,153,1000002,"shared-runtime");
+    const bool manualAccepted=queue.enqueue(manual);
+    const bool pickerAccepted=queue.enqueue(picker);
+    CHECK(manualAccepted);
+    CHECK(pickerAccepted);
+    if(manualAccepted){
+        MoveResult cancelled=queue.cancelJob(manual.token.jobId);
+        check_move_result(cancelled,MoveTerminal::Cancelled,manual,0);
+    }
+    if(pickerAccepted){
+        MoveResult cancelled=queue.cancelJob(picker.token.jobId);
+        check_move_result(cancelled,MoveTerminal::Cancelled,picker,0);
+    }
     CHECK(queue.front()!=nullptr && queue.front()->token.jobId==1501);
-    MoveResult removed=queue.cancelJob(1501);
-    CHECK(removed.completed && removed.terminal==MoveTerminal::Cancelled);
-    CHECK(queue.front()!=nullptr && queue.front()->token.jobId==1502);
-    CHECK(queue.enqueue(overflow));
 }
 
 static void test_move_queue_phase_guards_and_issue_outcomes(){
@@ -8307,7 +8305,7 @@ int main(){
     test_strict_counts_parsing();
     test_move_queue_alternates_issue_verify_and_succeeds();
     test_move_queue_enqueue_validates_identity_state_and_copies_guid();
-    test_move_queue_capacity_is_exact_and_rejection_is_transactional();
+    test_move_queue_allows_bounded_auto_with_manual_and_picker_jobs();
     test_move_queue_phase_guards_and_issue_outcomes();
     test_move_queue_four_transient_issues_still_receive_four_verifies();
     test_move_queue_invalid_outcomes_fail_closed();

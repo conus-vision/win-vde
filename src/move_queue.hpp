@@ -42,10 +42,6 @@ struct MoveResult {
     std::string recordId;
 };
 
-// Layout-backed producers are capped at 4096 records. Keeping the same bound
-// here also limits duplicate-ID scans and cancellation-copy work.
-static const size_t MAX_MOVE_QUEUE_JOBS = 4096;
-
 class MoveQueue {
     static const int kMaxAttempts = 4;
     std::deque<MoveJob> jobs_;
@@ -91,7 +87,6 @@ public:
                 job.token.jobId==0 || zeroGuid(job.destination) ||
                 job.attempts!=0 || job.waitingForVerify)
             return false;
-        if(jobs_.size()>=MAX_MOVE_QUEUE_JOBS) return false;
         for(const MoveJob& queued : jobs_)
             if(queued.token.jobId==job.token.jobId) return false;
         jobs_.push_back(job);
