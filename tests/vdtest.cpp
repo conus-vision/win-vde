@@ -98,6 +98,439 @@ static WindowIdentityKey IK(uintptr_t hwnd,DWORD pid,uint64_t started){
     return key;
 }
 
+static void test_footer_literal_and_links_are_exact(){
+    CHECK(BuildFooterText()==
+          L"Virtual Desktop Extension for Windows 11 by Volodymyr Moskvin (c) 2026 Conus Vision");
+    CHECK(std::wstring(FooterRepoLabel())==
+          L"Virtual Desktop Extension");
+    CHECK(std::wstring(FooterMiddle())==
+          L" for Windows 11 by Volodymyr Moskvin (c) 2026 ");
+    CHECK(std::wstring(FooterConusLabel())==L"Conus Vision");
+    CHECK(std::wstring(FooterRepoUrl())==
+          L"https://github.com/conus-vision/win-vde");
+    CHECK(std::wstring(FooterConusUrl())==L"https://conus.vision");
+    CHECK(std::wstring(PickerFooterUrl(PickerFooterLink::Repository))==
+          FooterRepoUrl());
+    CHECK(std::wstring(PickerFooterUrl(PickerFooterLink::ConusVision))==
+          FooterConusUrl());
+    CHECK(PickerFooterUrl(PickerFooterLink::None)==nullptr);
+}
+
+static void test_footer_minimum_size_is_one_line_and_dpi_scaled(){
+    CHECK(PickerScaleForDpi(34,96)==34);
+    CHECK(PickerScaleForDpi(34,120)==43);
+    CHECK(PickerScaleForDpi(34,144)==51);
+    CHECK(PickerScaleForDpi(34,192)==68);
+    CHECK(PickerScaleForDpi(720,120)==900);
+    CHECK(PickerScaleForDpi(720,144)==1080);
+    CHECK(PickerScaleForDpi(720,192)==1440);
+    CHECK(PickerScaleForDpi(720,0)==720);
+
+    const SIZE one=PickerDesiredClientSize(
+        1,240,150,16,58,38,34,720);
+    const SIZE oneWithoutFooter=PickerDesiredClientSize(
+        1,240,150,16,58,38,0,720);
+    CHECK(one.cx==720);
+    CHECK(one.cy==312);
+    CHECK(one.cy-oneWithoutFooter.cy==34);
+    const SIZE oneAt125=PickerDesiredClientSize(
+        1,PickerScaleForDpi(240,120),PickerScaleForDpi(150,120),
+        PickerScaleForDpi(16,120),PickerScaleForDpi(58,120),
+        PickerScaleForDpi(38,120),PickerScaleForDpi(34,120),
+        PickerScaleForDpi(720,120));
+    CHECK(oneAt125.cx==900);
+    CHECK(oneAt125.cy-PickerDesiredClientSize(
+        1,300,188,20,73,48,0,900).cy==43);
+    const SIZE oneAt150=PickerDesiredClientSize(
+        1,PickerScaleForDpi(240,144),PickerScaleForDpi(150,144),
+        PickerScaleForDpi(16,144),PickerScaleForDpi(58,144),
+        PickerScaleForDpi(38,144),PickerScaleForDpi(34,144),
+        PickerScaleForDpi(720,144));
+    CHECK(oneAt150.cx==1080);
+    CHECK(oneAt150.cy==468);
+    const SIZE five=PickerDesiredClientSize(
+        5,240,150,16,58,38,34,720);
+    CHECK(five.cx==1296);
+    CHECK(five.cy==312);
+
+    const SIZE oneAt200=PickerDesiredClientSize(
+        1,480,300,32,116,76,68,1440);
+    CHECK(oneAt200.cx==1440 && oneAt200.cy==624);
+    PickerFooterLayout footerAt200;
+    CHECK(BuildPickerFooterLayout(
+        oneAt200.cx,oneAt200.cy,32,68,44,
+        360,720,200,footerAt200));
+    CHECK(footerAt200.footer.top==556);
+    CHECK(footerAt200.repoText.x==80 &&
+          footerAt200.conusLink.right==1360);
+}
+
+static bool SamePickerFooterLayout(
+        const PickerFooterLayout& left,
+        const PickerFooterLayout& right) noexcept {
+    return left.footer.left==right.footer.left &&
+           left.footer.top==right.footer.top &&
+           left.footer.right==right.footer.right &&
+           left.footer.bottom==right.footer.bottom &&
+           left.repoLink.left==right.repoLink.left &&
+           left.repoLink.top==right.repoLink.top &&
+           left.repoLink.right==right.repoLink.right &&
+           left.repoLink.bottom==right.repoLink.bottom &&
+           left.conusLink.left==right.conusLink.left &&
+           left.conusLink.top==right.conusLink.top &&
+           left.conusLink.right==right.conusLink.right &&
+           left.conusLink.bottom==right.conusLink.bottom &&
+           left.repoText.x==right.repoText.x &&
+           left.repoText.y==right.repoText.y &&
+           left.middleText.x==right.middleText.x &&
+           left.middleText.y==right.middleText.y &&
+           left.conusText.x==right.conusText.x &&
+           left.conusText.y==right.conusText.y;
+}
+
+static void test_footer_geometry_hit_hover_cursor_and_open_result_seams(){
+    PickerFooterLayout layout;
+    CHECK(BuildPickerFooterLayout(
+        720,312,16,34,22,180,360,100,layout));
+    CHECK(layout.footer.left==0 && layout.footer.top==278 &&
+          layout.footer.right==720 && layout.footer.bottom==312);
+    CHECK(layout.repoText.x==40 && layout.repoText.y==278);
+    CHECK(layout.middleText.x==220 && layout.middleText.y==278);
+    CHECK(layout.conusText.x==580 && layout.conusText.y==278);
+    CHECK(layout.repoLink.left==40 && layout.repoLink.top==278 &&
+          layout.repoLink.right==220 && layout.repoLink.bottom==300);
+    CHECK(layout.conusLink.left==580 && layout.conusLink.top==278 &&
+          layout.conusLink.right==680 && layout.conusLink.bottom==300);
+    CHECK(layout.repoLink.top>=layout.footer.top &&
+          layout.repoLink.bottom<=layout.footer.bottom);
+    CHECK(layout.conusLink.top>=layout.footer.top &&
+          layout.conusLink.bottom<=layout.footer.bottom);
+
+    PickerFooterLayout exactFit;
+    CHECK(BuildPickerFooterLayout(
+        672,312,16,34,22,180,360,100,exactFit));
+    CHECK(exactFit.repoText.x==16);
+    CHECK(exactFit.repoLink.right<=exactFit.conusLink.left);
+    CHECK(exactFit.conusLink.right==656);
+    CHECK(exactFit.conusLink.right<=exactFit.footer.right-16);
+    PickerFooterLayout exactFitAt150;
+    CHECK(BuildPickerFooterLayout(
+        1008,468,24,51,33,270,540,150,exactFitAt150));
+    CHECK(exactFitAt150.repoText.x==24);
+    CHECK(exactFitAt150.middleText.x==294);
+    CHECK(exactFitAt150.conusText.x==834);
+    CHECK(exactFitAt150.conusLink.right==984);
+
+    PickerFooterLayout rejected=layout;
+    CHECK(!BuildPickerFooterLayout(
+        671,312,16,34,22,180,360,100,rejected));
+    CHECK(SamePickerFooterLayout(rejected,layout));
+    CHECK(!BuildPickerFooterLayout(
+        720,20,16,34,22,180,360,100,rejected));
+    CHECK(!BuildPickerFooterLayout(
+        720,312,16,34,35,180,360,100,rejected));
+    CHECK(!BuildPickerFooterLayout(
+        720,312,16,34,22,-1,360,100,rejected));
+
+    CHECK(HitPickerFooterLink(layout,POINT{40,278})==
+          PickerFooterLink::Repository);
+    CHECK(HitPickerFooterLink(layout,POINT{219,299})==
+          PickerFooterLink::Repository);
+    CHECK(HitPickerFooterLink(layout,POINT{220,278})==
+          PickerFooterLink::None);
+    CHECK(HitPickerFooterLink(layout,POINT{580,278})==
+          PickerFooterLink::ConusVision);
+    CHECK(HitPickerFooterLink(layout,POINT{680,278})==
+          PickerFooterLink::None);
+    PickerFooterLayout defensiveOverlap=layout;
+    defensiveOverlap.conusLink=defensiveOverlap.repoLink;
+    CHECK(HitPickerFooterLink(defensiveOverlap,POINT{40,278})==
+          PickerFooterLink::Repository);
+
+    PickerState generation;
+    generation.paintGeneration=17;
+    CHECK(HitCurrentPickerFooterLink(
+        generation,16,layout,POINT{40,278})==PickerFooterLink::None);
+    CHECK(HitCurrentPickerFooterLink(
+        generation,17,layout,POINT{40,278})==
+          PickerFooterLink::Repository);
+
+    PickerFooterLink hover=PickerFooterLink::None;
+    CHECK(UpdatePickerFooterHover(
+        hover,PickerFooterLink::Repository));
+    CHECK(hover==PickerFooterLink::Repository);
+    CHECK(!UpdatePickerFooterHover(
+        hover,PickerFooterLink::Repository));
+    CHECK(UpdatePickerFooterHover(
+        hover,PickerFooterLink::ConusVision));
+    CHECK(hover==PickerFooterLink::ConusVision);
+    CHECK(UpdatePickerFooterHover(hover,PickerFooterLink::None));
+    CHECK(!ResetPickerFooterHover(hover));
+    hover=PickerFooterLink::ConusVision;
+    CHECK(ResetPickerFooterHover(hover));
+    CHECK(hover==PickerFooterLink::None);
+    CHECK(!PickerFooterSuppressesRowHover(PickerFooterLink::None));
+    CHECK(PickerFooterSuppressesRowHover(PickerFooterLink::Repository));
+    CHECK(PickerFooterSuppressesRowHover(PickerFooterLink::ConusVision));
+    CHECK(!PickerFooterUsesHandCursor(PickerFooterLink::None));
+    CHECK(PickerFooterUsesHandCursor(PickerFooterLink::Repository));
+    CHECK(PickerFooterUsesHandCursor(PickerFooterLink::ConusVision));
+
+    CHECK(!PickerFooterOpenSucceeded(0));
+    CHECK(!PickerFooterOpenSucceeded(2));
+    CHECK(!PickerFooterOpenSucceeded(31));
+    CHECK(!PickerFooterOpenSucceeded(32));
+    CHECK(PickerFooterOpenSucceeded(33));
+    CHECK(PickerFooterOpenSucceeded(4096));
+}
+
+static void test_footer_cache_and_activation_are_transactional(){
+    PickerFooterPaintCache footer;
+    footer.repo=L"old repo";
+    footer.middle=L"old middle";
+    footer.conus=L"old conus";
+    footer.layout.repoLink={1,2,3,4};
+    PickerFooterPaintCache staged;
+    staged.repo=FooterRepoLabel();
+    staged.middle=FooterMiddle();
+    staged.conus=FooterConusLabel();
+    CHECK(BuildPickerFooterLayout(
+        720,312,16,34,22,180,360,100,staged.layout));
+    footer.swap(staged);
+    CHECK(footer.repo==FooterRepoLabel());
+    CHECK(footer.middle==FooterMiddle());
+    CHECK(footer.conus==FooterConusLabel());
+    CHECK(footer.layout.repoLink.left==40);
+    footer.clear();
+    CHECK(footer.repo.empty() && footer.middle.empty() &&
+          footer.conus.empty());
+    CHECK(footer.layout.repoLink.left==0 &&
+          footer.layout.repoLink.right==0);
+
+    PickerFooterLink cacheHover=PickerFooterLink::Repository;
+    bool tooltipActive=true;
+    CHECK(RefreshPickerPaintCacheTransaction(footer,
+        [&](PickerFooterPaintCache& next){
+            next.repo=FooterRepoLabel();
+            next.middle=FooterMiddle();
+            next.conus=FooterConusLabel();
+            return BuildPickerFooterLayout(
+                720,312,16,34,22,180,360,100,next.layout);
+        },
+        [&]() noexcept {
+            ResetPickerFooterHover(cacheHover);
+            tooltipActive=false;
+        },
+        [&](PickerFooterPaintCache& published) noexcept {
+            ResetPickerFooterHover(cacheHover);
+            tooltipActive=false;
+            published.clear();
+        }));
+    CHECK(cacheHover==PickerFooterLink::None && !tooltipActive);
+    CHECK(footer.layout.repoLink.left==40);
+
+    cacheHover=PickerFooterLink::ConusVision;
+    tooltipActive=true;
+    CHECK(!RefreshPickerPaintCacheTransaction(footer,
+        [&](PickerFooterPaintCache& next){
+            next.repo=L"partial";
+            next.layout.repoLink={90,90,100,100};
+            return false;
+        },
+        [&]() noexcept {
+            ResetPickerFooterHover(cacheHover);
+            tooltipActive=false;
+        },
+        [&](PickerFooterPaintCache& published) noexcept {
+            ResetPickerFooterHover(cacheHover);
+            tooltipActive=false;
+            published.clear();
+        }));
+    CHECK(cacheHover==PickerFooterLink::None && !tooltipActive);
+    CHECK(footer.repo.empty() && footer.layout.repoLink.left==0 &&
+          footer.layout.repoLink.right==0);
+
+    PickerState state;
+    state.paintGeneration=91;
+    PickerFooterLayout layout;
+    CHECK(BuildPickerFooterLayout(
+        720,312,16,34,22,180,360,100,layout));
+    const PickerFooterActivation repo=ResolvePickerFooterActivation(
+        state,91,layout,POINT{40,278});
+    CHECK(repo.link==PickerFooterLink::Repository);
+    CHECK(repo.url==FooterRepoUrl());
+    CHECK(repo.consumed);
+    int opens=0,notifications=0;
+    const wchar_t* openedUrl=nullptr;
+    CHECK(DispatchPickerFooterActivation(repo,
+        [&](const wchar_t* url)->intptr_t {
+            ++opens;
+            openedUrl=url;
+            return 33;
+        },
+        [&](){ ++notifications; }));
+    CHECK(opens==1 && notifications==0 && openedUrl==FooterRepoUrl());
+
+    const PickerFooterActivation conus=ResolvePickerFooterActivation(
+        state,91,layout,POINT{580,278});
+    CHECK(conus.link==PickerFooterLink::ConusVision);
+    CHECK(conus.url==FooterConusUrl());
+    CHECK(DispatchPickerFooterActivation(conus,
+        [&](const wchar_t* url)->intptr_t {
+            ++opens;
+            openedUrl=url;
+            return 32;
+        },
+        [&](){ ++notifications; }));
+    CHECK(opens==2 && notifications==1 && openedUrl==FooterConusUrl());
+
+    const PickerFooterActivation stale=ResolvePickerFooterActivation(
+        state,90,layout,POINT{40,278});
+    CHECK(!stale.consumed && stale.link==PickerFooterLink::None &&
+          stale.url==nullptr);
+    CHECK(!PickerFooterUsesHandCursor(HitCurrentPickerFooterLink(
+        state,90,layout,POINT{40,278})));
+    CHECK(!DispatchPickerFooterActivation(stale,
+        [&](const wchar_t*)->intptr_t { ++opens; return 33; },
+        [&](){ ++notifications; }));
+    CHECK(opens==2 && notifications==1);
+}
+
+static void test_composite_picker_cache_cannot_omit_footer_state(){
+    PickerPaintCacheState<int> cache;
+    cache.hoverRows={1,2};
+    cache.switchHeader=L"old switch";
+    cache.moveHeader=L"old move";
+    cache.footer.repo=L"old repo";
+    cache.footer.layout.repoLink={1,2,3,4};
+    cache.generation=7;
+    cache.hintWidth=8;
+    cache.clearButton={9,10,11,12};
+
+    CHECK(RefreshPickerPaintCacheTransaction(cache,
+        [&](PickerPaintCacheState<int>& staged){
+            staged.hoverRows={3};
+            staged.switchHeader=L"new switch";
+            staged.moveHeader=L"new move";
+            staged.footer.repo=FooterRepoLabel();
+            staged.footer.middle=FooterMiddle();
+            staged.footer.conus=FooterConusLabel();
+            staged.generation=17;
+            staged.hintWidth=18;
+            staged.clearButton={19,20,21,22};
+            return BuildPickerFooterLayout(
+                720,312,16,34,22,180,360,100,
+                staged.footer.layout);
+        },[]() noexcept {},
+        [](PickerPaintCacheState<int>& published) noexcept {
+            published.clear();
+        }));
+    CHECK((cache.hoverRows==std::vector<int>{3}));
+    CHECK(cache.switchHeader==L"new switch" &&
+          cache.moveHeader==L"new move");
+    CHECK(cache.footer.repo==FooterRepoLabel() &&
+          cache.footer.layout.repoLink.left==40);
+    CHECK(cache.generation==17 && cache.hintWidth==18 &&
+          cache.clearButton.left==19 && cache.clearButton.bottom==22);
+
+    CHECK(!RefreshPickerPaintCacheTransaction(cache,
+        [&](PickerPaintCacheState<int>& staged){
+            staged.footer.repo=L"partial";
+            staged.footer.layout.repoLink={80,81,82,83};
+            staged.generation=99;
+            return false;
+        },[]() noexcept {},
+        [](PickerPaintCacheState<int>& published) noexcept {
+            published.clear();
+        }));
+    CHECK(cache.hoverRows.empty() && cache.switchHeader.empty() &&
+          cache.moveHeader.empty());
+    CHECK(cache.footer.repo.empty() &&
+          cache.footer.layout.repoLink.left==0 &&
+          cache.footer.layout.repoLink.right==0);
+    CHECK(cache.generation==0 && cache.hintWidth==0 &&
+          cache.clearButton.left==0 && cache.clearButton.right==0);
+}
+
+static void test_footer_first_route_consumes_before_search_and_tiles(){
+    PickerState state;
+    state.paintGeneration=31;
+    PickerFooterLayout layout;
+    CHECK(BuildPickerFooterLayout(
+        720,312,16,34,22,180,360,100,layout));
+    const PickerFooterActivation repo=ResolvePickerFooterActivation(
+        state,31,layout,POINT{40,278});
+
+    for(intptr_t shellResult : {static_cast<intptr_t>(32),
+                                static_cast<intptr_t>(33)}){
+        const PickerPointerActivation route=ResolvePickerPointerActivation(
+            repo,true,true,4);
+        CHECK(route.target==PickerPointerTarget::Footer);
+        int footerCalls=0,searchCalls=0,tileCalls=0,notifications=0;
+        CHECK(DispatchPickerPointerActivation(route,
+            [&](const PickerFooterActivation& activation){
+                ++footerCalls;
+                CHECK(DispatchPickerFooterActivation(activation,
+                    [&](const wchar_t*)->intptr_t { return shellResult; },
+                    [&](){ ++notifications; }));
+            },
+            [&](){ ++searchCalls; },
+            [&](){ ++searchCalls; },
+            [&](int){ ++tileCalls; }));
+        CHECK(footerCalls==1 && searchCalls==0 && tileCalls==0);
+        CHECK(notifications==(shellResult<=32?1:0));
+    }
+
+    PickerFooterActivation none;
+    PickerPointerActivation clear=ResolvePickerPointerActivation(
+        none,true,true,4);
+    CHECK(clear.target==PickerPointerTarget::ClearSearch);
+    PickerPointerActivation search=ResolvePickerPointerActivation(
+        none,false,true,4);
+    CHECK(search.target==PickerPointerTarget::Search);
+    PickerPointerActivation tile=ResolvePickerPointerActivation(
+        none,false,false,4);
+    CHECK(tile.target==PickerPointerTarget::Tile && tile.tileIndex==4);
+}
+
+static void test_footer_hover_event_state_covers_every_reset_path(){
+    PickerHoverEventState state;
+    state.rowTooltipActive=true;
+    int invalidations=0;
+    if(UpdatePickerFooterHoverEvent(
+            state,PickerFooterLink::Repository)) ++invalidations;
+    CHECK(invalidations==1 && !state.rowTooltipActive &&
+          state.footerLink==PickerFooterLink::Repository);
+    state.rowTooltipActive=true;
+    if(UpdatePickerFooterHoverEvent(
+            state,PickerFooterLink::Repository)) ++invalidations;
+    CHECK(invalidations==1 && !state.rowTooltipActive);
+    if(UpdatePickerFooterHoverEvent(
+            state,PickerFooterLink::ConusVision)) ++invalidations;
+    if(UpdatePickerFooterHoverEvent(
+            state,PickerFooterLink::None)) ++invalidations;
+    CHECK(invalidations==3);
+
+    const std::vector<PickerHoverResetReason> reasons={
+        PickerHoverResetReason::CachePublication,
+        PickerHoverResetReason::CacheFailure,
+        PickerHoverResetReason::ExplicitInvalidation,
+        PickerHoverResetReason::Hide,
+        PickerHoverResetReason::MouseLeave
+    };
+    uint64_t expectedResetCount=0;
+    for(PickerHoverResetReason reason : reasons){
+        state.footerLink=PickerFooterLink::Repository;
+        state.rowTooltipActive=true;
+        ResetPickerHoverEventState(state,reason);
+        ++expectedResetCount;
+        CHECK(state.footerLink==PickerFooterLink::None);
+        CHECK(!state.rowTooltipActive);
+        CHECK(state.lastResetReason==reason);
+        CHECK(state.resetCount==expectedResetCount);
+    }
+}
+
 static void test_picker_distinguishes_current_selected_and_active(){
     PickerState state;
     const GUID current=G(L"{231A0000-0000-0000-0000-000000000001}");
@@ -13483,6 +13916,13 @@ static void test_validated_touch_rebase_preserves_external_semantics(){
 }
 
 int main(){
+    test_footer_literal_and_links_are_exact();
+    test_footer_minimum_size_is_one_line_and_dpi_scaled();
+    test_footer_geometry_hit_hover_cursor_and_open_result_seams();
+    test_footer_cache_and_activation_are_transactional();
+    test_composite_picker_cache_cannot_omit_footer_state();
+    test_footer_first_route_consumes_before_search_and_tiles();
+    test_footer_hover_event_state_covers_every_reset_path();
     test_picker_distinguishes_current_selected_and_active();
     test_picker_zero_guids_and_partial_identities_never_highlight();
     test_picker_active_identity_rejects_hwnd_reuse();

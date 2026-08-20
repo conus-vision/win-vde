@@ -50,10 +50,9 @@ restart, and moves each matched window to the desktop it was saved on.
 - **Automatic restore** — on utility start (if a browser is already open) and
   when a browser launches (after a ~20 s stabilization), windows are returned to
   their saved desktops.
-- **Wipe-proof auto layout** — closing windows never erases your saved layout.
-  A window that disappears is kept and only forgotten after it has been gone
-  for a few utility runs (grace period), so temporarily closing and reopening a
-  window restores it.
+- **30-day closed-window memory** — a closed Firefox, Chrome, or Edge window
+  keeps its remembered virtual desktop for 30 days. If it reappears before
+  expiry, VDE restores it before updating the saved layout.
 - **Two layouts** — a rolling *auto* layout plus a manual checkpoint you save on
   demand.
 - **Desktop picker** — global hotkey (default `Ctrl+Alt+D`) opens a grid of
@@ -61,6 +60,9 @@ restart, and moves each matched window to the desktop it was saved on.
   to filter windows — matching **any of their browser tabs**, not just the
   active one, by tab title *or* full **URL** (address bar) — scroll tiles with
   the wheel, hover a clipped name for its full title.
+- **Persistent Ctrl+Click picker** — moving the active window also switches to
+  the destination desktop while keeping the picker open and its active context
+  highlighted.
 - **Start with Windows** — optional run-at-logon toggle.
 - **Honest about breakage** — if a Windows update changes the undocumented
   interfaces, the app explains what happened and runs in a limited mode instead
@@ -95,7 +97,7 @@ icon for:
 | **Restore last auto saved layout** | Restore from the rolling auto layout |
 | **Settings…** | Hotkey, auto-save/restore, start-with-Windows |
 | **About…** | Version, author, contact, project link |
-| **Exit** | Quit (saves the auto layout if windows are open) |
+| **Exit** | Quit after saving the current automatic layout |
 
 **Picker:** click a desktop to switch to it; `Ctrl`+click to move the active
 window there. Arrow keys / number keys navigate; `Esc` closes.
@@ -114,7 +116,8 @@ vde.exe restore-auto  restore from the last auto-saved layout
 
 Stored under `%LOCALAPPDATA%\VirtualDesktopsExtention\`:
 
-- `layout-auto.txt` — the rolling auto layout (merged, grace-aged).
+- `layout-auto.txt` — the rolling auto layout with 30-day closed-window
+  retention.
 - `layout-manual.txt` — your manual checkpoint (full snapshot).
 
 A legacy `layout.txt` from earlier builds is migrated to `layout-auto.txt` on

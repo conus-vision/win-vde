@@ -1,4 +1,4 @@
-// vde.rc — ресурсы для Virtual Desktops Extention for Windows 11
+// vde.rc — ресурсы для Virtual Desktop Extension for Windows 11
 // ID 101 должен совпадать с IDI_APPICON в vde.cpp.
 // vde.ico должен лежать рядом с этим файлом во время компиляции rc.exe.
 // Это единственная иконка в exe, поэтому Проводник возьмёт её как значок файла.

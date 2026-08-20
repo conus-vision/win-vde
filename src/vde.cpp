@@ -1,4 +1,4 @@
-// vde.cpp — Virtual Desktops Extention for Windows 11
+// vde.cpp — Virtual Desktop Extension for Windows 11
 // -----------------------------------------------------------------------------
 // Единое приложение:
 //   * Резидент в трее + глобальный хоткей Ctrl+Alt+D -> пикер «перенести
@@ -68,9 +68,10 @@
 #pragma comment(lib, "comctl32.lib")
 
 // =============================== app config ==================================
-static const wchar_t* APP_NAME  = L"Virtual Desktops Extention for Windows 11";
-static const wchar_t* APP_SHORT = L"Virtual Desktops Extention"; // <=63 chars for balloon title
-// Если 'Extention' — опечатка и нужно 'Extension', поменяйте обе строки выше.
+static const wchar_t* APP_NAME  = L"Virtual Desktop Extension for Windows 11";
+static const wchar_t* APP_SHORT = L"Virtual Desktop Extension"; // <=63 chars for balloon title
+static const wchar_t* REPO_URL = FooterRepoUrl();
+static const wchar_t* CONUS_URL = FooterConusUrl();
 
 static UINT g_hotMods = MOD_CONTROL | MOD_ALT;  // Ctrl+Alt+D по умолчанию
 static UINT g_hotVk   = 'D';
@@ -4321,7 +4322,7 @@ static HFONT g_uiFont=nullptr;
 static const UINT WM_TRAY=WM_APP+1;
 static NOTIFYICONDATAW g_nid={0};
 static int g_dpi=96;
-static int S(int v){ return MulDiv(v,g_dpi,96); }   // px@96dpi -> px@текущий DPI
+static int S(int v){ return PickerScaleForDpi(v,g_dpi); }
 
 static void StopWorkers(HWND messageWindow){
     if(g_sessionWorker){ g_sessionWorker->Stop(); g_sessionWorker.reset(); }
@@ -4343,7 +4344,8 @@ static bool QuiesceRuntime(HWND messageWindow) noexcept {
         StopWorkers(messageWindow);
     });
 }
-static int TILE_W=240,TILE_H=150,PAD=16,HEADER=44,SEARCH_H=40;  // базовые (96 dpi); пересчёт в InitMetrics
+static int TILE_W=240,TILE_H=150,PAD=16,HEADER=44,SEARCH_H=40;
+static int FOOTER_H=34,FOOTER_MIN_W=720,FOOTER_LINK_H=22;
 static int g_cols=1,g_rows=1;
 static HFONT g_fPT=nullptr,g_fPN=nullptr,g_fPI=nullptr,g_fPX=nullptr;   // cached picker fonts (avoid re-create per repaint)
 static int g_lastHoverRow=-1;                                          // last tooltip row (avoid redundant TTM churn)
@@ -4352,6 +4354,7 @@ static std::wstring g_pickerTooltipText;
 static void InitMetrics(){
     HDC dc=GetDC(nullptr); g_dpi=GetDeviceCaps(dc,LOGPIXELSX); ReleaseDC(nullptr,dc);
     TILE_W=S(240); TILE_H=S(150); PAD=S(16); HEADER=S(38); SEARCH_H=S(58);
+    FOOTER_H=S(34); FOOTER_MIN_W=S(720); FOOTER_LINK_H=S(22);
     if(g_fPT)DeleteObject(g_fPT); if(g_fPN)DeleteObject(g_fPN); if(g_fPI)DeleteObject(g_fPI); if(g_fPX)DeleteObject(g_fPX);
     g_fPT=CreateFontW(S(20),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     g_fPN=CreateFontW(S(17),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
@@ -4362,32 +4365,9 @@ static void InitMetrics(){
 static HWND g_search=nullptr; static WNDPROC g_searchOrigProc=nullptr;
 static HWND g_tip=nullptr;
 struct RowRec { RECT rc; std::wstring full; bool trunc; };
-struct PickerPaintCache {
-    std::vector<RowRec> hoverRows;
-    std::wstring switchHeader,moveHeader;
-    uint64_t generation=0;
-    int hintWidth=0;
-    RECT clearButton={0,0,0,0};
-    void swap(PickerPaintCache& other) noexcept {
-        hoverRows.swap(other.hoverRows);
-        switchHeader.swap(other.switchHeader);
-        moveHeader.swap(other.moveHeader);
-        const uint64_t priorGeneration=generation;
-        generation=other.generation;
-        other.generation=priorGeneration;
-        const int width=hintWidth;
-        hintWidth=other.hintWidth;
-        other.hintWidth=width;
-        const RECT button=clearButton;
-        clearButton=other.clearButton;
-        other.clearButton=button;
-    }
-    void clear() noexcept {
-        PickerPaintCache empty;
-        swap(empty);
-    }
-};
+using PickerPaintCache=PickerPaintCacheState<RowRec>;
 static PickerPaintCache g_pickerPaintCache;
+static PickerHoverEventState g_pickerHoverState;
 static std::wstring LowerW(std::wstring s){ if(!s.empty()) CharLowerW(&s[0]); return s; }
 static bool MatchesSearch(const std::wstring& title){ return g_picker.searchText.empty() || LowerW(title).find(g_picker.searchText)!=std::wstring::npos; }
 // ---- picker palette (per mockup) ----
@@ -4654,6 +4634,11 @@ static bool ApplyPickerSearchText(std::wstring searchText) noexcept {
 }
 
 static void ResetPickerHoverTooltip() noexcept;
+static void ResetPickerHoverState(
+        PickerHoverResetReason reason) noexcept {
+    ResetPickerHoverTooltip();
+    ResetPickerHoverEventState(g_pickerHoverState,reason);
+}
 static bool RefreshPickerPaintCache() noexcept;
 static bool g_tabBlobsBuilt=false;
 static void HandleSearchSessionResult(const SessionRoute& route,
@@ -4784,7 +4769,11 @@ static void LayoutTiles(int clientW){
     g_rows=(n+g_cols-1)/g_cols;
     for(int i=0;i<n;++i){ int r=i/g_cols,c=i%g_cols; RECT rc; rc.left=PAD+c*(TILE_W+PAD); rc.top=SEARCH_H+HEADER+PAD+r*(TILE_H+PAD); rc.right=rc.left+TILE_W; rc.bottom=rc.top+TILE_H; g_tiles[i].rc=rc; }
 }
-static SIZE DesiredClientSize(){ int n=(int)g_tiles.size(); int cols=std::min(std::max(1,n),5); int rows=(n+cols-1)/cols; SIZE s; s.cx=PAD+cols*(TILE_W+PAD); s.cy=SEARCH_H+HEADER+PAD+rows*(TILE_H+PAD); return s; }
+static SIZE DesiredClientSize(){
+    return PickerDesiredClientSize(
+        g_tiles.size(),TILE_W,TILE_H,PAD,SEARCH_H,HEADER,
+        FOOTER_H,FOOTER_MIN_W);
+}
 
 static int PickerTileVisibleRows(const Tile& tile) noexcept {
     const int listTop=tile.rc.top+S(10)+S(22)+S(6);
@@ -4824,7 +4813,7 @@ public:
     HDC get() const noexcept { return dc_; }
 };
 
-static bool RebuildPickerPaintCache(int clientWidth,
+static bool RebuildPickerPaintCache(int clientWidth,int clientHeight,
                                     uint64_t generation) noexcept {
     return RefreshPickerPaintCacheTransaction(
         g_pickerPaintCache,[&](PickerPaintCache& cache){
@@ -4836,6 +4825,9 @@ static bool RebuildPickerPaintCache(int clientWidth,
         cache.moveHeader=L"Move window:  ";
         cache.moveHeader+=
             g_targetTitle.empty()?L"(no window)":g_targetTitle;
+        cache.footer.repo=FooterRepoLabel();
+        cache.footer.middle=FooterMiddle();
+        cache.footer.conus=FooterConusLabel();
 
         if(g_picker.searchActive){
             const RECT searchBox=SearchBoxRect(clientWidth);
@@ -4854,6 +4846,21 @@ static bool RebuildPickerPaintCache(int clientWidth,
         if(!GetTextExtentPoint32W(measure.get(),hint,
                 static_cast<int>(wcslen(hint)),&hintSize)) return false;
         cache.hintWidth=hintSize.cx;
+        SIZE repoExtent={0,0},middleExtent={0,0},conusExtent={0,0};
+        if(!GetTextExtentPoint32W(
+                measure.get(),cache.footer.repo.c_str(),
+                static_cast<int>(cache.footer.repo.size()),&repoExtent) ||
+           !GetTextExtentPoint32W(
+                measure.get(),cache.footer.middle.c_str(),
+                static_cast<int>(cache.footer.middle.size()),&middleExtent) ||
+           !GetTextExtentPoint32W(
+                measure.get(),cache.footer.conus.c_str(),
+                static_cast<int>(cache.footer.conus.size()),&conusExtent))
+            return false;
+        if(!BuildPickerFooterLayout(
+            clientWidth,clientHeight,PAD,FOOTER_H,FOOTER_LINK_H,
+            repoExtent.cx,middleExtent.cx,conusExtent.cx,
+            cache.footer.layout)) return false;
         for(const Tile& tile : g_tiles){
             RECT name=tile.rc;
             name.left+=S(14);
@@ -4894,9 +4901,9 @@ static bool RebuildPickerPaintCache(int clientWidth,
         }
         return true;
     },[]() noexcept {
-        ResetPickerHoverTooltip();
+        ResetPickerHoverState(PickerHoverResetReason::CachePublication);
     },[](PickerPaintCache& cache) noexcept {
-        ResetPickerHoverTooltip();
+        ResetPickerHoverState(PickerHoverResetReason::CacheFailure);
         cache.clear();
     });
 }
@@ -4904,23 +4911,27 @@ static bool RebuildPickerPaintCache(int clientWidth,
 static void InvalidatePublishedPickerPaintCache() noexcept {
     InvalidatePickerPaintCacheState(
         g_picker,g_pickerPaintCache,
-        []() noexcept { ResetPickerHoverTooltip(); });
+        []() noexcept {
+            ResetPickerHoverState(
+                PickerHoverResetReason::ExplicitInvalidation);
+        });
 }
 
 static bool RefreshPickerPaintCache() noexcept {
     const uint64_t generation=BeginPickerPaintRefresh(g_picker);
     if(!g_main){
-        ResetPickerHoverTooltip();
+        ResetPickerHoverState(PickerHoverResetReason::CacheFailure);
         g_pickerPaintCache.clear();
         return false;
     }
     RECT client={0,0,0,0};
     if(!GetClientRect(g_main,&client)){
-        ResetPickerHoverTooltip();
+        ResetPickerHoverState(PickerHoverResetReason::CacheFailure);
         g_pickerPaintCache.clear();
         return false;
     }
-    return RebuildPickerPaintCache(client.right,generation);
+    return RebuildPickerPaintCache(
+        client.right,client.bottom,generation);
 }
 
 class PickerBackBuffer {
@@ -5072,6 +5083,25 @@ static void Paint(HDC hdcReal,HDC hdc,RECT client){
             RECT thb={t.rc.right-S(9),thbY,t.rc.right-S(5),thbY+thbH}; FillRoundRect(hdc,thb,S(2),CLR_SCROLL_THB,CLR_SCROLL_THB,1);
         }
     }
+    if(paintCacheReady){
+        const PickerFooterLayout& footer=
+            g_pickerPaintCache.footer.layout;
+        SelectObject(hdc,fI);
+        SetTextColor(hdc,g_pickerHoverState.footerLink==PickerFooterLink::Repository
+            ?CLR_HEAD:CLR_ACTIVE);
+        TextOutW(hdc,footer.repoText.x,footer.repoText.y,
+            g_pickerPaintCache.footer.repo.c_str(),
+            static_cast<int>(g_pickerPaintCache.footer.repo.size()));
+        SetTextColor(hdc,CLR_HINT);
+        TextOutW(hdc,footer.middleText.x,footer.middleText.y,
+            g_pickerPaintCache.footer.middle.c_str(),
+            static_cast<int>(g_pickerPaintCache.footer.middle.size()));
+        SetTextColor(hdc,g_pickerHoverState.footerLink==PickerFooterLink::ConusVision
+            ?CLR_HEAD:CLR_ACTIVE);
+        TextOutW(hdc,footer.conusText.x,footer.conusText.y,
+            g_pickerPaintCache.footer.conus.c_str(),
+            static_cast<int>(g_pickerPaintCache.footer.conus.size()));
+    }
     if(hdc!=hdcReal)
         BitBlt(hdcReal,0,0,client.right,client.bottom,hdc,0,0,SRCCOPY);
 }
@@ -5090,6 +5120,7 @@ static void ResetPickerHoverTooltip() noexcept {
     g_lastHoverRow=-1;
     g_lastHoverGeneration=0;
     g_pickerTooltipText.clear();
+    g_pickerHoverState.rowTooltipActive=false;
 }
 static void TrackPickerHoverTooltip(HWND hwnd,const RowRec& row,
                                     int rowIndex,uint64_t generation,
@@ -5114,13 +5145,17 @@ static void TrackPickerHoverTooltip(HWND hwnd,const RowRec& row,
         SendMessageW(g_tip,TTM_TRACKACTIVATE,TRUE,(LPARAM)&ti);
         g_lastHoverRow=rowIndex;
         g_lastHoverGeneration=generation;
+        g_pickerHoverState.rowTooltipActive=true;
     }
     POINT screenPoint=clientPoint;
     ClientToScreen(hwnd,&screenPoint);
     SendMessageW(g_tip,TTM_TRACKPOSITION,0,
         (LPARAM)MAKELONG(screenPoint.x+S(16),screenPoint.y+S(20)));
 }
-static void HidePicker(){ ResetPickerHoverTooltip(); ShowWindow(g_main,SW_HIDE); }
+static void HidePicker(){
+    ResetPickerHoverState(PickerHoverResetReason::Hide);
+    ShowWindow(g_main,SW_HIDE);
+}
 // Search EDIT subclass: forward navigation keys to the grid; let letters/numbers type.
 static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM wp, LPARAM lp){
     if((m==WM_KEYDOWN||m==WM_KEYUP)&&wp==VK_CONTROL){ InvalidateRect(g_main,nullptr,FALSE); return 0; }
@@ -5426,7 +5461,7 @@ static HICON LoadAppIcon(int cx,int cy){
 static void TrayAdd(HWND hwnd){
     g_nid.cbSize=sizeof(g_nid); g_nid.hWnd=hwnd; g_nid.uID=1; g_nid.uFlags=NIF_ICON|NIF_MESSAGE|NIF_TIP; g_nid.uCallbackMessage=WM_TRAY;
     g_nid.hIcon=LoadAppIcon(GetSystemMetrics(SM_CXSMICON),GetSystemMetrics(SM_CYSMICON));
-    wcsncpy_s(g_nid.szTip, g_degraded ? L"Virtual Desktops Extension (compatibility issue - see About)" : APP_NAME, _TRUNCATE);
+    wcsncpy_s(g_nid.szTip, g_degraded ? L"Virtual Desktop Extension (compatibility issue - see About)" : APP_NAME, _TRUNCATE);
     Shell_NotifyIconW(NIM_ADD,&g_nid);
 }
 static void TrayRemove(){ Shell_NotifyIconW(NIM_DELETE,&g_nid); }
@@ -5625,7 +5660,7 @@ static void OpenSettings(){
     RECT wr={0,0,W,H}; AdjustWindowRect(&wr,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,FALSE);
     int ww=wr.right-wr.left, wh=wr.bottom-wr.top;
     int sx=(GetSystemMetrics(SM_CXSCREEN)-ww)/2, sy=(GetSystemMetrics(SM_CYSCREEN)-wh)/2;
-    g_settings=CreateWindowExW(0,L"VdeSettings",L"Settings - Virtual Desktops Extention",
+    g_settings=CreateWindowExW(0,L"VdeSettings",L"Settings - Virtual Desktop Extension",
         WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,sx,sy,ww,wh,nullptr,nullptr,g_inst,nullptr);
     if(g_settings){ ShowWindow(g_settings,SW_SHOW); SetForegroundWindow(g_settings); }
 }
@@ -5633,7 +5668,7 @@ static void OpenSettings(){
 // --------------------------- About window ------------------------------------
 static HWND g_about=nullptr;
 static void AboutCopy(HWND hwnd){
-    std::wstring s=std::wstring(L"Virtual Desktops Extension v")+APP_VERSION+L" | info@conus.vision | Windows build "+std::to_wstring(GetWindowsBuild());
+    std::wstring s=std::wstring(L"Virtual Desktop Extension v")+APP_VERSION+L" | info@conus.vision | Windows build "+std::to_wstring(GetWindowsBuild());
     if(OpenClipboard(hwnd)){ EmptyClipboard();
         size_t bytes=(s.size()+1)*sizeof(wchar_t); HGLOBAL h=GlobalAlloc(GMEM_MOVEABLE,bytes);
         if(h){ void* d=GlobalLock(h); if(d){ memcpy(d,s.c_str(),bytes); GlobalUnlock(h); SetClipboardData(CF_UNICODETEXT,h); } }
@@ -5644,7 +5679,7 @@ static LRESULT CALLBACK AboutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     switch(msg){
     case WM_CREATE:{
         int y=S(16);
-        std::wstring title=std::wstring(L"Virtual Desktops Extension for Windows 11  \x2014  v")+APP_VERSION;
+        std::wstring title=std::wstring(L"Virtual Desktop Extension for Windows 11  \x2014  v")+APP_VERSION;
         CreateWindowW(L"STATIC",title.c_str(),WS_CHILD|WS_VISIBLE,S(16),y,S(352),S(20),hwnd,nullptr,g_inst,nullptr); y+=S(26);
         CreateWindowW(L"STATIC",L"Saves and restores browser windows across Windows 11 virtual desktops.",WS_CHILD|WS_VISIBLE,S(16),y,S(352),S(34),hwnd,nullptr,g_inst,nullptr); y+=S(40);
         CreateWindowW(L"STATIC",L"Author:  Volodymyr Moskvin",WS_CHILD|WS_VISIBLE,S(16),y,S(352),S(20),hwnd,nullptr,g_inst,nullptr); y+=S(24);
@@ -5683,7 +5718,7 @@ static void OpenAbout(){
     RECT wr={0,0,W,H}; AdjustWindowRect(&wr,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,FALSE);
     int ww=wr.right-wr.left, wh=wr.bottom-wr.top;
     int sx=(GetSystemMetrics(SM_CXSCREEN)-ww)/2, sy=(GetSystemMetrics(SM_CYSCREEN)-wh)/2;
-    g_about=CreateWindowExW(0,L"VdeAbout",L"About - Virtual Desktops Extension",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,sx,sy,ww,wh,nullptr,nullptr,g_inst,nullptr);
+    g_about=CreateWindowExW(0,L"VdeAbout",L"About - Virtual Desktop Extension",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,sx,sy,ww,wh,nullptr,nullptr,g_inst,nullptr);
     if(g_about){ ShowWindow(g_about,SW_SHOW); SetForegroundWindow(g_about); }
 }
 
@@ -5734,7 +5769,7 @@ static void ShowCompatIssue(bool buildChanged){
     RECT wr={0,0,W,H}; AdjustWindowRect(&wr,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,FALSE);
     int ww=wr.right-wr.left, wh=wr.bottom-wr.top;
     int sx=(GetSystemMetrics(SM_CXSCREEN)-ww)/2, sy=(GetSystemMetrics(SM_CYSCREEN)-wh)/2;
-    g_compat=CreateWindowExW(WS_EX_TOPMOST,L"VdeCompat",L"Virtual Desktops Extension \x2014 compatibility issue",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,sx,sy,ww,wh,nullptr,nullptr,g_inst,nullptr);
+    g_compat=CreateWindowExW(WS_EX_TOPMOST,L"VdeCompat",L"Virtual Desktop Extension \x2014 compatibility issue",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,sx,sy,ww,wh,nullptr,nullptr,g_inst,nullptr);
     if(g_compat){ ShowWindow(g_compat,SW_SHOW); SetForegroundWindow(g_compat); }
 }
 
@@ -5789,8 +5824,23 @@ static void OpenHelp(){
     RECT wr={0,0,W,H}; AdjustWindowRect(&wr,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,FALSE);
     int ww=wr.right-wr.left, wh=wr.bottom-wr.top;
     int sx=(GetSystemMetrics(SM_CXSCREEN)-ww)/2, sy=(GetSystemMetrics(SM_CYSCREEN)-wh)/2;
-    g_help=CreateWindowExW(0,L"VdeHelp",L"Help - Virtual Desktops Extension",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,sx,sy,ww,wh,nullptr,nullptr,g_inst,nullptr);
+    g_help=CreateWindowExW(0,L"VdeHelp",L"Help - Virtual Desktop Extension",WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,sx,sy,ww,wh,nullptr,nullptr,g_inst,nullptr);
     if(g_help){ ShowWindow(g_help,SW_SHOW); SetForegroundWindow(g_help); }
+}
+
+static bool OpenPickerFooterLink(
+        HWND owner,const PickerFooterActivation& activation) noexcept {
+    PickerFooterActivation exact=activation;
+    if(exact.link==PickerFooterLink::Repository) exact.url=REPO_URL;
+    else if(exact.link==PickerFooterLink::ConusVision) exact.url=CONUS_URL;
+    return DispatchPickerFooterActivation(exact,
+        [&](const wchar_t* url)->intptr_t {
+            const HINSTANCE opened=ShellExecuteW(
+                owner,L"open",url,nullptr,nullptr,SW_SHOWNORMAL);
+            return reinterpret_cast<intptr_t>(opened);
+        },[](){
+            Balloon(L"The selected project link could not be opened.");
+        });
 }
 
 static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
@@ -5798,6 +5848,20 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     case WM_HOTKEY: ShowPicker(CapturePickerTarget()); return 0;
     case WM_PAINT:{ ScopedPickerPaint paint(hwnd); HDC target=paint.get(); if(!target)return 0; RECT cr; GetClientRect(hwnd,&cr); HDC canvas=target; if(g_pickerBuffer.ensure(target,cr.right,cr.bottom))canvas=g_pickerBuffer.get(); Paint(target,canvas,cr); return 0; }
     case WM_ERASEBKGND: return 1;
+    case WM_SETCURSOR:{
+        const bool cacheReady=PickerPaintCacheMatches(
+            g_picker,g_pickerPaintCache.generation);
+        POINT point={0,0};
+        if(cacheReady && GetCursorPos(&point) &&
+           ScreenToClient(hwnd,&point) &&
+           PickerFooterUsesHandCursor(HitCurrentPickerFooterLink(
+               g_picker,g_pickerPaintCache.generation,
+               g_pickerPaintCache.footer.layout,point))){
+            HCURSOR hand=LoadCursorW(nullptr,IDC_HAND);
+            if(hand){ SetCursor(hand); return TRUE; }
+        }
+        break;
+    }
     case WM_CTLCOLOREDIT: if((HWND)lp==g_search){ HDC dc=(HDC)wp; SetTextColor(dc,CLR_TEXT); SetBkColor(dc,CLR_SEARCH);
         static HBRUSH sbr=nullptr; if(!sbr)sbr=CreateSolidBrush(CLR_SEARCH); return (LRESULT)sbr; }
         return DefWindowProcW(hwnd,msg,wp,lp);
@@ -5814,14 +5878,79 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     case WM_KEYUP:
         if(wp==VK_CONTROL) InvalidateRect(hwnd,nullptr,FALSE);
         return 0;
-    case WM_LBUTTONDOWN:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
+    case WM_LBUTTONDOWN:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
         const bool cacheReady=PickerPaintCacheMatches(g_picker,g_pickerPaintCache.generation);
-        if(cacheReady && g_pickerPaintCache.clearButton.right>g_pickerPaintCache.clearButton.left && PtInRect(&g_pickerPaintCache.clearButton,pt)){ SetWindowTextW(g_search,L""); g_picker.searchActive=false; RefreshPickerPaintCache(); SetFocus(g_search); InvalidateRect(hwnd,nullptr,FALSE); return 0; }   // clear + deactivate border, keep caret
-        { RECT cr; GetClientRect(hwnd,&cr); RECT sb=SearchBoxRect(cr.right); if(PtInRect(&sb,pt)){ g_picker.searchActive=true; RefreshPickerPaintCache(); SetFocus(g_search); InvalidateRect(hwnd,nullptr,FALSE); return 0; } }   // clicked the search field -> activate
-        if(g_picker.searchActive){ g_picker.searchActive=false; RefreshPickerPaintCache(); InvalidateRect(hwnd,nullptr,FALSE); }   // clicked outside the field -> deactivate border
-        for(size_t i=0;i<g_tiles.size();++i) if(PtInRect(&g_tiles[i].rc,pt)){ Activate((int)i,ctrl); return 0; } return 0; }
+        const PickerFooterActivation footerActivation=
+            ResolvePickerFooterActivation(
+            g_picker,g_pickerPaintCache.generation,
+            g_pickerPaintCache.footer.layout,pt);
+        const bool clearSearchHit=cacheReady &&
+            g_pickerPaintCache.clearButton.right>
+                g_pickerPaintCache.clearButton.left &&
+            PtInRect(&g_pickerPaintCache.clearButton,pt);
+        RECT client={0,0,0,0};
+        const bool searchHit=GetClientRect(hwnd,&client) &&
+            PickerPointInRect(SearchBoxRect(client.right),pt);
+        int tileIndex=-1;
+        for(size_t index=0;index<g_tiles.size();++index)
+            if(PtInRect(&g_tiles[index].rc,pt)){
+                tileIndex=static_cast<int>(index);
+                break;
+            }
+        const PickerPointerActivation activation=
+            ResolvePickerPointerActivation(
+                footerActivation,clearSearchHit,searchHit,tileIndex);
+        if(DispatchPickerPointerActivation(activation,
+            [&](const PickerFooterActivation& footer){
+                OpenPickerFooterLink(hwnd,footer);
+            },[&](){
+                SetWindowTextW(g_search,L"");
+                g_picker.searchActive=false;
+                RefreshPickerPaintCache();
+                SetFocus(g_search);
+                InvalidateRect(hwnd,nullptr,FALSE);
+            },[&](){
+                g_picker.searchActive=true;
+                RefreshPickerPaintCache();
+                SetFocus(g_search);
+                InvalidateRect(hwnd,nullptr,FALSE);
+            },[&](int index){
+                if(g_picker.searchActive){
+                    g_picker.searchActive=false;
+                    RefreshPickerPaintCache();
+                    InvalidateRect(hwnd,nullptr,FALSE);
+                }
+                const bool ctrl=
+                    (GetKeyState(VK_CONTROL)&0x8000)!=0;
+                Activate(index,ctrl);
+            })) return 0;
+        if(g_picker.searchActive){
+            g_picker.searchActive=false;
+            RefreshPickerPaintCache();
+            InvalidateRect(hwnd,nullptr,FALSE);
+        }
+        return 0;
+    }
     case WM_MOUSEMOVE:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
         const bool cacheReady=PickerPaintCacheMatches(g_picker,g_pickerPaintCache.generation);
+        const PickerFooterLink footerHover=HitCurrentPickerFooterLink(
+            g_picker,g_pickerPaintCache.generation,
+            g_pickerPaintCache.footer.layout,pt);
+        if(UpdatePickerFooterHoverEvent(g_pickerHoverState,footerHover)){
+            if(cacheReady)
+                InvalidateRect(hwnd,
+                    &g_pickerPaintCache.footer.layout.footer,FALSE);
+            else
+                InvalidateRect(hwnd,nullptr,FALSE);
+        }
+        if(PickerFooterSuppressesRowHover(footerHover)){
+            ResetPickerHoverTooltip();
+            TRACKMOUSEEVENT tme={sizeof(tme)};
+            tme.dwFlags=TME_LEAVE;
+            tme.hwndTrack=hwnd;
+            TrackMouseEvent(&tme);
+            return 0;
+        }
         int hovRow=-1; if(cacheReady) for(size_t i=0;i<g_pickerPaintCache.hoverRows.size();++i) if(PtInRect(&g_pickerPaintCache.hoverRows[i].rc,pt)){ hovRow=(int)i; break; }
         if(hovRow>=0 && g_pickerPaintCache.hoverRows[hovRow].trunc && g_tip){    // R9: full name on hover when truncated
             TrackPickerHoverTooltip(hwnd,g_pickerPaintCache.hoverRows[hovRow],
@@ -5830,7 +5959,16 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         for(size_t i=0;i<g_tiles.size();++i) if(PtInRect(&g_tiles[i].rc,pt)){ if(g_picker.selectedIndex!=(int)i){SetPickerSelectionWithLegacy((int)i); RefreshPickerPaintCache(); InvalidateRect(hwnd,nullptr,FALSE);} break; }
         TRACKMOUSEEVENT tme={sizeof(tme)}; tme.dwFlags=TME_LEAVE; tme.hwndTrack=hwnd; TrackMouseEvent(&tme);
         return 0; }
-    case WM_MOUSELEAVE: ResetPickerHoverTooltip(); return 0;
+    case WM_MOUSELEAVE:{
+        const bool footerChanged=
+            g_pickerHoverState.footerLink!=PickerFooterLink::None;
+        ResetPickerHoverState(PickerHoverResetReason::MouseLeave);
+        if(footerChanged && PickerPaintCacheMatches(
+                g_picker,g_pickerPaintCache.generation))
+            InvalidateRect(hwnd,
+                &g_pickerPaintCache.footer.layout.footer,FALSE);
+        return 0;
+    }
     case WM_MOUSEWHEEL:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; ScreenToClient(hwnd,&pt); int delta=GET_WHEEL_DELTA_WPARAM(wp);   // R8: scroll a tile's window list
         for(auto& t:g_tiles) if(PtInRect(&t.rc,pt)){ const int maximum=PickerTileMaxScroll(t); RememberPickerScroll(t,AdvancePickerScroll(t.scroll,maximum,delta)); RefreshPickerPaintCache(); InvalidateRect(hwnd,nullptr,FALSE); break; }
         return 0; }
