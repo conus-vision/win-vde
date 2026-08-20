@@ -3,6 +3,8 @@
 #define UNICODE
 #define _UNICODE
 #include "window_identity.hpp" // must be self-contained at first include
+#include "gdi_buffer.hpp"
+#include "icon_cache.hpp"
 #include "picker_state.hpp"
 #include "reconcile_worker.hpp"
 #include "session_worker.hpp"
@@ -29,6 +31,7 @@
 #include <utility>
 #include <vector>
 #include <thread>
+#include <type_traits>
 #include "lifecycle.hpp"
 
 static int g_fail = 0, g_total = 0;
@@ -864,6 +867,738 @@ static void test_picker_bitmap_replacement_deselects_before_delete(){
     CHECK(!PublishPickerBitmapReplacement(state,44,11,release));
     CHECK(state.owned==prior.owned && state.selected==prior.selected);
     CHECK(release==77);
+}
+
+static void test_gdi_buffer_resize_does_not_leak_selected_bitmaps(){
+    HDC screen=GetDC(nullptr);
+    if(!screen) return;
+    {
+        GdiBuffer warm;
+        CHECK(warm.ensure(screen,64,64));
+        warm.reset();
+        warm.reset();
+    }
+    const DWORD before=GetGuiResources(GetCurrentProcess(),GR_GDIOBJECTS);
+    for(int cycle=0;cycle<4;++cycle){
+        GdiBuffer buffer;
+        for(int i=0;i<100;++i)
+            CHECK(buffer.ensure(screen,200+i,120+i));
+        if((cycle&1)==0){
+            buffer.reset();
+            buffer.reset();
+        }
+    }
+    const DWORD after=GetGuiResources(GetCurrentProcess(),GR_GDIOBJECTS);
+    ReleaseDC(nullptr,screen);
+    CHECK(after<=before+1);
+}
+
+static void test_gdi_buffer_is_noncopyable(){
+    CHECK(!std::is_copy_constructible<GdiBuffer>::value);
+    CHECK(!std::is_copy_assignable<GdiBuffer>::value);
+}
+
+struct FakeGdiBufferState {
+    uintptr_t dc=1;
+    uintptr_t original=10;
+    uintptr_t selected=10;
+    uintptr_t nextBitmap=20;
+    uintptr_t reportedPrevious=0;
+    bool failCreateDc=false;
+    bool failCurrentObject=false;
+    bool failCreateBitmap=false;
+    bool failSelect=false;
+    int failSelectOnCall=0;
+    bool failDeleteDc=false;
+    bool failDeleteObject=false;
+    bool deletedWhileSelected=false;
+    bool duplicateDelete=false;
+    int createDcCalls=0;
+    int createBitmapCalls=0;
+    int selectCalls=0;
+    int deleteObjectCalls=0;
+    int deleteDcCalls=0;
+    std::set<uintptr_t> alive;
+    std::vector<std::string> events;
+};
+
+static HDC FakeGdiCreateDc(void* context,HDC){
+    FakeGdiBufferState& state=*static_cast<FakeGdiBufferState*>(context);
+    ++state.createDcCalls;
+    state.events.push_back("create-dc");
+    return state.failCreateDc?nullptr:reinterpret_cast<HDC>(state.dc);
+}
+
+static HGDIOBJ FakeGdiGetCurrent(void* context,HDC,int){
+    FakeGdiBufferState& state=*static_cast<FakeGdiBufferState*>(context);
+    state.events.push_back("get-current");
+    return state.failCurrentObject
+        ?nullptr:reinterpret_cast<HGDIOBJ>(state.original);
+}
+
+static HBITMAP FakeGdiCreateBitmap(void* context,HDC,int,int){
+    FakeGdiBufferState& state=*static_cast<FakeGdiBufferState*>(context);
+    ++state.createBitmapCalls;
+    state.events.push_back("create-bitmap");
+    if(state.failCreateBitmap) return nullptr;
+    const uintptr_t bitmap=state.nextBitmap++;
+    state.alive.insert(bitmap);
+    return reinterpret_cast<HBITMAP>(bitmap);
+}
+
+static HGDIOBJ FakeGdiSelect(void* context,HDC,HGDIOBJ object){
+    FakeGdiBufferState& state=*static_cast<FakeGdiBufferState*>(context);
+    ++state.selectCalls;
+    state.events.push_back("select:"+
+        std::to_string(reinterpret_cast<uintptr_t>(object)));
+    if(state.failSelect ||
+       (state.failSelectOnCall!=0 &&
+        state.selectCalls==state.failSelectOnCall)){
+        state.failSelect=false;
+        return HGDI_ERROR;
+    }
+    const uintptr_t previous=state.selected;
+    state.selected=reinterpret_cast<uintptr_t>(object);
+    const uintptr_t reported=state.reportedPrevious;
+    state.reportedPrevious=0;
+    return reinterpret_cast<HGDIOBJ>(reported?reported:previous);
+}
+
+static BOOL FakeGdiDeleteObject(void* context,HGDIOBJ object){
+    FakeGdiBufferState& state=*static_cast<FakeGdiBufferState*>(context);
+    ++state.deleteObjectCalls;
+    const uintptr_t value=reinterpret_cast<uintptr_t>(object);
+    state.events.push_back("delete-object:"+std::to_string(value));
+    if(state.selected==value) state.deletedWhileSelected=true;
+    if(state.failDeleteObject) return FALSE;
+    if(state.alive.erase(value)!=1) state.duplicateDelete=true;
+    return TRUE;
+}
+
+static BOOL FakeGdiDeleteDc(void* context,HDC){
+    FakeGdiBufferState& state=*static_cast<FakeGdiBufferState*>(context);
+    ++state.deleteDcCalls;
+    state.events.push_back("delete-dc");
+    if(state.failDeleteDc) return FALSE;
+    state.selected=0;
+    return TRUE;
+}
+
+static GdiBufferOps FakeGdiOps(FakeGdiBufferState& state){
+    GdiBufferOps ops;
+    ops.context=&state;
+    ops.createCompatibleDc=&FakeGdiCreateDc;
+    ops.getCurrentObject=&FakeGdiGetCurrent;
+    ops.createCompatibleBitmap=&FakeGdiCreateBitmap;
+    ops.selectObject=&FakeGdiSelect;
+    ops.deleteObject=&FakeGdiDeleteObject;
+    ops.deleteDc=&FakeGdiDeleteDc;
+    return ops;
+}
+
+static void test_gdi_buffer_fake_ownership_is_exact(){
+    FakeGdiBufferState state;
+    {
+        GdiBuffer buffer(FakeGdiOps(state));
+        const HDC reference=reinterpret_cast<HDC>(99);
+        CHECK(buffer.ensure(reference,200,120));
+        CHECK(buffer.ensure(reference,200,120));
+        CHECK(state.createDcCalls==1 && state.createBitmapCalls==1);
+        CHECK(buffer.ensure(reference,240,160));
+        CHECK(state.selected==21);
+        CHECK(state.deleteObjectCalls==1 && state.alive.count(20)==0);
+        CHECK(!state.deletedWhileSelected && !state.duplicateDelete);
+        const std::vector<std::string> expected={
+            "create-dc","get-current","create-bitmap","select:20",
+            "create-bitmap","select:21","delete-object:20"};
+        CHECK(state.events==expected);
+        buffer.reset();
+        CHECK(state.events.size()==10);
+        CHECK(state.events[7]=="select:10");
+        CHECK(state.events[8]=="delete-dc");
+        CHECK(state.events[9]=="delete-object:21");
+        const size_t resetEvents=state.events.size();
+        buffer.reset();
+        CHECK(state.events.size()==resetEvents);
+    }
+    CHECK(state.deleteObjectCalls==2 && state.deleteDcCalls==1);
+    CHECK(state.alive.empty());
+    CHECK(!state.deletedWhileSelected && !state.duplicateDelete);
+}
+
+static void test_gdi_buffer_failures_are_atomic_and_cleanup_exact(){
+    FakeGdiBufferState state;
+    {
+        GdiBuffer buffer(FakeGdiOps(state));
+        const HDC reference=reinterpret_cast<HDC>(99);
+        CHECK(buffer.ensure(reference,200,120));
+        const HDC publishedDc=buffer.get();
+
+        state.failCreateBitmap=true;
+        CHECK(!buffer.ensure(reference,240,160));
+        state.failCreateBitmap=false;
+        CHECK(buffer.get()==publishedDc && state.selected==20);
+        CHECK(state.deleteObjectCalls==0 && state.alive.count(20)==1);
+
+        state.failSelect=true;
+        CHECK(!buffer.ensure(reference,240,160));
+        CHECK(buffer.get()==publishedDc && state.selected==20);
+        CHECK(state.deleteObjectCalls==1 && state.alive.size()==1);
+        CHECK(state.alive.count(20)==1 && !state.deletedWhileSelected);
+    }
+    CHECK(state.deleteObjectCalls==2 && state.deleteDcCalls==1);
+    CHECK(state.alive.empty() && !state.duplicateDelete);
+
+    FakeGdiBufferState noOriginal;
+    noOriginal.failCurrentObject=true;
+    {
+        GdiBuffer buffer(FakeGdiOps(noOriginal));
+        CHECK(!buffer.ensure(reinterpret_cast<HDC>(99),200,120));
+        CHECK(buffer.get()==nullptr);
+    }
+    CHECK(noOriginal.createDcCalls==1);
+    CHECK(noOriginal.createBitmapCalls==0);
+    CHECK(noOriginal.deleteDcCalls==1);
+    CHECK(noOriginal.deleteObjectCalls==0);
+
+    FakeGdiBufferState noBitmap;
+    noBitmap.failCreateBitmap=true;
+    {
+        GdiBuffer buffer(FakeGdiOps(noBitmap));
+        CHECK(!buffer.ensure(reinterpret_cast<HDC>(99),200,120));
+        CHECK(buffer.get()==nullptr);
+    }
+    CHECK(noBitmap.createDcCalls==1 && noBitmap.createBitmapCalls==1);
+    CHECK(noBitmap.deleteDcCalls==1 && noBitmap.deleteObjectCalls==0);
+
+    FakeGdiBufferState noSelection;
+    noSelection.failSelect=true;
+    {
+        GdiBuffer buffer(FakeGdiOps(noSelection));
+        CHECK(!buffer.ensure(reinterpret_cast<HDC>(99),200,120));
+        CHECK(buffer.get()==nullptr);
+    }
+    CHECK(noSelection.createDcCalls==1 &&
+          noSelection.createBitmapCalls==1);
+    CHECK(noSelection.deleteDcCalls==1 &&
+          noSelection.deleteObjectCalls==1);
+    CHECK(noSelection.alive.empty());
+}
+
+static void test_gdi_buffer_failed_deselect_releases_dc_before_bitmap(){
+    FakeGdiBufferState state;
+    {
+        GdiBuffer buffer(FakeGdiOps(state));
+        CHECK(buffer.ensure(reinterpret_cast<HDC>(99),200,120));
+        state.failSelect=true;
+        buffer.reset();
+        CHECK(state.events.size()==7);
+        CHECK(state.events[4]=="select:10");
+        CHECK(state.events[5]=="delete-dc");
+        CHECK(state.events[6]=="delete-object:20");
+        CHECK(!state.deletedWhileSelected);
+    }
+    CHECK(state.deleteDcCalls==1 && state.deleteObjectCalls==1);
+    CHECK(state.alive.empty() && !state.duplicateDelete);
+}
+
+static void test_gdi_buffer_rejects_unexpected_previous_selection_atomically(){
+    FakeGdiBufferState state;
+    {
+        GdiBuffer buffer(FakeGdiOps(state));
+        const HDC reference=reinterpret_cast<HDC>(99);
+        CHECK(buffer.ensure(reference,200,120));
+        state.reportedPrevious=10;
+        CHECK(!buffer.ensure(reference,240,160));
+        CHECK(state.selected==20);
+        CHECK(state.alive.size()==1 && state.alive.count(20)==1);
+        CHECK(state.deleteObjectCalls==1);
+        CHECK(!state.deletedWhileSelected && !state.duplicateDelete);
+        CHECK(buffer.ensure(reference,240,160));
+        CHECK(state.selected==22);
+        CHECK(state.alive.size()==1 && state.alive.count(22)==1);
+    }
+    CHECK(state.alive.empty());
+    CHECK(!state.deletedWhileSelected && !state.duplicateDelete);
+}
+
+static void test_gdi_buffer_retains_selected_bitmap_until_reset_can_retry(){
+    FakeGdiBufferState state;
+    GdiBuffer buffer(FakeGdiOps(state));
+    CHECK(buffer.ensure(reinterpret_cast<HDC>(99),200,120));
+    state.failSelect=true;
+    state.failDeleteDc=true;
+    buffer.reset();
+    CHECK(buffer.get()!=nullptr);
+    CHECK(state.deleteDcCalls==1 && state.deleteObjectCalls==0);
+    CHECK(state.selected==20 && state.alive.count(20)==1);
+    CHECK(!state.deletedWhileSelected && !state.duplicateDelete);
+
+    state.failDeleteDc=false;
+    buffer.reset();
+    CHECK(buffer.get()==nullptr);
+    CHECK(state.deleteDcCalls==2 && state.deleteObjectCalls==1);
+    CHECK(state.alive.empty());
+    CHECK(!state.deletedWhileSelected && !state.duplicateDelete);
+}
+
+static void test_gdi_buffer_invalid_sizes_never_allocate(){
+    FakeGdiBufferState state;
+    GdiBuffer buffer(FakeGdiOps(state));
+    const HDC reference=reinterpret_cast<HDC>(99);
+    CHECK(!buffer.ensure(nullptr,200,120));
+    CHECK(!buffer.ensure(reference,0,120));
+    CHECK(!buffer.ensure(reference,-1,120));
+    CHECK(!buffer.ensure(reference,200,0));
+    CHECK(!buffer.ensure(reference,200,-1));
+    CHECK(state.createDcCalls==0 && state.createBitmapCalls==0);
+    CHECK(state.selectCalls==0 && state.deleteObjectCalls==0);
+    CHECK(state.deleteDcCalls==0);
+}
+
+static void test_gdi_buffer_catastrophic_rollback_retains_both_bitmaps(){
+    FakeGdiBufferState state;
+    GdiBuffer buffer(FakeGdiOps(state));
+    const HDC reference=reinterpret_cast<HDC>(99);
+    CHECK(buffer.ensure(reference,200,120));
+    state.reportedPrevious=10;
+    state.failSelectOnCall=3;
+    state.failDeleteDc=true;
+    CHECK(!buffer.ensure(reference,240,160));
+    CHECK(buffer.get()!=nullptr);
+    CHECK(state.selected==21);
+    CHECK(state.alive.size()==2 && state.alive.count(20)==1 &&
+          state.alive.count(21)==1);
+    CHECK(state.deleteObjectCalls==0 && state.deleteDcCalls==1);
+    CHECK(!state.deletedWhileSelected && !state.duplicateDelete);
+
+    state.failSelectOnCall=0;
+    state.failDeleteDc=false;
+    buffer.reset();
+    CHECK(buffer.get()==nullptr);
+    CHECK(state.deleteDcCalls==2 && state.deleteObjectCalls==2);
+    CHECK(state.alive.empty());
+    CHECK(!state.deletedWhileSelected && !state.duplicateDelete);
+}
+
+static void test_gdi_buffer_retains_dc_when_original_read_cleanup_fails(){
+    FakeGdiBufferState state;
+    state.failCurrentObject=true;
+    state.failDeleteDc=true;
+    GdiBuffer buffer(FakeGdiOps(state));
+    CHECK(!buffer.ensure(reinterpret_cast<HDC>(99),200,120));
+    CHECK(buffer.get()!=nullptr);
+    CHECK(state.createDcCalls==1 && state.deleteDcCalls==1);
+    CHECK(state.createBitmapCalls==0 && state.deleteObjectCalls==0);
+
+    state.failDeleteDc=false;
+    buffer.reset();
+    CHECK(buffer.get()==nullptr && state.deleteDcCalls==2);
+}
+
+static void test_gdi_buffer_retains_every_failed_bitmap_delete_for_reset(){
+    const HDC reference=reinterpret_cast<HDC>(99);
+
+    FakeGdiBufferState rejectedCandidate;
+    {
+        GdiBuffer buffer(FakeGdiOps(rejectedCandidate));
+        rejectedCandidate.failSelect=true;
+        rejectedCandidate.failDeleteObject=true;
+        CHECK(!buffer.ensure(reference,200,120));
+        CHECK(rejectedCandidate.alive.size()==1);
+        const int creates=rejectedCandidate.createDcCalls;
+        CHECK(!buffer.ensure(reference,200,120));
+        CHECK(rejectedCandidate.createDcCalls==creates);
+        rejectedCandidate.failDeleteObject=false;
+        buffer.reset();
+        CHECK(rejectedCandidate.alive.empty());
+    }
+    CHECK(!rejectedCandidate.duplicateDelete &&
+          !rejectedCandidate.deletedWhileSelected);
+
+    FakeGdiBufferState rolledBackCandidate;
+    {
+        GdiBuffer buffer(FakeGdiOps(rolledBackCandidate));
+        CHECK(buffer.ensure(reference,200,120));
+        rolledBackCandidate.reportedPrevious=10;
+        rolledBackCandidate.failDeleteObject=true;
+        CHECK(!buffer.ensure(reference,240,160));
+        CHECK(rolledBackCandidate.selected==20);
+        CHECK(rolledBackCandidate.alive.size()==2);
+        rolledBackCandidate.failDeleteObject=false;
+        buffer.reset();
+        CHECK(rolledBackCandidate.alive.empty());
+    }
+    CHECK(!rolledBackCandidate.duplicateDelete &&
+          !rolledBackCandidate.deletedWhileSelected);
+
+    FakeGdiBufferState retiredOld;
+    {
+        GdiBuffer buffer(FakeGdiOps(retiredOld));
+        CHECK(buffer.ensure(reference,200,120));
+        retiredOld.failDeleteObject=true;
+        CHECK(buffer.ensure(reference,240,160));
+        CHECK(retiredOld.selected==21 && retiredOld.alive.size()==2);
+        const int creates=retiredOld.createBitmapCalls;
+        CHECK(buffer.ensure(reference,240,160));
+        CHECK(retiredOld.createBitmapCalls==creates);
+        CHECK(!buffer.ensure(reference,260,180));
+        CHECK(retiredOld.createBitmapCalls==creates);
+        retiredOld.failDeleteObject=false;
+        CHECK(buffer.ensure(reference,240,160));
+        CHECK(retiredOld.alive.size()==1 && retiredOld.alive.count(21)==1);
+        buffer.reset();
+        CHECK(retiredOld.alive.empty());
+    }
+    CHECK(!retiredOld.duplicateDelete && !retiredOld.deletedWhileSelected);
+}
+
+struct FakeIconCacheState {
+    uintptr_t nextOwned=1000;
+    bool failCopy=false;
+    bool throwCopy=false;
+    bool throwDestroy=false;
+    bool failDestroy=false;
+    bool duplicateDestroy=false;
+    int copyCalls=0;
+    std::set<uintptr_t> alive;
+    std::vector<uintptr_t> destroyed;
+    std::vector<std::string> events;
+};
+
+static IconCacheOps FakeIconOps(FakeIconCacheState& state){
+    IconCacheOps ops;
+    ops.copy=[&](HICON borrowed)->HICON {
+        ++state.copyCalls;
+        state.events.push_back("copy:"+std::to_string(
+            reinterpret_cast<uintptr_t>(borrowed)));
+        if(state.throwCopy) throw std::runtime_error("copy failure");
+        if(state.failCopy) return nullptr;
+        const uintptr_t owned=state.nextOwned++;
+        state.alive.insert(owned);
+        return reinterpret_cast<HICON>(owned);
+    };
+    ops.destroy=[&](HICON icon)->bool {
+        const uintptr_t owned=reinterpret_cast<uintptr_t>(icon);
+        state.events.push_back("destroy:"+std::to_string(owned));
+        if(state.throwDestroy) throw std::runtime_error("destroy failure");
+        if(state.failDestroy) return false;
+        state.destroyed.push_back(owned);
+        if(state.alive.erase(owned)!=1) state.duplicateDestroy=true;
+        return true;
+    };
+    return ops;
+}
+
+static void test_icon_cache_replacement_prune_clear_and_destructor_are_exact(){
+    FakeIconCacheState state;
+    {
+        OwnedIconCache cache(3,FakeIconOps(state));
+        HICON first=cache.insertBorrowed(
+            "a",reinterpret_cast<HICON>(11),1);
+        HICON second=cache.insertBorrowed(
+            "b",reinterpret_cast<HICON>(12),2);
+        CHECK(first==reinterpret_cast<HICON>(1000));
+        CHECK(second==reinterpret_cast<HICON>(1001));
+        CHECK(cache.size()==2 && cache.peek("a")==first);
+        CHECK(cache.getAndTouch("a",9)==first);
+
+        HICON replacement=cache.insertBorrowed(
+            "a",reinterpret_cast<HICON>(13),10);
+        CHECK(replacement==reinterpret_cast<HICON>(1002));
+        CHECK(cache.peek("a")==replacement && cache.size()==2);
+        CHECK(state.events[state.events.size()-2]=="copy:13");
+        CHECK(state.events.back()=="destroy:1000");
+
+        state.failCopy=true;
+        CHECK(cache.insertBorrowed(
+            "a",reinterpret_cast<HICON>(14),11)==nullptr);
+        state.failCopy=false;
+        CHECK(cache.peek("a")==replacement && cache.size()==2);
+        state.throwCopy=true;
+        CHECK(cache.insertBorrowed(
+            "a",reinterpret_cast<HICON>(15),12)==nullptr);
+        state.throwCopy=false;
+        CHECK(cache.peek("a")==replacement && cache.size()==2);
+        const int copiesBeforeNull=state.copyCalls;
+        CHECK(cache.insertBorrowed("null",nullptr,13)==nullptr);
+        CHECK(state.copyCalls==copiesBeforeNull && cache.size()==2);
+
+        cache.pruneTo({"a"});
+        CHECK(cache.size()==1 && cache.peek("b")==nullptr);
+        CHECK(state.alive.size()==1 && state.alive.count(1002)==1);
+        cache.clear();
+        CHECK(cache.size()==0 && state.alive.empty());
+        const size_t destroyed=state.destroyed.size();
+        cache.clear();
+        CHECK(state.destroyed.size()==destroyed);
+    }
+    CHECK(state.copyCalls==5);
+    CHECK(state.destroyed.size()==3);
+    CHECK(state.alive.empty() && !state.duplicateDestroy);
+}
+
+static void test_icon_cache_enforces_touch_lru_immediately(){
+    FakeIconCacheState state;
+    {
+        OwnedIconCache cache(2,FakeIconOps(state));
+        HICON a=cache.insertBorrowed("a",reinterpret_cast<HICON>(1),10);
+        HICON b=cache.insertBorrowed("b",reinterpret_cast<HICON>(2),20);
+        CHECK(a && b && cache.size()==2);
+        CHECK(cache.getAndTouch("a",30)==a);
+        HICON c=cache.insertBorrowed("c",reinterpret_cast<HICON>(3),40);
+        CHECK(c && cache.size()==2);
+        CHECK(cache.peek("a")==a && cache.peek("b")==nullptr);
+        CHECK(cache.peek("c")==c);
+        CHECK(state.destroyed.size()==1 && state.destroyed[0]==1001);
+    }
+    CHECK(state.alive.empty() && state.destroyed.size()==3);
+    CHECK(!state.duplicateDestroy);
+
+    FakeIconCacheState selfEvicted;
+    {
+        OwnedIconCache cache(1,FakeIconOps(selfEvicted));
+        HICON retained=cache.insertBorrowed(
+            "newer",reinterpret_cast<HICON>(4),100);
+        CHECK(retained!=nullptr);
+        CHECK(cache.insertBorrowed(
+            "older",reinterpret_cast<HICON>(5),1)==nullptr);
+        CHECK(cache.size()==1 && cache.peek("newer")==retained);
+        CHECK(cache.peek("older")==nullptr);
+    }
+    CHECK(selfEvicted.alive.empty() && !selfEvicted.duplicateDestroy);
+
+    FakeIconCacheState peekOnly;
+    {
+        OwnedIconCache cache(2,FakeIconOps(peekOnly));
+        HICON a=cache.insertBorrowed("a",reinterpret_cast<HICON>(1),10);
+        cache.insertBorrowed("b",reinterpret_cast<HICON>(2),20);
+        CHECK(cache.peek("a")==a);
+        cache.insertBorrowed("c",reinterpret_cast<HICON>(3),30);
+        CHECK(cache.peek("a")==nullptr);
+    }
+    CHECK(peekOnly.alive.empty() && !peekOnly.duplicateDestroy);
+
+    FakeIconCacheState tied;
+    {
+        OwnedIconCache cache(2,FakeIconOps(tied));
+        cache.insertBorrowed("b",reinterpret_cast<HICON>(1),10);
+        cache.insertBorrowed("a",reinterpret_cast<HICON>(2),10);
+        cache.insertBorrowed("c",reinterpret_cast<HICON>(3),20);
+        CHECK(cache.peek("a")==nullptr);
+        CHECK(cache.peek("b")!=nullptr && cache.peek("c")!=nullptr);
+    }
+    CHECK(tied.alive.empty() && !tied.duplicateDestroy);
+}
+
+static void test_icon_cache_rejects_zero_limit_and_missing_ops(){
+    FakeIconCacheState zeroState;
+    {
+        OwnedIconCache zero(0,FakeIconOps(zeroState));
+        CHECK(zero.insertBorrowed(
+            "a",reinterpret_cast<HICON>(1),1)==nullptr);
+        CHECK(zero.size()==0 && zeroState.copyCalls==0);
+    }
+    CHECK(zeroState.destroyed.empty());
+
+    FakeIconCacheState missingCopyState;
+    IconCacheOps missingCopy=FakeIconOps(missingCopyState);
+    missingCopy.copy={};
+    OwnedIconCache withoutCopy(2,std::move(missingCopy));
+    CHECK(withoutCopy.insertBorrowed(
+        "a",reinterpret_cast<HICON>(1),1)==nullptr);
+    CHECK(withoutCopy.size()==0 && missingCopyState.copyCalls==0);
+
+    FakeIconCacheState missingDestroyState;
+    IconCacheOps missingDestroy=FakeIconOps(missingDestroyState);
+    missingDestroy.destroy={};
+    OwnedIconCache withoutDestroy(2,std::move(missingDestroy));
+    CHECK(withoutDestroy.insertBorrowed(
+        "a",reinterpret_cast<HICON>(1),1)==nullptr);
+    CHECK(withoutDestroy.size()==0 && missingDestroyState.copyCalls==0);
+}
+
+static void test_icon_cache_callback_exceptions_do_not_escape(){
+    FakeIconCacheState state;
+    {
+        OwnedIconCache cache(2,FakeIconOps(state));
+        CHECK(cache.insertBorrowed(
+            "a",reinterpret_cast<HICON>(1),1)!=nullptr);
+        state.throwDestroy=true;
+        CHECK(!cache.clear());
+        CHECK(cache.size()==1 && state.alive.size()==1);
+        state.throwDestroy=false;
+        CHECK(cache.clear());
+        CHECK(cache.size()==0 && state.alive.empty());
+    }
+    CHECK(state.destroyed.size()==1 && !state.duplicateDestroy);
+}
+
+static void test_icon_cache_destroy_failure_retains_bounded_ownership(){
+    FakeIconCacheState replacement;
+    {
+        OwnedIconCache cache(1,FakeIconOps(replacement));
+        HICON original=cache.insertBorrowed(
+            "a",reinterpret_cast<HICON>(1),10);
+        replacement.failDestroy=true;
+        CHECK(cache.insertBorrowed(
+            "a",reinterpret_cast<HICON>(2),20)==nullptr);
+        CHECK(cache.peek("a")==original && cache.size()==1);
+        CHECK(replacement.alive.size()==2);
+        const int copies=replacement.copyCalls;
+        CHECK(cache.insertBorrowed(
+            "b",reinterpret_cast<HICON>(3),30)==nullptr);
+        CHECK(replacement.copyCalls==copies);
+        replacement.failDestroy=false;
+        CHECK(cache.clear());
+        CHECK(cache.size()==0 && replacement.alive.empty());
+    }
+    CHECK(!replacement.duplicateDestroy);
+
+    FakeIconCacheState pruning;
+    {
+        OwnedIconCache cache(2,FakeIconOps(pruning));
+        cache.insertBorrowed("a",reinterpret_cast<HICON>(1),1);
+        cache.insertBorrowed("b",reinterpret_cast<HICON>(2),2);
+        pruning.failDestroy=true;
+        CHECK(!cache.pruneTo({"b"}));
+        CHECK(cache.size()==2 && cache.peek("a")!=nullptr);
+        pruning.failDestroy=false;
+        CHECK(cache.pruneTo({"b"}));
+        CHECK(cache.size()==1 && cache.peek("a")==nullptr);
+        CHECK(cache.clear());
+    }
+    CHECK(pruning.alive.empty() && !pruning.duplicateDestroy);
+}
+
+static void test_icon_cache_caps_257_live_keys_at_256_immediately(){
+    FakeIconCacheState state;
+    {
+        OwnedIconCache cache(256,FakeIconOps(state));
+        for(int index=0;index<257;++index){
+            const std::string key="window-"+std::to_string(index);
+            cache.insertBorrowed(key,
+                reinterpret_cast<HICON>(static_cast<uintptr_t>(index+1)),
+                static_cast<uint64_t>(index+1));
+            CHECK(cache.size()<=256);
+        }
+        CHECK(cache.size()==256);
+        CHECK(cache.peek("window-0")==nullptr);
+        CHECK(state.destroyed.size()==1);
+    }
+    CHECK(state.copyCalls==257);
+    CHECK(state.destroyed.size()==257);
+    CHECK(state.alive.empty() && !state.duplicateDestroy);
+}
+
+static void test_icon_preload_gate_caps_work_and_skips_idle_refresh(){
+    IconPreloadGate gate;
+    gate.markDirty();
+    const size_t available=256;
+    size_t loaderCalls=0;
+    size_t turns=0;
+    IconPreloadTurn turn;
+    do {
+        turn=gate.runTurn(4,[&](size_t cursor){
+            if(cursor>=available) return IconPreloadStep::Exhausted;
+            ++loaderCalls;
+            return IconPreloadStep::Miss;
+        });
+        ++turns;
+        CHECK(turn.misses<=4);
+    } while(!turn.complete && turns<100);
+    CHECK(turn.complete && turns==65 && loaderCalls==256);
+
+    const IconPreloadTurn idle=gate.runTurn(4,[&](size_t){
+        ++loaderCalls;
+        return IconPreloadStep::Miss;
+    });
+    CHECK(idle.complete && idle.misses==0 && loaderCalls==256);
+
+    gate.markDirty();
+    const IconPreloadTurn cached=gate.runTurn(4,[&](size_t cursor){
+        if(cursor>=104) return IconPreloadStep::Exhausted;
+        if(cursor<100) return IconPreloadStep::Cached;
+        ++loaderCalls;
+        return IconPreloadStep::Miss;
+    });
+    CHECK(!cached.complete && cached.visited==104 && cached.misses==4);
+    gate.cancel();
+    CHECK(!gate.dirty());
+    const IconPreloadTurn hidden=gate.runTurn(4,[&](size_t){
+        ++loaderCalls;
+        return IconPreloadStep::Miss;
+    });
+    CHECK(hidden.complete && hidden.misses==0 && loaderCalls==260);
+}
+
+static void test_picker_scroll_clamp_reaches_rows_beyond_icon_budget(){
+    std::vector<int> scrolls(100,999);
+    std::vector<int> maxima(100,3);
+    maxima.back()=1;
+    for(size_t index=0;index<scrolls.size();++index)
+        scrolls[index]=PickerVisibleScroll(scrolls[index],maxima[index]);
+    CHECK(scrolls[63]==3);
+    CHECK(scrolls.back()==1);
+}
+
+static void test_ordered_teardown_retries_without_destroying_dependencies(){
+    OrderedTeardownGate gate;
+    int windows=0,classes=0,resources=0;
+    bool windowsReady=false,classesReady=false,resourcesReady=false;
+    auto run=[&](){
+        return gate.run(
+            [&](){ ++windows; return windowsReady; },
+            [&](){ ++classes; return classesReady; },
+            [&](){ ++resources; return resourcesReady; });
+    };
+
+    CHECK(!run());
+    CHECK(windows==1 && classes==0 && resources==0 && !gate.complete());
+    windowsReady=true;
+    CHECK(!run());
+    CHECK(windows==2 && classes==1 && resources==0 && !gate.complete());
+    classesReady=true;
+    CHECK(!run());
+    CHECK(windows==2 && classes==2 && resources==1 && !gate.complete());
+    resourcesReady=true;
+    CHECK(run() && gate.complete());
+    CHECK(windows==2 && classes==2 && resources==2);
+    CHECK(run());
+    CHECK(windows==2 && classes==2 && resources==2);
+
+    gate.reset();
+    CHECK(!gate.complete());
+}
+
+static void test_fixed_icon_retirement_retains_failed_release_without_allocating(){
+    FixedIconRetirement<3> retired;
+    CHECK(retired.retain(reinterpret_cast<HICON>(1)));
+    CHECK(retired.retain(reinterpret_cast<HICON>(2)));
+    CHECK(retired.retain(reinterpret_cast<HICON>(3)));
+    CHECK(!retired.retain(reinterpret_cast<HICON>(4)));
+    CHECK(retired.size()==3);
+
+    std::set<uintptr_t> alive={1,2,3};
+    bool failSecond=true;
+    CHECK(!retired.clear([&](HICON icon)->bool {
+        const uintptr_t value=reinterpret_cast<uintptr_t>(icon);
+        if(value==2 && failSecond) return false;
+        return alive.erase(value)==1;
+    }));
+    CHECK(retired.size()==1 && alive.size()==1 && alive.count(2)==1);
+    failSecond=false;
+    CHECK(retired.clear([&](HICON icon)->bool {
+        return alive.erase(reinterpret_cast<uintptr_t>(icon))==1;
+    }));
+    CHECK(retired.size()==0 && alive.empty());
+    CHECK(retired.clear([](HICON)->bool { return false; }));
+
+    CHECK(retired.retain(reinterpret_cast<HICON>(5)));
+    CHECK(!retired.clear([](HICON)->bool {
+        throw std::runtime_error("release failure");
+    }));
+    CHECK(retired.size()==1);
 }
 
 static void test_picker_valid_current_commits_only_with_model(){
@@ -10116,6 +10851,336 @@ static std::string ReadRawFile(const std::wstring& path){
     return read.status==FileReadStatus::Ok ? read.bytes : std::string();
 }
 
+static void test_picker_uses_self_contained_gdi_buffer(){
+    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    CHECK(!source.empty());
+    CHECK(source.find("#include \"gdi_buffer.hpp\"")!=std::string::npos);
+    CHECK(source.find("static GdiBuffer g_pickerBuffer;")!=std::string::npos);
+    CHECK(source.find("class PickerBackBuffer")==std::string::npos);
+    CHECK(source.find("CreateCompatibleBitmap")==std::string::npos);
+}
+
+static std::string SourceSection(const std::string& source,
+                                 const std::string& begin,
+                                 const std::string& end){
+    const size_t first=source.find(begin);
+    if(first==std::string::npos) return {};
+    const size_t last=source.find(end,first+begin.size());
+    if(last==std::string::npos || last<=first) return {};
+    return source.substr(first,last-first);
+}
+
+static void test_picker_icon_loading_is_bounded_and_outside_paint(){
+    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    CHECK(!source.empty());
+    CHECK(source.find("#include \"icon_cache.hpp\"")!=std::string::npos);
+    CHECK(source.find("static OwnedIconCache g_windowIconCache(256")!=
+          std::string::npos);
+    CHECK(source.find("static HICON WindowIcon")==std::string::npos);
+    CHECK(source.find("SMTO_ABORTIFHUNG,200")==std::string::npos);
+
+    const std::string row=SourceSection(
+        source,"struct WinItem {","struct Tile {");
+    CHECK(!row.empty());
+    CHECK(row.find("std::string runtimeKey")!=std::string::npos);
+    CHECK(row.find("HICON icon")==std::string::npos);
+
+    const std::string enumerate=SourceSection(
+        source,"static BOOL CALLBACK EnumAll(",
+        "static bool PopulatePickerFilteredRows(");
+    CHECK(!enumerate.empty());
+    CHECK(enumerate.find("RuntimeKey(fast)")!=std::string::npos);
+    CHECK(enumerate.find("liveKeys")!=std::string::npos);
+    CHECK(enumerate.find("WM_GETICON")==std::string::npos);
+    CHECK(enumerate.find("GetClassLongPtrW")==std::string::npos);
+    CHECK(enumerate.find("LoadWindowIconOutsidePaint")==std::string::npos);
+
+    const std::string loader=SourceSection(
+        source,"static HICON LoadWindowIconOutsidePaint(",
+        "static HICON CachedWindowIcon(");
+    CHECK(!loader.empty());
+    CHECK(loader.find("getAndTouch")!=std::string::npos);
+    CHECK(loader.find("GetClassLongPtrW")!=std::string::npos);
+    CHECK(loader.find("WM_GETICON,ICON_SMALL2")!=std::string::npos);
+    CHECK(loader.find("SMTO_ABORTIFHUNG|SMTO_BLOCK,25")!=
+          std::string::npos);
+    const size_t firstIdentity=loader.find(
+        "RecaptureGenericWindowIdentity");
+    const size_t timeout=loader.find("SendMessageTimeoutW");
+    const size_t secondIdentity=loader.find(
+        "RecaptureGenericWindowIdentity",firstIdentity+1);
+    const size_t publish=loader.find("insertBorrowed");
+    CHECK(firstIdentity!=std::string::npos && timeout!=std::string::npos &&
+          secondIdentity!=std::string::npos && publish!=std::string::npos);
+    CHECK(firstIdentity<timeout && timeout<secondIdentity &&
+          secondIdentity<publish);
+
+    const std::string paint=SourceSection(
+        source,"static void Paint(","static void TipDeactivate(");
+    CHECK(!paint.empty());
+    CHECK(paint.find("CachedWindowIcon(window.runtimeKey)")!=
+          std::string::npos);
+    CHECK(paint.find("LoadWindowIconOutsidePaint")==std::string::npos);
+    CHECK(paint.find("RuntimeKey(")==std::string::npos);
+    CHECK(paint.find("SendMessageTimeoutW")==std::string::npos);
+    CHECK(paint.find("GetClassLongPtrW")==std::string::npos);
+    CHECK(paint.find("getAndTouch")==std::string::npos);
+    CHECK(paint.find("insertBorrowed")==std::string::npos);
+    CHECK(paint.find("LowerW(")==std::string::npos);
+    CHECK(paint.find("EnsureTabSearch")==std::string::npos);
+
+    const std::string build=SourceSection(
+        source,"static bool BuildModel(",
+        "static bool SetPickerSelectionCurrent(");
+    CHECK(!build.empty());
+    CHECK(build.find("if(published) PruneIconCache(liveKeys);")!=
+          std::string::npos);
+}
+
+static void test_picker_preloads_only_laid_out_visible_rows(){
+    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    CHECK(!source.empty());
+    const std::string preload=SourceSection(
+        source,"static void PreloadVisiblePickerIcons(",
+        "class ScopedPickerMeasureDc");
+    CHECK(!preload.empty());
+    CHECK(preload.find("LoadWindowIconOutsidePaint(window)")!=
+          std::string::npos);
+    CHECK(preload.find("g_pickerIconPreloadGate.runTurn(")!=
+          std::string::npos);
+    CHECK(preload.find("PICKER_ICON_PRELOAD_MISS_BUDGET")!=
+          std::string::npos);
+
+    const std::string queued=SourceSection(
+        source,"static bool BuildPickerIconPreloadQueue() noexcept {",
+        "static void SchedulePickerIconPreloadContinuation() noexcept {");
+    CHECK(!queued.empty());
+    CHECK(queued.find("tile.filtered[position]")!=std::string::npos);
+    CHECK(queued.find("PickerTileVisibleRows(tile)")!=std::string::npos);
+    CHECK(queued.find("PickerVisibleScroll(")!=std::string::npos);
+    CHECK(queued.find("PICKER_ICON_CACHE_LIMIT")!=std::string::npos);
+
+    const std::string refresh=SourceSection(
+        source,"static bool RefreshPickerPaintCache(\n"
+               "        bool allowHiddenPreparation) noexcept {",
+        "struct PickerLightweightSnapshot");
+    CHECK(!refresh.empty());
+    const size_t layout=refresh.find("LayoutTiles(client.right)");
+    const size_t clamp=refresh.find("ClampAllPickerScrolls()");
+    const size_t preloaded=refresh.find("PreloadVisiblePickerIcons()");
+    const size_t rebuild=refresh.find("RebuildPickerPaintCache(");
+    CHECK(layout!=std::string::npos && clamp!=std::string::npos &&
+          preloaded!=std::string::npos && rebuild!=std::string::npos);
+    CHECK(layout<clamp && clamp<preloaded && preloaded<rebuild);
+    CHECK(source.find("bool allowHiddenPreparation=false")!=
+          std::string::npos);
+    CHECK(refresh.find("IsWindowVisible(g_main)")!=std::string::npos);
+    CHECK(refresh.find("CancelPickerIconPreload(g_main)")!=
+          std::string::npos);
+
+    const std::string clampRows=SourceSection(
+        source,"static void ClampAllPickerScrolls() noexcept {",
+        "static bool BuildPickerIconPreloadQueue() noexcept {");
+    CHECK(!clampRows.empty());
+    CHECK(clampRows.find(
+        "for(size_t index=0;index<g_tiles.size();++index)")!=
+          std::string::npos);
+    CHECK(clampRows.find("RememberPickerScroll(tile,clamped)")!=
+          std::string::npos);
+    CHECK(clampRows.find("PICKER_ICON_PRELOAD_MISS_BUDGET")==
+          std::string::npos);
+
+    const std::string filtering=SourceSection(
+        source,"static bool RebuildPickerFilteredRows() noexcept {",
+        "static void ResetPickerHoverTooltip()");
+    CHECK(filtering.find("MarkPickerIconPreloadDirty()")!=
+          std::string::npos);
+    const std::string model=SourceSection(
+        source,"static bool BuildModel(",
+        "static bool SetPickerSelectionCurrent(");
+    CHECK(model.find("MarkPickerIconPreloadDirty()")!=
+          std::string::npos);
+    const std::string wheel=SourceSection(
+        source,"case WM_MOUSEWHEEL:","case WM_COMMAND:");
+    CHECK(wheel.find("MarkPickerIconPreloadDirty(")!=
+          std::string::npos);
+
+    const std::string selection=SourceSection(
+        source,"static bool SetPickerSelectionCurrent(",
+        "static bool RememberPickerScroll(");
+    CHECK(selection.find("MarkPickerIconPreloadDirty(index)")!=
+          std::string::npos);
+
+    const std::string timers=SourceSection(
+        source,"case WM_TIMER:","case WM_QUERYENDSESSION:");
+    CHECK(timers.find("TIMER_PICKER_ICON_PRELOAD")!=std::string::npos);
+    CHECK(timers.find("PreloadVisiblePickerIcons(true)")!=
+          std::string::npos);
+    CHECK(timers.find("IsWindowVisible(hwnd)")!=std::string::npos);
+    CHECK(timers.find("CancelPickerIconPreload(hwnd)")!=
+          std::string::npos);
+
+    const std::string cancellation=SourceSection(
+        source,"static void CancelPickerIconPreload(HWND window) noexcept {",
+        "static bool QuiesceRuntime(");
+    CHECK(!cancellation.empty());
+    CHECK(cancellation.find("KillTimer(window,TIMER_PICKER_ICON_PRELOAD)")!=
+          std::string::npos);
+    CHECK(cancellation.find("g_pickerIconPreloadGate.cancel()")!=
+          std::string::npos);
+    CHECK(cancellation.find("g_pickerIconPreloadQueue.clear()")!=
+          std::string::npos);
+    const std::string quiesce=SourceSection(
+        source,"static bool QuiesceRuntime(","static int TILE_W=");
+    CHECK(quiesce.find("CancelPickerIconPreload(messageWindow)")!=
+          std::string::npos);
+    const std::string controlledHide=SourceSection(
+        source,"case PickerEffectKind::Hide:",
+        "case PickerEffectKind::ReportFailure:");
+    CHECK(controlledHide.find("CancelPickerIconPreload(g_main)")!=
+          std::string::npos);
+    const std::string idleHide=SourceSection(
+        source,"static void HidePicker(){","// Search EDIT subclass");
+    CHECK(idleHide.find("CancelPickerIconPreload(g_main)")!=
+          std::string::npos);
+
+    const std::string show=SourceSection(
+        source,"static void ShowPicker(","static void MoveSel(");
+    const size_t showDirty=show.rfind("MarkPickerIconPreloadDirty(");
+    const size_t showRefresh=show.rfind("RefreshPickerPaintCache(true)");
+    CHECK(showDirty!=std::string::npos && showRefresh!=std::string::npos &&
+          showDirty<showRefresh);
+}
+
+static void test_picker_wm_paint_requires_the_owned_buffer(){
+    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    const std::string message=SourceSection(
+        source,"case WM_PAINT:","case WM_ERASEBKGND:");
+    CHECK(!message.empty());
+    CHECK(message.find("RECT client={0,0,0,0};")!=std::string::npos);
+    CHECK(message.find("if(!GetClientRect(hwnd,&client)) return 0;")!=
+          std::string::npos);
+    CHECK(message.find(
+        "if(!g_pickerBuffer.ensure(target,client.right,client.bottom))")!=
+          std::string::npos);
+    CHECK(message.find("Paint(target,g_pickerBuffer.get(),client);")!=
+          std::string::npos);
+    CHECK(message.find("HDC canvas=target")==std::string::npos);
+}
+
+static size_t CountSourceText(const std::string& source,
+                              const std::string& needle){
+    size_t count=0;
+    size_t position=0;
+    while((position=source.find(needle,position))!=std::string::npos){
+        ++count;
+        position+=needle.size();
+    }
+    return count;
+}
+
+static void test_ui_resources_have_one_owned_cleanup_path(){
+    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    CHECK(!source.empty());
+    CHECK(source.find("static HBRUSH g_searchBrush=nullptr;")!=
+          std::string::npos);
+    CHECK(source.find("static HBRUSH sbr")==std::string::npos);
+    CHECK(source.find("static std::vector<HICON> g_ownedIcons;")!=
+          std::string::npos);
+    CHECK(CountSourceText(source,"InitMetrics();")==1);
+    CHECK(source.find("std::terminate()") == std::string::npos);
+    const std::string metrics=SourceSection(
+        source,"static void InitMetrics(){","// ---- picker search");
+    CHECK(metrics.find("g_ownedIcons.reserve(MAX_OWNED_APP_ICONS)")!=
+          std::string::npos);
+
+    const std::string track=SourceSection(
+        source,"static HICON TrackOwnedAppIcon(",
+        "static HICON LoadAppIcon(");
+    CHECK(!track.empty());
+    CHECK(track.find("g_ownedIcons.push_back(icon)")!=std::string::npos);
+    CHECK(track.find("DestroyIcon(icon)")!=std::string::npos);
+    CHECK(track.find("g_failedOwnedIconReleases.retain(icon)")!=
+          std::string::npos);
+
+    const std::string load=SourceSection(
+        source,"static HICON LoadAppIcon(","static void TrayAdd(");
+    CHECK(!load.empty());
+    CHECK(CountSourceText(load,"TrackOwnedAppIcon(")>=3);
+    CHECK(load.find("CopyIcon(fallback)")!=std::string::npos);
+    CHECK(load.find("return LoadIconW(")==std::string::npos);
+    const size_t capacityCheck=load.find("OwnedAppIconCapacityAvailable()");
+    const size_t firstLoad=load.find("LoadImageW(");
+    CHECK(capacityCheck!=std::string::npos && firstLoad!=std::string::npos &&
+          capacityCheck<firstLoad);
+
+    const std::string cleanup=SourceSection(
+        source,"static bool CleanupUiResources() noexcept {",
+        "static bool DestroyUiWindow(HWND& window) noexcept {");
+    CHECK(!cleanup.empty());
+    const size_t buffer=cleanup.find("g_pickerBuffer.reset()");
+    const size_t iconCache=cleanup.find("ClearWindowIconCache()");
+    const size_t fonts=cleanup.find("HFONT* fonts[]");
+    const size_t brush=cleanup.find("DeleteObject(g_searchBrush)");
+    const size_t icons=cleanup.find("for(HICON icon : g_ownedIcons)");
+    CHECK(buffer!=std::string::npos && iconCache!=std::string::npos &&
+          fonts!=std::string::npos && brush!=std::string::npos &&
+          icons!=std::string::npos);
+    CHECK(buffer<iconCache && iconCache<fonts && fonts<brush && brush<icons);
+    CHECK(cleanup.find("if(!g_pickerBuffer.released()) return false;")!=
+          std::string::npos);
+    CHECK(cleanup.find("if(!ClearWindowIconCache()) return false;")!=
+          std::string::npos);
+    CHECK(cleanup.find("g_ownedIcons.clear()")!=std::string::npos);
+    CHECK(cleanup.find("g_failedOwnedIconReleases.clear(")!=
+          std::string::npos);
+    CHECK(cleanup.find("g_nid.hIcon=nullptr")!=std::string::npos);
+
+    const std::string teardown=SourceSection(
+        source,"static bool DestroyUiWindow(HWND& window) noexcept {",
+        "class ScopedUiShutdown");
+    CHECK(!teardown.empty());
+    CHECK(teardown.find("!DestroyWindow(owned)")!=
+          std::string::npos);
+    const size_t destroySettings=teardown.find("DestroyUiWindow(g_settings)");
+    const size_t destroyMain=teardown.find("DestroyUiWindow(g_main)");
+    const size_t unregisterSettings=teardown.find(
+        "UnregisterUiClass(L\"VdeSettings\"");
+    const size_t unregisterMain=teardown.find(
+        "UnregisterUiClass(L\"VdeWindow\"");
+    const size_t cleanupCall=teardown.find("CleanupUiResources()");
+    CHECK(destroySettings!=std::string::npos &&
+          destroyMain!=std::string::npos &&
+          unregisterSettings!=std::string::npos &&
+          unregisterMain!=std::string::npos &&
+          cleanupCall!=std::string::npos);
+    CHECK(destroySettings<destroyMain && destroyMain<unregisterSettings &&
+          unregisterSettings<unregisterMain && unregisterMain<cleanupCall);
+    CHECK(CountSourceText(source,"CleanupUiResources();")==1);
+    CHECK(teardown.find("g_uiTeardown.run(")!=std::string::npos);
+    CHECK(teardown.find("g_uiShutdownComplete=true;")==std::string::npos);
+}
+
+static void test_message_pump_failure_uses_shared_teardown(){
+    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    const std::string run=SourceSection(
+        source,"static int RunGui(HINSTANCE hInst)","int WINAPI wWinMain(");
+    CHECK(!run.empty());
+    CHECK(run.find("ScopedUiShutdown shutdown;")!=std::string::npos);
+    CHECK(run.find("if(wait==WAIT_FAILED){")!=std::string::npos);
+    CHECK(run.find("GetLastError()")!=std::string::npos);
+    CHECK(run.find("runResult=4")!=std::string::npos);
+    CHECK(run.find("if(g_uiFont)DeleteObject(g_uiFont)")==
+          std::string::npos);
+
+    const std::string mainProcedure=SourceSection(
+        source,"static LRESULT CALLBACK WndProcImpl(",
+        "static LRESULT CALLBACK WndProc(");
+    CHECK(!mainProcedure.empty());
+    CHECK(mainProcedure.find("case WM_DESTROY:")!=std::string::npos);
+    CHECK(mainProcedure.find("g_pickerBuffer.reset()")==std::string::npos);
+}
+
 static void test_visible_branding_and_help_retention_are_exact(){
     const std::string source=ReadRawFile(L"src\\vde.cpp");
     const std::string retention=
@@ -16845,6 +17910,12 @@ static void test_validated_touch_rebase_preserves_external_semantics(){
 }
 
 int main(){
+    test_picker_uses_self_contained_gdi_buffer();
+    test_picker_icon_loading_is_bounded_and_outside_paint();
+    test_picker_preloads_only_laid_out_visible_rows();
+    test_picker_wm_paint_requires_the_owned_buffer();
+    test_ui_resources_have_one_owned_cleanup_path();
+    test_message_pump_failure_uses_shared_teardown();
     test_footer_literal_and_links_are_exact();
     test_footer_minimum_size_is_one_line_and_dpi_scaled();
     test_footer_geometry_hit_hover_cursor_and_open_result_seams();
@@ -16874,6 +17945,27 @@ int main(){
     test_picker_desktop_snapshot_rejects_zero_and_duplicates();
     test_picker_filter_cache_is_transactional_and_precomputed();
     test_picker_bitmap_replacement_deselects_before_delete();
+    test_gdi_buffer_resize_does_not_leak_selected_bitmaps();
+    test_gdi_buffer_is_noncopyable();
+    test_gdi_buffer_fake_ownership_is_exact();
+    test_gdi_buffer_failures_are_atomic_and_cleanup_exact();
+    test_gdi_buffer_failed_deselect_releases_dc_before_bitmap();
+    test_gdi_buffer_rejects_unexpected_previous_selection_atomically();
+    test_gdi_buffer_retains_selected_bitmap_until_reset_can_retry();
+    test_gdi_buffer_invalid_sizes_never_allocate();
+    test_gdi_buffer_catastrophic_rollback_retains_both_bitmaps();
+    test_gdi_buffer_retains_dc_when_original_read_cleanup_fails();
+    test_gdi_buffer_retains_every_failed_bitmap_delete_for_reset();
+    test_icon_cache_replacement_prune_clear_and_destructor_are_exact();
+    test_icon_cache_enforces_touch_lru_immediately();
+    test_icon_cache_rejects_zero_limit_and_missing_ops();
+    test_icon_cache_callback_exceptions_do_not_escape();
+    test_icon_cache_destroy_failure_retains_bounded_ownership();
+    test_icon_cache_caps_257_live_keys_at_256_immediately();
+    test_icon_preload_gate_caps_work_and_skips_idle_refresh();
+    test_picker_scroll_clamp_reaches_rows_beyond_icon_budget();
+    test_ordered_teardown_retries_without_destroying_dependencies();
+    test_fixed_icon_retirement_retains_failed_release_without_allocating();
     test_picker_valid_current_commits_only_with_model();
     test_picker_paint_cache_failure_blocks_show_transactionally();
     test_picker_com_output_is_owned_even_on_failed_call();

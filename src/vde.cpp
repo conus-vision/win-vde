@@ -51,6 +51,8 @@
 #include "lifecycle.hpp"
 #include "move_queue.hpp"
 #include "window_identity.hpp"
+#include "gdi_buffer.hpp"
+#include "icon_cache.hpp"
 #include "picker_state.hpp"
 #include "reconcile_worker.hpp"
 #include "session.hpp"    // bounded browser-session decoding primitives
@@ -85,6 +87,7 @@ static bool g_appFirefox = true, g_appChrome = true, g_appEdge = true;  // ка�
 #define TIMER_AUTO_FLUSH 5
 #define TIMER_PICKER_TRANSITION 6
 #define TIMER_PICKER_SEARCH_RETRY 7
+#define TIMER_PICKER_ICON_PRELOAD 8
 #define WM_PICKER_TRANSITION (WM_APP + 16)
 #define WM_PICKER_SEARCH_RETRY (WM_APP + 17)
 #define WM_MOVE_CANCEL_RETRY (WM_APP + 14)
@@ -5026,7 +5029,7 @@ static int CliRun(const std::wstring& cmd){
 }
 
 // ================================ GUI: picker ================================
-struct WinItem { HWND hwnd; WindowIdentityKey identity; std::wstring title; std::wstring titleLC; std::wstring search; HICON icon; };   // search = titleLC (+ all-tab text for browser windows)
+struct WinItem { HWND hwnd; WindowIdentityKey identity; std::string runtimeKey; std::wstring title; std::wstring titleLC; std::wstring search; };   // search = titleLC (+ all-tab text for browser windows)
 struct Tile { GUID guid; std::string guidKey; std::wstring name; std::wstring displayName; int index; std::vector<WinItem> windows; std::vector<size_t> filtered; RECT rc; int scroll=0; };
 static std::vector<Tile> g_tiles;
 static PickerEffect g_pickerScheduledEffect;
@@ -5043,8 +5046,30 @@ static HINSTANCE g_inst=nullptr;
 static HFONT g_uiFont=nullptr;
 static const UINT WM_TRAY=WM_APP+1;
 static NOTIFYICONDATAW g_nid={0};
+static const size_t MAX_OWNED_APP_ICONS=7;
+static std::vector<HICON> g_ownedIcons;
+static FixedIconRetirement<MAX_OWNED_APP_ICONS>
+    g_failedOwnedIconReleases;
+static bool g_appIconOwnershipReady=false;
+static bool g_uiShutdownComplete=false;
+static OrderedTeardownGate g_uiTeardown;
+struct PickerIconPreloadRef { size_t tile=0; size_t window=0; };
+static IconPreloadGate g_pickerIconPreloadGate;
+static std::vector<PickerIconPreloadRef> g_pickerIconPreloadQueue;
+static bool g_pickerIconPreloadQueueDirty=false;
+static bool g_pickerIconPreloadTimerArmed=false;
+static int g_pickerIconPreloadPriority=-1;
 static int g_dpi=96;
 static int S(int v){ return PickerScaleForDpi(v,g_dpi); }
+
+static void CancelPickerIconPreload(HWND window) noexcept {
+    if(window) KillTimer(window,TIMER_PICKER_ICON_PRELOAD);
+    g_pickerIconPreloadTimerArmed=false;
+    g_pickerIconPreloadQueueDirty=false;
+    g_pickerIconPreloadPriority=-1;
+    g_pickerIconPreloadQueue.clear();
+    g_pickerIconPreloadGate.cancel();
+}
 
 static void StopWorkers(HWND messageWindow){
     if(g_sessionWorker){ g_sessionWorker->Stop(); g_sessionWorker.reset(); }
@@ -5061,6 +5086,7 @@ static bool QuiesceRuntime(HWND messageWindow) noexcept {
         KillTimer(messageWindow,TIMER_AUTO_FLUSH);
         KillTimer(messageWindow,TIMER_PICKER_TRANSITION);
         KillTimer(messageWindow,TIMER_PICKER_SEARCH_RETRY);
+        CancelPickerIconPreload(messageWindow);
         g_flushTimerArmed=false;
         g_flushTimerDueMs=0;
         g_heartbeatTimerArmed=false;
@@ -5078,10 +5104,17 @@ static int TILE_W=240,TILE_H=150,PAD=16,HEADER=44,SEARCH_H=40;
 static int FOOTER_H=34,FOOTER_MIN_W=720,FOOTER_LINK_H=22;
 static int g_cols=1,g_rows=1;
 static HFONT g_fPT=nullptr,g_fPN=nullptr,g_fPI=nullptr,g_fPX=nullptr;   // cached picker fonts (avoid re-create per repaint)
+static HBRUSH g_searchBrush=nullptr;
 static int g_lastHoverRow=-1;                                          // last tooltip row (avoid redundant TTM churn)
 static uint64_t g_lastHoverGeneration=0;
 static std::wstring g_pickerTooltipText;
 static void InitMetrics(){
+    g_uiShutdownComplete=false;
+    g_uiTeardown.reset();
+    try {
+        g_ownedIcons.reserve(MAX_OWNED_APP_ICONS);
+        g_appIconOwnershipReady=true;
+    } catch(...) { g_appIconOwnershipReady=false; }
     HDC dc=GetDC(nullptr); g_dpi=GetDeviceCaps(dc,LOGPIXELSX); ReleaseDC(nullptr,dc);
     TILE_W=S(240); TILE_H=S(150); PAD=S(16); HEADER=S(38); SEARCH_H=S(58);
     FOOTER_H=S(34); FOOTER_MIN_W=S(720); FOOTER_LINK_H=S(22);
@@ -5090,6 +5123,7 @@ static void InitMetrics(){
     g_fPN=CreateFontW(S(17),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     g_fPI=CreateFontW(S(15),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     g_fPX=CreateFontW(S(30),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+    if(!g_searchBrush) g_searchBrush=CreateSolidBrush(RGB(34,33,38));
 }
 // ---- picker search / scroll / tooltip state ----
 static HWND g_search=nullptr; static WNDPROC g_searchOrigProc=nullptr;
@@ -5106,6 +5140,20 @@ static const COLORREF CLR_BG=RGB(20,20,24), CLR_TILE=RGB(28,28,33), CLR_TILE_DIM
     CLR_TEXT=RGB(208,206,210), CLR_HEAD=RGB(238,238,242), CLR_HINT=RGB(150,145,135), CLR_DIM=RGB(110,108,112),
     CLR_SCROLL_TRK=RGB(40,40,46), CLR_SCROLL_THB=RGB(96,92,86);
 static HFONT g_searchFont=nullptr;
+static uint64_t g_iconTouch=0;
+static HICON g_sharedFallbackIcon=LoadIconW(nullptr,IDI_APPLICATION);
+static const size_t PICKER_ICON_CACHE_LIMIT=256;
+static const size_t PICKER_ICON_PRELOAD_MISS_BUDGET=4;
+static OwnedIconCache g_windowIconCache(256,{
+    [](HICON icon){ return icon?CopyIcon(icon):nullptr; },
+    [](HICON icon)->bool { return !icon || DestroyIcon(icon)!=FALSE; }
+});
+
+static void MarkPickerIconPreloadDirty(int priority=-1) noexcept {
+    g_pickerIconPreloadQueueDirty=true;
+    g_pickerIconPreloadPriority=priority;
+    g_pickerIconPreloadGate.markDirty();
+}
 static RECT SearchBoxRect(int clientW){ RECT r; r.left=PAD; r.top=S(12); r.right=clientW-PAD; r.bottom=S(12)+S(40); return r; }
 static void FillRoundRect(HDC hdc, RECT r, int rad, COLORREF fill, COLORREF border, int bw){
     HBRUSH b=CreateSolidBrush(fill); HPEN p=CreatePen(PS_SOLID,bw,border);
@@ -5115,9 +5163,48 @@ static void FillRoundRect(HDC hdc, RECT r, int rad, COLORREF fill, COLORREF bord
 }
 
 static bool IsAltTabWindow(HWND h){ if(!IsWindowVisible(h))return false; if(GetWindowTextLengthW(h)<=0)return false; LONG_PTR ex=GetWindowLongPtrW(h,GWL_EXSTYLE); if(ex&WS_EX_TOOLWINDOW)return false; if(GetAncestor(h,GA_ROOTOWNER)!=h)return false; return true; }
-static HICON WindowIcon(HWND h){ DWORD_PTR r=0; SendMessageTimeoutW(h,WM_GETICON,ICON_SMALL2,0,SMTO_ABORTIFHUNG,200,&r); HICON i=(HICON)r;
-    if(!i)i=(HICON)GetClassLongPtrW(h,GCLP_HICONSM); if(!i){r=0;SendMessageTimeoutW(h,WM_GETICON,ICON_BIG,0,SMTO_ABORTIFHUNG,200,&r);i=(HICON)r;}
-    if(!i)i=(HICON)GetClassLongPtrW(h,GCLP_HICON); if(!i)i=LoadIconW(nullptr,IDI_APPLICATION); return i; }
+static uint64_t NextIconTouch() noexcept {
+    if(g_iconTouch!=(std::numeric_limits<uint64_t>::max)()) ++g_iconTouch;
+    return g_iconTouch;
+}
+
+static HICON LoadWindowIconOutsidePaint(const WinItem& window) noexcept {
+    HICON cached=g_windowIconCache.getAndTouch(
+        window.runtimeKey,NextIconTouch());
+    if(cached) return cached;
+    if(RecaptureGenericWindowIdentity(window.identity)!=
+       WindowIdentityRecapture::Match) return g_sharedFallbackIcon;
+    const HWND hwnd=reinterpret_cast<HWND>(window.identity.hwnd);
+    HICON borrowed=reinterpret_cast<HICON>(
+        GetClassLongPtrW(hwnd,GCLP_HICONSM));
+    if(!borrowed) borrowed=reinterpret_cast<HICON>(
+        GetClassLongPtrW(hwnd,GCLP_HICON));
+    if(!borrowed){
+        DWORD_PTR response=0;
+        SendMessageTimeoutW(hwnd,WM_GETICON,ICON_SMALL2,0,
+            SMTO_ABORTIFHUNG|SMTO_BLOCK,25,&response);
+        borrowed=reinterpret_cast<HICON>(response);
+    }
+    if(RecaptureGenericWindowIdentity(window.identity)!=
+       WindowIdentityRecapture::Match) return g_sharedFallbackIcon;
+    if(!borrowed) borrowed=g_sharedFallbackIcon;
+    HICON owned=borrowed?g_windowIconCache.insertBorrowed(
+        window.runtimeKey,borrowed,NextIconTouch()):nullptr;
+    return owned?owned:g_sharedFallbackIcon;
+}
+
+static HICON CachedWindowIcon(const std::string& runtimeKey) noexcept {
+    HICON cached=g_windowIconCache.peek(runtimeKey);
+    return cached?cached:g_sharedFallbackIcon;
+}
+
+static void PruneIconCache(const std::set<std::string>& liveKeys) noexcept {
+    g_windowIconCache.pruneTo(liveKeys);
+}
+
+static bool ClearWindowIconCache() noexcept {
+    return g_windowIconCache.clear();
+}
 
 static GUID CurrentDesktopGuid() noexcept {
     GUID guid={0};
@@ -5149,6 +5236,7 @@ static WindowIdentityKey CapturePickerWindowIdentity(HWND hwnd) noexcept {
 
 struct PickerEnumContext {
     std::vector<Tile>* tiles=nullptr;
+    std::set<std::string>* liveKeys=nullptr;
     std::map<DWORD,uint64_t> processStarts;
     bool failed=false;
 };
@@ -5214,19 +5302,29 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
                 context,PickerRowReadResult::TitleUnavailable);
         title.resize(static_cast<size_t>(copied));
 
+        FastWin fast;
+        fast.hwnd=hwnd;
+        fast.pid=pid;
+        fast.processStart=process->second;
+        fast.desktop=desktop;
+        fast.title=title;
         WinItem item;
         item.hwnd=hwnd;
-        item.identity=identity;
+        item.identity=IdentityOf(fast);
+        item.runtimeKey=RuntimeKey(fast);
         item.title=title;
         item.titleLC=title;
         if(!item.titleLC.empty()) CharLowerW(&item.titleLC[0]);
         item.search=item.titleLC;
-        item.icon=WindowIcon(hwnd);
         if(!AcceptPickerRowIdentity(
                 item.identity,RecaptureGenericWindowIdentity(item.identity)))
             return HandlePickerRowReadResult(
                 context,PickerRowReadResult::IdentityChanged);
+        if(!context.liveKeys)
+            return HandlePickerRowReadResult(
+                context,PickerRowReadResult::GlobalSnapshotFailure);
         tile->windows.push_back(std::move(item));
+        context.liveKeys->insert(tile->windows.back().runtimeKey);
         return TRUE;
     } catch(...) {
         return HandlePickerRowReadResult(
@@ -5247,6 +5345,7 @@ static bool PopulatePickerFilteredRows(std::vector<Tile>& tiles,
 static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi,
                        bool selectionFromActual=false){
     const GUID observedCurrent=CurrentDesktopGuid();
+    std::set<std::string> liveKeys;
     const bool published=RunPickerRefreshWithCurrent(
         g_tiles,g_picker,observedCurrent,
         [&](std::vector<Tile>& tiles,PickerState& state){
@@ -5298,6 +5397,7 @@ static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi,
 
             PickerEnumContext context;
             context.tiles=&tiles;
+            context.liveKeys=&liveKeys;
             if(!EnumWindows(EnumAll,reinterpret_cast<LPARAM>(&context)) ||
                context.failed) return false;
             if(!PopulatePickerFilteredRows(tiles,state.searchText))
@@ -5312,12 +5412,16 @@ static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi,
             if(state.modelGeneration==0) state.modelGeneration=1;
             return true;
         });
+    if(published) PruneIconCache(liveKeys);
+    if(published) MarkPickerIconPreloadDirty();
     return published;
 }
 
 static bool SetPickerSelectionCurrent(int index) noexcept {
     if(index<0 || index>=static_cast<int>(g_tiles.size())) return false;
-    return SetPickerSelection(g_picker,index,g_tiles[index].guid);
+    if(!SetPickerSelection(g_picker,index,g_tiles[index].guid)) return false;
+    MarkPickerIconPreloadDirty(index);
+    return true;
 }
 
 static bool RememberPickerScroll(Tile& tile,int scroll) noexcept {
@@ -5345,6 +5449,7 @@ static bool RebuildPickerFilteredRows() noexcept {
                     })) return false;
         for(size_t index=0;index<g_tiles.size();++index)
             g_tiles[index].filtered.swap(staged[index]);
+        MarkPickerIconPreloadDirty();
         return true;
     } catch(...) {
         return false;
@@ -5364,6 +5469,7 @@ static bool ApplyPickerSearchText(const std::wstring& editText,
         if(!SetPickerSearchText(g_picker,editText,searchText)) return false;
         for(size_t index=0;index<g_tiles.size();++index)
             g_tiles[index].filtered.swap(staged[index]);
+        MarkPickerIconPreloadDirty();
         if(searchText.empty())
             InvalidatePickerTabSearchCache(
                 g_pickerTabSearchCache,g_picker.modelGeneration);
@@ -5379,7 +5485,8 @@ static void ResetPickerHoverState(
     ResetPickerHoverTooltip();
     ResetPickerHoverEventState(g_pickerHoverState,reason);
 }
-static bool RefreshPickerPaintCache() noexcept;
+static bool RefreshPickerPaintCache(
+        bool allowHiddenPreparation=false) noexcept;
 static void HandleSearchSessionResult(const SessionRoute& route,
                                        const SessionResult& result){
     auto operation=g_searchOperations.find(route.operationId);
@@ -5643,6 +5750,99 @@ static int PickerTileMaxScroll(const Tile& tile) noexcept {
                        PickerTileVisibleRows(tile));
 }
 
+static void ClampAllPickerScrolls() noexcept {
+    int firstChanged=-1;
+    for(size_t index=0;index<g_tiles.size();++index){
+        Tile& tile=g_tiles[index];
+        const int maximum=PickerTileMaxScroll(tile);
+        const int clamped=PickerVisibleScroll(tile.scroll,maximum);
+        if(tile.scroll==clamped) continue;
+        if(!RememberPickerScroll(tile,clamped)) tile.scroll=clamped;
+        if(firstChanged<0) firstChanged=static_cast<int>(index);
+    }
+    if(firstChanged>=0) MarkPickerIconPreloadDirty(firstChanged);
+}
+
+static bool BuildPickerIconPreloadQueue() noexcept {
+    try {
+        std::vector<PickerIconPreloadRef> staged;
+        staged.reserve(PICKER_ICON_CACHE_LIMIT);
+        auto appendTile=[&](size_t tileIndex){
+            if(tileIndex>=g_tiles.size()) return;
+            const Tile& tile=g_tiles[tileIndex];
+            const int visibleRows=PickerTileVisibleRows(tile);
+            const int maximum=PickerTileMaxScroll(tile);
+            size_t position=static_cast<size_t>(
+                PickerVisibleScroll(tile.scroll,maximum));
+            for(int row=0;row<visibleRows &&
+                position<tile.filtered.size() &&
+                staged.size()<PICKER_ICON_CACHE_LIMIT;
+                ++row,++position){
+                const size_t windowIndex=tile.filtered[position];
+                if(windowIndex>=tile.windows.size()) break;
+                staged.push_back(PickerIconPreloadRef{
+                    tileIndex,windowIndex});
+            }
+        };
+
+        const int priority=g_pickerIconPreloadPriority>=0 &&
+            g_pickerIconPreloadPriority<static_cast<int>(g_tiles.size())
+            ?g_pickerIconPreloadPriority:-1;
+        const int selected=g_picker.selectedIndex>=0 &&
+            g_picker.selectedIndex<static_cast<int>(g_tiles.size())
+            ?g_picker.selectedIndex:-1;
+        if(priority>=0) appendTile(static_cast<size_t>(priority));
+        if(selected>=0 && selected!=priority)
+            appendTile(static_cast<size_t>(selected));
+        for(size_t index=0;index<g_tiles.size() &&
+            staged.size()<PICKER_ICON_CACHE_LIMIT;++index){
+            if(static_cast<int>(index)==priority ||
+               static_cast<int>(index)==selected) continue;
+            appendTile(index);
+        }
+        g_pickerIconPreloadQueue.swap(staged);
+        g_pickerIconPreloadQueueDirty=false;
+        g_pickerIconPreloadPriority=-1;
+        return true;
+    } catch(...) {
+        g_pickerIconPreloadQueue.clear();
+        g_pickerIconPreloadQueueDirty=false;
+        g_pickerIconPreloadPriority=-1;
+        g_pickerIconPreloadGate.cancel();
+        return false;
+    }
+}
+
+static void SchedulePickerIconPreloadContinuation() noexcept {
+    if(!g_main || g_pickerIconPreloadTimerArmed ||
+       !g_pickerIconPreloadGate.dirty()) return;
+    if(SetTimer(g_main,TIMER_PICKER_ICON_PRELOAD,1,nullptr))
+        g_pickerIconPreloadTimerArmed=true;
+}
+
+static void PreloadVisiblePickerIcons(bool continuation=false) noexcept {
+    if(!continuation && !g_pickerIconPreloadQueueDirty) return;
+    if(g_pickerIconPreloadQueueDirty &&
+       !BuildPickerIconPreloadQueue()) return;
+    const IconPreloadTurn turn=g_pickerIconPreloadGate.runTurn(
+        PICKER_ICON_PRELOAD_MISS_BUDGET,[&](size_t cursor){
+            if(cursor>=g_pickerIconPreloadQueue.size())
+                return IconPreloadStep::Exhausted;
+            const PickerIconPreloadRef ref=
+                g_pickerIconPreloadQueue[cursor];
+            if(ref.tile>=g_tiles.size() ||
+               ref.window>=g_tiles[ref.tile].windows.size())
+                return IconPreloadStep::Cached;
+            const WinItem& window=g_tiles[ref.tile].windows[ref.window];
+            if(g_windowIconCache.getAndTouch(
+                    window.runtimeKey,NextIconTouch()))
+                return IconPreloadStep::Cached;
+            LoadWindowIconOutsidePaint(window);
+            return IconPreloadStep::Miss;
+        });
+    if(!turn.complete) SchedulePickerIconPreloadContinuation();
+}
+
 class ScopedPickerMeasureDc {
     HWND window_=nullptr;
     HDC dc_=nullptr;
@@ -5766,7 +5966,8 @@ static void InvalidatePublishedPickerPaintCache() noexcept {
         });
 }
 
-static bool RefreshPickerPaintCache() noexcept {
+static bool RefreshPickerPaintCache(
+        bool allowHiddenPreparation) noexcept {
     const uint64_t generation=BeginPickerPaintRefresh(g_picker);
     if(!g_main){
         ResetPickerHoverState(PickerHoverResetReason::CacheFailure);
@@ -5779,6 +5980,12 @@ static bool RefreshPickerPaintCache() noexcept {
         g_pickerPaintCache.clear();
         return false;
     }
+    LayoutTiles(client.right);
+    ClampAllPickerScrolls();
+    if(IsWindowVisible(g_main) || allowHiddenPreparation)
+        PreloadVisiblePickerIcons();
+    else
+        CancelPickerIconPreload(g_main);
     return RebuildPickerPaintCache(
         client.right,client.bottom,generation);
 }
@@ -5877,62 +6084,6 @@ static void ArmPickerIdleRefresh() noexcept {
                  PICKER_IDLE_REFRESH_MS,nullptr);
 }
 
-class PickerBackBuffer {
-    HDC dc_=nullptr;
-    PickerBitmapSelection selection_;
-    int width_=0,height_=0;
-public:
-    bool ensure(HDC reference,int width,int height) noexcept {
-        if(!reference || width<=0 || height<=0) return false;
-        if(!dc_){
-            dc_=CreateCompatibleDC(reference);
-            if(!dc_) return false;
-            HGDIOBJ original=GetCurrentObject(dc_,OBJ_BITMAP);
-            if(!original){
-                DeleteDC(dc_);
-                dc_=nullptr;
-                return false;
-            }
-            selection_.original=reinterpret_cast<uintptr_t>(original);
-            selection_.selected=selection_.original;
-        }
-        if(selection_.owned && width_==width && height_==height)
-            return true;
-        HBITMAP replacement=CreateCompatibleBitmap(reference,width,height);
-        if(!replacement) return false;
-        HGDIOBJ previous=SelectObject(dc_,replacement);
-        if(!previous || previous==HGDI_ERROR){
-            DeleteObject(replacement);
-            return false;
-        }
-        PickerBitmapSelection staged=selection_;
-        uintptr_t release=0;
-        if(!PublishPickerBitmapReplacement(staged,
-                reinterpret_cast<uintptr_t>(replacement),
-                reinterpret_cast<uintptr_t>(previous),release)){
-            SelectObject(dc_,previous);
-            DeleteObject(replacement);
-            return false;
-        }
-        selection_=staged;
-        width_=width;
-        height_=height;
-        if(release) DeleteObject(reinterpret_cast<HGDIOBJ>(release));
-        return true;
-    }
-    void reset() noexcept {
-        if(dc_ && selection_.original)
-            SelectObject(dc_,reinterpret_cast<HGDIOBJ>(selection_.original));
-        if(selection_.owned)
-            DeleteObject(reinterpret_cast<HGDIOBJ>(selection_.owned));
-        if(dc_) DeleteDC(dc_);
-        dc_=nullptr;
-        selection_=PickerBitmapSelection{};
-        width_=height_=0;
-    }
-    HDC get() const noexcept { return dc_; }
-};
-
 class ScopedPickerPaint {
     HWND window_=nullptr;
     PAINTSTRUCT paint_={};
@@ -5945,7 +6096,7 @@ public:
     HDC get() const noexcept { return dc_; }
 };
 
-static PickerBackBuffer g_pickerBuffer;
+static GdiBuffer g_pickerBuffer;
 
 static void Paint(HDC hdcReal,HDC hdc,RECT client){
     HBRUSH bg=CreateSolidBrush(CLR_BG); FillRect(hdc,&client,bg); DeleteObject(bg); SetBkMode(hdc,TRANSPARENT);
@@ -6014,7 +6165,8 @@ static void Paint(HDC hdcReal,HDC hdc,RECT client){
                                 activeRect.left+S(5),activeRect.bottom-S(3)};
                 FillRoundRect(hdc,activeBar,S(2),CLR_ACTIVE,CLR_ACTIVE,S(1));
             }
-            if(window.icon)DrawIconEx(hdc,t.rc.left+S(14),y,window.icon,S(16),S(16),0,nullptr,DI_NORMAL);
+            HICON icon=CachedWindowIcon(window.runtimeKey);
+            if(icon)DrawIconEx(hdc,t.rc.left+S(14),y,icon,S(16),S(16),0,nullptr,DI_NORMAL);
             RECT ir; ir.left=t.rc.left+S(38); ir.top=y; ir.right=rowRight; ir.bottom=y+S(18);
             DrawTextW(hdc,window.title.c_str(),-1,&ir,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
             y+=rowH;
@@ -6098,6 +6250,7 @@ static void TrackPickerHoverTooltip(HWND hwnd,const RowRec& row,
 static void HidePicker(){
     if(g_picker.controlledTransition()) return;
     if(g_main) KillTimer(g_main,TIMER_PICKER_TRANSITION);
+    CancelPickerIconPreload(g_main);
     ResetPickerHoverState(PickerHoverResetReason::Hide);
     ShowWindow(g_main,SW_HIDE);
 }
@@ -6382,6 +6535,7 @@ static PickerObservation ExecutePickerEffect(
                 GetForegroundWindow()==g_main;
             break;
         case PickerEffectKind::Hide:
+            CancelPickerIconPreload(g_main);
             ResetPickerHoverState(PickerHoverResetReason::Hide);
             ShowWindow(g_main,SW_HIDE);
             observation.apiAccepted=true;
@@ -7216,7 +7370,8 @@ static void ShowPicker(PickerTargetCaptureState capture){
     if(g_search){ SetWindowTextW(g_search,L""); RECT sb=SearchBoxRect(cr.right);
         int eLeft=sb.left+S(14), eRight=sb.right-S(44), eH=S(22), eTop=sb.top+((sb.bottom-sb.top)-eH)/2;
         MoveWindow(g_search,eLeft,eTop,eRight-eLeft,eH,TRUE); ShowWindow(g_search,SW_SHOW); }
-    const bool paintCacheReady=RefreshPickerPaintCache();
+    MarkPickerIconPreloadDirty(g_picker.selectedIndex);
+    const bool paintCacheReady=RefreshPickerPaintCache(true);
     if(!PickerShowPreparationComplete(modelReady,paintCacheReady)){
         HidePicker();
         g_pickerPaintCache.clear();
@@ -7233,17 +7388,38 @@ static void MoveSel(int dx,int dy){ if(g_picker.controlledTransition()||g_tiles.
     if(c<0)c=0; if(c>=g_cols)c=g_cols-1; if(r<0)r=0; int idx=r*g_cols+c; if(idx>=n)idx=n-1; if(idx<0)idx=0; SetPickerSelectionCurrent(idx); RefreshPickerPaintCache(); InvalidateRect(g_main,nullptr,FALSE); }
 
 // ================================ GUI: tray ==================================
+static bool OwnedAppIconCapacityAvailable() noexcept {
+    return g_appIconOwnershipReady &&
+        g_ownedIcons.size()+g_failedOwnedIconReleases.size()<
+            MAX_OWNED_APP_ICONS;
+}
+
+static HICON TrackOwnedAppIcon(HICON icon) noexcept {
+    if(!icon) return nullptr;
+    if(!OwnedAppIconCapacityAvailable()){
+        if(!DestroyIcon(icon))
+            (void)g_failedOwnedIconReleases.retain(icon);
+        return nullptr;
+    }
+    // InitMetrics reserved every lifetime slot before any icon acquisition;
+    // HICON is trivially copied, so this publication cannot allocate or throw.
+    g_ownedIcons.push_back(icon);
+    return icon;
+}
+
 static HICON LoadAppIcon(int cx,int cy){
+    if(!OwnedAppIconCapacityAvailable()) return nullptr;
     // 1) встроенный ресурс (vde.res, см. vde.rc)
     HICON h=(HICON)LoadImageW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(IDI_APPICON),IMAGE_ICON,cx,cy,LR_DEFAULTCOLOR);
-    if(h)return h;
+    if(h)return TrackOwnedAppIcon(h);
     // 2) внешний файл vde.ico рядом с exe (если ресурс не вшит)
     wchar_t path[MAX_PATH]; GetModuleFileNameW(nullptr,path,MAX_PATH); std::wstring p=path;
     size_t s=p.find_last_of(L"\\/"); if(s!=std::wstring::npos)p=p.substr(0,s+1); p+=L"vde.ico";
     h=(HICON)LoadImageW(nullptr,p.c_str(),IMAGE_ICON,cx,cy,LR_LOADFROMFILE);
-    if(h)return h;
+    if(h)return TrackOwnedAppIcon(h);
     // 3) системная заглушка
-    return LoadIconW(nullptr,IDI_APPLICATION);
+    HICON fallback=LoadIconW(nullptr,IDI_APPLICATION);
+    return fallback?TrackOwnedAppIcon(CopyIcon(fallback)):nullptr;
 }
 static void TrayAdd(HWND hwnd){
     g_nid.cbSize=sizeof(g_nid); g_nid.hWnd=hwnd; g_nid.uID=1; g_nid.uFlags=NIF_ICON|NIF_MESSAGE|NIF_TIP; g_nid.uCallbackMessage=WM_TRAY;
@@ -7662,7 +7838,17 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                 g_picker.modelGeneration,g_picker.searchText))
             EnsureTabSearch();
         return 0;
-    case WM_PAINT:{ ScopedPickerPaint paint(hwnd); HDC target=paint.get(); if(!target)return 0; RECT cr; GetClientRect(hwnd,&cr); HDC canvas=target; if(g_pickerBuffer.ensure(target,cr.right,cr.bottom))canvas=g_pickerBuffer.get(); Paint(target,canvas,cr); return 0; }
+    case WM_PAINT:{
+        ScopedPickerPaint paint(hwnd);
+        HDC target=paint.get();
+        if(!target) return 0;
+        RECT client={0,0,0,0};
+        if(!GetClientRect(hwnd,&client)) return 0;
+        if(!g_pickerBuffer.ensure(target,client.right,client.bottom))
+            return 0;
+        Paint(target,g_pickerBuffer.get(),client);
+        return 0;
+    }
     case WM_ERASEBKGND: return 1;
     case WM_SETCURSOR:{
         const bool cacheReady=PickerPaintCacheMatches(
@@ -7679,7 +7865,8 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         break;
     }
     case WM_CTLCOLOREDIT: if((HWND)lp==g_search){ HDC dc=(HDC)wp; SetTextColor(dc,CLR_TEXT); SetBkColor(dc,CLR_SEARCH);
-        static HBRUSH sbr=nullptr; if(!sbr)sbr=CreateSolidBrush(CLR_SEARCH); return (LRESULT)sbr; }
+        return reinterpret_cast<LRESULT>(g_searchBrush
+            ?g_searchBrush:GetSysColorBrush(COLOR_WINDOW)); }
         return DefWindowProcW(hwnd,msg,wp,lp);
     case WM_KEYDOWN:{
         bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
@@ -7798,7 +7985,18 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     }
     case WM_MOUSEWHEEL:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; ScreenToClient(hwnd,&pt); int delta=GET_WHEEL_DELTA_WPARAM(wp);   // R8: scroll a tile's window list
         if(g_picker.controlledTransition()) return 0;
-        for(auto& t:g_tiles) if(PtInRect(&t.rc,pt)){ const int maximum=PickerTileMaxScroll(t); RememberPickerScroll(t,AdvancePickerScroll(t.scroll,maximum,delta)); RefreshPickerPaintCache(); InvalidateRect(hwnd,nullptr,FALSE); break; }
+        for(size_t tileIndex=0;tileIndex<g_tiles.size();++tileIndex){
+            Tile& t=g_tiles[tileIndex];
+            if(!PtInRect(&t.rc,pt)) continue;
+            const int maximum=PickerTileMaxScroll(t);
+            const int next=AdvancePickerScroll(t.scroll,maximum,delta);
+            if(next!=t.scroll && RememberPickerScroll(t,next))
+                MarkPickerIconPreloadDirty(
+                    static_cast<int>(tileIndex));
+            RefreshPickerPaintCache();
+            InvalidateRect(hwnd,nullptr,FALSE);
+            break;
+        }
         return 0; }
     case WM_COMMAND:                                            // R7: live-filter as the search text changes
         if(g_picker.controlledTransition()) return 0;
@@ -7838,6 +8036,18 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         return 0;
     case WM_TIMER:
         if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
+        if(wp==TIMER_PICKER_ICON_PRELOAD){
+            KillTimer(hwnd,TIMER_PICKER_ICON_PRELOAD);
+            g_pickerIconPreloadTimerArmed=false;
+            if(!IsWindowVisible(hwnd)){
+                CancelPickerIconPreload(hwnd);
+                return 0;
+            }
+            if(!g_pickerIconPreloadGate.dirty()) return 0;
+            PreloadVisiblePickerIcons(true);
+            InvalidateRect(hwnd,nullptr,FALSE);
+            return 0;
+        }
         if(wp==TIMER_PICKER_SEARCH_RETRY){
             KillTimer(hwnd,TIMER_PICKER_SEARCH_RETRY);
             if(PickerTabSearchRetryDeliveryReadyWhenIdle(
@@ -7993,7 +8203,6 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         DrainPickerForShutdown();
         FinalizeAutoLayout();
         QuiesceRuntime(hwnd);
-        g_pickerBuffer.reset();
         TrayRemove(); UnregisterHotKey(hwnd,1); PostQuitMessage(0); return 0;
     }
     return DefWindowProcW(hwnd,msg,wp,lp);
@@ -8004,6 +8213,97 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     try { return WndProcImpl(hwnd,msg,wp,lp); }
     catch(...) { return 0; }
 }
+
+static bool CleanupUiResources() noexcept {
+    g_pickerBuffer.reset();
+    if(!g_pickerBuffer.released()) return false;
+    if(!ClearWindowIconCache()) return false;
+    bool released=true;
+    HFONT* fonts[]={
+        &g_uiFont,&g_fPT,&g_fPN,&g_fPI,&g_fPX,&g_searchFont
+    };
+    for(HFONT* font : fonts){
+        if(*font){
+            if(DeleteObject(*font)) *font=nullptr;
+            else released=false;
+        }
+    }
+    if(g_searchBrush){
+        if(DeleteObject(g_searchBrush)) g_searchBrush=nullptr;
+        else released=false;
+    }
+    size_t retained=0;
+    for(HICON icon : g_ownedIcons){
+        if(!icon) continue;
+        if(DestroyIcon(icon)) continue;
+        g_ownedIcons[retained++]=icon;
+        released=false;
+    }
+    if(retained==0) g_ownedIcons.clear();
+    else g_ownedIcons.resize(retained);
+    if(!g_failedOwnedIconReleases.clear(
+            [](HICON icon)->bool {
+                return !icon || DestroyIcon(icon)!=FALSE;
+            })) released=false;
+    g_nid.hIcon=nullptr;
+    return released && g_ownedIcons.empty() &&
+        g_failedOwnedIconReleases.size()==0;
+}
+
+static bool DestroyUiWindow(HWND& window) noexcept {
+    HWND owned=window;
+    if(!owned) return true;
+    if(IsWindow(owned) && !DestroyWindow(owned)) return false;
+    window=nullptr;
+    return true;
+}
+
+static bool DestroyAllUiWindows() noexcept {
+    bool destroyed=true;
+    if(!DestroyUiWindow(g_settings)) destroyed=false;
+    if(!DestroyUiWindow(g_about)) destroyed=false;
+    if(!DestroyUiWindow(g_help)) destroyed=false;
+    if(!DestroyUiWindow(g_compat)) destroyed=false;
+    if(!DestroyUiWindow(g_main)) destroyed=false;
+    if(!destroyed) return false;
+    g_search=nullptr;
+    g_tip=nullptr;
+    g_searchOrigProc=nullptr;
+    return true;
+}
+
+static bool UnregisterUiClass(const wchar_t* name) noexcept {
+    if(!g_inst) return true;
+    SetLastError(ERROR_SUCCESS);
+    if(UnregisterClassW(name,g_inst)) return true;
+    return GetLastError()==ERROR_CLASS_DOES_NOT_EXIST;
+}
+
+static bool UnregisterUiClasses() noexcept {
+    bool unregistered=true;
+    if(!UnregisterUiClass(L"VdeSettings")) unregistered=false;
+    if(!UnregisterUiClass(L"VdeAbout")) unregistered=false;
+    if(!UnregisterUiClass(L"VdeCompat")) unregistered=false;
+    if(!UnregisterUiClass(L"VdeHelp")) unregistered=false;
+    if(!UnregisterUiClass(L"VdeWindow")) unregistered=false;
+    return unregistered;
+}
+
+static void ShutdownUi() noexcept {
+    if(g_uiShutdownComplete) return;
+    g_uiShutdownComplete=g_uiTeardown.run(
+        [](){ return DestroyAllUiWindows(); },
+        [](){ return UnregisterUiClasses(); },
+        [](){ return CleanupUiResources(); });
+}
+
+class ScopedUiShutdown {
+public:
+    ScopedUiShutdown()=default;
+    ScopedUiShutdown(const ScopedUiShutdown&)=delete;
+    ScopedUiShutdown& operator=(const ScopedUiShutdown&)=delete;
+    ~ScopedUiShutdown() noexcept { ShutdownUi(); }
+};
 
 // ================================ entry ======================================
 static std::wstring HotkeyString(){   // e.g. "Ctrl+Alt+D" from the current hotkey
@@ -8017,9 +8317,10 @@ static std::wstring HotkeyString(){   // e.g. "Ctrl+Alt+D" from the current hotk
     return s;
 }
 static int RunGui(HINSTANCE hInst){
+    ScopedUiShutdown shutdown;
+    int runResult=0;
     g_inst=hInst;
     INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_HOTKEY_CLASS|ICC_STANDARD_CLASSES|ICC_LINK_CLASS|ICC_BAR_CLASSES|ICC_TAB_CLASSES}; InitCommonControlsEx(&icc);
-    InitMetrics();
     g_uiFont=CreateFontW(-S(12),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     LoadSettings();
 
@@ -8061,7 +8362,14 @@ static int RunGui(HINSTANCE hInst){
                 TryLoadAutoLayoutAndInitialize();
             continue;
         }
-        if(wait==WAIT_FAILED) break;
+        if(wait==WAIT_FAILED){
+            const DWORD messageError=GetLastError();
+            runResult=4;
+            ReportStorageError(
+                L"The Windows message pump failed (error "+
+                std::to_wstring(messageError)+L").");
+            break;
+        }
         if(!PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)) continue;
         if(msg.message==WM_QUIT) break;
         if(g_settings && IsDialogMessageW(g_settings,&msg)) continue;
@@ -8070,8 +8378,7 @@ static int RunGui(HINSTANCE hInst){
         if(g_help && IsDialogMessageW(g_help,&msg)) continue;
         TranslateMessage(&msg); DispatchMessageW(&msg);
     }
-    if(g_uiFont)DeleteObject(g_uiFont);
-    return 0;
+    return runResult;
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int){
@@ -8151,10 +8458,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int){
     try { rc=RunWithTrayInstanceScope(
         cli,acquireTrayInstance,dispatch,releaseTrayInstance); }
     catch(...) {
+        ShutdownUi();
         ReleaseServices();
         CoUninitialize();
         return 1;
     }
+    ShutdownUi();
     CoUninitialize();
     return rc;
 }
