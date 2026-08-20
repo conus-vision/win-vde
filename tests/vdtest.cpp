@@ -326,6 +326,83 @@ static LayoutWin MatchRecord(const char* app, const char* title, const char* dom
     return w;
 }
 
+static void test_reconcile_restores_saved_a_and_creates_new_b(){
+    const UnixSeconds now=2000000000;
+    LayoutWin savedA=MatchRecord("firefox","A","a.com",1,{{"a.com",1}});
+    savedA.recordId="{00000000-0000-0000-0000-000000000301}";
+    savedA.deskIndex=0;
+    savedA.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    LayoutWin liveA=MatchRecord("firefox","A","a.com",1,{{"a.com",1}});
+    liveA.deskIndex=3;
+    liveA.desktop=G(L"{231A0000-0000-0000-0000-000000000004}");
+    LayoutWin liveB=MatchRecord("firefox","B","b.com",1,{{"b.com",1}});
+    liveB.deskIndex=4;
+    liveB.desktop=G(L"{231A0000-0000-0000-0000-000000000005}");
+
+    ReconcilePlan plan=PlanAppReconcile({savedA},{liveA,liveB},"firefox",now);
+    CHECK(plan.restores.size()==1);
+    CHECK(plan.restores[0].liveIndex==0);
+    CHECK(plan.newRecords.size()==1 && plan.newRecords[0].liveIndex==1);
+    CHECK(!plan.newRecords[0].recordId.empty());
+
+    std::vector<LayoutWin> committed=CommitAppReconcile({savedA},{liveA,liveB},plan,{0},now);
+    CHECK(committed.size()==2);
+    CHECK(GuidEq(committed[0].desktop,savedA.desktop));
+    CHECK(committed[0].missingSinceUtc==0);
+    CHECK(committed[1].activeTitle=="B");
+    CHECK(GuidEq(committed[1].desktop,liveB.desktop));
+}
+
+static void test_expired_reappearance_is_new_not_restored(){
+    const UnixSeconds now=2000000000;
+    LayoutWin expired=MatchRecord("firefox","A","a.com",1,{{"a.com",1}});
+    expired.recordId="{00000000-0000-0000-0000-000000000305}";
+    expired.deskIndex=0;
+    expired.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    expired.missingSinceUtc=now-WINDOW_RETENTION_SECONDS;
+    LayoutWin live=MatchRecord("firefox","A","a.com",1,{{"a.com",1}});
+    live.deskIndex=4;
+    live.desktop=G(L"{231A0000-0000-0000-0000-000000000005}");
+
+    ReconcilePlan plan=PlanAppReconcile({expired},{live},"firefox",now);
+    CHECK(plan.matches.empty());
+    CHECK(plan.restores.empty());
+    CHECK(plan.newRecords.size()==1);
+    CHECK(plan.newRecords[0].recordId!=expired.recordId);
+
+    std::vector<LayoutWin> committed=CommitAppReconcile({expired},{live},plan,{},now);
+    CHECK(committed.size()==1);
+    CHECK(committed[0].recordId==plan.newRecords[0].recordId);
+    CHECK(GuidEq(committed[0].desktop,live.desktop));
+}
+
+static void test_cached_stale_edge_preserves_match_and_defers_unmatched(){
+    const UnixSeconds now=2000000000;
+    LayoutWin saved=MatchRecord("msedge","Saved","saved.example",2,{{"saved.example",2}});
+    saved.recordId="{00000000-0000-0000-0000-000000000307}";
+    saved.deskIndex=0;
+    saved.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    LayoutWin matched=MatchRecord("msedge","Saved","stale.example",9,{{"saved.example",2}});
+    matched.deskIndex=0;
+    matched.desktop=saved.desktop;
+    LayoutWin unmatched=MatchRecord("msedge","New","new.example",1,{{"new.example",1}});
+    unmatched.deskIndex=1;
+    unmatched.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+
+    ReconcilePlan plan=PlanAppReconcile(
+        {saved},{matched,unmatched},"msedge",now,{},ReconcileFreshness::CachedStale);
+    CHECK(plan.matches.size()==1);
+    CHECK(plan.newRecords.empty());
+    CHECK(plan.missingSavedIndices.empty());
+
+    std::vector<LayoutWin> committed=CommitAppReconcile({saved},{matched,unmatched},plan,{},now);
+    CHECK(committed.size()==1);
+    CHECK(committed[0].counts==saved.counts);
+    CHECK(committed[0].activeTitle==saved.activeTitle);
+    CHECK(committed[0].activeDomain==saved.activeDomain);
+    CHECK(committed[0].tabCount==saved.tabCount);
+}
+
 static LayoutMatch Candidate(size_t savedIndex, size_t liveIndex, double score){
     LayoutMatch match;
     match.savedIndex=savedIndex; match.liveIndex=liveIndex; match.score=score;
@@ -703,6 +780,923 @@ static std::string FailingRecordIdGenerator(){ return std::string(); }
 static std::string ConstantRecordIdGenerator(){ return "{00000000-0000-0000-0000-000000000099}"; }
 static std::string MalformedRecordIdGenerator(){ return "not-a-guid"; }
 static std::string ZeroRecordIdGenerator(){ return "{00000000-0000-0000-0000-000000000000}"; }
+
+static std::string DeterministicRecordId(size_t ordinal){
+    GUID id{};
+    id.Data1=static_cast<unsigned long>(ordinal+1);
+    return W2U8(GuidToString(id));
+}
+
+static size_t& CountingRecordIdGeneratorCalls(){
+    static size_t calls=0;
+    return calls;
+}
+
+static void ResetCountingRecordIdGenerator(){
+    CountingRecordIdGeneratorCalls()=0;
+}
+
+static std::string CountingRecordIdGenerator(){
+    const size_t call=CountingRecordIdGeneratorCalls()++;
+    return DeterministicRecordId(MAX_LAYOUT_RECORDS+100+call);
+}
+
+static bool SameLayoutWinFields(const LayoutWin& left, const LayoutWin& right){
+    return left.recordId==right.recordId && left.app==right.app &&
+        left.deskIndex==right.deskIndex && GuidEq(left.desktop,right.desktop) &&
+        left.activeTitle==right.activeTitle && left.activeDomain==right.activeDomain &&
+        left.tabCount==right.tabCount && left.counts==right.counts &&
+        left.lastSeenUtc==right.lastSeenUtc &&
+        left.missingSinceUtc==right.missingSinceUtc &&
+        left.missingRuns==right.missingRuns;
+}
+
+static bool SameLayoutWinVectors(const std::vector<LayoutWin>& left,
+        const std::vector<LayoutWin>& right){
+    if(left.size()!=right.size()) return false;
+    for(size_t i=0;i<left.size();++i)
+        if(!SameLayoutWinFields(left[i],right[i])) return false;
+    return true;
+}
+
+static LayoutWin ReconcileTestRecord(const std::string& recordId, const char* app,
+        const char* title, const char* domain, int deskIndex, const GUID& desktop,
+        UnixSeconds lastSeenUtc){
+    LayoutWin record=MatchRecord(app,title,domain,1,{{domain,1}});
+    record.recordId=recordId;
+    record.deskIndex=deskIndex;
+    record.desktop=desktop;
+    record.lastSeenUtc=lastSeenUtc;
+    return record;
+}
+
+static ReconcilePlan ValidCommitPlan(const std::string& app, UnixSeconds nowUtc,
+        ReconcileFreshness freshness=ReconcileFreshness::Fresh){
+    ReconcilePlan plan;
+    plan.app=app;
+    plan.nowUtc=nowUtc;
+    plan.freshness=freshness;
+    return plan;
+}
+
+static NewRecordRequest PlannedNewRecord(size_t liveIndex, const std::string& recordId){
+    NewRecordRequest request;
+    request.liveIndex=liveIndex;
+    request.recordId=recordId;
+    return request;
+}
+
+static RestoreRequest PlannedRestore(size_t savedIndex, size_t liveIndex,
+        const GUID& destination){
+    RestoreRequest request;
+    request.savedIndex=savedIndex;
+    request.liveIndex=liveIndex;
+    request.destination=destination;
+    return request;
+}
+
+static void test_failed_chrome_restore_retains_saved_destination_and_marks_seen(){
+    const UnixSeconds now=2000000100;
+    LayoutWin saved=MatchRecord("chrome","A","a.com",1,{{"a.com",1}});
+    saved.recordId="{00000000-0000-0000-0000-000000000401}";
+    saved.deskIndex=1;
+    saved.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+    saved.lastSeenUtc=now-50;
+    saved.missingSinceUtc=now-20;
+    LayoutWin live=MatchRecord("chrome","A","a.com",1,{{"a.com",1}});
+    live.deskIndex=4;
+    live.desktop=G(L"{231A0000-0000-0000-0000-000000000005}");
+
+    ReconcilePlan plan=PlanAppReconcile({saved},{live},"chrome",now);
+    CHECK(plan.restores.size()==1);
+    CHECK(plan.restores[0].savedIndex==0 && plan.restores[0].liveIndex==0);
+    CHECK(GuidEq(plan.restores[0].destination,saved.desktop));
+    std::vector<LayoutWin> committed=CommitAppReconcile({saved},{live},plan,{},now);
+
+    CHECK(committed.size()==1);
+    CHECK(GuidEq(committed[0].desktop,saved.desktop));
+    CHECK(committed[0].deskIndex==saved.deskIndex);
+    CHECK(committed[0].recordId==saved.recordId);
+    CHECK(committed[0].lastSeenUtc==now && committed[0].missingSinceUtc==0);
+}
+
+static void test_empty_chrome_reconcile_marks_only_chrome_missing(){
+    const UnixSeconds now=2000000200;
+    LayoutWin firefox=MatchRecord("firefox","Firefox","ff.example",3,{{"ff.example",3}});
+    firefox.recordId="{00000000-0000-0000-0000-000000000402}";
+    firefox.deskIndex=0;
+    firefox.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    firefox.lastSeenUtc=now-100;
+    firefox.missingRuns=7;
+    LayoutWin chrome=MatchRecord("chrome","Chrome","chrome.example",2,{{"chrome.example",2}});
+    chrome.recordId="{00000000-0000-0000-0000-000000000403}";
+    chrome.deskIndex=1;
+    chrome.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+    chrome.lastSeenUtc=now-25;
+
+    ReconcilePlan plan=PlanAppReconcile({firefox,chrome},{},"chrome",now);
+    CHECK(plan.matches.empty() && plan.restores.empty() && plan.newRecords.empty());
+    CHECK(plan.missingSavedIndices==std::vector<size_t>({1}));
+    std::vector<LayoutWin> committed=CommitAppReconcile({firefox,chrome},{},plan,{},now);
+
+    CHECK(committed.size()==2);
+    CHECK(SameLayoutWinFields(committed[0],firefox));
+    CHECK(committed[1].missingSinceUtc==chrome.lastSeenUtc);
+    CHECK(committed[1].lastSeenUtc==chrome.lastSeenUtc);
+}
+
+static void test_reserved_chrome_record_cannot_be_stolen_by_duplicate(){
+    const UnixSeconds now=2000000300;
+    LayoutWin bound=MatchRecord("chrome","Same","same.com",1,{{"same.com",1}});
+    bound.recordId="{ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB}";
+    bound.deskIndex=0;
+    bound.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    bound.lastSeenUtc=now-10;
+    LayoutWin duplicate=MatchRecord("chrome","Same","same.com",1,{{"same.com",1}});
+    duplicate.deskIndex=2;
+    duplicate.desktop=G(L"{231A0000-0000-0000-0000-000000000003}");
+    const std::set<std::string> reserved={"abcdefab-cdef-abcd-efab-cdefabcdefab"};
+
+    ReconcilePlan plan=PlanAppReconcile(
+        {bound},{duplicate},"chrome",now,reserved,ReconcileFreshness::Fresh,
+        ConstantRecordIdGenerator);
+    CHECK(plan.matches.empty());
+    CHECK(plan.restores.empty());
+    CHECK(plan.missingSavedIndices.empty());
+    CHECK(plan.newRecords.size()==1 && plan.newRecords[0].liveIndex==0);
+    CHECK(plan.newRecords[0].recordId==ConstantRecordIdGenerator());
+    std::vector<LayoutWin> committed=CommitAppReconcile({bound},{duplicate},plan,{},now);
+
+    CHECK(committed.size()==2);
+    CHECK(SameLayoutWinFields(committed[0],bound));
+    CHECK(committed[1].recordId==ConstantRecordIdGenerator());
+    CHECK(committed[1].deskIndex==duplicate.deskIndex);
+    CHECK(GuidEq(committed[1].desktop,duplicate.desktop));
+}
+
+static void test_same_desktop_match_learns_live_index_without_restore(){
+    const UnixSeconds now=2000000400;
+    LayoutWin saved=MatchRecord("chrome","A","a.com",1,{{"a.com",1}});
+    saved.recordId="{00000000-0000-0000-0000-000000000405}";
+    saved.deskIndex=2;
+    saved.desktop=G(L"{231A0000-0000-0000-0000-000000000003}");
+    LayoutWin live=MatchRecord("chrome","A","a.com",1,{{"a.com",1}});
+    live.deskIndex=8;
+    live.desktop=saved.desktop;
+
+    ReconcilePlan plan=PlanAppReconcile({saved},{live},"chrome",now);
+    CHECK(plan.matches.size()==1);
+    CHECK(plan.restores.empty());
+    std::vector<LayoutWin> committed=CommitAppReconcile({saved},{live},plan,{},now);
+
+    CHECK(committed.size()==1);
+    CHECK(committed[0].recordId==saved.recordId);
+    CHECK(GuidEq(committed[0].desktop,live.desktop));
+    CHECK(committed[0].deskIndex==live.deskIndex);
+    CHECK(committed[0].lastSeenUtc==now);
+}
+
+static void test_late_window_after_first_wave_restores_before_save(){
+    LcState state;
+    CHECK(LcObserve(state,true,1,10,100,1,0).action==LcAction::None);
+    LcDecision first=LcObserve(state,true,1,10,100,1,1);
+    CHECK(first.action==LcAction::BeginRestore && first.generation!=0);
+    LcRestoreCompleted(state,first.generation,LcRestoreOutcome::Success,100,1,2);
+    CHECK(LcObserve(state,true,3,30,100,1,3).action==LcAction::None);
+    LcDecision late=LcObserve(state,true,3,30,100,1,4);
+    CHECK(late.action==LcAction::BeginRestore && late.generation!=first.generation);
+    CHECK(LcObserve(state,true,3,30,100,1,5).action==LcAction::None);
+
+    const UnixSeconds now=2000000500;
+    LayoutWin savedA=MatchRecord("firefox","A","a.com",1,{{"a.com",1}});
+    savedA.recordId="{00000000-0000-0000-0000-000000000406}";
+    savedA.deskIndex=0;
+    savedA.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    savedA.lastSeenUtc=now-10;
+    savedA.missingRuns=4;
+    LayoutWin savedB=MatchRecord("firefox","B","b.com",1,{{"b.com",1}});
+    savedB.recordId="{00000000-0000-0000-0000-000000000407}";
+    savedB.deskIndex=1;
+    savedB.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+    savedB.lastSeenUtc=now-100;
+    savedB.missingSinceUtc=now-100;
+    LayoutWin liveB=MatchRecord("firefox","B","b.com",1,{{"b.com",1}});
+    liveB.deskIndex=4;
+    liveB.desktop=G(L"{231A0000-0000-0000-0000-000000000005}");
+    const std::set<std::string> reserved={savedA.recordId};
+
+    ReconcilePlan plan=PlanAppReconcile({savedA,savedB},{liveB},"firefox",now,reserved);
+    CHECK(plan.matches.size()==1 && plan.matches[0].savedIndex==1 &&
+        plan.matches[0].liveIndex==0);
+    CHECK(plan.restores.size()==1 && plan.restores[0].savedIndex==1 &&
+        plan.restores[0].liveIndex==0);
+    CHECK(plan.newRecords.empty() && plan.missingSavedIndices.empty());
+    std::vector<LayoutWin> committed=CommitAppReconcile(
+        {savedA,savedB},{liveB},plan,{0},now);
+    CHECK(committed.size()==2);
+    CHECK(SameLayoutWinFields(committed[0],savedA));
+    CHECK(GuidEq(committed[1].desktop,savedB.desktop));
+
+    LcRestoreCompleted(state,late.generation,LcRestoreOutcome::Success,100,1,6);
+    CHECK(LcObserve(state,true,3,30,100,1,7).action==LcAction::None);
+    CHECK(LcObserve(state,true,3,30,100,1,8).action==LcAction::None);
+}
+
+static void test_edge_retention_is_independent_while_firefox_stays_open(){
+    const UnixSeconds now=2000000600;
+    LayoutWin firefoxA=MatchRecord("firefox","A","a.com",1,{{"a.com",1}});
+    firefoxA.recordId="{00000000-0000-0000-0000-000000000408}";
+    firefoxA.deskIndex=0;
+    firefoxA.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    firefoxA.lastSeenUtc=now-50;
+    firefoxA.missingRuns=3;
+    LayoutWin firefoxB=MatchRecord("firefox","B","b.com",2,{{"b.com",2}});
+    firefoxB.recordId="{00000000-0000-0000-0000-000000000409}";
+    firefoxB.deskIndex=1;
+    firefoxB.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+    firefoxB.lastSeenUtc=now-40;
+    std::vector<LayoutWin> firefoxRecords={firefoxA,firefoxB};
+    const std::vector<LayoutWin> originalFirefox=firefoxRecords;
+
+    LayoutWin edge=MatchRecord("msedge","Edge","edge.example",1,{{"edge.example",1}});
+    edge.recordId="{00000000-0000-0000-0000-000000000410}";
+    edge.deskIndex=2;
+    edge.desktop=G(L"{231A0000-0000-0000-0000-000000000003}");
+    edge.lastSeenUtc=now-10;
+    std::vector<LayoutWin> edgeRecords={edge};
+    LcState firefoxState,edgeState;
+
+    CHECK(LcObserve(firefoxState,true,10,10,10,10,0).action==LcAction::None);
+    LcDecision edgeMissing=LcObserve(edgeState,false,0,0,20,20,0);
+    CHECK(edgeMissing.action==LcAction::MarkMissingFromLastSeen);
+    ReconcilePlan absentPlan=PlanAppReconcile(edgeRecords,{},"msedge",now);
+    edgeRecords=CommitAppReconcile(edgeRecords,{},absentPlan,{},now);
+    CHECK(edgeRecords.size()==1 && edgeRecords[0].missingSinceUtc==edge.lastSeenUtc);
+    CHECK(SameLayoutWinVectors(firefoxRecords,originalFirefox));
+
+    LcDecision firefoxWave=LcObserve(firefoxState,true,10,10,10,10,1);
+    CHECK(firefoxWave.action==LcAction::BeginRestore);
+    LcRestoreCompleted(firefoxState,firefoxWave.generation,LcRestoreOutcome::Success,10,10,2);
+    CHECK(LcObserve(edgeState,false,0,0,20,20,1).action==LcAction::None);
+    CHECK(LcObserve(firefoxState,true,10,10,10,10,2).action==LcAction::None);
+    CHECK(LcObserve(edgeState,true,30,30,20,21,2).action==LcAction::None);
+
+    LayoutWin liveEdge=MatchRecord("msedge","Edge","edge.example",1,{{"edge.example",1}});
+    liveEdge.deskIndex=4;
+    liveEdge.desktop=G(L"{231A0000-0000-0000-0000-000000000005}");
+    ReconcilePlan returnPlan=PlanAppReconcile(edgeRecords,{liveEdge},"msedge",now+1);
+    CHECK(returnPlan.restores.size()==1);
+    edgeRecords=CommitAppReconcile(edgeRecords,{liveEdge},returnPlan,{0},now+1);
+    LcDecision edgeReturn=LcObserve(edgeState,true,30,30,20,21,3);
+    CHECK(edgeReturn.action==LcAction::BeginRestore);
+    LcRestoreCompleted(edgeState,edgeReturn.generation,LcRestoreOutcome::Success,20,21,4);
+    CHECK(LcObserve(firefoxState,true,10,10,10,10,3).action==LcAction::None);
+    CHECK(SameLayoutWinVectors(firefoxRecords,originalFirefox));
+}
+
+static void test_firefox_sibling_reappears_while_first_window_stays_open(){
+    const UnixSeconds now=2000000700;
+    LayoutWin savedA=MatchRecord("firefox","A","a.com",1,{{"a.com",1}});
+    savedA.recordId="{00000000-0000-0000-0000-000000000411}";
+    savedA.deskIndex=0;
+    savedA.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    savedA.lastSeenUtc=now-20;
+    savedA.missingRuns=5;
+    LayoutWin savedB=MatchRecord("firefox","B","b.com",1,{{"b.com",1}});
+    savedB.recordId="{00000000-0000-0000-0000-000000000412}";
+    savedB.deskIndex=1;
+    savedB.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+    savedB.lastSeenUtc=now-10;
+    const std::set<std::string> reserved={savedA.recordId};
+
+    ReconcilePlan missingPlan=PlanAppReconcile({savedA,savedB},{},"firefox",now,reserved);
+    CHECK(missingPlan.missingSavedIndices==std::vector<size_t>({1}));
+    std::vector<LayoutWin> afterMissing=CommitAppReconcile(
+        {savedA,savedB},{},missingPlan,{},now);
+    CHECK(afterMissing.size()==2);
+    CHECK(SameLayoutWinFields(afterMissing[0],savedA));
+    CHECK(afterMissing[1].missingSinceUtc==savedB.lastSeenUtc);
+
+    LayoutWin liveB=MatchRecord("firefox","B","b.com",1,{{"b.com",1}});
+    liveB.deskIndex=4;
+    liveB.desktop=G(L"{231A0000-0000-0000-0000-000000000005}");
+    ReconcilePlan returnPlan=PlanAppReconcile(
+        afterMissing,{liveB},"firefox",now+1,reserved);
+    CHECK(returnPlan.matches.size()==1 && returnPlan.matches[0].savedIndex==1);
+    CHECK(returnPlan.restores.size()==1 && returnPlan.restores[0].savedIndex==1 &&
+        returnPlan.restores[0].liveIndex==0);
+    CHECK(returnPlan.newRecords.empty() && returnPlan.missingSavedIndices.empty());
+    std::vector<LayoutWin> failed=CommitAppReconcile(
+        afterMissing,{liveB},returnPlan,{},now+1);
+
+    CHECK(failed.size()==2);
+    CHECK(SameLayoutWinFields(failed[0],savedA));
+    CHECK(GuidEq(failed[1].desktop,savedB.desktop));
+    CHECK(failed[1].deskIndex==savedB.deskIndex);
+    CHECK(failed[1].lastSeenUtc==now+1 && failed[1].missingSinceUtc==0);
+}
+
+static void test_reconcile_plan_and_commit_preserve_input_vectors(){
+    const UnixSeconds now=2000000800;
+    LayoutWin saved=MatchRecord("chrome","A","a.com",1,{{"a.com",1}});
+    saved.recordId="{00000000-0000-0000-0000-000000000413}";
+    saved.deskIndex=0;
+    saved.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    saved.lastSeenUtc=now-30;
+    saved.missingSinceUtc=now-20;
+    saved.missingRuns=6;
+    LayoutWin liveA=MatchRecord("chrome","A","a.com",1,{{"a.com",1}});
+    liveA.deskIndex=3;
+    liveA.desktop=G(L"{231A0000-0000-0000-0000-000000000004}");
+    LayoutWin liveB=MatchRecord("chrome","B","b.com",1,{{"b.com",1}});
+    liveB.deskIndex=4;
+    liveB.desktop=G(L"{231A0000-0000-0000-0000-000000000005}");
+    std::vector<LayoutWin> existing={saved};
+    std::vector<LayoutWin> live={liveA,liveB};
+    const std::vector<LayoutWin> originalExisting=existing;
+    const std::vector<LayoutWin> originalLive=live;
+
+    ReconcilePlan plan=PlanAppReconcile(
+        existing,live,"chrome",now,{},ReconcileFreshness::Fresh,
+        ConstantRecordIdGenerator);
+    CHECK(SameLayoutWinVectors(existing,originalExisting));
+    CHECK(SameLayoutWinVectors(live,originalLive));
+    std::vector<LayoutWin> committed=CommitAppReconcile(existing,live,plan,{0},now);
+    CHECK(committed.size()==2);
+    CHECK(SameLayoutWinVectors(existing,originalExisting));
+    CHECK(SameLayoutWinVectors(live,originalLive));
+}
+
+static void test_reconcile_empty_generator_defers_transactionally(){
+    const UnixSeconds now=2000000900;
+    LayoutWin existingFirefox=MatchRecord(
+        "firefox","Existing","existing.example",1,{{"existing.example",1}});
+    existingFirefox.recordId="{00000000-0000-0000-0000-000000000414}";
+    existingFirefox.deskIndex=0;
+    existingFirefox.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    existingFirefox.lastSeenUtc=now-10;
+    existingFirefox.missingRuns=8;
+    LayoutWin liveChrome=MatchRecord(
+        "chrome","New","new.example",1,{{"new.example",1}});
+    liveChrome.deskIndex=1;
+    liveChrome.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+    const std::vector<LayoutWin> existing={existingFirefox};
+
+    ReconcilePlan plan=PlanAppReconcile(
+        existing,{liveChrome},"chrome",now,{},ReconcileFreshness::Fresh,
+        FailingRecordIdGenerator);
+    CHECK(plan.deferred);
+    CHECK(plan.matches.empty());
+    CHECK(plan.restores.empty());
+    CHECK(plan.newRecords.empty());
+    CHECK(plan.missingSavedIndices.empty());
+    std::vector<LayoutWin> committed=CommitAppReconcile(existing,{liveChrome},plan,{},now);
+    CHECK(SameLayoutWinVectors(committed,existing));
+}
+
+static void test_reconcile_invalid_generators_defer_transactionally(){
+    const UnixSeconds now=2000001000;
+    LayoutWin existingFirefox=MatchRecord(
+        "firefox","Existing","existing.example",1,{{"existing.example",1}});
+    existingFirefox.recordId="{00000000-0000-0000-0000-000000000415}";
+    existingFirefox.deskIndex=0;
+    existingFirefox.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    existingFirefox.lastSeenUtc=now-10;
+    LayoutWin liveChrome=MatchRecord(
+        "chrome","New","new.example",1,{{"new.example",1}});
+    liveChrome.deskIndex=1;
+    liveChrome.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+    const std::vector<LayoutWin> existing={existingFirefox};
+    const RecordIdGenerator generators[]={MalformedRecordIdGenerator,ZeroRecordIdGenerator};
+
+    for(RecordIdGenerator generator : generators){
+        ReconcilePlan plan=PlanAppReconcile(
+            existing,{liveChrome},"chrome",now,{},ReconcileFreshness::Fresh,generator);
+        CHECK(plan.deferred);
+        CHECK(plan.matches.empty());
+        CHECK(plan.restores.empty());
+        CHECK(plan.newRecords.empty());
+        CHECK(plan.missingSavedIndices.empty());
+        std::vector<LayoutWin> committed=CommitAppReconcile(
+            existing,{liveChrome},plan,{},now);
+        CHECK(SameLayoutWinVectors(committed,existing));
+    }
+}
+
+static void test_reconcile_generator_collision_with_any_existing_record_defers(){
+    const UnixSeconds now=2000001100;
+    LayoutWin liveChrome=MatchRecord(
+        "chrome","New","new.example",1,{{"new.example",1}});
+    liveChrome.deskIndex=4;
+    liveChrome.desktop=G(L"{231A0000-0000-0000-0000-000000000005}");
+
+    for(int variant=0;variant<3;++variant){
+        LayoutWin existing=MatchRecord(
+            "chrome","Existing","existing.example",1,{{"existing.example",1}});
+        existing.recordId="00000000-0000-0000-0000-000000000099";
+        existing.deskIndex=0;
+        existing.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+        existing.lastSeenUtc=now-10;
+        std::set<std::string> reserved;
+        if(variant==0) existing.missingSinceUtc=now-WINDOW_RETENTION_SECONDS;
+        if(variant==1) existing.app="firefox";
+        if(variant==2) reserved.insert(existing.recordId);
+
+        ReconcilePlan plan=PlanAppReconcile(
+            {existing},{liveChrome},"chrome",now,reserved,ReconcileFreshness::Fresh,
+            ConstantRecordIdGenerator);
+        CHECK(plan.deferred);
+        CHECK(plan.matches.empty());
+        CHECK(plan.restores.empty());
+        CHECK(plan.newRecords.empty());
+        CHECK(plan.missingSavedIndices.empty());
+    }
+}
+
+static void test_reconcile_duplicate_generated_ids_defer_transactionally(){
+    const UnixSeconds now=2000001200;
+    LayoutWin liveA=MatchRecord("chrome","A","a.example",1,{{"a.example",1}});
+    liveA.deskIndex=0;
+    liveA.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    LayoutWin liveB=MatchRecord("chrome","B","b.example",1,{{"b.example",1}});
+    liveB.deskIndex=1;
+    liveB.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+
+    ReconcilePlan plan=PlanAppReconcile(
+        {},{liveA,liveB},"chrome",now,{},ReconcileFreshness::Fresh,
+        ConstantRecordIdGenerator);
+    CHECK(plan.deferred);
+    CHECK(plan.matches.empty());
+    CHECK(plan.restores.empty());
+    CHECK(plan.newRecords.empty());
+    CHECK(plan.missingSavedIndices.empty());
+}
+
+static void test_reconcile_unique_generated_id_commits_strict_v4(){
+    const UnixSeconds now=2000001300;
+    LayoutWin live=MatchRecord("chrome","New","new.example",1,{{"new.example",1}});
+    live.deskIndex=0;
+    live.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+
+    ReconcilePlan plan=PlanAppReconcile(
+        {},{live},"chrome",now,{},ReconcileFreshness::Fresh,
+        ConstantRecordIdGenerator);
+    CHECK(!plan.deferred);
+    CHECK(plan.matches.empty() && plan.restores.empty() &&
+        plan.missingSavedIndices.empty());
+    CHECK(plan.newRecords.size()==1 &&
+        plan.newRecords[0].recordId==ConstantRecordIdGenerator());
+    std::vector<LayoutWin> committed=CommitAppReconcile({}, {live}, plan, {}, now);
+    CHECK(committed.size()==1);
+
+    std::string snapshot,error;
+    CHECK(BuildCheckedLayoutSnapshot({},committed,now,snapshot,&error));
+    CHECK(error.empty());
+    std::vector<DeskRec> parsedDesks;
+    std::vector<LayoutWin> parsed;
+    int version=0;
+    CHECK(ParseLayout(snapshot,parsedDesks,parsed,now,&error,&version));
+    CHECK(error.empty() && version==4 && parsedDesks.empty());
+    CHECK(parsed.size()==1 && SameLayoutWinFields(parsed[0],committed[0]));
+}
+
+static void test_reconcile_null_generator_defers_transactionally(){
+    const UnixSeconds now=2000001400;
+    LayoutWin existingFirefox=MatchRecord(
+        "firefox","Existing","existing.example",1,{{"existing.example",1}});
+    existingFirefox.recordId="{00000000-0000-0000-0000-000000000416}";
+    existingFirefox.deskIndex=0;
+    existingFirefox.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    existingFirefox.lastSeenUtc=now-10;
+    existingFirefox.missingRuns=9;
+    LayoutWin liveChrome=MatchRecord(
+        "chrome","New","new.example",1,{{"new.example",1}});
+    liveChrome.deskIndex=1;
+    liveChrome.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+    const std::vector<LayoutWin> existing={existingFirefox};
+    RecordIdGenerator generator=nullptr;
+
+    ReconcilePlan plan=PlanAppReconcile(
+        existing,{liveChrome},"chrome",now,{},ReconcileFreshness::Fresh,generator);
+    CHECK(plan.app=="chrome" && plan.nowUtc==now &&
+        plan.freshness==ReconcileFreshness::Fresh);
+    CHECK(plan.deferred);
+    CHECK(plan.matches.empty());
+    CHECK(plan.restores.empty());
+    CHECK(plan.newRecords.empty());
+    CHECK(plan.missingSavedIndices.empty());
+    std::vector<LayoutWin> committed=CommitAppReconcile(existing,{liveChrome},plan,{},now);
+    CHECK(SameLayoutWinVectors(committed,existing));
+}
+
+static void test_reconcile_match_preflight_too_complex_defers_cleanly(){
+    const UnixSeconds now=2000001500;
+    LayoutWin savedBase=MatchRecord("chrome","Saved","same.example",1,{{"same.example",1}});
+    savedBase.deskIndex=0;
+    savedBase.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    savedBase.lastSeenUtc=now-10;
+    std::vector<LayoutWin> saved;
+    saved.reserve(1001);
+    for(size_t i=0;i<1001;++i){
+        LayoutWin record=savedBase;
+        record.recordId=DeterministicRecordId(i);
+        saved.push_back(record);
+    }
+    LayoutWin liveBase=MatchRecord("chrome","Live","other.example",1,{{"other.example",1}});
+    liveBase.deskIndex=1;
+    liveBase.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+    std::vector<LayoutWin> live(1000,liveBase);
+
+    ResetCountingRecordIdGenerator();
+    ReconcilePlan plan=PlanAppReconcile(
+        saved,live,"chrome",now,{},ReconcileFreshness::Fresh,
+        CountingRecordIdGenerator);
+    CHECK(plan.app=="chrome" && plan.nowUtc==now &&
+        plan.freshness==ReconcileFreshness::Fresh);
+    CHECK(plan.deferred);
+    CHECK(plan.matches.empty());
+    CHECK(plan.restores.empty());
+    CHECK(plan.newRecords.empty());
+    CHECK(plan.missingSavedIndices.empty());
+    CHECK(CountingRecordIdGeneratorCalls()==0);
+    std::vector<LayoutWin> committed=CommitAppReconcile(saved,live,plan,{},now);
+    CHECK(SameLayoutWinVectors(committed,saved));
+    ResetCountingRecordIdGenerator();
+}
+
+static void test_reconcile_window_caps_defer_before_generation(){
+    const UnixSeconds now=2000001600;
+    LayoutWin existingBase=MatchRecord(
+        "chrome","Existing","existing.example",1,{{"existing.example",1}});
+    existingBase.deskIndex=0;
+    existingBase.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    existingBase.lastSeenUtc=now-10;
+    std::vector<LayoutWin> existing;
+    existing.reserve(MAX_LAYOUT_RECORDS);
+    for(size_t i=0;i<MAX_LAYOUT_RECORDS;++i){
+        LayoutWin record=existingBase;
+        record.recordId=DeterministicRecordId(i);
+        existing.push_back(record);
+    }
+    std::vector<LayoutWin> strictExisting=existing;
+    std::string snapshot,error;
+    CHECK(BuildCheckedLayoutSnapshot({},strictExisting,now,snapshot,&error));
+    CHECK(error.empty());
+
+    LayoutWin liveFirefox=MatchRecord(
+        "firefox","New","new.example",1,{{"new.example",1}});
+    liveFirefox.deskIndex=1;
+    liveFirefox.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+
+    ResetCountingRecordIdGenerator();
+    ReconcilePlan fullOutput=PlanAppReconcile(
+        existing,{liveFirefox},"firefox",now,{},ReconcileFreshness::Fresh,
+        CountingRecordIdGenerator);
+    CHECK(fullOutput.deferred);
+    CHECK(fullOutput.matches.empty());
+    CHECK(fullOutput.restores.empty());
+    CHECK(fullOutput.newRecords.empty());
+    CHECK(fullOutput.missingSavedIndices.empty());
+    CHECK(CountingRecordIdGeneratorCalls()==0);
+    CHECK(SameLayoutWinVectors(
+        CommitAppReconcile(existing,{liveFirefox},fullOutput,{},now),existing));
+
+    std::vector<LayoutWin> oversizedExisting=existing;
+    LayoutWin extra=existingBase;
+    extra.recordId=DeterministicRecordId(MAX_LAYOUT_RECORDS);
+    oversizedExisting.push_back(extra);
+    ResetCountingRecordIdGenerator();
+    ReconcilePlan existingOverflow=PlanAppReconcile(
+        oversizedExisting,{liveFirefox},"firefox",now,{},ReconcileFreshness::Fresh,
+        CountingRecordIdGenerator);
+    CHECK(existingOverflow.deferred);
+    CHECK(existingOverflow.matches.empty());
+    CHECK(existingOverflow.restores.empty());
+    CHECK(existingOverflow.newRecords.empty());
+    CHECK(existingOverflow.missingSavedIndices.empty());
+    CHECK(CountingRecordIdGeneratorCalls()==0);
+
+    std::vector<LayoutWin> oversizedLive(MAX_LAYOUT_RECORDS+1,liveFirefox);
+    ResetCountingRecordIdGenerator();
+    ReconcilePlan liveOverflow=PlanAppReconcile(
+        {},oversizedLive,"firefox",now,{},ReconcileFreshness::Fresh,
+        CountingRecordIdGenerator);
+    CHECK(liveOverflow.deferred);
+    CHECK(liveOverflow.matches.empty());
+    CHECK(liveOverflow.restores.empty());
+    CHECK(liveOverflow.newRecords.empty());
+    CHECK(liveOverflow.missingSavedIndices.empty());
+    CHECK(CountingRecordIdGeneratorCalls()==0);
+    ResetCountingRecordIdGenerator();
+}
+
+static void test_reconcile_unsupported_app_defers_without_generation(){
+    const UnixSeconds now=2000001700;
+    LayoutWin existing=ReconcileTestRecord(
+        DeterministicRecordId(10000),"firefox","Existing","existing.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-10);
+    LayoutWin liveOpera=MatchRecord("opera","New","new.example",1,{{"new.example",1}});
+    liveOpera.deskIndex=1;
+    liveOpera.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+
+    ResetCountingRecordIdGenerator();
+    ReconcilePlan plan=PlanAppReconcile(
+        {existing},{liveOpera},"opera",now,{},ReconcileFreshness::Fresh,
+        CountingRecordIdGenerator);
+    CHECK(plan.app=="opera" && plan.nowUtc==now &&
+        plan.freshness==ReconcileFreshness::Fresh);
+    CHECK(plan.deferred);
+    CHECK(plan.matches.empty());
+    CHECK(plan.restores.empty());
+    CHECK(plan.newRecords.empty());
+    CHECK(plan.missingSavedIndices.empty());
+    CHECK(CountingRecordIdGeneratorCalls()==0);
+    ResetCountingRecordIdGenerator();
+}
+
+static void test_commit_reconcile_rejects_out_of_range_mixed_plan_atomically(){
+    const UnixSeconds now=2000001800;
+    LayoutWin saved=ReconcileTestRecord(
+        DeterministicRecordId(10001),"chrome","Saved","same.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-10);
+    LayoutWin live=MatchRecord("chrome","Live","same.example",1,{{"same.example",1}});
+    live.deskIndex=saved.deskIndex;
+    live.desktop=saved.desktop;
+    const std::vector<LayoutWin> existing={saved};
+    const std::vector<LayoutWin> liveRecords={live};
+
+    for(int variant=0;variant<3;++variant){
+        ReconcilePlan plan=ValidCommitPlan("chrome",now);
+        plan.matches.push_back(Candidate(0,0,1.0));
+        if(variant==0) plan.missingSavedIndices.push_back(existing.size());
+        if(variant==1) plan.newRecords.push_back(
+            PlannedNewRecord(liveRecords.size(),DeterministicRecordId(11000)));
+        if(variant==2) plan.matches.push_back(Candidate(existing.size(),0,1.0));
+        CHECK(SameLayoutWinVectors(
+            CommitAppReconcile(existing,liveRecords,plan,{},now),existing));
+    }
+}
+
+static void test_commit_reconcile_rejects_malformed_restore_sets_atomically(){
+    const UnixSeconds now=2000001850;
+    LayoutWin savedA=ReconcileTestRecord(
+        DeterministicRecordId(10010),"chrome","A","a.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-10);
+    LayoutWin savedB=ReconcileTestRecord(
+        DeterministicRecordId(10011),"chrome","B","b.example",1,
+        G(L"{231A0000-0000-0000-0000-000000000002}"),now-20);
+    LayoutWin liveA=MatchRecord("chrome","A","a.example",1,{{"a.example",1}});
+    liveA.deskIndex=2;
+    liveA.desktop=G(L"{231A0000-0000-0000-0000-000000000003}");
+    LayoutWin liveB=MatchRecord("chrome","B","b.example",1,{{"b.example",1}});
+    liveB.deskIndex=3;
+    liveB.desktop=G(L"{231A0000-0000-0000-0000-000000000004}");
+    const std::vector<LayoutWin> existing={savedA,savedB};
+    const std::vector<LayoutWin> live={liveA,liveB};
+
+    ReconcilePlan baseline=ValidCommitPlan("chrome",now);
+    baseline.matches.push_back(Candidate(0,0,1.0));
+    baseline.restores.push_back(PlannedRestore(0,0,savedA.desktop));
+    std::vector<LayoutWin> accepted=CommitAppReconcile(existing,live,baseline,{0},now);
+    CHECK(accepted.size()==2 && accepted[0].lastSeenUtc==now);
+
+    for(int variant=0;variant<7;++variant){
+        ReconcilePlan malformed=baseline;
+        std::set<size_t> successful;
+        if(variant==0) malformed.restores[0].savedIndex=existing.size();
+        if(variant==1) malformed.restores[0].liveIndex=live.size();
+        if(variant==2)
+            malformed.restores[0]=PlannedRestore(1,1,savedB.desktop);
+        if(variant==3) malformed.restores[0].destination=savedB.desktop;
+        if(variant==4) malformed.restores.push_back(malformed.restores[0]);
+        if(variant==5) malformed.restores.clear();
+        if(variant==6) successful.insert(1);
+        CHECK(SameLayoutWinVectors(
+            CommitAppReconcile(existing,live,malformed,successful,now),existing));
+    }
+    CHECK(SameLayoutWinVectors(existing,{savedA,savedB}));
+    CHECK(SameLayoutWinVectors(live,{liveA,liveB}));
+}
+
+static void test_commit_reconcile_rejects_duplicate_match_ownership(){
+    const UnixSeconds now=2000001900;
+    LayoutWin first=ReconcileTestRecord(
+        DeterministicRecordId(10002),"chrome","Same","same.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-10);
+    LayoutWin second=first;
+    second.recordId=DeterministicRecordId(10003);
+    LayoutWin liveFirst=MatchRecord("chrome","Same","same.example",1,{{"same.example",1}});
+    liveFirst.deskIndex=first.deskIndex;
+    liveFirst.desktop=first.desktop;
+    LayoutWin liveSecond=liveFirst;
+    const std::vector<LayoutWin> existing={first,second};
+    const std::vector<LayoutWin> live={liveFirst,liveSecond};
+
+    ReconcilePlan duplicateSaved=ValidCommitPlan("chrome",now);
+    duplicateSaved.matches={Candidate(0,0,1.0),Candidate(0,1,1.0)};
+    CHECK(SameLayoutWinVectors(
+        CommitAppReconcile(existing,live,duplicateSaved,{},now),existing));
+
+    ReconcilePlan duplicateLive=ValidCommitPlan("chrome",now);
+    duplicateLive.matches={Candidate(0,0,1.0),Candidate(1,0,1.0)};
+    CHECK(SameLayoutWinVectors(
+        CommitAppReconcile(existing,live,duplicateLive,{},now),existing));
+}
+
+static void test_commit_reconcile_rejects_app_mismatches(){
+    const UnixSeconds now=2000002000;
+    LayoutWin chromeSaved=ReconcileTestRecord(
+        DeterministicRecordId(10004),"chrome","Saved","same.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-10);
+    LayoutWin chromeLive=MatchRecord("chrome","Live","same.example",1,{{"same.example",1}});
+    chromeLive.deskIndex=chromeSaved.deskIndex;
+    chromeLive.desktop=chromeSaved.desktop;
+    LayoutWin firefoxSaved=chromeSaved;
+    firefoxSaved.recordId=DeterministicRecordId(10005);
+    firefoxSaved.app="firefox";
+    LayoutWin firefoxLive=chromeLive;
+    firefoxLive.app="firefox";
+
+    ReconcilePlan planAppMismatch=ValidCommitPlan("firefox",now);
+    planAppMismatch.matches.push_back(Candidate(0,0,1.0));
+    CHECK(SameLayoutWinVectors(
+        CommitAppReconcile({chromeSaved},{chromeLive},planAppMismatch,{},now),
+        {chromeSaved}));
+
+    ReconcilePlan liveAppMismatch=ValidCommitPlan("chrome",now);
+    liveAppMismatch.matches.push_back(Candidate(0,0,1.0));
+    CHECK(SameLayoutWinVectors(
+        CommitAppReconcile({chromeSaved},{firefoxLive},liveAppMismatch,{},now),
+        {chromeSaved}));
+
+    ReconcilePlan existingAppMismatch=ValidCommitPlan("chrome",now);
+    existingAppMismatch.matches.push_back(Candidate(0,0,1.0));
+    CHECK(SameLayoutWinVectors(
+        CommitAppReconcile({firefoxSaved},{chromeLive},existingAppMismatch,{},now),
+        {firefoxSaved}));
+}
+
+static void test_commit_reconcile_rejects_invalid_new_record_requests(){
+    const UnixSeconds now=2000002100;
+    LayoutWin existing=ReconcileTestRecord(
+        DeterministicRecordId(0xABCDEF),"firefox","Existing","existing.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-10);
+    LayoutWin liveA=MatchRecord("chrome","A","a.example",1,{{"a.example",1}});
+    liveA.deskIndex=1;
+    liveA.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+    LayoutWin liveB=MatchRecord("chrome","B","b.example",1,{{"b.example",1}});
+    liveB.deskIndex=2;
+    liveB.desktop=G(L"{231A0000-0000-0000-0000-000000000003}");
+    const std::vector<LayoutWin> existingRecords={existing};
+
+    const std::string invalidIds[]={"not-a-guid","{00000000-0000-0000-0000-000000000000}"};
+    for(const std::string& invalidId : invalidIds){
+        ReconcilePlan plan=ValidCommitPlan("chrome",now);
+        plan.newRecords.push_back(PlannedNewRecord(0,invalidId));
+        CHECK(SameLayoutWinVectors(
+            CommitAppReconcile(existingRecords,{liveA},plan,{},now),existingRecords));
+    }
+
+    ReconcilePlan collision=ValidCommitPlan("chrome",now);
+    collision.newRecords.push_back(
+        PlannedNewRecord(0,existing.recordId.substr(1,existing.recordId.size()-2)));
+    CHECK(SameLayoutWinVectors(
+        CommitAppReconcile(existingRecords,{liveA},collision,{},now),existingRecords));
+
+    ReconcilePlan duplicateIds=ValidCommitPlan("chrome",now);
+    duplicateIds.newRecords={
+        PlannedNewRecord(0,DeterministicRecordId(12000)),
+        PlannedNewRecord(1,DeterministicRecordId(12000))
+    };
+    CHECK(SameLayoutWinVectors(
+        CommitAppReconcile(existingRecords,{liveA,liveB},duplicateIds,{},now),
+        existingRecords));
+
+    ReconcilePlan duplicateLive=ValidCommitPlan("chrome",now);
+    duplicateLive.newRecords={
+        PlannedNewRecord(0,DeterministicRecordId(12001)),
+        PlannedNewRecord(0,DeterministicRecordId(12002))
+    };
+    CHECK(SameLayoutWinVectors(
+        CommitAppReconcile(existingRecords,{liveA,liveB},duplicateLive,{},now),
+        existingRecords));
+}
+
+static void test_commit_reconcile_rejects_cached_stale_actions(){
+    const UnixSeconds now=2000002200;
+    LayoutWin existing=ReconcileTestRecord(
+        DeterministicRecordId(10006),"chrome","Existing","existing.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-10);
+    LayoutWin live=MatchRecord("chrome","New","new.example",1,{{"new.example",1}});
+    live.deskIndex=1;
+    live.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+    const std::vector<LayoutWin> existingRecords={existing};
+
+    ReconcilePlan staleNew=ValidCommitPlan(
+        "chrome",now,ReconcileFreshness::CachedStale);
+    staleNew.newRecords.push_back(PlannedNewRecord(0,DeterministicRecordId(12003)));
+    CHECK(SameLayoutWinVectors(
+        CommitAppReconcile(existingRecords,{live},staleNew,{},now),existingRecords));
+
+    ReconcilePlan staleMissing=ValidCommitPlan(
+        "chrome",now,ReconcileFreshness::CachedStale);
+    staleMissing.missingSavedIndices.push_back(0);
+    CHECK(SameLayoutWinVectors(
+        CommitAppReconcile(existingRecords,{},staleMissing,{},now),existingRecords));
+}
+
+static void test_commit_reconcile_rejects_planning_clock_mismatch(){
+    const UnixSeconds now=2000002300;
+    LayoutWin saved=ReconcileTestRecord(
+        DeterministicRecordId(10007),"chrome","Saved","same.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-10);
+    LayoutWin live=MatchRecord("chrome","Live","same.example",1,{{"same.example",1}});
+    live.deskIndex=saved.deskIndex;
+    live.desktop=saved.desktop;
+    ReconcilePlan plan=ValidCommitPlan("chrome",now-1);
+    plan.matches.push_back(Candidate(0,0,1.0));
+
+    CHECK(SameLayoutWinVectors(
+        CommitAppReconcile({saved},{live},plan,{},now),{saved}));
+}
+
+static void test_reconcile_rejects_nonpositive_planning_clocks(){
+    LayoutWin live=MatchRecord("chrome","Live","same.example",1,{{"same.example",1}});
+    live.deskIndex=0;
+    live.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    const UnixSeconds invalidTimes[]={0,-1};
+
+    for(UnixSeconds invalidNow : invalidTimes){
+        ResetCountingRecordIdGenerator();
+        ReconcilePlan planned=PlanAppReconcile(
+            {},{live},"chrome",invalidNow,{},ReconcileFreshness::Fresh,
+            CountingRecordIdGenerator);
+        CHECK(planned.app=="chrome" && planned.nowUtc==invalidNow &&
+            planned.freshness==ReconcileFreshness::Fresh);
+        CHECK(planned.deferred);
+        CHECK(planned.matches.empty());
+        CHECK(planned.restores.empty());
+        CHECK(planned.newRecords.empty());
+        CHECK(planned.missingSavedIndices.empty());
+        CHECK(CountingRecordIdGeneratorCalls()==0);
+
+        LayoutWin saved=ReconcileTestRecord(
+            DeterministicRecordId(10008),"chrome","Saved","same.example",0,
+            live.desktop,2000002300);
+        ReconcilePlan manual=ValidCommitPlan("chrome",invalidNow);
+        manual.matches.push_back(Candidate(0,0,1.0));
+        CHECK(SameLayoutWinVectors(
+            CommitAppReconcile({saved},{live},manual,{},invalidNow),{saved}));
+        ResetCountingRecordIdGenerator();
+    }
+}
+
+static void test_reconcile_rejects_invalid_freshness_before_planning(){
+    const UnixSeconds now=2000002350;
+    LayoutWin saved=ReconcileTestRecord(
+        DeterministicRecordId(10009),"chrome","Saved","same.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-10);
+    LayoutWin live=MatchRecord("chrome","Saved","same.example",1,{{"same.example",1}});
+    live.deskIndex=1;
+    live.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+    const ReconcileFreshness invalid=static_cast<ReconcileFreshness>(99);
+
+    ResetCountingRecordIdGenerator();
+    ReconcilePlan plan=PlanAppReconcile(
+        {saved},{live},"chrome",now,{},invalid,CountingRecordIdGenerator);
+
+    CHECK(plan.app=="chrome" && plan.nowUtc==now && plan.freshness==invalid);
+    CHECK(plan.deferred);
+    CHECK(plan.matches.empty());
+    CHECK(plan.restores.empty());
+    CHECK(plan.newRecords.empty());
+    CHECK(plan.missingSavedIndices.empty());
+    CHECK(CountingRecordIdGeneratorCalls()==0);
+    ResetCountingRecordIdGenerator();
+}
+
+static void test_commit_reconcile_rejects_projected_output_overflow(){
+    const UnixSeconds now=2000002400;
+    LayoutWin base=ReconcileTestRecord(
+        DeterministicRecordId(13000),"chrome","Existing","existing.example",0,
+        G(L"{231A0000-0000-0000-0000-000000000001}"),now-10);
+    std::vector<LayoutWin> existing;
+    existing.reserve(MAX_LAYOUT_RECORDS);
+    for(size_t i=0;i<MAX_LAYOUT_RECORDS;++i){
+        LayoutWin record=base;
+        record.recordId=DeterministicRecordId(13000+i);
+        existing.push_back(record);
+    }
+    LayoutWin live=MatchRecord("firefox","New","new.example",1,{{"new.example",1}});
+    live.deskIndex=1;
+    live.desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+    ReconcilePlan plan=ValidCommitPlan("firefox",now);
+    plan.newRecords.push_back(
+        PlannedNewRecord(0,DeterministicRecordId(13000+MAX_LAYOUT_RECORDS)));
+
+    CHECK(SameLayoutWinVectors(
+        CommitAppReconcile(existing,{live},plan,{},now),existing));
+}
 
 static void test_layout_legacy_migration_rejects_generated_id_collision_transactionally(){
     std::string data = "# VDE snapshot v3\n"
@@ -6581,6 +7575,36 @@ int main(){
     test_retention_mark_seen_clears_missing_and_updates_last_seen();
     test_retention_mark_missing_uses_last_seen_and_is_idempotent();
     test_retention_prune_preserves_order_duplicates_and_input();
+    test_reconcile_restores_saved_a_and_creates_new_b();
+    test_expired_reappearance_is_new_not_restored();
+    test_cached_stale_edge_preserves_match_and_defers_unmatched();
+    test_failed_chrome_restore_retains_saved_destination_and_marks_seen();
+    test_empty_chrome_reconcile_marks_only_chrome_missing();
+    test_reserved_chrome_record_cannot_be_stolen_by_duplicate();
+    test_same_desktop_match_learns_live_index_without_restore();
+    test_late_window_after_first_wave_restores_before_save();
+    test_edge_retention_is_independent_while_firefox_stays_open();
+    test_firefox_sibling_reappears_while_first_window_stays_open();
+    test_reconcile_plan_and_commit_preserve_input_vectors();
+    test_reconcile_empty_generator_defers_transactionally();
+    test_reconcile_invalid_generators_defer_transactionally();
+    test_reconcile_generator_collision_with_any_existing_record_defers();
+    test_reconcile_duplicate_generated_ids_defer_transactionally();
+    test_reconcile_unique_generated_id_commits_strict_v4();
+    test_reconcile_null_generator_defers_transactionally();
+    test_reconcile_match_preflight_too_complex_defers_cleanly();
+    test_reconcile_window_caps_defer_before_generation();
+    test_reconcile_unsupported_app_defers_without_generation();
+    test_commit_reconcile_rejects_out_of_range_mixed_plan_atomically();
+    test_commit_reconcile_rejects_malformed_restore_sets_atomically();
+    test_commit_reconcile_rejects_duplicate_match_ownership();
+    test_commit_reconcile_rejects_app_mismatches();
+    test_commit_reconcile_rejects_invalid_new_record_requests();
+    test_commit_reconcile_rejects_cached_stale_actions();
+    test_commit_reconcile_rejects_planning_clock_mismatch();
+    test_reconcile_rejects_nonpositive_planning_clocks();
+    test_reconcile_rejects_invalid_freshness_before_planning();
+    test_commit_reconcile_rejects_projected_output_overflow();
     test_layout_score_formula_and_fallback();
     test_layout_score_browser_symmetry_and_cross_app_rejection();
     test_layout_score_identical_two_domain_is_exact();
