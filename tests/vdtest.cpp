@@ -1710,6 +1710,23 @@ static void test_reconcile_projects_mark_missing_expiration_before_capacity(){
     ResetCountingRecordIdGenerator();
 }
 
+static void test_projected_retained_count_rejects_mismatched_flags(){
+    const UnixSeconds now=2100000100;
+    LayoutWin record=OldStyleRecord();
+    record.lastSeenUtc=now-1;
+    const std::vector<LayoutWin> existing={record};
+
+    size_t retained=17;
+    CHECK(!ProjectedRetainedExistingCount(
+        existing,std::vector<bool>(),now,retained));
+    CHECK(retained==17);
+
+    retained=23;
+    CHECK(!ProjectedRetainedExistingCount(
+        existing,std::vector<bool>({false,true}),now,retained));
+    CHECK(retained==23);
+}
+
 static void test_reconcile_duplicate_injected_match_ownership_defers_cleanly(){
     const UnixSeconds now=2000001690;
     LayoutWin savedA=ReconcileTestRecord(
@@ -8013,6 +8030,7 @@ int main(){
     test_reconcile_reserved_id_cap_is_fail_closed_at_boundary();
     test_reconcile_guaranteed_capacity_defers_before_matcher();
     test_reconcile_projects_mark_missing_expiration_before_capacity();
+    test_projected_retained_count_rejects_mismatched_flags();
     test_reconcile_duplicate_injected_match_ownership_defers_cleanly();
     test_reconcile_rejects_all_malformed_injected_matches();
     test_reconcile_unsupported_app_defers_without_generation();

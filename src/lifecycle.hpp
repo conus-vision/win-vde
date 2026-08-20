@@ -53,10 +53,12 @@ inline bool IsExpiredAfterProjectedMarkMissing(
         nowUtc-missingSinceUtc>=WINDOW_RETENTION_SECONDS;
 }
 
-inline size_t ProjectedRetainedExistingCount(
+inline bool ProjectedRetainedExistingCount(
         const std::vector<LayoutWin>& existing,
         const std::vector<bool>& markMissing,
-        UnixSeconds nowUtc){
+        UnixSeconds nowUtc,
+        size_t& retainedOut){
+    if(markMissing.size()!=existing.size()) return false;
     size_t retained=0;
     for(size_t i=0;i<existing.size();++i){
         const bool expired=markMissing[i]
@@ -64,7 +66,8 @@ inline size_t ProjectedRetainedExistingCount(
             : IsExpired(existing[i],nowUtc);
         if(!expired) ++retained;
     }
-    return retained;
+    retainedOut=retained;
+    return true;
 }
 
 inline ReconcilePlan PlanAppReconcile(
@@ -189,9 +192,10 @@ inline ReconcilePlan PlanAppReconcile(
             projectedMissing[i]=true;
             missingSavedIndices.push_back(i);
         }
-        const size_t projectedRetained=ProjectedRetainedExistingCount(
-            existing,projectedMissing,nowUtc);
-        if(projectedRetained>MAX_LAYOUT_RECORDS ||
+        size_t projectedRetained=0;
+        if(!ProjectedRetainedExistingCount(
+                existing,projectedMissing,nowUtc,projectedRetained) ||
+                projectedRetained>MAX_LAYOUT_RECORDS ||
                 newRecordCount>MAX_LAYOUT_RECORDS-projectedRetained)
             return deferredPlan();
         plan.missingSavedIndices.swap(missingSavedIndices);
@@ -306,9 +310,10 @@ inline std::vector<LayoutWin> CommitAppReconcile(
         }
     }
 
-    const size_t projectedRetained=ProjectedRetainedExistingCount(
-        existing,projectedMissing,nowUtc);
-    if(projectedRetained>MAX_LAYOUT_RECORDS ||
+    size_t projectedRetained=0;
+    if(!ProjectedRetainedExistingCount(
+            existing,projectedMissing,nowUtc,projectedRetained) ||
+            projectedRetained>MAX_LAYOUT_RECORDS ||
             plan.newRecords.size()>MAX_LAYOUT_RECORDS-projectedRetained)
         return existing;
 
