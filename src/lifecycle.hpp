@@ -4,8 +4,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -35,6 +37,15 @@ inline bool operator==(const RestoreBudgetKey& a, const RestoreBudgetKey& b){
            a.fullRuntimeIdentity == b.fullRuntimeIdentity &&
            a.destinationGuid == b.destinationGuid;
 }
+
+// Explicit per-instance seam for deterministic allocation-fault tests.
+struct RestoreBudgetOps {
+    std::function<RestoreBudgetKey(const RestoreBudgetKey&)> copyKey;
+
+    RestoreBudgetOps(){
+        copyKey=[](const RestoreBudgetKey& key)->RestoreBudgetKey{ return key; };
+    }
+};
 
 struct LcState {
     bool initialized = false;
@@ -88,8 +99,19 @@ inline LcDecision LcMissingDecision(LcState& state){
         : LcDecision{LcAction::MarkMissingFromLastSeen, generation};
 }
 
-inline uint64_t LcSaturatingAdd(uint64_t value, uint64_t increment){
-    return value > UINT64_MAX - increment ? UINT64_MAX : value + increment;
+inline void LcRebaseClockIfRolledBack(LcState& state, uint64_t nowMs){
+    if(nowMs >= state.lastObservedMs) return;
+    if(state.restorePending) state.appearanceSinceMs = nowMs;
+    if(state.retryNotBeforeMs != 0){
+        if(nowMs > UINT64_MAX - LC_DEFERRED_BACKOFF_MS){
+            state.restorePending = false;
+            state.stableSnapshots = 0;
+            state.deferredUntilInputChanges = true;
+            state.retryNotBeforeMs = 0;
+        } else {
+            state.retryNotBeforeMs = nowMs + LC_DEFERRED_BACKOFF_MS;
+        }
+    }
 }
 
 inline bool LcElapsedAtLeast(uint64_t nowMs, uint64_t sinceMs, uint64_t delayMs){
@@ -131,11 +153,7 @@ inline LcDecision LcObserve(LcState& state,
         return {};
     }
 
-    if(nowMs < state.lastObservedMs){
-        if(state.restorePending) state.appearanceSinceMs = nowMs;
-        if(state.retryNotBeforeMs != 0)
-            state.retryNotBeforeMs = LcSaturatingAdd(nowMs, LC_DEFERRED_BACKOFF_MS);
-    }
+    LcRebaseClockIfRolledBack(state, nowMs);
     const bool wasPresent = state.present;
     const bool windowChanged = state.windowSetSignature != windowSetSignature;
     const bool sessionChanged =
@@ -240,10 +258,16 @@ inline void LcRestoreCompleted(LcState& state,
             state.deferredUntilInputChanges = true;
             state.retryNotBeforeMs = 0;
         } else if(state.present){
-            state.deferredUntilInputChanges = false;
-            state.retryNotBeforeMs =
-                LcSaturatingAdd(nowMs, LC_DEFERRED_BACKOFF_MS);
-            LcArmPending(state, nowMs, 0);
+            if(nowMs > UINT64_MAX - LC_DEFERRED_BACKOFF_MS){
+                state.restorePending = false;
+                state.stableSnapshots = 0;
+                state.deferredUntilInputChanges = true;
+                state.retryNotBeforeMs = 0;
+            } else {
+                state.deferredUntilInputChanges = false;
+                state.retryNotBeforeMs = nowMs + LC_DEFERRED_BACKOFF_MS;
+                LcArmPending(state, nowMs, 0);
+            }
         }
         return;
     }
@@ -266,12 +290,15 @@ inline void LcExplicitSaveCompleted(LcState& state,
                                     uint64_t nowMs){
     if(!state.saveInFlight || generation == 0 ||
        generation != state.saveGeneration) return;
+    const uint64_t completedLayoutSignature = state.saveRequestedLayoutSignature;
     state.saveInFlight = false;
     state.saveGeneration = 0;
     state.saveRequestedLayoutSignature = 0;
-    state.completedLayoutSignature = layoutSignature;
+    state.completedLayoutSignature = completedLayoutSignature;
     LcResetDeferred(state);
+    LcRebaseClockIfRolledBack(state, nowMs);
     state.lastObservedMs = nowMs;
+    (void)layoutSignature;
     (void)sessionStampSignature;
 }
 
@@ -279,8 +306,13 @@ class RestoreBudgets {
     struct Entry {
         RestoreBudgetKey key;
     };
+    static_assert(std::is_nothrow_move_constructible<Entry>::value,
+                  "Restore budget commits require no-throw entry moves");
+    static_assert(std::is_nothrow_move_assignable<Entry>::value,
+                  "Restore budget eviction requires no-throw entry moves");
     static const std::size_t kMaximumEntries = 256;
     mutable std::vector<Entry> entries_;
+    RestoreBudgetOps ops_;
 
     bool touchIfPresent(const RestoreBudgetKey& key) const {
         for(auto it = entries_.begin(); it != entries_.end(); ++it){
@@ -295,14 +327,18 @@ class RestoreBudgets {
     }
 
 public:
+    RestoreBudgets() = default;
+    explicit RestoreBudgets(RestoreBudgetOps ops) : ops_(std::move(ops)) {}
+
     bool mayAttempt(const RestoreBudgetKey& key) const {
         return !touchIfPresent(key);
     }
 
     void markExhausted(const RestoreBudgetKey& key){
         if(touchIfPresent(key)) return;
-        if(entries_.size() == kMaximumEntries) entries_.erase(entries_.begin());
-        entries_.push_back({key});
+        Entry pending{ops_.copyKey(key)};
+        entries_.push_back(std::move(pending));
+        if(entries_.size() > kMaximumEntries) entries_.erase(entries_.begin());
     }
 
     void clearExact(const RestoreBudgetKey& key){

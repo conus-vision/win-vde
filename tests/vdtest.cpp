@@ -1339,6 +1339,46 @@ static void test_lc_deferred_backoff_rebases_after_clock_rollback(){
     CHECK(LcObserve(s,true,1,10,100,20,35000).action==LcAction::BeginRestore);
 }
 
+static void test_lc_deferred_backoff_distinguishes_exact_max_from_overflow(){
+    const uint64_t exactStart=UINT64_MAX-30000;
+    LcState exact;
+    LcDecision exactWave=lc_begin_initial(exact,1,10,100,20,0);
+    LcRestoreCompleted(exact,exactWave.generation,LcRestoreOutcome::Deferred,
+                       100,20,exactStart);
+    CHECK(exact.retryNotBeforeMs==UINT64_MAX &&
+          !exact.deferredUntilInputChanges);
+    CHECK(LcObserve(exact,true,1,10,100,20,UINT64_MAX-1).action==LcAction::None);
+    CHECK(LcObserve(exact,true,1,10,100,20,UINT64_MAX).action==LcAction::BeginRestore);
+
+    const uint64_t overflowStart=exactStart+1;
+    LcState overflow;
+    LcDecision overflowWave=lc_begin_initial(overflow,1,10,100,20,0);
+    LcRestoreCompleted(overflow,overflowWave.generation,LcRestoreOutcome::Deferred,
+                       100,20,overflowStart);
+    CHECK(LcObserve(overflow,true,1,10,100,20,UINT64_MAX).action==LcAction::None);
+
+    LcState released;
+    LcDecision releasedWave=lc_begin_initial(released,1,10,100,20,0);
+    LcRestoreCompleted(released,releasedWave.generation,LcRestoreOutcome::Deferred,
+                       100,20,overflowStart);
+    CHECK(LcObserve(released,true,2,11,100,20,UINT64_MAX).action==LcAction::None);
+    CHECK(LcObserve(released,true,2,11,100,20,UINT64_MAX).action==LcAction::BeginRestore);
+}
+
+static void test_lc_deferred_rollback_to_unrepresentable_deadline_fails_closed(){
+    const uint64_t exactStart=UINT64_MAX-30000;
+    const uint64_t rolledBackOrigin=exactStart+1;
+    LcState s;
+    LcDecision wave=lc_begin_initial(s,1,10,100,20,0);
+    LcRestoreCompleted(s,wave.generation,LcRestoreOutcome::Deferred,
+                       100,20,exactStart);
+    CHECK(LcObserve(s,true,1,10,100,20,UINT64_MAX-1).action==LcAction::None);
+    CHECK(LcObserve(s,true,1,10,100,20,rolledBackOrigin).action==LcAction::None);
+    CHECK(LcObserve(s,true,1,10,100,20,UINT64_MAX).action==LcAction::None);
+    CHECK(LcObserve(s,true,2,11,100,20,UINT64_MAX).action==LcAction::None);
+    CHECK(LcObserve(s,true,2,11,100,20,UINT64_MAX).action==LcAction::BeginRestore);
+}
+
 static void test_lc_deferred_ignores_alternating_completion_session_payload(){
     LcState s;
     LcDecision wave=lc_begin_initial(s,1,10,100,20,0);
@@ -1426,6 +1466,34 @@ static void test_lc_explicit_save_completion_is_generation_safe(){
     CHECK(!s.saveInFlight && s.completedLayoutSignature==102);
 }
 
+static void test_lc_explicit_save_completion_commits_captured_layout_only(){
+    LcState s;
+    LcDecision restore=lc_begin_initial(s,1,10,100,20,0);
+    LcRestoreCompleted(s,restore.generation,LcRestoreOutcome::Success,100,20,2);
+    LcDecision save101=LcObserve(s,true,1,10,101,20,3);
+    CHECK(save101.action==LcAction::SaveLayout &&
+          s.saveRequestedLayoutSignature==101);
+    CHECK(LcObserve(s,true,1,10,102,20,4).action==LcAction::None);
+    LcExplicitSaveCompleted(s,save101.generation,102,20,5);
+    LcDecision save102=LcObserve(s,true,1,10,102,20,6);
+    CHECK(save102.action==LcAction::SaveLayout &&
+          save102.generation!=save101.generation);
+}
+
+static void test_lc_explicit_save_completion_rebases_pending_wave_on_rollback(){
+    LcState s;
+    LcDecision restore=lc_begin_initial(s,1,10,100,20,0);
+    LcRestoreCompleted(s,restore.generation,LcRestoreOutcome::Success,100,20,2);
+    LcDecision save=LcObserve(s,true,1,10,101,20,1000);
+    CHECK(save.action==LcAction::SaveLayout);
+    CHECK(LcObserve(s,true,2,20,101,21,100000).action==LcAction::None);
+    CHECK(s.saveInFlight && s.restorePending);
+    LcExplicitSaveCompleted(s,save.generation,101,21,0);
+    CHECK(LcObserve(s,true,2,21,101,21,19999).action==LcAction::None);
+    LcDecision timeout=LcObserve(s,true,2,22,101,21,20000);
+    CHECK(timeout.action==LcAction::BeginRestore && timeout.generation!=0);
+}
+
 static void test_restore_budgets_isolate_siblings_runtime_and_destination(){
     RestoreBudgets budgets;
     const RestoreBudgetKey failedA{"record-a","runtime-a","desktop-a"};
@@ -1486,6 +1554,47 @@ static void test_restore_budgets_cap_uses_deterministic_touch_lru(){
     CHECK(budgets.mayAttempt(numbered_budget_key(1)));  // least-recent untouched evicted
     CHECK(!budgets.mayAttempt(numbered_budget_key(2)));
     CHECK(!budgets.mayAttempt(numbered_budget_key(256)));
+}
+
+static void test_restore_budgets_new_key_copy_failure_is_transactional(){
+    for(int fault=0;fault<2;++fault){
+        bool inject=true;
+        const RestoreBudgetKey rejected=numbered_budget_key(256);
+        RestoreBudgetOps ops;
+        ops.copyKey=[&](const RestoreBudgetKey& key)->RestoreBudgetKey{
+            if(inject && key==rejected){
+                if(fault==0) throw std::bad_alloc();
+                throw std::length_error("injected restore-budget copy fault");
+            }
+            return key;
+        };
+        RestoreBudgets budgets(ops);
+        for(int i=0;i<256;++i) budgets.markExhausted(numbered_budget_key(i));
+        CHECK(!budgets.mayAttempt(numbered_budget_key(0))); // LRU is now key 1
+
+        bool caught=false;
+        try {
+            budgets.markExhausted(rejected);
+        } catch(const std::bad_alloc&) {
+            caught=fault==0;
+        } catch(const std::length_error&) {
+            caught=fault==1;
+        } catch(...) {
+            caught=false;
+        }
+        CHECK(caught && budgets.size()==256);
+        CHECK(!budgets.mayAttempt(numbered_budget_key(1))); // old key survived
+        CHECK(budgets.mayAttempt(rejected));                // new key was not committed
+
+        inject=false;
+        budgets.markExhausted(numbered_budget_key(257));
+        CHECK(budgets.size()==256);
+        CHECK(budgets.mayAttempt(numbered_budget_key(2)));  // order survived; key 1 was touched
+        CHECK(!budgets.mayAttempt(numbered_budget_key(3)));
+        CHECK(!budgets.mayAttempt(numbered_budget_key(0)));
+        CHECK(!budgets.mayAttempt(numbered_budget_key(1)));
+        CHECK(!budgets.mayAttempt(numbered_budget_key(257)));
+    }
 }
 
 // --- minimal SNSS encoder mirroring the REAL format ---
@@ -6529,13 +6638,18 @@ int main(){
     test_lc_deferred_key_change_during_backoff_restarts_settle_now();
     test_lc_inflight_a_to_b_to_a_history_rearms_deferred_wave();
     test_lc_deferred_backoff_rebases_after_clock_rollback();
+    test_lc_deferred_backoff_distinguishes_exact_max_from_overflow();
+    test_lc_deferred_rollback_to_unrepresentable_deadline_fails_closed();
     test_lc_deferred_ignores_alternating_completion_session_payload();
     test_lc_all_completion_outcomes_honor_one_queued_rearm();
     test_lc_exhausted_records_actual_layout_without_save_loop();
     test_lc_explicit_save_completion_is_generation_safe();
+    test_lc_explicit_save_completion_commits_captured_layout_only();
+    test_lc_explicit_save_completion_rebases_pending_wave_on_rollback();
     test_restore_budgets_isolate_siblings_runtime_and_destination();
     test_restore_budgets_prune_only_dead_runtime_identities();
     test_restore_budgets_cap_uses_deterministic_touch_lru();
+    test_restore_budgets_new_key_copy_failure_is_transactional();
     test_bounded_read_exact_limit_and_preallocation_rejection();
     test_session_bounded_reader_binds_bytes_to_exact_aba_handle();
     test_session_bounded_reader_rejects_handle_changes_and_close_failure();
