@@ -1583,13 +1583,29 @@ static void test_session_cache_shares_payload_and_rejects_oversize(){
     CHECK(cache.RetainedBytes()<=bytes);
 }
 
+static SessionFileReadResult successfulSessionRead(const std::string& bytes,
+                                                    const SessionStamp& stamp){
+    SessionFileReadResult result;
+    result.status=FileReadStatus::Ok;
+    result.bytes=bytes;
+    result.readStamp=stamp;
+    result.readStampKnown=true;
+    return result;
+}
+
+static SessionFileReadResult successfulSessionRead(const std::string& bytes,
+        unsigned long long size,unsigned long long mtime){
+    SessionStamp stamp; stamp.size=size; stamp.mtime=mtime;
+    return successfulSessionRead(bytes,stamp);
+}
+
 static void test_session_worker_valid_empty_is_fresh_and_cache_hit_is_shared(){
     SessionResultSink sink;
     std::atomic<int> reads(0),parses(0),stamps(0);
     SessionWorkerOps ops;
     ops.resolvePath=[](const AppProfile&){ return std::wstring(L"session-file"); };
     ops.getStamp=[&](const std::wstring&,SessionStamp& stamp){ ++stamps; stamp.size=5; stamp.mtime=9; return true; };
-    ops.readFile=[&](const std::wstring&){ ++reads; FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="valid"; return r; };
+    ops.readFile=[&](const std::wstring&){ ++reads; return successfulSessionRead("valid",5,9); };
     ops.parse=[&](const AppProfile&,const std::string& bytes,std::vector<WinFp>& output){ ++parses; output.clear(); return bytes=="valid"; };
     ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
     SessionWorker worker((HWND)1,ops,16,1024*1024);
@@ -1621,7 +1637,7 @@ static void test_session_worker_malformed_cold_is_unavailable(){
     SessionWorkerOps ops;
     ops.resolvePath=[](const AppProfile&){ return std::wstring(L"cold"); };
     ops.getStamp=[](const std::wstring&,SessionStamp& stamp){ stamp.size=11; stamp.mtime=1; return true; };
-    ops.readFile=[](const std::wstring&){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="malformed"; return r; };
+    ops.readFile=[](const std::wstring&){ return successfulSessionRead("malformed",11,1); };
     ops.parse=[&](const AppProfile&,const std::string&,std::vector<WinFp>& output){ ++parses; output.push_back(WinFp{}); return false; };
     ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
     SessionWorker worker((HWND)1,ops);
@@ -1644,7 +1660,7 @@ static void test_session_worker_non_ok_reads_never_parse_and_publish_current_sta
     SessionWorkerOps ops;
     ops.resolvePath=[](const AppProfile&){ return std::wstring(L"read-gated"); };
     ops.getStamp=[](const std::wstring&,SessionStamp& stamp){ stamp.size=23; stamp.mtime=45; return true; };
-    ops.readFile=[&](const std::wstring&){ FileReadResult result; result.status=statuses[reads++]; return result; };
+    ops.readFile=[&](const std::wstring&){ SessionFileReadResult result; result.status=statuses[reads++]; return result; };
     ops.parse=[&](const AppProfile&,const std::string&,std::vector<WinFp>&){ ++parses; return true; };
     ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
     SessionWorker worker((HWND)1,ops);
@@ -1668,7 +1684,7 @@ static void test_session_worker_disappeared_source_is_not_reported_as_current(){
     SessionWorkerOps ops;
     ops.resolvePath=[&](const AppProfile&){ return ++resolves==1?std::wstring(L"gone"):std::wstring(); };
     ops.getStamp=[&](const std::wstring& path,SessionStamp& stamp){ ++stampCalls; stamp.size=4; stamp.mtime=5; return path==L"gone"; };
-    ops.readFile=[](const std::wstring&){ FileReadResult result; result.status=FileReadStatus::Missing; return result; };
+    ops.readFile=[](const std::wstring&){ SessionFileReadResult result; result.status=FileReadStatus::Missing; return result; };
     ops.parse=[](const AppProfile&,const std::string&,std::vector<WinFp>&){ return true; };
     ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
     SessionWorker worker((HWND)1,ops);
@@ -1688,7 +1704,7 @@ static void test_session_worker_stamp_change_uses_exact_path_cached_stale(){
     SessionWorkerOps ops;
     ops.resolvePath=[](const AppProfile&){ return std::wstring(L"same-path"); };
     ops.getStamp=[&](const std::wstring&,SessionStamp& stamp){ stamp.size=9; stamp.mtime=mtime.load(); return true; };
-    ops.readFile=[](const std::wstring&){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="bytes"; return r; };
+    ops.readFile=[&](const std::wstring&){ return successfulSessionRead("bytes",9,mtime.load()); };
     ops.parse=[&](const AppProfile&,const std::string&,std::vector<WinFp>& output){
         output.clear(); WinFp window; window.activeTitle="cached"; output.push_back(window); return parseOk.load();
     };
@@ -1719,7 +1735,7 @@ static void test_session_worker_rotation_during_parse_is_never_fresh(){
     SessionWorkerOps ops;
     ops.resolvePath=[&](const AppProfile&){ return ++resolves==1?std::wstring(L"Session_old"):std::wstring(L"Session_new"); };
     ops.getStamp=[](const std::wstring& path,SessionStamp& stamp){ stamp.size=100; stamp.mtime=path==L"Session_old"?1:2; return true; };
-    ops.readFile=[](const std::wstring&){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="old"; return r; };
+    ops.readFile=[](const std::wstring&){ return successfulSessionRead("old",100,1); };
     ops.parse=[](const AppProfile&,const std::string&,std::vector<WinFp>& output){ output.clear(); output.push_back(WinFp{}); return true; };
     ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
     SessionWorker worker((HWND)1,ops);
@@ -1748,8 +1764,11 @@ static void test_session_worker_equal_metadata_replacement_never_publishes_old_b
         return true;
     };
     ops.readFile=[&](const std::wstring&){
-        ++reads; FileReadResult result; result.status=FileReadStatus::Ok;
-        result.bytes=std::string(4,(char)('A'+(int)objectId.load()-1)); return result;
+        ++reads;
+        unsigned long long identity=objectId.load();
+        SessionStamp stamp; stamp.size=4; stamp.mtime=100; stamp.changeTime=1000+identity;
+        stamp.volumeSerial=7; stamp.fileIdLow=identity; stamp.fileIdHigh=9;
+        return successfulSessionRead(std::string(4,(char)('A'+(int)identity-1)),stamp);
     };
     ops.parse=[&](const AppProfile&,const std::string& bytes,std::vector<WinFp>& output){
         ++parses; output.clear(); WinFp window; window.activeTitle=bytes; output.push_back(std::move(window));
@@ -1786,6 +1805,60 @@ static void test_session_worker_equal_metadata_replacement_never_publishes_old_b
     worker.Stop();
 }
 
+static SessionStamp syntheticSessionStamp(unsigned long long revision){
+    SessionStamp stamp;
+    stamp.size=1; stamp.mtime=100+revision; stamp.changeTime=200+revision;
+    stamp.volumeSerial=300; stamp.fileIdLow=400+revision; stamp.fileIdHigh=500;
+    return stamp;
+}
+
+static void test_session_worker_rejects_aba_bytes_without_matching_handle_stamp(){
+    SessionStamp endpoint=syntheticSessionStamp(1);
+    SessionStamp bytesStamp=endpoint;
+    std::string bytes="A";
+    std::atomic<int> parses(0);
+    SessionResultSink sink;
+    SessionWorkerOps ops;
+    ops.resolvePath=[](const AppProfile&){ return std::wstring(L"aba-path"); };
+    ops.getStamp=[&](const std::wstring&,SessionStamp& stamp){ stamp=endpoint; return true; };
+    ops.readFile=[&](const std::wstring&){ return successfulSessionRead(bytes,bytesStamp); };
+    ops.parse=[&](const AppProfile&,const std::string& input,std::vector<WinFp>& output){
+        ++parses;
+        output.clear(); WinFp window; window.activeTitle=input; output.push_back(window); return true;
+    };
+    ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
+
+    SessionWorker cachedWorker((HWND)1,ops);
+    SessionRequest request; request.app="firefox"; request.profile=sessionTestProfile("firefox");
+    request.requestId=203; CHECK(cachedWorker.Request(request));
+    std::unique_ptr<SessionResult> seeded=sink.waitFor(203);
+    CHECK(seeded && seeded->status==SessionDataStatus::Fresh && seeded->windows &&
+          seeded->windows->at(0).activeTitle=="A" && seeded->dataStamp==endpoint);
+    const std::vector<WinFp>* cachedIdentity=seeded?seeded->windows.get():nullptr;
+
+    SessionStamp cachedStamp=endpoint;
+    endpoint=syntheticSessionStamp(2);       // A is current at both endpoint observations.
+    bytesStamp=syntheticSessionStamp(9);     // The exact read handle belonged to B.
+    bytes="B";
+    request.requestId=204; CHECK(cachedWorker.Request(request));
+    std::unique_ptr<SessionResult> stale=sink.waitFor(204);
+    CHECK(stale && stale->status==SessionDataStatus::CachedStale &&
+          stale->windows.get()==cachedIdentity && stale->windows->at(0).activeTitle=="A");
+    CHECK(stale && stale->sourceStampKnown && stale->sourceStamp==endpoint &&
+          stale->dataStamp==cachedStamp);
+    CHECK(cachedWorker.Stop());
+
+    SessionResultSink coldSink;
+    ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return coldSink.post(hwnd,message,wp,lp); };
+    SessionWorker coldWorker((HWND)1,ops);
+    request.requestId=205; CHECK(coldWorker.Request(request));
+    std::unique_ptr<SessionResult> cold=coldSink.waitFor(205);
+    CHECK(cold && cold->status==SessionDataStatus::Unavailable && !cold->windows &&
+          cold->sourceStampKnown && cold->sourceStamp==endpoint && cold->dataGeneration==0);
+    CHECK(parses.load()==1);
+    CHECK(coldWorker.Stop());
+}
+
 static void test_session_worker_rotation_uses_only_exact_attempted_path_cache(){
     SessionResultSink sink;
     std::atomic<int> resolves(0);
@@ -1793,7 +1866,7 @@ static void test_session_worker_rotation_uses_only_exact_attempted_path_cache(){
     SessionWorkerOps ops;
     ops.resolvePath=[&](const AppProfile&){ int call=++resolves; return call<=3?std::wstring(L"Session_old"):std::wstring(L"Session_new"); };
     ops.getStamp=[&](const std::wstring& path,SessionStamp& stamp){ stamp.size=50; stamp.mtime=path==L"Session_old"?oldMtime.load():3; return true; };
-    ops.readFile=[](const std::wstring&){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="bytes"; return r; };
+    ops.readFile=[&](const std::wstring&){ return successfulSessionRead("bytes",50,oldMtime.load()); };
     ops.parse=[](const AppProfile&,const std::string&,std::vector<WinFp>& output){ output.clear(); WinFp fp; fp.activeTitle="old-cache"; output.push_back(fp); return true; };
     ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
     SessionWorker worker((HWND)1,ops);
@@ -1838,7 +1911,7 @@ static SessionWorkerOps coalescingWorkerOps(SessionResultSink& sink,BlockingSess
     SessionWorkerOps ops;
     ops.resolvePath=[](const AppProfile& profile){ return U82W(profile.id)+L"-session"; };
     ops.getStamp=[](const std::wstring& path,SessionStamp& stamp){ stamp.size=path.size(); stamp.mtime=1; return true; };
-    ops.readFile=[](const std::wstring&){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="valid"; return r; };
+    ops.readFile=[](const std::wstring& path){ return successfulSessionRead("valid",path.size(),1); };
     ops.parse=[&](const AppProfile& profile,const std::string& bytes,std::vector<WinFp>& output){ return blocker.parse(profile,bytes,output); };
     ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
     return ops;
@@ -1915,7 +1988,7 @@ static void test_session_worker_cross_app_manual_preempts_pending_metadata(){
     SessionWorkerOps ops;
     ops.resolvePath=[](const AppProfile& profile){ return U82W(profile.id)+L"-priority"; };
     ops.getStamp=[](const std::wstring&,SessionStamp& stamp){ stamp.size=1; stamp.mtime=1; return true; };
-    ops.readFile=[](const std::wstring&){ FileReadResult result; result.status=FileReadStatus::Ok; result.bytes="ok"; return result; };
+    ops.readFile=[](const std::wstring&){ return successfulSessionRead("ok",1,1); };
     ops.parse=[&](const AppProfile& profile,const std::string&,std::vector<WinFp>& output){ return parser.parse(profile,output); };
     ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
     SessionWorker worker((HWND)1,ops);
@@ -2151,7 +2224,7 @@ static void test_session_data_generation_is_per_app_and_hash_breaks_stamp_ties()
     SessionWorkerOps ops;
     ops.resolvePath=[](const AppProfile& profile){ return U82W(profile.id)+L"-path"; };
     ops.getStamp=[](const std::wstring&,SessionStamp& stamp){ stamp.size=7; stamp.mtime=1; return true; };
-    ops.readFile=[](const std::wstring& path){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes=W2U8(path); return r; };
+    ops.readFile=[](const std::wstring& path){ return successfulSessionRead(W2U8(path),7,1); };
     ops.parse=[&](const AppProfile& profile,const std::string&,std::vector<WinFp>& output){
         output.clear(); WinFp fp;
         { std::lock_guard<std::mutex> lock(contentMutex); fp.activeTitle=profile.id=="firefox"?firefoxTitle:"C"; }
@@ -2198,7 +2271,10 @@ static void test_session_data_generation_is_monotonic_when_historical_cache_retu
     SessionWorkerOps ops;
     ops.resolvePath=[](const AppProfile&){ return std::wstring(L"generation-history"); };
     ops.getStamp=[&](const std::wstring&,SessionStamp& stamp){ stamp.size=1; stamp.mtime=mtime.load(); return true; };
-    ops.readFile=[&](const std::wstring&){ ++reads; FileReadResult result; result.status=FileReadStatus::Ok; result.bytes="S"+std::to_string(mtime.load()); return result; };
+    ops.readFile=[&](const std::wstring&){
+        ++reads; unsigned long long current=mtime.load();
+        return successfulSessionRead("S"+std::to_string(current),1,current);
+    };
     ops.parse=[&](const AppProfile&,const std::string& bytes,std::vector<WinFp>& output){
         ++parses; output.clear();
         if(!parseOk.load()) return false;
@@ -2309,7 +2385,7 @@ static void test_session_worker_oversized_payload_is_unavailable(){
     SessionWorkerOps ops;
     ops.resolvePath=[](const AppProfile&){ return std::wstring(L"large"); };
     ops.getStamp=[](const std::wstring&,SessionStamp& stamp){ stamp.size=5; stamp.mtime=1; return true; };
-    ops.readFile=[](const std::wstring&){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="valid"; return r; };
+    ops.readFile=[](const std::wstring&){ return successfulSessionRead("valid",5,1); };
     ops.parse=[](const AppProfile&,const std::string&,std::vector<WinFp>& output){ output.clear(); WinFp fp; fp.tabsBlob=std::string(4096,'x'); output.push_back(std::move(fp)); return true; };
     ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
     SessionWorker worker((HWND)1,ops,16,128);
@@ -2417,7 +2493,7 @@ static SessionWorkerOps reentrantStopWorkerOps(const std::shared_ptr<ReentrantSt
     SessionWorkerOps ops;
     ops.resolvePath=[](const AppProfile&){ return std::wstring(L"reentrant"); };
     ops.getStamp=[](const std::wstring&,SessionStamp& stamp){ stamp.size=1; stamp.mtime=1; return true; };
-    ops.readFile=[](const std::wstring&){ FileReadResult result; result.status=FileReadStatus::Ok; result.bytes="ok"; return result; };
+    ops.readFile=[](const std::wstring&){ return successfulSessionRead("ok",1,1); };
     ops.parse=[state,blockParser](const AppProfile& profile,const std::string& bytes,std::vector<WinFp>& output){
         if(blockParser) return state->parser->parse(profile,bytes,output);
         output.clear(); return true;
@@ -2550,7 +2626,7 @@ static SessionWorkerOps deterministicPostStopOps(
     SessionWorkerOps ops;
     ops.resolvePath=[](const AppProfile&){ return std::wstring(L"deterministic-stop"); };
     ops.getStamp=[](const std::wstring&,SessionStamp& stamp){ stamp.size=1; stamp.mtime=1; return true; };
-    ops.readFile=[](const std::wstring&){ FileReadResult result; result.status=FileReadStatus::Ok; result.bytes="ok"; return result; };
+    ops.readFile=[](const std::wstring&){ return successfulSessionRead("ok",1,1); };
     ops.parse=[state](const AppProfile& profile,const std::string& bytes,std::vector<WinFp>& output){
         return state->parser->parse(profile,bytes,output);
     };
@@ -2643,7 +2719,7 @@ static void test_worker_retained_budget_includes_posted_ui_ownership(){
     SessionWorkerOps ops;
     ops.resolvePath=[](const AppProfile&){ return std::wstring(L"owned"); };
     ops.getStamp=[](const std::wstring&,SessionStamp& stamp){ stamp.size=5; stamp.mtime=1; return true; };
-    ops.readFile=[](const std::wstring&){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="valid"; return r; };
+    ops.readFile=[](const std::wstring&){ return successfulSessionRead("valid",5,1); };
     ops.parse=[](const AppProfile&,const std::string&,std::vector<WinFp>& output){ output.clear(); output.push_back(WinFp{}); return true; };
     ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
     SessionWorker worker((HWND)1,ops);
@@ -2666,7 +2742,7 @@ static void test_failed_cache_replacement_preserves_exact_stale_payload(){
     SessionWorkerOps ops;
     ops.resolvePath=[](const AppProfile&){ return std::wstring(L"budgeted"); };
     ops.getStamp=[&](const std::wstring&,SessionStamp& stamp){ stamp.size=5; stamp.mtime=mtime.load(); return true; };
-    ops.readFile=[](const std::wstring&){ FileReadResult r; r.status=FileReadStatus::Ok; r.bytes="valid"; return r; };
+    ops.readFile=[&](const std::wstring&){ return successfulSessionRead("valid",5,mtime.load()); };
     ops.parse=[&](const AppProfile&,const std::string&,std::vector<WinFp>& output){ output.clear(); WinFp fp; fp.activeTitle=std::string(200,title.load()); output.push_back(std::move(fp)); return true; };
     ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
     SessionWorker worker((HWND)1,ops,16,onePayload);
@@ -2825,7 +2901,7 @@ static SessionWorkerOps exceptionWorkerOps(SessionResultSink& sink,
     SessionWorkerOps ops;
     ops.resolvePath=[](const AppProfile&){ return std::wstring(L"exception-path"); };
     ops.getStamp=[](const std::wstring&,SessionStamp& stamp){ stamp.size=2; stamp.mtime=3; return true; };
-    ops.readFile=[](const std::wstring&){ FileReadResult result; result.status=FileReadStatus::Ok; result.bytes="ok"; return result; };
+    ops.readFile=[](const std::wstring&){ return successfulSessionRead("ok",2,3); };
     ops.parse=[](const AppProfile&,const std::string&,std::vector<WinFp>& output){
         output.clear(); WinFp window; window.activeTitle="ok"; output.push_back(std::move(window)); return true;
     };
@@ -3159,6 +3235,192 @@ static bool RawFileExists(const std::wstring& path){
 static std::string ReadRawFile(const std::wstring& path){
     FileReadResult read=ReadFileBytesBounded(path,MAX_LAYOUT_FILE_BYTES);
     return read.status==FileReadStatus::Ok ? read.bytes : std::string();
+}
+
+static void test_session_bounded_reader_binds_bytes_to_exact_aba_handle(){
+    LayoutTempDir temp;
+    std::wstring live=temp.file(L"live.bin");
+    std::wstring incoming=temp.file(L"incoming.bin");
+    std::wstring parkedA=temp.file(L"parked-a.bin");
+    std::wstring parkedB=temp.file(L"parked-b.bin");
+    CHECK(WriteRawFile(live,"AAAA"));
+    CHECK(WriteRawFile(incoming,"BBBB"));
+    SessionStamp stampA,stampB;
+    CHECK(GetSessionStamp(live,stampA));
+    CHECK(GetSessionStamp(incoming,stampB));
+    CHECK(stampA!=stampB && stampA.size==stampB.size);
+    CHECK(MoveFileExW(live.c_str(),parkedA.c_str(),MOVEFILE_WRITE_THROUGH)!=FALSE);
+    CHECK(MoveFileExW(incoming.c_str(),live.c_str(),MOVEFILE_WRITE_THROUGH)!=FALSE);
+
+    bool restored=false;
+    SessionFileReadOps ops;
+    ops.afterOpen=[&](HANDLE){
+        bool movedB=MoveFileExW(live.c_str(),parkedB.c_str(),MOVEFILE_WRITE_THROUGH)!=FALSE;
+        bool movedA=MoveFileExW(parkedA.c_str(),live.c_str(),MOVEFILE_WRITE_THROUGH)!=FALSE;
+        restored=movedA&&movedB;
+        if(!restored) throw std::runtime_error("ABA restore failed");
+    };
+    SessionFileReadResult read=ReadBrowserSessionFileBounded(live,MAX_BROWSER_SESSION_BYTES,ops);
+    SessionStamp current;
+    CHECK(restored && GetSessionStamp(live,current) &&
+          current.volumeSerial==stampA.volumeSerial && current.fileIdLow==stampA.fileIdLow &&
+          current.fileIdHigh==stampA.fileIdHigh);
+    CHECK(read.status==FileReadStatus::Ok && read.bytes=="BBBB" && read.readStampKnown);
+    CHECK(read.readStamp.volumeSerial==stampB.volumeSerial &&
+          read.readStamp.fileIdLow==stampB.fileIdLow && read.readStamp.fileIdHigh==stampB.fileIdHigh &&
+          read.readStamp!=current);
+}
+
+static void test_session_bounded_reader_rejects_handle_changes_and_close_failure(){
+    LayoutTempDir temp;
+    std::wstring path=temp.file(L"session.bin");
+    CHECK(WriteRawFile(path,std::string(128*1024,'s')));
+
+    SessionFileReadOps exactOps;
+    auto exactRead=exactOps.readFile;
+    auto exactStamp=exactOps.getStamp;
+    std::vector<DWORD> requested;
+    int stampCalls=0;
+    exactOps.readFile=[&](HANDLE file,void* bytes,DWORD amount,DWORD& read)->BOOL{
+        requested.push_back(amount); return exactRead(file,bytes,amount,read);
+    };
+    exactOps.getStamp=[&](HANDLE file,SessionStamp& stamp){
+        ++stampCalls; return exactStamp(file,stamp);
+    };
+    SessionFileReadResult exact=ReadBrowserSessionFileBounded(path,MAX_BROWSER_SESSION_BYTES,exactOps);
+    SessionStamp pathStamp;
+    CHECK(exact.status==FileReadStatus::Ok && exact.readStampKnown &&
+          GetSessionStamp(path,pathStamp) && exact.readStamp==pathStamp);
+    CHECK(exact.bytes.size()==128*1024 && stampCalls==2 && requested.size()==3);
+    CHECK((std::all_of)(requested.begin(),requested.end(),
+        [](DWORD amount){ return amount<=64*1024; }));
+    CHECK(requested.back()==1);
+
+    SessionFileReadOps sharedWriteOps;
+    bool concurrentWriterOpened=false;
+    sharedWriteOps.afterOpen=[&](HANDLE){
+        HANDLE writer=CreateFileW(path.c_str(),GENERIC_WRITE,
+            FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,nullptr);
+        concurrentWriterOpened=writer!=INVALID_HANDLE_VALUE;
+        if(concurrentWriterOpened) CloseHandle(writer);
+    };
+    SessionFileReadResult sharedWrite=ReadBrowserSessionFileBounded(
+        path,MAX_BROWSER_SESSION_BYTES,sharedWriteOps);
+    CHECK(concurrentWriterOpened && sharedWrite.status==FileReadStatus::Ok &&
+          sharedWrite.readStampKnown);
+
+    SessionFileReadOps truncatedOps;
+    auto truncatedRead=truncatedOps.readFile;
+    auto truncatedClose=truncatedOps.closeHandle;
+    int truncatedCalls=0;
+    int truncatedCloseCalls=0;
+    truncatedOps.readFile=[&](HANDLE file,void* bytes,DWORD amount,DWORD& read)->BOOL{
+        if(truncatedCalls++==0) return truncatedRead(file,bytes,(std::min)(amount,3UL),read);
+        read=0; return TRUE;
+    };
+    truncatedOps.closeHandle=[&](HANDLE file){
+        ++truncatedCloseCalls; return truncatedClose(file);
+    };
+    SessionFileReadResult truncated=ReadBrowserSessionFileBounded(path,MAX_BROWSER_SESSION_BYTES,truncatedOps);
+    CHECK(truncatedCloseCalls==1 && truncated.status==FileReadStatus::Unavailable &&
+          truncated.bytes.empty() && !truncated.readStampKnown);
+
+    SessionFileReadOps growthOps;
+    auto growthRead=growthOps.readFile;
+    auto growthStamp=growthOps.getStamp;
+    int growthCalls=0;
+    int growthStampCalls=0;
+    growthOps.readFile=[&](HANDLE file,void* bytes,DWORD amount,DWORD& read)->BOOL{
+        if(++growthCalls==3){ *(char*)bytes='x'; read=1; return TRUE; }
+        return growthRead(file,bytes,amount,read);
+    };
+    growthOps.getStamp=[&](HANDLE file,SessionStamp& stamp){
+        ++growthStampCalls; return growthStamp(file,stamp);
+    };
+    SessionFileReadResult growth=ReadBrowserSessionFileBounded(path,MAX_BROWSER_SESSION_BYTES,growthOps);
+    CHECK(growthStampCalls==2 && growth.status==FileReadStatus::Unavailable &&
+          growth.bytes.empty() && !growth.readStampKnown);
+
+    SessionFileReadOps changedOps;
+    auto changedStamp=changedOps.getStamp;
+    int changedCalls=0;
+    changedOps.getStamp=[&](HANDLE file,SessionStamp& stamp){
+        bool ok=changedStamp(file,stamp);
+        if(ok && ++changedCalls==2) ++stamp.changeTime;
+        return ok;
+    };
+    SessionFileReadResult changed=ReadBrowserSessionFileBounded(path,MAX_BROWSER_SESSION_BYTES,changedOps);
+    CHECK(changedCalls==2 && changed.status==FileReadStatus::Unavailable &&
+          changed.bytes.empty() && !changed.readStampKnown);
+
+    SessionFileReadOps overLimitOps;
+    auto overLimitStamp=overLimitOps.getStamp;
+    int overLimitCalls=0;
+    overLimitOps.getStamp=[&](HANDLE file,SessionStamp& stamp){
+        bool ok=overLimitStamp(file,stamp);
+        if(ok && ++overLimitCalls==2) stamp.size=128*1024+1;
+        return ok;
+    };
+    SessionFileReadResult overLimit=ReadBrowserSessionFileBounded(path,128*1024,overLimitOps);
+    CHECK(overLimitCalls==2 && overLimit.status==FileReadStatus::TooLarge &&
+          overLimit.bytes.empty() && !overLimit.readStampKnown);
+
+    SessionFileReadOps closeOps;
+    auto realClose=closeOps.closeHandle;
+    int closeCalls=0;
+    closeOps.closeHandle=[&](HANDLE file)->BOOL{
+        ++closeCalls; realClose(file); SetLastError(ERROR_INVALID_HANDLE); return FALSE;
+    };
+    SessionFileReadResult closeFailed=ReadBrowserSessionFileBounded(path,MAX_BROWSER_SESSION_BYTES,closeOps);
+    CHECK(closeCalls==1 && closeFailed.status==FileReadStatus::Unavailable &&
+          closeFailed.bytes.empty() && !closeFailed.readStampKnown);
+
+    SessionFileReadOps throwingCloseOps;
+    auto throwingRealClose=throwingCloseOps.closeHandle;
+    HANDLE reusedHandle=nullptr;
+    std::vector<HANDLE> otherHandles;
+    int throwingCloseCalls=0;
+    throwingCloseOps.closeHandle=[&](HANDLE file)->BOOL{
+        ++throwingCloseCalls;
+        if(!throwingRealClose(file)) throw std::runtime_error("real close failed");
+        for(int attempt=0;attempt<256 && !reusedHandle;++attempt){
+            HANDLE candidate=CreateEventW(nullptr,TRUE,FALSE,nullptr);
+            if(candidate==file) reusedHandle=candidate;
+            else if(candidate) otherHandles.push_back(candidate);
+        }
+        throw std::runtime_error("close callback fault after close");
+    };
+    SessionFileReadResult closeThrew=ReadBrowserSessionFileBounded(
+        path,MAX_BROWSER_SESSION_BYTES,throwingCloseOps);
+    DWORD handleFlags=0;
+    bool reusedStillValid=reusedHandle && GetHandleInformation(reusedHandle,&handleFlags)!=FALSE;
+    CHECK(throwingCloseCalls==1 && reusedHandle!=nullptr && reusedStillValid);
+    CHECK(closeThrew.status==FileReadStatus::Unavailable && closeThrew.bytes.empty() &&
+          !closeThrew.readStampKnown);
+    if(reusedStillValid) CloseHandle(reusedHandle);
+    for(size_t i=0;i<otherHandles.size();++i) CloseHandle(otherHandles[i]);
+
+    SessionFileReadOps throwingStampOps;
+    auto throwingStampClose=throwingStampOps.closeHandle;
+    int throwingStampCloseCalls=0;
+    throwingStampOps.getStamp=[](HANDLE,SessionStamp&)->bool{ throw std::bad_alloc(); };
+    throwingStampOps.closeHandle=[&](HANDLE file){
+        ++throwingStampCloseCalls; return throwingStampClose(file);
+    };
+    SessionFileReadResult stampThrew=ReadBrowserSessionFileBounded(
+        path,MAX_BROWSER_SESSION_BYTES,throwingStampOps);
+    CHECK(throwingStampCloseCalls==1 && stampThrew.status==FileReadStatus::Unavailable &&
+          stampThrew.bytes.empty() && !stampThrew.readStampKnown);
+
+    DWORD handlesBefore=0,handlesAfter=0;
+    CHECK(GetProcessHandleCount(GetCurrentProcess(),&handlesBefore)!=0);
+    for(int attempt=0;attempt<128;++attempt){
+        SessionFileReadResult repeated=ReadBrowserSessionFileBounded(path,MAX_BROWSER_SESSION_BYTES);
+        CHECK(repeated.status==FileReadStatus::Ok && repeated.readStampKnown);
+    }
+    CHECK(GetProcessHandleCount(GetCurrentProcess(),&handlesAfter)!=0);
+    CHECK(handlesAfter==handlesBefore);
 }
 
 static std::vector<std::wstring> DiagnosticCopies(const std::wstring& source){
@@ -5694,6 +5956,7 @@ int main(){
     test_session_worker_stamp_change_uses_exact_path_cached_stale();
     test_session_worker_rotation_during_parse_is_never_fresh();
     test_session_worker_equal_metadata_replacement_never_publishes_old_bytes_fresh();
+    test_session_worker_rejects_aba_bytes_without_matching_handle_stamp();
     test_session_worker_rotation_uses_only_exact_attempted_path_cache();
     test_session_worker_ten_rapid_requests_are_active_plus_newest_pending();
     test_session_worker_low_probe_cannot_replace_user_pending();
@@ -5795,6 +6058,8 @@ int main(){
     test_lc_absent_does_not_wipe_and_rearm();
     test_lc_exit();
     test_bounded_read_exact_limit_and_preallocation_rejection();
+    test_session_bounded_reader_binds_bytes_to_exact_aba_handle();
+    test_session_bounded_reader_rejects_handle_changes_and_close_failure();
     test_bounded_read_failures_are_transactional_and_status_bearing();
     test_bounded_read_denies_concurrent_in_place_writer();
     test_layout_load_missing_and_valid_primary();

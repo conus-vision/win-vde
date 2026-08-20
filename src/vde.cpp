@@ -243,13 +243,14 @@ static std::vector<WinFp> ReadSessionForTransitional(const AppProfile& profile,
     std::wstring before=ResolveBrowserSessionPath(profile);
     SessionStamp beforeStamp;
     if(before.empty() || !GetSessionStamp(before,beforeStamp)) return {};
-    FileReadResult read=ReadFileBytesBounded(before,MAX_BROWSER_SESSION_BYTES);
-    if(read.status!=FileReadStatus::Ok) return {};
+    SessionFileReadResult read=ReadBrowserSessionFileBounded(before,MAX_BROWSER_SESSION_BYTES);
+    if(read.status!=FileReadStatus::Ok || !read.readStampKnown || read.readStamp!=beforeStamp) return {};
     std::vector<WinFp> parsed;
     if(!ParseBrowserSessionData(profile,read.bytes,parsed)) return {};
     std::wstring after=ResolveBrowserSessionPath(profile);
     SessionStamp afterStamp;
-    if(after!=before || !GetSessionStamp(after,afterStamp) || afterStamp!=beforeStamp) return {};
+    if(after!=before || !GetSessionStamp(after,afterStamp) ||
+       beforeStamp!=read.readStamp || read.readStamp!=afterStamp) return {};
     if(usedPathOut) *usedPathOut=after;
     return parsed;
 }

@@ -450,7 +450,7 @@ inline bool ParseBrowserSessionData(const AppProfile& profile,const std::string&
 struct SessionWorkerOps {
     std::function<std::wstring(const AppProfile&)> resolvePath;
     std::function<bool(const std::wstring&,SessionStamp&)> getStamp;
-    std::function<FileReadResult(const std::wstring&)> readFile;
+    std::function<SessionFileReadResult(const std::wstring&)> readFile;
     std::function<bool(const AppProfile&,const std::string&,std::vector<WinFp>&)> parse;
     std::function<bool()> beforePost;
     std::function<bool()> beforeJoinWait;
@@ -463,7 +463,9 @@ inline SessionWorkerOps DefaultSessionWorkerOps(){
     SessionWorkerOps ops;
     ops.resolvePath=[](const AppProfile& profile){ return ResolveBrowserSessionPath(profile); };
     ops.getStamp=[](const std::wstring& path,SessionStamp& stamp){ return GetSessionStamp(path,stamp); };
-    ops.readFile=[](const std::wstring& path){ return ReadFileBytesBounded(path,MAX_BROWSER_SESSION_BYTES); };
+    ops.readFile=[](const std::wstring& path){
+        return ReadBrowserSessionFileBounded(path,MAX_BROWSER_SESSION_BYTES);
+    };
     ops.parse=[](const AppProfile& profile,const std::string& bytes,std::vector<WinFp>& output){ return ParseBrowserSessionData(profile,bytes,output); };
     ops.makeResult=[](){ return std::unique_ptr<SessionResult>(new SessionResult()); };
     ops.postMessage=[](HWND window,UINT message,WPARAM wp,LPARAM lp){ return PostMessageW(window,message,wp,lp)!=FALSE; };
@@ -861,9 +863,11 @@ private:
             return;
         }
         if(!beforeKnown){ ObserveCurrent(result,request.profile); ApplyFallback(result,before); return; }
-        FileReadResult read;
+        SessionFileReadResult read;
         try { read=ops_.readFile(before); } catch(...) { read.status=FileReadStatus::Unavailable; }
-        if(read.status!=FileReadStatus::Ok){ ObserveCurrent(result,request.profile); ApplyFallback(result,before); return; }
+        if(read.status!=FileReadStatus::Ok || !read.readStampKnown || read.readStamp!=stampBefore){
+            ObserveCurrent(result,request.profile); ApplyFallback(result,before); return;
+        }
         std::vector<WinFp> parsed;
         bool parsedOk=false;
         try { parsedOk=ops_.parse(request.profile,read.bytes,parsed); } catch(...) { parsed.clear(); parsedOk=false; }
@@ -874,12 +878,13 @@ private:
         result.sourceStamp=SessionStamp{};
         try { result.sourceStampKnown=!after.empty()&&ops_.getStamp(after,stampAfter); } catch(...) { result.sourceStampKnown=false; }
         if(result.sourceStampKnown) result.sourceStamp=stampAfter;
-        if(parsedOk&&result.sourceStampKnown&&before==after&&stampBefore==stampAfter){
+        if(parsedOk&&result.sourceStampKnown&&before==after&&
+           stampBefore==read.readStamp&&read.readStamp==stampAfter){
             uint64_t hash=HashSessionWindows(parsed);
             GenerationState generation;
-            PrepareGeneration(request.app,after,stampAfter,hash,generation);
+            PrepareGeneration(request.app,after,read.readStamp,hash,generation);
             SessionCacheValue inserted;
-            if(cache_.Put(request.app,after,stampAfter,std::move(parsed),hash,generation.generation,inserted)){
+            if(cache_.Put(request.app,after,read.readStamp,std::move(parsed),hash,generation.generation,inserted)){
                 PublishGeneration(request.app,generation);
                 result.status=SessionDataStatus::Fresh; result.windows=inserted.windows;
                 result.dataStamp=inserted.stamp; result.dataGeneration=inserted.dataGeneration;

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <map>
@@ -602,11 +603,8 @@ struct SessionStamp {
     bool operator!=(const SessionStamp& other) const { return !(*this==other); }
 };
 
-inline bool GetSessionStamp(const std::wstring& path,SessionStamp& output){
-    HANDLE file=CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,
-                            FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
-                            nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
-    if(file==INVALID_HANDLE_VALUE) return false;
+inline bool GetSessionStampFromHandle(HANDLE file,SessionStamp& output){
+    if(file==nullptr || file==INVALID_HANDLE_VALUE) return false;
     FILE_BASIC_INFO basicBefore{},basicAfter{};
     FILE_STANDARD_INFO standard{};
     FILE_ID_INFO identity{};
@@ -614,14 +612,11 @@ inline bool GetSessionStamp(const std::wstring& path,SessionStamp& output){
             GetFileInformationByHandleEx(file,FileStandardInfo,&standard,sizeof(standard))!=FALSE &&
             GetFileInformationByHandleEx(file,FileIdInfo,&identity,sizeof(identity))!=FALSE &&
             GetFileInformationByHandleEx(file,FileBasicInfo,&basicAfter,sizeof(basicAfter))!=FALSE;
-    bool closed=CloseHandle(file)!=FALSE;
-    if(!ok || !closed || standard.Directory || standard.EndOfFile.QuadPart<0 ||
+    if(!ok || standard.Directory || standard.EndOfFile.QuadPart<0 ||
        basicBefore.LastWriteTime.QuadPart!=basicAfter.LastWriteTime.QuadPart ||
        basicBefore.ChangeTime.QuadPart!=basicAfter.ChangeTime.QuadPart) return false;
-    unsigned long long size=(unsigned long long)standard.EndOfFile.QuadPart;
-    if(size>MAX_BROWSER_SESSION_BYTES) return false;
     SessionStamp stamp;
-    stamp.size=size;
+    stamp.size=(unsigned long long)standard.EndOfFile.QuadPart;
     stamp.mtime=(unsigned long long)basicAfter.LastWriteTime.QuadPart;
     stamp.changeTime=(unsigned long long)basicAfter.ChangeTime.QuadPart;
     stamp.volumeSerial=(unsigned long long)identity.VolumeSerialNumber;
@@ -629,4 +624,151 @@ inline bool GetSessionStamp(const std::wstring& path,SessionStamp& output){
     std::memcpy(&stamp.fileIdHigh,identity.FileId.Identifier+sizeof(stamp.fileIdLow),sizeof(stamp.fileIdHigh));
     output=stamp;
     return true;
+}
+
+inline bool GetSessionStamp(const std::wstring& path,SessionStamp& output){
+    HANDLE file=CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES,
+                            FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                            nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(file==INVALID_HANDLE_VALUE) return false;
+    SessionStamp stamp;
+    bool ok=GetSessionStampFromHandle(file,stamp);
+    bool closed=CloseHandle(file)!=FALSE;
+    if(!ok || !closed || stamp.size>MAX_BROWSER_SESSION_BYTES) return false;
+    output=stamp;
+    return true;
+}
+
+struct SessionFileReadResult {
+    FileReadStatus status=FileReadStatus::Unavailable;
+    std::string bytes;
+    SessionStamp readStamp;
+    bool readStampKnown=false;
+};
+
+struct SessionFileReadOps {
+    std::function<HANDLE(const std::wstring&)> openFile;
+    std::function<bool(HANDLE,SessionStamp&)> getStamp;
+    std::function<BOOL(HANDLE,void*,DWORD,DWORD&)> readFile;
+    std::function<BOOL(HANDLE)> closeHandle;
+    std::function<void(HANDLE)> afterOpen;
+    std::function<void(HANDLE)> afterRead;
+
+    SessionFileReadOps(){
+        openFile=[](const std::wstring& path){
+            return CreateFileW(path.c_str(),GENERIC_READ|FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL|FILE_FLAG_SEQUENTIAL_SCAN,nullptr);
+        };
+        getStamp=[](HANDLE file,SessionStamp& stamp){ return GetSessionStampFromHandle(file,stamp); };
+        readFile=[](HANDLE file,void* buffer,DWORD requested,DWORD& read){
+            return ReadFile(file,buffer,requested,&read,nullptr);
+        };
+        closeHandle=[](HANDLE file){ return CloseHandle(file); };
+    }
+};
+
+namespace session_file_detail {
+
+inline bool MissingSessionFileError(DWORD error){
+    return error==ERROR_FILE_NOT_FOUND || error==ERROR_PATH_NOT_FOUND;
+}
+
+class ScopedSessionFile {
+public:
+    ScopedSessionFile(HANDLE file,const SessionFileReadOps& ops):file_(file),ops_(ops){}
+    ~ScopedSessionFile(){
+        if(file_==INVALID_HANDLE_VALUE) return;
+        try { ops_.closeHandle(file_); }
+        catch(...) {}
+    }
+    bool Close(){
+        if(file_==INVALID_HANDLE_VALUE) return false;
+        HANDLE file=file_;
+        file_=INVALID_HANDLE_VALUE;
+        try { return ops_.closeHandle(file)!=FALSE; }
+        catch(...) { return false; }
+    }
+private:
+    HANDLE file_;
+    const SessionFileReadOps& ops_;
+};
+
+inline SessionFileReadResult SessionReadFailure(FileReadStatus status){
+    SessionFileReadResult result;
+    result.status=status;
+    return result;
+}
+
+} // namespace session_file_detail
+
+inline SessionFileReadResult ReadBrowserSessionFileBounded(const std::wstring& path,
+        unsigned long long outputLimit,const SessionFileReadOps& ops){
+    using namespace session_file_detail;
+    unsigned long long limit=(std::min)(outputLimit,MAX_BROWSER_SESSION_BYTES);
+    HANDLE file=INVALID_HANDLE_VALUE;
+    try { file=ops.openFile(path); }
+    catch(...) { return SessionReadFailure(FileReadStatus::Unavailable); }
+    if(file==INVALID_HANDLE_VALUE){
+        DWORD error=GetLastError();
+        return SessionReadFailure(MissingSessionFileError(error)?
+            FileReadStatus::Missing:FileReadStatus::Unavailable);
+    }
+    ScopedSessionFile owned(file,ops);
+    try {
+        if(ops.afterOpen) ops.afterOpen(file);
+        SessionStamp before;
+        if(!ops.getStamp(file,before)) return SessionReadFailure(FileReadStatus::Unavailable);
+        if(before.size>limit || before.size>(unsigned long long)(std::numeric_limits<size_t>::max)())
+            return SessionReadFailure(FileReadStatus::TooLarge);
+
+        std::string bytes;
+        if((size_t)before.size>bytes.max_size()) return SessionReadFailure(FileReadStatus::TooLarge);
+        bytes.reserve((size_t)before.size);
+        char buffer[64*1024];
+        while((unsigned long long)bytes.size()<before.size){
+            unsigned long long remaining=before.size-(unsigned long long)bytes.size();
+            DWORD requested=(DWORD)(std::min)(remaining,(unsigned long long)sizeof(buffer));
+            DWORD read=0;
+            if(!ops.readFile(file,buffer,requested,read) || read==0 || read>requested)
+                return SessionReadFailure(FileReadStatus::Unavailable);
+            if((unsigned long long)bytes.size()>limit-read)
+                return SessionReadFailure(FileReadStatus::TooLarge);
+            bytes.append(buffer,read);
+        }
+
+        char extra=0;
+        DWORD extraRead=0;
+        if(!ops.readFile(file,&extra,1,extraRead) || extraRead>1)
+            return SessionReadFailure(FileReadStatus::Unavailable);
+        bool grewPastExpectedEof=extraRead!=0;
+        if(ops.afterRead) ops.afterRead(file);
+
+        SessionStamp after;
+        if(!ops.getStamp(file,after))
+            return SessionReadFailure(FileReadStatus::Unavailable);
+        if(after.size>limit) return SessionReadFailure(FileReadStatus::TooLarge);
+        if(grewPastExpectedEof)
+            return SessionReadFailure(before.size>=limit?FileReadStatus::TooLarge:FileReadStatus::Unavailable);
+        if(after!=before || bytes.size()!=(size_t)before.size)
+            return SessionReadFailure(FileReadStatus::Unavailable);
+        if(!owned.Close()) return SessionReadFailure(FileReadStatus::Unavailable);
+
+        SessionFileReadResult result;
+        result.status=FileReadStatus::Ok;
+        result.bytes.swap(bytes);
+        result.readStamp=after;
+        result.readStampKnown=true;
+        return result;
+    } catch(const std::bad_alloc&) { return SessionReadFailure(FileReadStatus::Unavailable); }
+      catch(const std::length_error&) { return SessionReadFailure(FileReadStatus::TooLarge); }
+      catch(...) { return SessionReadFailure(FileReadStatus::Unavailable); }
+}
+
+inline SessionFileReadResult ReadBrowserSessionFileBounded(const std::wstring& path,
+                                                            unsigned long long outputLimit){
+    try {
+        SessionFileReadOps ops;
+        return ReadBrowserSessionFileBounded(path,outputLimit,ops);
+    } catch(...) { return session_file_detail::SessionReadFailure(FileReadStatus::Unavailable); }
 }
