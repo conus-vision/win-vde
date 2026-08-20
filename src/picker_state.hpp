@@ -22,6 +22,38 @@ struct PickerState {
     bool searchActive=false;
     bool controlledTransition=false;
     std::map<std::string,int> scrollByDesktop;
+    uint64_t paintGeneration=0;
+
+    void swap(PickerState& other) noexcept {
+        static_assert(noexcept(searchText.swap(other.searchText)),
+                      "picker search swap must be noexcept");
+        static_assert(noexcept(scrollByDesktop.swap(
+                          other.scrollByDesktop)),
+                      "picker scroll swap must be noexcept");
+        GUID guid=currentDesktop;
+        currentDesktop=other.currentDesktop;
+        other.currentDesktop=guid;
+        guid=selectedDesktop;
+        selectedDesktop=other.selectedDesktop;
+        other.selectedDesktop=guid;
+        const int index=selectedIndex;
+        selectedIndex=other.selectedIndex;
+        other.selectedIndex=index;
+        const WindowIdentityKey identity=activeWindow;
+        activeWindow=other.activeWindow;
+        other.activeWindow=identity;
+        searchText.swap(other.searchText);
+        const bool active=searchActive;
+        searchActive=other.searchActive;
+        other.searchActive=active;
+        const bool transition=controlledTransition;
+        controlledTransition=other.controlledTransition;
+        other.controlledTransition=transition;
+        scrollByDesktop.swap(other.scrollByDesktop);
+        const uint64_t generation=paintGeneration;
+        paintGeneration=other.paintGeneration;
+        other.paintGeneration=generation;
+    }
 };
 
 struct PickerTargetCaptureState {
@@ -90,6 +122,48 @@ inline bool AcceptPickerRowIdentity(
         WindowIdentityRecapture recapture) noexcept {
     return recapture==WindowIdentityRecapture::Match &&
            SameIdentity(identity,identity);
+}
+
+inline bool PickerTargetMatchesActive(
+        uintptr_t target,const WindowIdentityKey& active) noexcept {
+    return target!=0 && target==active.hwnd &&
+           SameIdentity(active,active);
+}
+
+inline bool PickerCommitIdentityAllowed(
+        uintptr_t target,const WindowIdentityKey& active,
+        const WindowIdentityKey& captured,
+        WindowIdentityRecapture recapture) noexcept {
+    return PickerTargetMatchesActive(target,active) &&
+           recapture==WindowIdentityRecapture::Match &&
+           SameIdentity(active,captured);
+}
+
+inline bool PickerSearchResultMatches(
+        const WindowIdentityKey& row,
+        const WindowIdentityKey& result) noexcept {
+    return SameIdentity(row,result);
+}
+
+enum class PickerRowReadResult {
+    Success,
+    IdentityUnavailable,
+    DesktopUnavailable,
+    TitleUnavailable,
+    IdentityChanged,
+    AllocationFailure,
+    GlobalSnapshotFailure
+};
+
+inline bool ContinuePickerRowEnumeration(
+        PickerRowReadResult result,bool& modelFailed) noexcept {
+    if(modelFailed) return false;
+    if(result==PickerRowReadResult::AllocationFailure ||
+       result==PickerRowReadResult::GlobalSnapshotFailure){
+        modelFailed=true;
+        return false;
+    }
+    return true;
 }
 
 inline bool SetPickerCurrentDesktop(PickerState& state,
@@ -178,26 +252,9 @@ inline PickerState PreservePickerUi(const PickerState& state){
 }
 
 inline void SwapPickerState(PickerState& left,PickerState& right) noexcept {
-    GUID guid=left.currentDesktop;
-    left.currentDesktop=right.currentDesktop;
-    right.currentDesktop=guid;
-    guid=left.selectedDesktop;
-    left.selectedDesktop=right.selectedDesktop;
-    right.selectedDesktop=guid;
-    const int selectedIndex=left.selectedIndex;
-    left.selectedIndex=right.selectedIndex;
-    right.selectedIndex=selectedIndex;
-    const WindowIdentityKey activeWindow=left.activeWindow;
-    left.activeWindow=right.activeWindow;
-    right.activeWindow=activeWindow;
-    left.searchText.swap(right.searchText);
-    const bool searchActive=left.searchActive;
-    left.searchActive=right.searchActive;
-    right.searchActive=searchActive;
-    const bool controlledTransition=left.controlledTransition;
-    left.controlledTransition=right.controlledTransition;
-    right.controlledTransition=controlledTransition;
-    left.scrollByDesktop.swap(right.scrollByDesktop);
+    static_assert(noexcept(left.swap(right)),
+                  "picker state publication must be noexcept");
+    left.swap(right);
 }
 
 template<class Model,class Build>
@@ -251,6 +308,66 @@ inline bool RunPickerPaintCacheTransaction(Cache& publishedCache,
     }
 }
 
+template<class Cache,class Build,class BeforePublish,class OnFailure>
+inline bool RefreshPickerPaintCacheTransaction(
+        Cache& publishedCache,Build&& build,
+        BeforePublish&& beforePublish,OnFailure&& onFailure) noexcept {
+    static_assert(noexcept(publishedCache.swap(publishedCache)),
+                  "picker paint-cache publication must be noexcept");
+    static_assert(noexcept(beforePublish()),
+                  "picker pre-publication hook must be noexcept");
+    static_assert(noexcept(onFailure(publishedCache)),
+                  "picker cache invalidation must be noexcept");
+    try {
+        Cache stagedCache;
+        if(!build(stagedCache)){
+            onFailure(publishedCache);
+            return false;
+        }
+        beforePublish();
+        publishedCache.swap(stagedCache);
+        return true;
+    } catch(...) {
+        onFailure(publishedCache);
+        return false;
+    }
+}
+
+inline uint64_t BeginPickerPaintRefresh(PickerState& state) noexcept {
+    if(state.paintGeneration==(std::numeric_limits<uint64_t>::max)())
+        state.paintGeneration=1;
+    else
+        ++state.paintGeneration;
+    if(state.paintGeneration==0) state.paintGeneration=1;
+    return state.paintGeneration;
+}
+
+template<class Cache,class ResetHover>
+inline void InvalidatePickerPaintCacheState(
+        PickerState& state,Cache& cache,ResetHover&& resetHover) noexcept {
+    static_assert(noexcept(resetHover()),
+                  "picker hover reset must be noexcept");
+    static_assert(noexcept(cache.clear()),
+                  "picker cache invalidation must be noexcept");
+    BeginPickerPaintRefresh(state);
+    resetHover();
+    cache.clear();
+}
+
+inline bool PickerPaintCacheMatches(const PickerState& state,
+                                    uint64_t cacheGeneration) noexcept {
+    return cacheGeneration!=0 &&
+           state.paintGeneration==cacheGeneration;
+}
+
+inline bool PickerHoverPairMatches(int previousRow,
+                                   uint64_t previousGeneration,
+                                   int row,uint64_t cacheGeneration) noexcept {
+    return previousRow>=0 && row>=0 && previousRow==row &&
+           previousGeneration!=0 &&
+           previousGeneration==cacheGeneration;
+}
+
 inline bool PickerShowPreparationComplete(bool modelReady,
                                           bool paintCacheReady) noexcept {
     return modelReady && paintCacheReady;
@@ -283,11 +400,13 @@ inline int PickerVisibleScroll(int savedScroll,int maxScroll) noexcept {
     return savedScroll>maxScroll?maxScroll:savedScroll;
 }
 
-inline int AdvancePickerScroll(int scroll,int wheelDelta) noexcept {
-    if(wheelDelta>0) return scroll>0?scroll-1:0;
-    if(wheelDelta<0 && scroll<(std::numeric_limits<int>::max)())
-        return scroll+1;
-    return scroll;
+inline int AdvancePickerScroll(int savedScroll,int maxScroll,
+                               int wheelDelta) noexcept {
+    const int maximum=maxScroll>0?maxScroll:0;
+    const int visible=PickerVisibleScroll(savedScroll,maximum);
+    if(wheelDelta>0) return visible>0?visible-1:0;
+    if(wheelDelta<0) return visible<maximum?visible+1:maximum;
+    return visible;
 }
 
 inline bool PublishPickerBitmapReplacement(

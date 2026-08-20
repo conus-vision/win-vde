@@ -4347,6 +4347,8 @@ static int TILE_W=240,TILE_H=150,PAD=16,HEADER=44,SEARCH_H=40;  // базовы�
 static int g_cols=1,g_rows=1;
 static HFONT g_fPT=nullptr,g_fPN=nullptr,g_fPI=nullptr,g_fPX=nullptr;   // cached picker fonts (avoid re-create per repaint)
 static int g_lastHoverRow=-1;                                          // last tooltip row (avoid redundant TTM churn)
+static uint64_t g_lastHoverGeneration=0;
+static std::wstring g_pickerTooltipText;
 static void InitMetrics(){
     HDC dc=GetDC(nullptr); g_dpi=GetDeviceCaps(dc,LOGPIXELSX); ReleaseDC(nullptr,dc);
     TILE_W=S(240); TILE_H=S(150); PAD=S(16); HEADER=S(38); SEARCH_H=S(58);
@@ -4363,12 +4365,16 @@ struct RowRec { RECT rc; std::wstring full; bool trunc; };
 struct PickerPaintCache {
     std::vector<RowRec> hoverRows;
     std::wstring switchHeader,moveHeader;
+    uint64_t generation=0;
     int hintWidth=0;
     RECT clearButton={0,0,0,0};
     void swap(PickerPaintCache& other) noexcept {
         hoverRows.swap(other.hoverRows);
         switchHeader.swap(other.switchHeader);
         moveHeader.swap(other.moveHeader);
+        const uint64_t priorGeneration=generation;
+        generation=other.generation;
+        other.generation=priorGeneration;
         const int width=hintWidth;
         hintWidth=other.hintWidth;
         other.hintWidth=width;
@@ -4437,6 +4443,11 @@ struct PickerEnumContext {
     bool failed=false;
 };
 
+static BOOL HandlePickerRowReadResult(
+        PickerEnumContext& context,PickerRowReadResult result) noexcept {
+    return ContinuePickerRowEnumeration(result,context.failed)?TRUE:FALSE;
+}
+
 static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
     PickerEnumContext& context=
         *reinterpret_cast<PickerEnumContext*>(parameter);
@@ -4444,17 +4455,15 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
         if(!IsAltTabWindow(hwnd)) return TRUE;
 
         DWORD pid=0;
-        if(!GetWindowThreadProcessId(hwnd,&pid) || pid==0){
-            context.failed=true;
-            return FALSE;
-        }
+        if(!GetWindowThreadProcessId(hwnd,&pid) || pid==0)
+            return HandlePickerRowReadResult(
+                context,PickerRowReadResult::IdentityUnavailable);
         auto process=context.processStarts.find(pid);
         if(process==context.processStarts.end()){
             uint64_t started=0;
-            if(!TryReadProcessStart(pid,started)){
-                context.failed=true;
-                return FALSE;
-            }
+            if(!TryReadProcessStart(pid,started))
+                return HandlePickerRowReadResult(
+                    context,PickerRowReadResult::IdentityUnavailable);
             process=context.processStarts.emplace(pid,started).first;
         }
         WindowIdentityKey identity;
@@ -4462,40 +4471,37 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
         identity.pid=pid;
         identity.processStart=process->second;
         if(!AcceptPickerRowIdentity(
-                identity,WindowIdentityRecapture::Match)){
-            context.failed=true;
-            return FALSE;
-        }
+                identity,WindowIdentityRecapture::Match))
+            return HandlePickerRowReadResult(
+                context,PickerRowReadResult::IdentityUnavailable);
 
         GUID desktop={0};
-        if(!g_vdmDoc ||
-           FAILED(g_vdmDoc->GetWindowDesktopId(hwnd,&desktop)) ||
-           GuidIsZero(desktop)){
-            context.failed=true;
-            return FALSE;
-        }
+        if(!g_vdmDoc)
+            return HandlePickerRowReadResult(
+                context,PickerRowReadResult::GlobalSnapshotFailure);
+        if(FAILED(g_vdmDoc->GetWindowDesktopId(hwnd,&desktop)) ||
+           GuidIsZero(desktop))
+            return HandlePickerRowReadResult(
+                context,PickerRowReadResult::DesktopUnavailable);
         Tile* tile=nullptr;
         for(Tile& candidate : *context.tiles)
             if(GuidEq(candidate.guid,desktop)){
                 tile=&candidate;
                 break;
             }
-        if(!tile){
-            context.failed=true;
-            return FALSE;
-        }
+        if(!tile)
+            return HandlePickerRowReadResult(
+                context,PickerRowReadResult::DesktopUnavailable);
 
         const int length=GetWindowTextLengthW(hwnd);
-        if(length<=0){
-            context.failed=true;
-            return FALSE;
-        }
+        if(length<=0)
+            return HandlePickerRowReadResult(
+                context,PickerRowReadResult::TitleUnavailable);
         std::wstring title(static_cast<size_t>(length)+1,L'\0');
         const int copied=GetWindowTextW(hwnd,&title[0],length+1);
-        if(copied<=0){
-            context.failed=true;
-            return FALSE;
-        }
+        if(copied<=0)
+            return HandlePickerRowReadResult(
+                context,PickerRowReadResult::TitleUnavailable);
         title.resize(static_cast<size_t>(copied));
 
         WinItem item;
@@ -4507,15 +4513,14 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
         item.search=item.titleLC;
         item.icon=WindowIcon(hwnd);
         if(!AcceptPickerRowIdentity(
-                item.identity,RecaptureGenericWindowIdentity(item.identity))){
-            context.failed=true;
-            return FALSE;
-        }
+                item.identity,RecaptureGenericWindowIdentity(item.identity)))
+            return HandlePickerRowReadResult(
+                context,PickerRowReadResult::IdentityChanged);
         tile->windows.push_back(std::move(item));
         return TRUE;
     } catch(...) {
-        context.failed=true;
-        return FALSE;
+        return HandlePickerRowReadResult(
+            context,PickerRowReadResult::AllocationFailure);
     }
 }
 
@@ -4648,6 +4653,7 @@ static bool ApplyPickerSearchText(std::wstring searchText) noexcept {
     }
 }
 
+static void ResetPickerHoverTooltip() noexcept;
 static bool RefreshPickerPaintCache() noexcept;
 static bool g_tabBlobsBuilt=false;
 static void HandleSearchSessionResult(const SessionRoute& route,
@@ -4722,11 +4728,14 @@ static void HandleSearchReconcileResult(std::unique_ptr<ReconcileResult> result)
         for(size_t index=0;index<result->fastWindows.size();++index){
             const WinFp* session=ReconcileSessionForFast(*result,index);
             if(!session || session->tabsBlob.empty()) continue;
+            const WindowIdentityKey resultIdentity=
+                IdentityOf(result->fastWindows[index]);
             std::wstring blob=U82W(session->tabsBlob);
             if(!blob.empty()) CharLowerW(&blob[0]);
             for(Tile& tile : g_tiles)
                 for(WinItem& item : tile.windows)
-                    if(item.hwnd==result->fastWindows[index].hwnd)
+                    if(PickerSearchResultMatches(
+                            item.identity,resultIdentity))
                         item.search=item.titleLC+L" "+blob;
         }
         accepted=true;
@@ -4777,6 +4786,25 @@ static void LayoutTiles(int clientW){
 }
 static SIZE DesiredClientSize(){ int n=(int)g_tiles.size(); int cols=std::min(std::max(1,n),5); int rows=(n+cols-1)/cols; SIZE s; s.cx=PAD+cols*(TILE_W+PAD); s.cy=SEARCH_H+HEADER+PAD+rows*(TILE_H+PAD); return s; }
 
+static int PickerTileVisibleRows(const Tile& tile) noexcept {
+    const int listTop=tile.rc.top+S(10)+S(22)+S(6);
+    const int listBottom=tile.rc.bottom-S(10);
+    return std::max(0,(listBottom-listTop)/S(22));
+}
+
+static int PickerTileFilteredCount(const Tile& tile) noexcept {
+    const size_t integerMax=static_cast<size_t>(
+        (std::numeric_limits<int>::max)());
+    return tile.filtered.size()>integerMax
+        ?(std::numeric_limits<int>::max)()
+        :static_cast<int>(tile.filtered.size());
+}
+
+static int PickerTileMaxScroll(const Tile& tile) noexcept {
+    return std::max(0,PickerTileFilteredCount(tile)-
+                       PickerTileVisibleRows(tile));
+}
+
 class ScopedPickerMeasureDc {
     HWND window_=nullptr;
     HDC dc_=nullptr;
@@ -4796,9 +4824,11 @@ public:
     HDC get() const noexcept { return dc_; }
 };
 
-static bool RebuildPickerPaintCache(int clientWidth) noexcept {
-    return RunPickerPaintCacheTransaction(
+static bool RebuildPickerPaintCache(int clientWidth,
+                                    uint64_t generation) noexcept {
+    return RefreshPickerPaintCacheTransaction(
         g_pickerPaintCache,[&](PickerPaintCache& cache){
+        cache.generation=generation;
         cache.switchHeader=L"Switch to: ";
         const int selected=g_picker.selectedIndex;
         if(selected>=0 && selected<static_cast<int>(g_tiles.size()))
@@ -4833,14 +4863,12 @@ static bool RebuildPickerPaintCache(int clientWidth) noexcept {
             const int rowHeight=S(22);
             const int listTop=name.bottom+S(6);
             const int listBottom=tile.rc.bottom-S(10);
-            const int visibleRows=std::max(
-                0,(listBottom-listTop)/rowHeight);
-            const int maximumScroll=std::max(
-                0,static_cast<int>(tile.filtered.size())-visibleRows);
+            const int visibleRows=PickerTileVisibleRows(tile);
+            const int maximumScroll=PickerTileMaxScroll(tile);
             const int visibleScroll=PickerVisibleScroll(
                 tile.scroll,maximumScroll);
             const bool hasScroll=
-                static_cast<int>(tile.filtered.size())>visibleRows;
+                PickerTileFilteredCount(tile)>visibleRows;
             const int rowRight=tile.rc.right-
                 (hasScroll?S(18):S(14));
             int y=listTop;
@@ -4865,14 +4893,34 @@ static bool RebuildPickerPaintCache(int clientWidth) noexcept {
             }
         }
         return true;
+    },[]() noexcept {
+        ResetPickerHoverTooltip();
+    },[](PickerPaintCache& cache) noexcept {
+        ResetPickerHoverTooltip();
+        cache.clear();
     });
 }
 
+static void InvalidatePublishedPickerPaintCache() noexcept {
+    InvalidatePickerPaintCacheState(
+        g_picker,g_pickerPaintCache,
+        []() noexcept { ResetPickerHoverTooltip(); });
+}
+
 static bool RefreshPickerPaintCache() noexcept {
-    if(!g_main) return false;
+    const uint64_t generation=BeginPickerPaintRefresh(g_picker);
+    if(!g_main){
+        ResetPickerHoverTooltip();
+        g_pickerPaintCache.clear();
+        return false;
+    }
     RECT client={0,0,0,0};
-    return GetClientRect(g_main,&client) &&
-           RebuildPickerPaintCache(client.right);
+    if(!GetClientRect(g_main,&client)){
+        ResetPickerHoverTooltip();
+        g_pickerPaintCache.clear();
+        return false;
+    }
+    return RebuildPickerPaintCache(client.right,generation);
 }
 
 class PickerBackBuffer {
@@ -4949,6 +4997,8 @@ static void Paint(HDC hdcReal,HDC hdc,RECT client){
     HBRUSH bg=CreateSolidBrush(CLR_BG); FillRect(hdc,&client,bg); DeleteObject(bg); SetBkMode(hdc,TRANSPARENT);
     HFONT fT=g_fPT, fN=g_fPN, fI=g_fPI, fX=g_fPX;   // cached (created in InitMetrics)
     bool ctrlHeld=(GetKeyState(VK_CONTROL)&0x8000)!=0;
+    const bool paintCacheReady=PickerPaintCacheMatches(
+        g_picker,g_pickerPaintCache.generation);
 
     // subtle rounded outer border
     { HPEN p=CreatePen(PS_SOLID,1,CLR_BORDER); HPEN op=(HPEN)SelectObject(hdc,p); HBRUSH ob=(HBRUSH)SelectObject(hdc,(HBRUSH)GetStockObject(NULL_BRUSH));
@@ -4957,7 +5007,7 @@ static void Paint(HDC hdcReal,HDC hdc,RECT client){
     // ---- search box (rounded) + clear (x) button ----
     RECT sb=SearchBoxRect(client.right);
     FillRoundRect(hdc, sb, S(12), CLR_SEARCH, g_picker.searchActive?CLR_ACTIVE:CLR_PASSIVE, g_picker.searchActive?S(2):S(1));   // active only after user clicks/types
-    if(g_picker.searchActive && g_pickerPaintCache.clearButton.right>g_pickerPaintCache.clearButton.left){ // big × (no circle) — shown whenever the field is active
+    if(paintCacheReady && g_picker.searchActive && g_pickerPaintCache.clearButton.right>g_pickerPaintCache.clearButton.left){ // big × (no circle) — shown whenever the field is active
         SelectObject(hdc,fX); SetTextColor(hdc,CLR_HINT); RECT xr=g_pickerPaintCache.clearButton; DrawTextW(hdc,L"\x2715",-1,&xr,DT_CENTER|DT_SINGLELINE|DT_VCENTER);
     }
 
@@ -4967,9 +5017,12 @@ static void Paint(HDC hdcReal,HDC hdc,RECT client){
     const wchar_t* hint=L"Ctrl+Click - Move current window to selected desktop";
     RECT hr={PAD,headTop,client.right-PAD,headBot}; DrawTextW(hdc,hint,-1,&hr,DT_RIGHT|DT_SINGLELINE|DT_VCENTER);
     SelectObject(hdc,fT); SetTextColor(hdc,CLR_HEAD);
-    const std::wstring& head=ctrlHeld?
-        g_pickerPaintCache.moveHeader:g_pickerPaintCache.switchHeader;
-    RECT h2={PAD,headTop,client.right-PAD-g_pickerPaintCache.hintWidth-S(24),headBot}; DrawTextW(hdc,head.c_str(),-1,&h2,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS|DT_VCENTER);
+    const wchar_t* head=paintCacheReady
+        ?(ctrlHeld?g_pickerPaintCache.moveHeader.c_str()
+                  :g_pickerPaintCache.switchHeader.c_str())
+        :L"";
+    const int hintWidth=paintCacheReady?g_pickerPaintCache.hintWidth:0;
+    RECT h2={PAD,headTop,client.right-PAD-hintWidth-S(24),headBot}; DrawTextW(hdc,head,-1,&h2,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS|DT_VCENTER);
 
     // ---- tiles ----
     const COLORREF currentTile=BlendColor(CLR_TILE,CLR_ACTIVE,48);
@@ -4989,9 +5042,10 @@ static void Paint(HDC hdcReal,HDC hdc,RECT client){
         DrawTextW(hdc,t.displayName.c_str(),-1,&nr,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
         SelectObject(hdc,fI); SetTextColor(hdc,CLR_TEXT);
         int rowH=S(22), listTop=nr.bottom+S(6), listBot=t.rc.bottom-S(10);
-        int visRows=std::max(0,(listBot-listTop)/rowH); int maxScroll=std::max(0,(int)t.filtered.size()-visRows);
+        int visRows=PickerTileVisibleRows(t); int maxScroll=PickerTileMaxScroll(t);
         const int visibleScroll=PickerVisibleScroll(t.scroll,maxScroll);
-        bool hasScroll=(int)t.filtered.size()>visRows; int rowRight=t.rc.right-(hasScroll?S(18):S(14));
+        const int filteredCount=PickerTileFilteredCount(t);
+        bool hasScroll=filteredCount>visRows; int rowRight=t.rc.right-(hasScroll?S(18):S(14));
         int y=listTop;
         for(size_t position=static_cast<size_t>(visibleScroll);
             position<t.filtered.size();++position){
@@ -5013,7 +5067,7 @@ static void Paint(HDC hdcReal,HDC hdc,RECT client){
         }
         if(hasScroll){                                   // custom rounded scrollbar
             RECT trk={t.rc.right-S(9),listTop,t.rc.right-S(5),listBot}; FillRoundRect(hdc,trk,S(2),CLR_SCROLL_TRK,CLR_SCROLL_TRK,1);
-            int trkH=listBot-listTop, thbH=std::max(S(24),trkH*visRows/std::max(1,(int)t.filtered.size()));
+            int trkH=listBot-listTop, thbH=std::max(S(24),trkH*visRows/std::max(1,filteredCount));
             int thbY=listTop+(maxScroll>0?(trkH-thbH)*visibleScroll/maxScroll:0);
             RECT thb={t.rc.right-S(9),thbY,t.rc.right-S(5),thbY+thbH}; FillRoundRect(hdc,thb,S(2),CLR_SCROLL_THB,CLR_SCROLL_THB,1);
         }
@@ -5021,8 +5075,52 @@ static void Paint(HDC hdcReal,HDC hdc,RECT client){
     if(hdc!=hdcReal)
         BitBlt(hdcReal,0,0,client.right,client.bottom,hdc,0,0,SRCCOPY);
 }
-static void TipDeactivate(){ if(g_tip){ TOOLINFOW ti={0}; ti.cbSize=sizeof(ti); ti.hwnd=g_main; ti.uId=1; SendMessageW(g_tip,TTM_TRACKACTIVATE,FALSE,(LPARAM)&ti); } }
-static void HidePicker(){ TipDeactivate(); ShowWindow(g_main,SW_HIDE); }
+static void TipDeactivate() noexcept {
+    if(!g_tip) return;
+    TOOLINFOW ti={0};
+    ti.cbSize=sizeof(ti);
+    ti.hwnd=g_main;
+    ti.uId=1;
+    SendMessageW(g_tip,TTM_TRACKACTIVATE,FALSE,(LPARAM)&ti);
+    ti.lpszText=const_cast<LPWSTR>(L"");
+    SendMessageW(g_tip,TTM_UPDATETIPTEXTW,0,(LPARAM)&ti);
+}
+static void ResetPickerHoverTooltip() noexcept {
+    TipDeactivate();
+    g_lastHoverRow=-1;
+    g_lastHoverGeneration=0;
+    g_pickerTooltipText.clear();
+}
+static void TrackPickerHoverTooltip(HWND hwnd,const RowRec& row,
+                                    int rowIndex,uint64_t generation,
+                                    POINT clientPoint) noexcept {
+    if(!g_tip) return;
+    if(!PickerHoverPairMatches(
+            g_lastHoverRow,g_lastHoverGeneration,
+            rowIndex,generation)){
+        ResetPickerHoverTooltip();
+        try {
+            g_pickerTooltipText=row.full;
+        } catch(...) {
+            return;
+        }
+        TOOLINFOW ti={0};
+        ti.cbSize=sizeof(ti);
+        ti.hwnd=hwnd;
+        ti.uId=1;
+        ti.lpszText=const_cast<LPWSTR>(
+            g_pickerTooltipText.c_str());
+        SendMessageW(g_tip,TTM_UPDATETIPTEXTW,0,(LPARAM)&ti);
+        SendMessageW(g_tip,TTM_TRACKACTIVATE,TRUE,(LPARAM)&ti);
+        g_lastHoverRow=rowIndex;
+        g_lastHoverGeneration=generation;
+    }
+    POINT screenPoint=clientPoint;
+    ClientToScreen(hwnd,&screenPoint);
+    SendMessageW(g_tip,TTM_TRACKPOSITION,0,
+        (LPARAM)MAKELONG(screenPoint.x+S(16),screenPoint.y+S(20)));
+}
+static void HidePicker(){ ResetPickerHoverTooltip(); ShowWindow(g_main,SW_HIDE); }
 // Search EDIT subclass: forward navigation keys to the grid; let letters/numbers type.
 static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM wp, LPARAM lp){
     if((m==WM_KEYDOWN||m==WM_KEYUP)&&wp==VK_CONTROL){ InvalidateRect(g_main,nullptr,FALSE); return 0; }
@@ -5088,6 +5186,8 @@ static bool CaptureFastWindowForMove(HWND hwnd,FastWin& output,bool& tracked,
 
 static void Commit(int idx){
     if(idx<0 || idx>=(int)g_tiles.size()) return;
+    const uintptr_t target=reinterpret_cast<uintptr_t>(g_target);
+    if(!PickerTargetMatchesActive(target,g_picker.activeWindow)) return;
     HidePicker();
     if(!g_target || !IsWindow(g_target)) return;
     const GUID destination=g_tiles[idx].guid;
@@ -5095,6 +5195,10 @@ static void Commit(int idx){
     FastWin fast;
     bool tracked=false,titleComplete=true;
     if(!CaptureFastWindowForMove(g_target,fast,tracked,titleComplete)) return;
+    const WindowIdentityKey capturedIdentity=IdentityOf(fast);
+    if(!PickerCommitIdentityAllowed(
+            target,g_picker.activeWindow,capturedIdentity,
+            RecaptureGenericWindowIdentity(capturedIdentity))) return;
     const std::string runtimeKey=RuntimeKey(fast);
 
     PickerMoveOperation operation;
@@ -5272,7 +5376,11 @@ static PickerTargetCaptureState CapturePickerTarget() noexcept {
 static void ShowPicker(PickerTargetCaptureState capture){
     if(g_degraded) return;   // desktop COM unavailable; startup dialog + tray tip already explain
     const bool modelReady=BuildModel(capture.identity,true);
-    if(!modelReady) return;
+    if(!modelReady){
+        RefreshPickerPaintCache();
+        return;
+    }
+    InvalidatePublishedPickerPaintCache();
     g_target=reinterpret_cast<HWND>(capture.hwnd);
     g_targetTitle.swap(capture.title);
     g_tabBlobsBuilt=false;
@@ -5401,7 +5509,8 @@ static void GoToDesktop(int idx){
 // Клик = переключение на десктоп; Ctrl = перенести активное окно туда.
 static void Activate(int idx, bool ctrlMove){
     if(idx<0||idx>=(int)g_tiles.size())return;
-    SetPickerSelectionWithLegacy(idx);
+    if(!SetPickerSelectionWithLegacy(idx)) return;
+    RefreshPickerPaintCache();
     if(ctrlMove) Commit(idx);
     else         GoToDesktop(idx);
 }
@@ -5706,27 +5815,24 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         if(wp==VK_CONTROL) InvalidateRect(hwnd,nullptr,FALSE);
         return 0;
     case WM_LBUTTONDOWN:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
-        if(g_pickerPaintCache.clearButton.right>g_pickerPaintCache.clearButton.left && PtInRect(&g_pickerPaintCache.clearButton,pt)){ SetWindowTextW(g_search,L""); g_picker.searchActive=false; RefreshPickerPaintCache(); SetFocus(g_search); InvalidateRect(hwnd,nullptr,FALSE); return 0; }   // clear + deactivate border, keep caret
+        const bool cacheReady=PickerPaintCacheMatches(g_picker,g_pickerPaintCache.generation);
+        if(cacheReady && g_pickerPaintCache.clearButton.right>g_pickerPaintCache.clearButton.left && PtInRect(&g_pickerPaintCache.clearButton,pt)){ SetWindowTextW(g_search,L""); g_picker.searchActive=false; RefreshPickerPaintCache(); SetFocus(g_search); InvalidateRect(hwnd,nullptr,FALSE); return 0; }   // clear + deactivate border, keep caret
         { RECT cr; GetClientRect(hwnd,&cr); RECT sb=SearchBoxRect(cr.right); if(PtInRect(&sb,pt)){ g_picker.searchActive=true; RefreshPickerPaintCache(); SetFocus(g_search); InvalidateRect(hwnd,nullptr,FALSE); return 0; } }   // clicked the search field -> activate
         if(g_picker.searchActive){ g_picker.searchActive=false; RefreshPickerPaintCache(); InvalidateRect(hwnd,nullptr,FALSE); }   // clicked outside the field -> deactivate border
         for(size_t i=0;i<g_tiles.size();++i) if(PtInRect(&g_tiles[i].rc,pt)){ Activate((int)i,ctrl); return 0; } return 0; }
     case WM_MOUSEMOVE:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
-        int hovRow=-1; for(size_t i=0;i<g_pickerPaintCache.hoverRows.size();++i) if(PtInRect(&g_pickerPaintCache.hoverRows[i].rc,pt)){ hovRow=(int)i; break; }
+        const bool cacheReady=PickerPaintCacheMatches(g_picker,g_pickerPaintCache.generation);
+        int hovRow=-1; if(cacheReady) for(size_t i=0;i<g_pickerPaintCache.hoverRows.size();++i) if(PtInRect(&g_pickerPaintCache.hoverRows[i].rc,pt)){ hovRow=(int)i; break; }
         if(hovRow>=0 && g_pickerPaintCache.hoverRows[hovRow].trunc && g_tip){    // R9: full name on hover when truncated
-            if(hovRow!=g_lastHoverRow){                        // update text/activate only on row change (avoid churn/lag)
-                TOOLINFOW ti={0}; ti.cbSize=sizeof(ti); ti.hwnd=hwnd; ti.uId=1; ti.lpszText=(LPWSTR)g_pickerPaintCache.hoverRows[hovRow].full.c_str();
-                SendMessageW(g_tip,TTM_UPDATETIPTEXTW,0,(LPARAM)&ti);
-                SendMessageW(g_tip,TTM_TRACKACTIVATE,TRUE,(LPARAM)&ti);
-                g_lastHoverRow=hovRow;
-            }
-            POINT sp=pt; ClientToScreen(hwnd,&sp); SendMessageW(g_tip,TTM_TRACKPOSITION,0,(LPARAM)MAKELONG(sp.x+S(16),sp.y+S(20)));
-        } else if(g_lastHoverRow!=-1){ TipDeactivate(); g_lastHoverRow=-1; }
+            TrackPickerHoverTooltip(hwnd,g_pickerPaintCache.hoverRows[hovRow],
+                hovRow,g_pickerPaintCache.generation,pt);
+        } else if(g_lastHoverRow!=-1){ ResetPickerHoverTooltip(); }
         for(size_t i=0;i<g_tiles.size();++i) if(PtInRect(&g_tiles[i].rc,pt)){ if(g_picker.selectedIndex!=(int)i){SetPickerSelectionWithLegacy((int)i); RefreshPickerPaintCache(); InvalidateRect(hwnd,nullptr,FALSE);} break; }
         TRACKMOUSEEVENT tme={sizeof(tme)}; tme.dwFlags=TME_LEAVE; tme.hwndTrack=hwnd; TrackMouseEvent(&tme);
         return 0; }
-    case WM_MOUSELEAVE: TipDeactivate(); g_lastHoverRow=-1; return 0;
+    case WM_MOUSELEAVE: ResetPickerHoverTooltip(); return 0;
     case WM_MOUSEWHEEL:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; ScreenToClient(hwnd,&pt); int delta=GET_WHEEL_DELTA_WPARAM(wp);   // R8: scroll a tile's window list
-        for(auto& t:g_tiles) if(PtInRect(&t.rc,pt)){ RememberPickerScroll(t,AdvancePickerScroll(t.scroll,delta)); RefreshPickerPaintCache(); InvalidateRect(hwnd,nullptr,FALSE); break; }
+        for(auto& t:g_tiles) if(PtInRect(&t.rc,pt)){ const int maximum=PickerTileMaxScroll(t); RememberPickerScroll(t,AdvancePickerScroll(t.scroll,maximum,delta)); RefreshPickerPaintCache(); InvalidateRect(hwnd,nullptr,FALSE); break; }
         return 0; }
     case WM_COMMAND:                                            // R7: live-filter as the search text changes
         if(g_search && (HWND)lp==g_search && HIWORD(wp)==EN_CHANGE){

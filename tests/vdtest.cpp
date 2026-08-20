@@ -293,11 +293,15 @@ static void test_picker_visible_scroll_clamps_without_mutating_saved_value(){
 }
 
 static void test_picker_wheel_scroll_saturates_at_integer_bounds(){
-    CHECK(AdvancePickerScroll(0,120)==0);
-    CHECK(AdvancePickerScroll(3,120)==2);
-    CHECK(AdvancePickerScroll(3,-120)==4);
-    CHECK(AdvancePickerScroll(INT_MAX,-120)==INT_MAX);
-    CHECK(AdvancePickerScroll(3,0)==3);
+    CHECK(AdvancePickerScroll(0,3,120)==0);
+    CHECK(AdvancePickerScroll(3,3,120)==2);
+    CHECK(AdvancePickerScroll(2,3,-120)==3);
+    CHECK(AdvancePickerScroll(3,3,-120)==3);
+    CHECK(AdvancePickerScroll(99,3,120)==2);
+    CHECK(AdvancePickerScroll(99,3,-120)==3);
+    CHECK(AdvancePickerScroll(99,3,0)==3);
+    CHECK(AdvancePickerScroll(2,3,0)==2);
+    CHECK(AdvancePickerScroll(INT_MAX,0,-120)==0);
 }
 
 static void test_picker_target_failed_recapture_clears_entire_capture(){
@@ -464,6 +468,221 @@ static void test_picker_com_output_is_owned_even_on_failed_call(){
         CHECK(static_cast<bool>(output));
     }
     CHECK(releases==1);
+}
+
+struct PickerTestPaintCache {
+    int value=0;
+    uint64_t generation=0;
+    int* clock=nullptr;
+    int* swapOrder=nullptr;
+    void swap(PickerTestPaintCache& other) noexcept {
+        if(clock && swapOrder) *swapOrder=++*clock;
+        const int priorValue=value;
+        value=other.value;
+        other.value=priorValue;
+        const uint64_t priorGeneration=generation;
+        generation=other.generation;
+        other.generation=priorGeneration;
+    }
+    void clear() noexcept {
+        value=0;
+        generation=0;
+    }
+};
+
+static void test_picker_cache_publication_resets_hover_and_invalidates_failures(){
+    PickerState state;
+    const uint64_t firstGeneration=BeginPickerPaintRefresh(state);
+    CHECK(firstGeneration!=0);
+    CHECK(state.paintGeneration==firstGeneration);
+
+    int clock=0,beforePublish=0,swapOrder=0,failures=0;
+    PickerTestPaintCache cache;
+    cache.value=1;
+    cache.generation=firstGeneration;
+    cache.clock=&clock;
+    cache.swapOrder=&swapOrder;
+    const uint64_t nextGeneration=BeginPickerPaintRefresh(state);
+    CHECK(!PickerPaintCacheMatches(state,cache.generation));
+    CHECK(RefreshPickerPaintCacheTransaction(cache,
+        [&](PickerTestPaintCache& staged){
+            staged.value=2;
+            staged.generation=nextGeneration;
+            return true;
+        },
+        [&]() noexcept { beforePublish=++clock; },
+        [&](PickerTestPaintCache&) noexcept { ++failures; }));
+    CHECK(beforePublish==1 && swapOrder==2 && failures==0);
+    CHECK(cache.value==2 && cache.generation==nextGeneration);
+    CHECK(PickerPaintCacheMatches(state,cache.generation));
+    CHECK(PickerHoverPairMatches(4,nextGeneration,4,cache.generation));
+    CHECK(!PickerHoverPairMatches(4,firstGeneration,4,cache.generation));
+
+    state.paintGeneration=(std::numeric_limits<uint64_t>::max)();
+    CHECK(BeginPickerPaintRefresh(state)==1);
+
+    for(int callerCategory=0;callerCategory<5;++callerCategory){
+        cache.value=10+callerCategory;
+        cache.generation=BeginPickerPaintRefresh(state);
+        failures=0;
+        CHECK(!RefreshPickerPaintCacheTransaction(cache,
+            [](PickerTestPaintCache& staged){
+                staged.value=99;
+                return false;
+            },
+            []() noexcept {},
+            [&](PickerTestPaintCache& published) noexcept {
+                published.value=0;
+                published.generation=0;
+                ++failures;
+            }));
+        CHECK(cache.value==0 && cache.generation==0 && failures==1);
+        CHECK(!PickerPaintCacheMatches(state,cache.generation));
+    }
+
+    cache.value=77;
+    cache.generation=BeginPickerPaintRefresh(state);
+    failures=0;
+    CHECK(!RefreshPickerPaintCacheTransaction(cache,
+        [](PickerTestPaintCache&)->bool { throw std::bad_alloc(); },
+        []() noexcept {},
+        [&](PickerTestPaintCache& published) noexcept {
+            published.value=0;
+            published.generation=0;
+            ++failures;
+        }));
+    CHECK(cache.value==0 && cache.generation==0 && failures==1);
+}
+
+static void test_picker_commit_requires_exact_active_identity(){
+    const WindowIdentityKey active=IK(0x1234,77,9001);
+    CHECK(PickerTargetMatchesActive(0x1234,active));
+    CHECK(!PickerTargetMatchesActive(0x1235,active));
+    CHECK(!PickerTargetMatchesActive(0,active));
+    CHECK(PickerCommitIdentityAllowed(
+        0x1234,active,active,WindowIdentityRecapture::Match));
+    CHECK(!PickerCommitIdentityAllowed(
+        0x1235,active,active,WindowIdentityRecapture::Match));
+    CHECK(!PickerCommitIdentityAllowed(
+        0x1234,active,IK(0x1234,78,9001),
+        WindowIdentityRecapture::Match));
+    CHECK(!PickerCommitIdentityAllowed(
+        0x1234,active,IK(0x1234,77,9002),
+        WindowIdentityRecapture::Match));
+    CHECK(!PickerCommitIdentityAllowed(
+        0x1234,active,active,WindowIdentityRecapture::Lost));
+    CHECK(!PickerCommitIdentityAllowed(
+        0x1234,active,active,WindowIdentityRecapture::Indeterminate));
+}
+
+static void test_picker_model_publish_invalidates_cache_before_reentry(){
+    PickerState state;
+    state.paintGeneration=41;
+    std::vector<int> model={1};
+    CHECK(RunPickerRefreshTransaction(model,state,
+        [](std::vector<int>& staged,PickerState& next){
+            staged.push_back(2);
+            next.searchText=L"published";
+            return true;
+        }));
+    PickerTestPaintCache cache;
+    cache.value=7;
+    cache.generation=41;
+    CHECK(PickerPaintCacheMatches(state,cache.generation));
+
+    bool reentrantAcceptedOldCache=true;
+    InvalidatePickerPaintCacheState(state,cache,[&]() noexcept {
+        reentrantAcceptedOldCache=
+            PickerPaintCacheMatches(state,cache.generation);
+    });
+    CHECK(!reentrantAcceptedOldCache);
+    CHECK(cache.value==0 && cache.generation==0);
+    CHECK(state.paintGeneration==42);
+}
+
+static void test_picker_volatile_rows_skip_but_structural_failures_abort(){
+    PickerState state;
+    std::vector<int> model={9};
+    const std::vector<PickerRowReadResult> volatileSequence={
+        PickerRowReadResult::Success,
+        PickerRowReadResult::IdentityUnavailable,
+        PickerRowReadResult::DesktopUnavailable,
+        PickerRowReadResult::TitleUnavailable,
+        PickerRowReadResult::IdentityChanged,
+        PickerRowReadResult::Success
+    };
+    CHECK(RunPickerRefreshTransaction(model,state,
+        [&](std::vector<int>& staged,PickerState&){
+            bool modelFailed=false;
+            int row=0;
+            for(PickerRowReadResult result : volatileSequence){
+                if(result==PickerRowReadResult::Success)
+                    staged.push_back(++row);
+                else if(!ContinuePickerRowEnumeration(
+                            result,modelFailed)) return false;
+            }
+            return !modelFailed;
+        }));
+    CHECK((model==std::vector<int>{1,2}));
+
+    for(PickerRowReadResult fatal : {
+            PickerRowReadResult::AllocationFailure,
+            PickerRowReadResult::GlobalSnapshotFailure}){
+        CHECK(!RunPickerRefreshTransaction(model,state,
+            [&](std::vector<int>& staged,PickerState&){
+                bool modelFailed=false;
+                staged.push_back(7);
+                return ContinuePickerRowEnumeration(fatal,modelFailed);
+            }));
+        CHECK((model==std::vector<int>{1,2}));
+    }
+}
+
+static void test_picker_async_search_joins_by_full_identity(){
+    const WindowIdentityKey row=IK(0x1234,77,9001);
+    CHECK(PickerSearchResultMatches(row,row));
+    CHECK(!PickerSearchResultMatches(row,IK(0x1235,77,9001)));
+    CHECK(!PickerSearchResultMatches(row,IK(0x1234,78,9001)));
+    CHECK(!PickerSearchResultMatches(row,IK(0x1234,77,9002)));
+    CHECK(!PickerSearchResultMatches(row,WindowIdentityKey{}));
+}
+
+static void test_picker_state_whole_object_swap_includes_generation_sentinel(){
+    const GUID leftDesktop=G(
+        L"{231A0000-0000-0000-0000-000000000001}");
+    const GUID rightDesktop=G(
+        L"{231A0000-0000-0000-0000-000000000002}");
+    PickerState left,right;
+    left.currentDesktop=leftDesktop;
+    left.selectedDesktop=rightDesktop;
+    left.selectedIndex=3;
+    left.activeWindow=IK(11,12,13);
+    left.searchText=L"left";
+    left.searchActive=true;
+    left.controlledTransition=true;
+    left.scrollByDesktop[GuidKey(leftDesktop)]=4;
+    left.paintGeneration=101;
+    right.currentDesktop=rightDesktop;
+    right.selectedDesktop=leftDesktop;
+    right.selectedIndex=7;
+    right.activeWindow=IK(21,22,23);
+    right.searchText=L"right";
+    right.scrollByDesktop[GuidKey(rightDesktop)]=8;
+    right.paintGeneration=202;
+
+    CHECK(noexcept(SwapPickerState(left,right)));
+    CHECK(noexcept(left.swap(right)));
+    SwapPickerState(left,right);
+    CHECK(IsCurrentDesktop(left,rightDesktop));
+    CHECK(left.selectedIndex==7 && left.searchText==L"right");
+    CHECK(left.paintGeneration==202);
+    CHECK(IsCurrentDesktop(right,leftDesktop));
+    CHECK(right.selectedIndex==3 && right.searchText==L"left");
+    CHECK(right.searchActive && right.controlledTransition);
+    CHECK(right.scrollByDesktop.at(GuidKey(leftDesktop))==4);
+    CHECK(right.paintGeneration==101);
+    SwapPickerState(left,right);
+    CHECK(left.paintGeneration==101 && right.paintGeneration==202);
 }
 
 static MoveJob MJ(MoveOwner owner, uint64_t operationId,
@@ -13284,6 +13503,12 @@ int main(){
     test_picker_valid_current_commits_only_with_model();
     test_picker_paint_cache_failure_blocks_show_transactionally();
     test_picker_com_output_is_owned_even_on_failed_call();
+    test_picker_cache_publication_resets_hover_and_invalidates_failures();
+    test_picker_commit_requires_exact_active_identity();
+    test_picker_model_publish_invalidates_cache_before_reentry();
+    test_picker_volatile_rows_skip_but_structural_failures_abort();
+    test_picker_async_search_joins_by_full_identity();
+    test_picker_state_whole_object_swap_includes_generation_sentinel();
     test_finalization_runs_once();
     test_window_identity_requires_full_nonzero_process_identity();
     test_snapshot_versions_change_only_for_changed_inputs();
