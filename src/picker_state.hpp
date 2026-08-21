@@ -88,6 +88,20 @@ inline SIZE PickerDesiredClientSize(
     return result;
 }
 
+inline POINT PickerCenteredOrigin(const RECT& workArea,
+                                  const SIZE& outerSize) noexcept {
+    const long long width=static_cast<long long>(workArea.right)-
+        workArea.left;
+    const long long height=static_cast<long long>(workArea.bottom)-
+        workArea.top;
+    POINT origin;
+    origin.x=PickerSaturatingInt(static_cast<long long>(workArea.left)+
+        (width-outerSize.cx)/2);
+    origin.y=PickerSaturatingInt(static_cast<long long>(workArea.top)+
+        (height-outerSize.cy)/2);
+    return origin;
+}
+
 struct PickerFooterLayout {
     RECT footer={0,0,0,0};
     RECT repoLink={0,0,0,0};

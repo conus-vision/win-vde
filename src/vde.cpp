@@ -7525,6 +7525,35 @@ static PickerTargetCaptureState CapturePickerTarget() noexcept {
     return capture;
 }
 
+static bool GetPrimaryPickerWorkArea(RECT& workArea) noexcept {
+    POINT origin={0,0};
+    HMONITOR monitor=MonitorFromPoint(
+        origin,MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO info={sizeof(info)};
+    if(monitor && GetMonitorInfoW(monitor,&info) &&
+       info.rcWork.right>info.rcWork.left &&
+       info.rcWork.bottom>info.rcWork.top){
+        workArea=info.rcWork;
+        return true;
+    }
+
+    RECT fallback={0,0,0,0};
+    if(SystemParametersInfoW(
+            SPI_GETWORKAREA,0,&fallback,0) &&
+       fallback.right>fallback.left &&
+       fallback.bottom>fallback.top){
+        workArea=fallback;
+        return true;
+    }
+
+    fallback={0,0,GetSystemMetrics(SM_CXSCREEN),
+                   GetSystemMetrics(SM_CYSCREEN)};
+    if(fallback.right<=fallback.left ||
+       fallback.bottom<=fallback.top) return false;
+    workArea=fallback;
+    return true;
+}
+
 static void ShowPicker(PickerTargetCaptureState capture){
     if(g_degraded || g_picker.controlledTransition()) return;   // desktop COM unavailable; startup dialog + tray tip already explain
     const bool modelReady=BuildModel(capture.identity,true);
@@ -7538,11 +7567,18 @@ static void ShowPicker(PickerTargetCaptureState capture){
     InvalidatePickerTabSearchCache(
         g_pickerTabSearchCache,g_picker.modelGeneration);
     SIZE sz=DesiredClientSize();
-    HMONITOR mon=MonitorFromWindow(g_target?g_target:g_main,MONITOR_DEFAULTTOPRIMARY); MONITORINFO mi={sizeof(mi)}; GetMonitorInfo(mon,&mi);
-    RECT wr={0,0,sz.cx,sz.cy}; AdjustWindowRectEx(&wr,WS_POPUP,FALSE,WS_EX_TOOLWINDOW|WS_EX_TOPMOST);
-    int ww=wr.right-wr.left,wh=wr.bottom-wr.top;
-    int wx=mi.rcWork.left+((mi.rcWork.right-mi.rcWork.left)-ww)/2, wy=mi.rcWork.top+((mi.rcWork.bottom-mi.rcWork.top)-wh)/2;
-    SetWindowPos(g_main,HWND_TOPMOST,wx,wy,ww,wh,SWP_NOACTIVATE);
+    RECT workArea={0,0,0,0};
+    if(!GetPrimaryPickerWorkArea(workArea)) return;
+    RECT windowRect={0,0,sz.cx,sz.cy};
+    AdjustWindowRectEx(
+        &windowRect,WS_POPUP,FALSE,WS_EX_TOOLWINDOW|WS_EX_TOPMOST);
+    const SIZE outer={
+        windowRect.right-windowRect.left,
+        windowRect.bottom-windowRect.top
+    };
+    const POINT origin=PickerCenteredOrigin(workArea,outer);
+    SetWindowPos(g_main,HWND_TOPMOST,origin.x,origin.y,
+                 outer.cx,outer.cy,SWP_NOACTIVATE);
     RECT cr; GetClientRect(g_main,&cr); LayoutTiles(cr.right);
     EnsurePickerChildren();
     if(g_search){ SetWindowTextW(g_search,L""); RECT sb=SearchBoxRect(cr.right);

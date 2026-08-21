@@ -168,6 +168,23 @@ static void test_footer_minimum_size_is_one_line_and_dpi_scaled(){
           footerAt200.conusLink.right==1360);
 }
 
+static void test_picker_centered_origin_uses_exact_work_area(){
+    const POINT primary=PickerCenteredOrigin(
+        RECT{0,40,1920,1040},SIZE{720,500});
+    CHECK(primary.x==600);
+    CHECK(primary.y==290);
+
+    const POINT negative=PickerCenteredOrigin(
+        RECT{-1920,-200,0,880},SIZE{800,400});
+    CHECK(negative.x==-1360);
+    CHECK(negative.y==140);
+
+    const POINT oversized=PickerCenteredOrigin(
+        RECT{0,0,640,480},SIZE{800,600});
+    CHECK(oversized.x==-80);
+    CHECK(oversized.y==-60);
+}
+
 static bool SamePickerFooterLayout(
         const PickerFooterLayout& left,
         const PickerFooterLayout& right) noexcept {
@@ -11813,6 +11830,24 @@ static void test_picker_ctrl_move_uses_shared_foreground_handoff(){
     CHECK(mouse.find("GetKeyState(VK_CONTROL)")==std::string::npos);
 }
 
+static void test_picker_show_uses_primary_monitor_only(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string helper=SourceSection(
+        source,"static bool GetPrimaryPickerWorkArea(",
+        "static void ShowPicker(");
+    const std::string show=SourceSection(
+        source,"static void ShowPicker(","static void MoveSel(");
+    CHECK(!helper.empty());
+    CHECK(helper.find("MonitorFromPoint(")!=std::string::npos);
+    CHECK(helper.find("MONITOR_DEFAULTTOPRIMARY")!=std::string::npos);
+    CHECK(helper.find("GetMonitorInfoW(")!=std::string::npos);
+    CHECK(helper.find("SPI_GETWORKAREA")!=std::string::npos);
+    CHECK(show.find("GetPrimaryPickerWorkArea(")!=std::string::npos);
+    CHECK(show.find("PickerCenteredOrigin(")!=std::string::npos);
+    CHECK(show.find("MonitorFromWindow(")==std::string::npos);
+    CHECK(show.find("g_target?g_target:g_main")==std::string::npos);
+}
+
 static void test_picker_preloads_only_laid_out_visible_rows(){
     const std::string source=ReadSourceFile(L"src\\vde.cpp");
     CHECK(!source.empty());
@@ -18832,6 +18867,7 @@ int main(){
     test_picker_icon_loading_is_bounded_and_outside_paint();
     test_picker_enum_publishes_display_only_rows_safely();
     test_picker_ctrl_move_uses_shared_foreground_handoff();
+    test_picker_show_uses_primary_monitor_only();
     test_picker_preloads_only_laid_out_visible_rows();
     test_picker_wm_paint_requires_the_owned_buffer();
     test_cli_list_uses_one_atomic_desktop_snapshot();
@@ -18839,6 +18875,7 @@ int main(){
     test_message_pump_failure_uses_shared_teardown();
     test_footer_literal_and_links_are_exact();
     test_footer_minimum_size_is_one_line_and_dpi_scaled();
+    test_picker_centered_origin_uses_exact_work_area();
     test_footer_geometry_hit_hover_cursor_and_open_result_seams();
     test_footer_cache_and_activation_are_transactional();
     test_composite_picker_cache_cannot_omit_footer_state();
