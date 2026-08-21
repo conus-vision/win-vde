@@ -6729,7 +6729,7 @@ static void TrackPickerHoverTooltip(HWND hwnd,const RowRec& row,
     SendMessageW(g_tip,TTM_TRACKPOSITION,0,
         (LPARAM)MAKELONG(screenPoint.x+S(16),screenPoint.y+S(20)));
 }
-static void HidePicker(){
+static void HidePicker() noexcept {
     if(g_picker.controlledTransition()) return;
     if(g_main) KillTimer(g_main,TIMER_PICKER_TRANSITION);
     CancelPickerIconPreload(g_main);
@@ -7509,35 +7509,89 @@ static PickerAcceptedPlanRecordResult SelectPickerAcceptedPlanRecord(
     }
 }
 
-static void BeginVerifiedPickerMove(int index) noexcept {
-    if(g_picker.controlledTransition() || index<0 ||
-       index>=static_cast<int>(g_tiles.size()) ||
-       g_picker.selectedIndex!=index ||
-       !GuidEq(g_picker.selectedDesktop,g_tiles[index].guid) ||
-       !g_main || !g_vdmi || !g_vdmDoc) return;
+static PickerTraceMoveBeginReason BeginVerifiedPickerMove(
+        int index,uint64_t activationId) noexcept {
+    PickerTraceMoveBeginEvent traceEvent;
+    traceEvent.activationId=activationId;
+    traceEvent.tileIndex=index;
+    bool transitionPublishedForTrace=false;
+    const auto finish=[&](PickerTraceMoveBeginReason reason,
+                          bool flush=true) noexcept {
+        traceEvent.reason=reason;
+        g_pickerTrace.emit(traceEvent);
+        if(flush) g_pickerTrace.flushBoundary();
+        return reason;
+    };
+    if(g_picker.controlledTransition())
+        return finish(PickerTraceMoveBeginReason::AlreadyControlled);
+    if(index<0 || index>=static_cast<int>(g_tiles.size()))
+        return finish(PickerTraceMoveBeginReason::InvalidIndex);
+    if(g_picker.selectedIndex!=index)
+        return finish(PickerTraceMoveBeginReason::SelectionIndexMismatch);
+    if(!GuidEq(g_picker.selectedDesktop,g_tiles[index].guid))
+        return finish(PickerTraceMoveBeginReason::SelectionDesktopMismatch);
+    if(!g_main)
+        return finish(PickerTraceMoveBeginReason::MainWindowMissing);
+    if(!g_vdmi)
+        return finish(PickerTraceMoveBeginReason::DesktopManagerMissing);
+    if(!g_vdmDoc)
+        return finish(PickerTraceMoveBeginReason::DesktopDocumentMissing);
     try {
         const uintptr_t targetHwnd=reinterpret_cast<uintptr_t>(g_target);
-        if(!PickerTargetMatchesActive(targetHwnd,g_picker.activeWindow) ||
-           !g_target || !IsWindow(g_target)) return;
+        // Preserve the original short-circuit order: a null target first
+        // fails the active-target match and is reported as TargetMismatch.
+        if(!PickerTargetMatchesActive(targetHwnd,g_picker.activeWindow))
+            return finish(PickerTraceMoveBeginReason::TargetMismatch);
+        if(!g_target)
+            return finish(PickerTraceMoveBeginReason::TargetWindowMissing);
+        if(!IsWindow(g_target))
+            return finish(PickerTraceMoveBeginReason::TargetWindowInvalid);
         const GUID destination=g_tiles[index].guid;
         const GUID currentOrigin=CurrentDesktopGuid();
         PickerReadValidity popupValidity=PickerReadValidity::Unavailable;
         GUID popupOrigin={0};
         ReadPickerWindowDesktop(g_main,popupValidity,popupOrigin);
-        if(GuidIsZero(destination) || GetDesktopIndexByGuid(destination)<0 ||
-           GuidIsZero(currentOrigin) ||
-           popupValidity!=PickerReadValidity::Valid ||
-           GuidIsZero(popupOrigin)) return;
+        traceEvent.destination=destination;
+        traceEvent.currentOrigin=currentOrigin;
+        traceEvent.popupOrigin=popupOrigin;
+        if(GuidIsZero(destination))
+            return finish(PickerTraceMoveBeginReason::DestinationZero);
+        if(GetDesktopIndexByGuid(destination)<0)
+            return finish(
+                PickerTraceMoveBeginReason::DestinationLookupFailed);
+        if(GuidIsZero(currentOrigin))
+            return finish(
+                PickerTraceMoveBeginReason::CurrentDesktopUnavailable);
+        if(popupValidity!=PickerReadValidity::Valid ||
+           GuidIsZero(popupOrigin))
+            return finish(
+                PickerTraceMoveBeginReason::PopupDesktopUnavailable);
 
         FastWin fast;
         bool tracked=false,titleComplete=true;
         if(!CaptureFastWindowForMove(
-                g_target,fast,tracked,titleComplete) ||
-           GuidIsZero(fast.desktop)) return;
+                g_target,fast,tracked,titleComplete))
+            return finish(PickerTraceMoveBeginReason::FastCaptureFailed);
+        traceEvent.targetOrigin=fast.desktop;
+        if(GuidIsZero(fast.desktop))
+            return finish(
+                PickerTraceMoveBeginReason::TargetDesktopUnavailable);
         const WindowIdentityKey identity=IdentityOf(fast);
+        const WindowIdentityRecapture identityRecapture=
+            RecaptureGenericWindowIdentity(identity);
         if(!PickerCommitIdentityAllowed(
                 targetHwnd,g_picker.activeWindow,identity,
-                RecaptureGenericWindowIdentity(identity))) return;
+                identityRecapture)){
+            if(!PickerTargetMatchesActive(
+                    targetHwnd,g_picker.activeWindow))
+                return finish(PickerTraceMoveBeginReason::IdentityMismatch);
+            if(identityRecapture==WindowIdentityRecapture::Lost)
+                return finish(PickerTraceMoveBeginReason::IdentityLost);
+            if(identityRecapture==WindowIdentityRecapture::Indeterminate)
+                return finish(
+                    PickerTraceMoveBeginReason::IdentityIndeterminate);
+            return finish(PickerTraceMoveBeginReason::IdentityMismatch);
+        }
         const std::string runtimeKey=RuntimeKey(identity);
         std::string acceptedPlanApp,acceptedPlanRecord;
         uint64_t acceptedPlanOperationId=0;
@@ -7551,7 +7605,8 @@ static void BeginVerifiedPickerMove(int index) noexcept {
                 acceptedPlanOperationId,acceptedPlanIdentityGeneration,
                 acceptedPlanFreshRecord,hasAcceptedPlanFreshRecord,
                 acceptedPlanRecordExists);
-        if(acceptedPlan==PickerAcceptedPlanRecordResult::Rejected) return;
+        if(acceptedPlan==PickerAcceptedPlanRecordResult::Rejected)
+            return finish(PickerTraceMoveBeginReason::AcceptedPlanConflict);
         if(acceptedPlan==PickerAcceptedPlanRecordResult::Selected){
             fast.app=acceptedPlanApp;
             tracked=true;
@@ -7559,6 +7614,7 @@ static void BeginVerifiedPickerMove(int index) noexcept {
 
         PickerTransition prepared;
         prepared.generation=TakeNonzeroId(g_nextOperationId);
+        traceEvent.generation=prepared.generation;
         prepared.reservationToken.owner=MoveOwner::Picker;
         prepared.reservationToken.operationId=prepared.generation;
         prepared.reservationToken.jobId=TakeNonzeroId(g_nextMoveJobId);
@@ -7634,7 +7690,9 @@ static void BeginVerifiedPickerMove(int index) noexcept {
         if(bound!=g_recordByRuntime.end() &&
            SameIdentity(bound->second.identity,identity)){
             if(acceptedPlan==PickerAcceptedPlanRecordResult::Selected &&
-               bound->second.recordId!=acceptedPlanRecord) return;
+               bound->second.recordId!=acceptedPlanRecord)
+                return finish(
+                    PickerTraceMoveBeginReason::BoundRecordConflict);
             reservation.recordId=bound->second.recordId;
         } else {
             std::string recordId;
@@ -7651,7 +7709,9 @@ static void BeginVerifiedPickerMove(int index) noexcept {
                 acceptedPlan==PickerAcceptedPlanRecordResult::Selected &&
                 !acceptedPlanRecordExists &&
                 !reservation.hasAcceptedFreshRecord;
-            if(acceptedNewNeedsOrigin && !hasCapturedProvisional) return;
+            if(acceptedNewNeedsOrigin && !hasCapturedProvisional)
+                return finish(
+                    PickerTraceMoveBeginReason::SafeOriginUnavailable);
             const bool safeOriginRecord=PickerHasSafeOriginRecord(
                 hasCapturedProvisional,
                 reservation.hasAcceptedFreshRecord);
@@ -7747,22 +7807,31 @@ static void BeginVerifiedPickerMove(int index) noexcept {
         bool acceptedPendingPublished=false;
         bool operationClaimPublished=false;
         bool transitionPublished=false;
+        PickerTraceMoveBeginReason stagingFailure=
+            PickerTraceMoveBeginReason::ReservationHandoffFailed;
         if(acceptedPlan==PickerAcceptedPlanRecordResult::Selected){
             auto operation=
                 g_pendingAutoOperations.find(acceptedPlanOperationId);
-            if(operation==g_pendingAutoOperations.end() ||
-               !StagePickerOperationLifetimeClaim(
+            if(operation==g_pendingAutoOperations.end())
+                return finish(
+                    PickerTraceMoveBeginReason::AcceptedOperationMissing);
+            if(!StagePickerOperationLifetimeClaim(
                    operation->second.pickerClaimedRecordByRuntime,
                    runtimeKey,acceptedPlanRecord,
                    acceptedPlanRecordExists,stagedOperationClaims))
-                return;
+                return finish(
+                    PickerTraceMoveBeginReason::OperationClaimStageFailed);
             claimedOperation=&operation->second;
         }
         const bool staged=RunSuccessorFirstReservationHandoff([&](){
+            stagingFailure=
+                PickerTraceMoveBeginReason::ReservationHandoffFailed;
             if(!BeginReservationHandoff(runtimeKey,reservation,handoff))
                 return false;
             prepared.pendingRecordId=handoff.installed.recordId;
             if(preserveAcceptedPlanPending){
+                stagingFailure=
+                    PickerTraceMoveBeginReason::PendingAssociationStageFailed;
                 if(!StagePickerAcceptedPlanPendingAssociation(
                         g_pendingRecordByRuntime,runtimeKey,
                         handoff.installed.recordId,stagedAcceptedPending))
@@ -7776,6 +7845,8 @@ static void BeginVerifiedPickerMove(int index) noexcept {
                 operationClaimPublished=true;
             }
             if(provisionalNeedsInsert){
+                stagingFailure=
+                    PickerTraceMoveBeginReason::ProvisionalInsertFailed;
                 if(!g_provisionalRecordByRuntime.emplace(
                         runtimeKey,handoff.installed.recordId).second)
                     return false;
@@ -7810,7 +7881,8 @@ static void BeginVerifiedPickerMove(int index) noexcept {
             }
             RollbackReservationHandoff(handoff);
         });
-        if(!staged) return;
+        if(!staged) return finish(stagingFailure);
+        transitionPublishedForTrace=true;
 
         SetPickerCurrentDesktop(g_picker,currentOrigin);
         if(!g_picker.transition.pendingRecordId.empty()){
@@ -7833,12 +7905,24 @@ static void BeginVerifiedPickerMove(int index) noexcept {
             terminal.recordId=g_picker.transition.pendingRecordId;
             ConsumeCheckpointAndReleaseMoveReservation(terminal);
             g_picker.transition.swap(prepared);
-            return;
+            return finish(PickerTraceMoveBeginReason::NoInitialEffect);
         }
+        traceEvent.firstEffect=effect.kind;
+        (void)finish(PickerTraceMoveBeginReason::Accepted,false);
         QueuePickerEffect(effect);
+        g_pickerTrace.flushBoundary();
+        return PickerTraceMoveBeginReason::Accepted;
     } catch(...) {
         // Entry staging is failure-atomic; any published transition owns its
         // exact guard and the durable pump will finish or roll it back.
+        PickerTraceMoveBeginExceptionEvent event;
+        event.activationId=activationId;
+        event.transitionPublished=transitionPublishedForTrace;
+        g_pickerTrace.emit(event);
+        g_pickerTrace.flushBoundary();
+        return transitionPublishedForTrace
+            ? PickerTraceMoveBeginReason::Accepted
+            : PickerTraceMoveBeginReason::NoInitialEffect;
     }
 }
 class PickerTraceCaptureEmitScope {
@@ -8147,7 +8231,7 @@ static void ApplyAutoFix(){
 // Переключиться на десктоп. SwitchDesktop = слот 6 vtable (совпадает на 23H2/24H2).
 // Фокус-данс через Progman, как в референсе MScholtes: без него система может
 // «вернуть» исходный десктоп из-за активного окна -> переключение уходило не туда.
-static void GoToDesktop(int idx){
+static void GoToDesktop(int idx) noexcept {
     if(g_picker.controlledTransition()) return;
     if(idx<0||idx>=(int)g_tiles.size())return;
     HidePicker();
@@ -8156,13 +8240,34 @@ static void GoToDesktop(int idx){
         g_tiles[idx].guid,invoked);
 }
 // Клик = переключение на десктоп; Ctrl = перенести активное окно туда.
-static void Activate(int idx, bool ctrlMove){
-    if(g_picker.controlledTransition()) return;
-    if(idx<0||idx>=(int)g_tiles.size())return;
-    if(!SetPickerSelectionCurrent(idx)) return;
-    RefreshPickerPaintCache();
-    if(ctrlMove) BeginVerifiedPickerMove(idx);
-    else         GoToDesktop(idx);
+static void Activate(int idx,bool ctrlMove,
+                     PickerTraceActivationSource source) noexcept {
+    const uint64_t activationId=g_pickerTrace.nextCorrelationId();
+    (void)DispatchPickerActivation(
+        activationId,source,g_picker.controlledTransition(),idx,
+        static_cast<int>(g_tiles.size()),ctrlMove,
+        [](uint64_t id,PickerTraceActivationSource activationSource,
+           bool ctrl,int tileIndex) noexcept {
+            PickerTraceActivationRequestEvent event;
+            event.activationId=id;
+            event.source=activationSource;
+            event.ctrl=ctrl;
+            event.tileIndex=tileIndex;
+            g_pickerTrace.emit(event);
+        },[](int index) noexcept {
+            return SetPickerSelectionCurrent(index);
+        },[]() noexcept {
+            (void)RefreshPickerPaintCache();
+        },[](int index) noexcept {
+            GoToDesktop(index);
+        },[](int index,uint64_t id) noexcept {
+            (void)BeginVerifiedPickerMove(index,id);
+        },[](uint64_t id,PickerTraceActivationResult result) noexcept {
+            PickerTraceActivationResultEvent event;
+            event.activationId=id;
+            event.result=result;
+            g_pickerTrace.emit(event);
+        });
 }
 
 // --------------------------- settings window ---------------------------------
@@ -8526,19 +8631,41 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             else HidePicker();
             return 0;
         }
+        if(wp==VK_RETURN||wp==VK_SPACE){
+            Activate(g_picker.selectedIndex,ctrl,
+                     PickerTraceActivationSource::Keyboard);
+            return 0;
+        }
+        if(wp>='1'&&wp<='9'){
+            Activate(static_cast<int>(wp-'1'),ctrl,
+                     PickerTraceActivationSource::Keyboard);
+            return 0;
+        }
+        if(wp=='0'){
+            Activate(9,ctrl,PickerTraceActivationSource::Keyboard);
+            return 0;
+        }
         if(g_picker.controlledTransition()) return 0;
-        if(wp==VK_RETURN||wp==VK_SPACE){Activate(g_picker.selectedIndex,ctrl);return 0;}
         if(wp==VK_LEFT){MoveSel(-1,0);return 0;} if(wp==VK_RIGHT){MoveSel(1,0);return 0;}
         if(wp==VK_UP){MoveSel(0,-1);return 0;} if(wp==VK_DOWN){MoveSel(0,1);return 0;}
         if(wp==VK_TAB){ bool sh=(GetKeyState(VK_SHIFT)&0x8000)!=0; int n=(int)g_tiles.size(); if(n){int selected=g_picker.selectedIndex; if(selected<0||selected>=n)selected=0; SetPickerSelectionCurrent((selected+(sh?-1:1)+n)%n); RefreshPickerPaintCache(); InvalidateRect(hwnd,nullptr,FALSE);} return 0; }
-        if(wp>='1'&&wp<='9'){Activate((int)(wp-'1'),ctrl);return 0;} if(wp=='0'){Activate(9,ctrl);return 0;}
         return 0; }
     case WM_KEYUP:
         if(wp==VK_CONTROL) InvalidateRect(hwnd,nullptr,FALSE);
         return 0;
     case WM_LBUTTONDOWN:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
         const bool ctrl=PickerMouseControlHeld(wp);
-        if(g_picker.controlledTransition()) return 0;
+        PickerTraceMouseDownEvent mouseEvent;
+        mouseEvent.rawWparam=static_cast<uint64_t>(wp);
+        mouseEvent.x=pt.x;
+        mouseEvent.y=pt.y;
+        mouseEvent.ctrl=ctrl;
+        mouseEvent.controlled=g_picker.controlledTransition();
+        mouseEvent.searchActive=g_picker.searchActive;
+        if(mouseEvent.controlled){
+            g_pickerTrace.emit(mouseEvent);
+            return 0;
+        }
         const bool cacheReady=PickerPaintCacheMatches(g_picker,g_pickerPaintCache.generation);
         const PickerFooterActivation footerActivation=
             ResolvePickerFooterActivation(
@@ -8560,6 +8687,9 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         const PickerPointerActivation activation=
             ResolvePickerPointerActivation(
                 footerActivation,clearSearchHit,searchHit,tileIndex);
+        mouseEvent.target=activation.target;
+        mouseEvent.tileIndex=activation.tileIndex;
+        g_pickerTrace.emit(mouseEvent);
         if(DispatchPickerPointerActivation(activation,
             [&](const PickerFooterActivation& footer){
                 OpenPickerFooterLink(hwnd,footer);
@@ -8580,7 +8710,7 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                     RefreshPickerPaintCache();
                     InvalidateRect(hwnd,nullptr,FALSE);
                 }
-                Activate(index,ctrl);
+                Activate(index,ctrl,PickerTraceActivationSource::Mouse);
             })) return 0;
         if(g_picker.searchActive){
             g_picker.searchActive=false;

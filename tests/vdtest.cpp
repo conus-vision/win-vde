@@ -12212,7 +12212,7 @@ static void test_picker_preloads_only_laid_out_visible_rows(){
     CHECK(controlledHide.find("CancelPickerIconPreload(g_main)")!=
           std::string::npos);
     const std::string idleHide=SourceSection(
-        source,"static void HidePicker(){","// Search EDIT subclass");
+        source,"static void HidePicker()","// Search EDIT subclass");
     CHECK(idleHide.find("CancelPickerIconPreload(g_main)")!=
           std::string::npos);
 
@@ -20668,6 +20668,341 @@ static void test_picker_trace_snapshot_observer_reports_failures_no_throw(){
     CHECK(desktop.releases==1);
 }
 
+struct PickerTraceActivationRunForTest {
+    PickerTraceActivationResult result=
+        PickerTraceActivationResult::InvalidTile;
+    int selectCalls=0;
+    int refreshCalls=0;
+    int plainCalls=0;
+    int beginCalls=0;
+    uint64_t requestId=0;
+    uint64_t resultId=0;
+    uint64_t beginId=0;
+    int beginIndex=-1;
+    int requestCount=0;
+    int resultCount=0;
+    PickerTraceActivationSource requestSource=
+        PickerTraceActivationSource::Mouse;
+    std::array<char,8> transcript{};
+    size_t transcriptLength=0;
+};
+
+static PickerTraceActivationRunForTest RunPickerTraceActivationForTest(
+        bool controlled,int index,int count,bool ctrlMove,bool selectOk,
+        PickerTraceWriter* writer=nullptr,
+        PickerTraceActivationSource source=PickerTraceActivationSource::Mouse){
+    PickerTraceActivationRunForTest run;
+    const uint64_t activationId=444;
+    const auto record=[&](char value) noexcept {
+        if(run.transcriptLength<run.transcript.size())
+            run.transcript[run.transcriptLength++]=value;
+    };
+    run.result=DispatchPickerActivation(
+        activationId,source,
+        controlled,index,count,ctrlMove,
+        [&](uint64_t id,PickerTraceActivationSource source,
+            bool ctrl,int tile) noexcept {
+            record('q');
+            ++run.requestCount;
+            run.requestId=id;
+            run.requestSource=source;
+            CHECK(ctrl==ctrlMove);
+            CHECK(tile==index);
+            if(writer){
+                PickerTraceActivationRequestEvent event;
+                event.activationId=id;
+                event.source=source;
+                event.ctrl=ctrl;
+                event.tileIndex=tile;
+                writer->emit(event);
+            }
+        },[&](int selected) noexcept {
+            record('s');
+            ++run.selectCalls;
+            CHECK(selected==index);
+            return selectOk;
+        },[&]() noexcept {
+            record('f');
+            ++run.refreshCalls;
+        },[&](int selected) noexcept {
+            record('p');
+            ++run.plainCalls;
+            CHECK(selected==index);
+        },[&](int selected,uint64_t id) noexcept {
+            record('b');
+            ++run.beginCalls;
+            run.beginIndex=selected;
+            run.beginId=id;
+        },[&](uint64_t id,PickerTraceActivationResult result) noexcept {
+            record('r');
+            ++run.resultCount;
+            run.resultId=id;
+            if(writer){
+                PickerTraceActivationResultEvent event;
+                event.activationId=id;
+                event.result=result;
+                writer->emit(event);
+            }
+        });
+    return run;
+}
+
+static void test_picker_trace_activation_dispatches_every_guard_once(){
+    struct Case {
+        bool controlled;
+        int index;
+        int count;
+        bool ctrl;
+        bool selectOk;
+        PickerTraceActivationSource source;
+        PickerTraceActivationResult expected;
+        const char* transcript;
+        int selectCalls;
+        int refreshCalls;
+        int plainCalls;
+        int beginCalls;
+    };
+    const Case cases[]={
+        {true,0,2,true,true,PickerTraceActivationSource::Keyboard,
+            PickerTraceActivationResult::AlreadyControlled,"qr",0,0,0,0},
+        {false,-1,2,true,true,PickerTraceActivationSource::Mouse,
+            PickerTraceActivationResult::InvalidTile,"qr",0,0,0,0},
+        {false,1,2,true,false,PickerTraceActivationSource::Mouse,
+            PickerTraceActivationResult::SelectionPublicationFailed,
+            "qsr",1,0,0,0},
+        {false,1,2,false,true,PickerTraceActivationSource::Mouse,
+            PickerTraceActivationResult::RoutedPlainSwitch,"qsfpr",1,1,1,0},
+        {false,1,2,true,true,PickerTraceActivationSource::Keyboard,
+            PickerTraceActivationResult::DispatchedMoveEntry,"qsfbr",1,1,0,1}
+    };
+    for(const Case& value:cases){
+        const PickerTraceActivationRunForTest run=
+            RunPickerTraceActivationForTest(
+                value.controlled,value.index,value.count,
+                value.ctrl,value.selectOk,nullptr,value.source);
+        CHECK(run.result==value.expected);
+        CHECK(run.requestCount==1 && run.resultCount==1);
+        CHECK(run.requestId==444 && run.resultId==444);
+        CHECK(run.requestSource==value.source);
+        CHECK(std::string(run.transcript.data(),run.transcriptLength)==
+              value.transcript);
+        CHECK(run.selectCalls==value.selectCalls);
+        CHECK(run.refreshCalls==value.refreshCalls);
+        CHECK(run.plainCalls==value.plainCalls);
+        CHECK(run.beginCalls==value.beginCalls);
+        if(value.beginCalls)
+            CHECK(run.beginId==444 && run.beginIndex==value.index);
+    }
+}
+
+static void test_picker_trace_activation_sources_have_stable_json_names(){
+    struct Case { PickerTraceActivationSource source; const char* name; };
+    const Case cases[]={
+        {PickerTraceActivationSource::Mouse,"mouse"},
+        {PickerTraceActivationSource::Keyboard,"keyboard"}
+    };
+    for(const Case& value:cases){
+        CHECK(std::string(PickerTraceActivationSourceName(value.source))==
+              value.name);
+        PickerTraceActivationRequestEvent event;
+        event.source=value.source;
+        std::string line;
+        CHECK(SerializePickerTraceLine(PickerTraceEnvelope{},event,line));
+        CHECK(line.find(std::string("\"source\":\"")+value.name+"\"")!=
+              std::string::npos);
+    }
+}
+
+static void test_picker_trace_move_begin_reasons_have_stable_json_names(){
+    struct Case { PickerTraceMoveBeginReason reason; const char* name; };
+    const Case cases[]={
+        {PickerTraceMoveBeginReason::Accepted,"accepted"},
+        {PickerTraceMoveBeginReason::AlreadyControlled,"already_controlled"},
+        {PickerTraceMoveBeginReason::InvalidIndex,"invalid_index"},
+        {PickerTraceMoveBeginReason::SelectionIndexMismatch,"selection_index_mismatch"},
+        {PickerTraceMoveBeginReason::SelectionDesktopMismatch,"selection_desktop_mismatch"},
+        {PickerTraceMoveBeginReason::MainWindowMissing,"main_window_missing"},
+        {PickerTraceMoveBeginReason::DesktopManagerMissing,"desktop_manager_missing"},
+        {PickerTraceMoveBeginReason::DesktopDocumentMissing,"desktop_document_missing"},
+        {PickerTraceMoveBeginReason::TargetMismatch,"target_mismatch"},
+        {PickerTraceMoveBeginReason::TargetWindowMissing,"target_window_missing"},
+        {PickerTraceMoveBeginReason::TargetWindowInvalid,"target_window_invalid"},
+        {PickerTraceMoveBeginReason::DestinationZero,"destination_zero"},
+        {PickerTraceMoveBeginReason::DestinationLookupFailed,"destination_lookup_failed"},
+        {PickerTraceMoveBeginReason::CurrentDesktopUnavailable,"current_desktop_unavailable"},
+        {PickerTraceMoveBeginReason::PopupDesktopUnavailable,"popup_desktop_unavailable"},
+        {PickerTraceMoveBeginReason::FastCaptureFailed,"fast_capture_failed"},
+        {PickerTraceMoveBeginReason::TargetDesktopUnavailable,"target_desktop_unavailable"},
+        {PickerTraceMoveBeginReason::IdentityMismatch,"identity_mismatch"},
+        {PickerTraceMoveBeginReason::IdentityLost,"identity_lost"},
+        {PickerTraceMoveBeginReason::IdentityIndeterminate,"identity_indeterminate"},
+        {PickerTraceMoveBeginReason::AcceptedPlanConflict,"accepted_plan_conflict"},
+        {PickerTraceMoveBeginReason::BoundRecordConflict,"bound_record_conflict"},
+        {PickerTraceMoveBeginReason::SafeOriginUnavailable,"safe_origin_unavailable"},
+        {PickerTraceMoveBeginReason::AcceptedOperationMissing,"accepted_operation_missing"},
+        {PickerTraceMoveBeginReason::OperationClaimStageFailed,"operation_claim_stage_failed"},
+        {PickerTraceMoveBeginReason::ReservationHandoffFailed,"reservation_handoff_failed"},
+        {PickerTraceMoveBeginReason::PendingAssociationStageFailed,"pending_association_stage_failed"},
+        {PickerTraceMoveBeginReason::ProvisionalInsertFailed,"provisional_insert_failed"},
+        {PickerTraceMoveBeginReason::NoInitialEffect,"no_initial_effect"}
+    };
+    static_assert(sizeof(cases)/sizeof(cases[0])==
+        static_cast<size_t>(PickerTraceMoveBeginReason::NoInitialEffect)+1,
+        "move-begin reason table must be exhaustive");
+    size_t ordinal=0;
+    for(const Case& value:cases){
+        CHECK(static_cast<size_t>(value.reason)==ordinal++);
+        CHECK(std::string(PickerTraceMoveBeginReasonName(value.reason))==
+              value.name);
+        PickerTraceMoveBeginEvent event;
+        event.reason=value.reason;
+        std::string line;
+        CHECK(SerializePickerTraceLine(PickerTraceEnvelope{},event,line));
+        CHECK(line.find(std::string("\"reason\":\"")+value.name+"\"")!=
+              std::string::npos);
+    }
+}
+
+static void test_picker_trace_move_begin_exception_distinguishes_publication(){
+    PickerTraceMoveBeginExceptionEvent before;
+    before.activationId=71;
+    PickerTraceMoveBeginExceptionEvent after=before;
+    after.transitionPublished=true;
+    std::string beforeLine,afterLine;
+    CHECK(SerializePickerTraceLine(
+        PickerTraceEnvelope{},before,beforeLine));
+    CHECK(SerializePickerTraceLine(
+        PickerTraceEnvelope{},after,afterLine));
+    CHECK(PickerTraceStrictJsonLineForTest(beforeLine));
+    CHECK(PickerTraceStrictJsonLineForTest(afterLine));
+    CHECK(beforeLine.find("\"event\":\"move.begin.exception\"")!=
+          std::string::npos);
+    CHECK(afterLine.find("\"event\":\"move.begin.exception\"")!=
+          std::string::npos);
+    CHECK(beforeLine.find("\"activation_id\":71")!=std::string::npos);
+    CHECK(afterLine.find("\"activation_id\":71")!=std::string::npos);
+    CHECK(beforeLine.find("\"transition_published\":false")!=
+          std::string::npos);
+    CHECK(afterLine.find("\"transition_published\":true")!=
+          std::string::npos);
+    CHECK(beforeLine!=afterLine);
+}
+
+static void test_picker_trace_activation_is_trace_behavior_equivalent(){
+    const PickerTraceActivationRunForTest plain=
+        RunPickerTraceActivationForTest(false,1,3,true,true,nullptr);
+    std::string bytes;
+    PickerTraceWriter writer(
+        PickerTraceMemorySinkForTest(bytes),PickerTraceLimits{4096,8},
+        std::array<unsigned char,16>{});
+    const PickerTraceActivationRunForTest traced=
+        RunPickerTraceActivationForTest(false,1,3,true,true,&writer);
+    CHECK(plain.result==traced.result);
+    CHECK(plain.selectCalls==traced.selectCalls);
+    CHECK(plain.refreshCalls==traced.refreshCalls);
+    CHECK(plain.plainCalls==traced.plainCalls);
+    CHECK(plain.beginCalls==traced.beginCalls);
+    CHECK(plain.beginId==traced.beginId);
+    CHECK(plain.beginIndex==traced.beginIndex);
+    CHECK(plain.transcript==traced.transcript);
+    CHECK(plain.transcriptLength==traced.transcriptLength);
+    CHECK(bytes.find("\"event\":\"activation.request\"")!=
+          std::string::npos);
+    CHECK(bytes.find("\"event\":\"activation.result\"")!=
+          std::string::npos);
+}
+
+static void test_picker_trace_activation_runtime_wiring_is_causal(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string begin=SourceSection(
+        source,
+        "static PickerTraceMoveBeginReason BeginVerifiedPickerMove(",
+        "class PickerTraceCaptureEmitScope");
+    CHECK(!begin.empty());
+    CHECK(begin.find("nextCorrelationId(")==std::string::npos);
+    CHECK(begin.find("traceEvent.activationId=activationId;")!=
+          std::string::npos);
+    CHECK(begin.find("traceEvent.tileIndex=index;")!=std::string::npos);
+    CHECK(begin.find("traceEvent.generation=prepared.generation;")!=
+          std::string::npos);
+    CHECK(begin.find("traceEvent.targetOrigin=fast.desktop;")!=
+          std::string::npos);
+    CHECK(begin.find("traceEvent.popupOrigin=popupOrigin;")!=
+          std::string::npos);
+    CHECK(begin.find("traceEvent.currentOrigin=currentOrigin;")!=
+          std::string::npos);
+    CHECK(begin.find("traceEvent.destination=destination;")!=
+          std::string::npos);
+    CHECK(begin.find("traceEvent.firstEffect=effect.kind;")!=
+          std::string::npos);
+    CHECK(begin.find("event.activationId=activationId;")!=
+          std::string::npos);
+    CHECK(CountSourceText(begin,"return finish(")==27);
+    CHECK(begin.find("return;")==std::string::npos);
+    CHECK(CountSourceText(begin,"PickerTraceMoveBeginExceptionEvent")==1);
+    const size_t acceptedEmit=begin.find(
+        "(void)finish(PickerTraceMoveBeginReason::Accepted,false);");
+    const size_t queue=begin.find("QueuePickerEffect(effect);",acceptedEmit);
+    const size_t acceptedFlush=begin.find(
+        "g_pickerTrace.flushBoundary();",queue);
+    CHECK(acceptedEmit!=std::string::npos && queue!=std::string::npos &&
+          acceptedFlush!=std::string::npos &&
+          acceptedEmit<queue && queue<acceptedFlush);
+    const size_t stagedGuard=begin.find("if(!staged) return finish(");
+    const size_t tracePublished=begin.find(
+        "transitionPublishedForTrace=true;",stagedGuard);
+    CHECK(stagedGuard!=std::string::npos &&
+          tracePublished!=std::string::npos &&
+          stagedGuard<tracePublished);
+
+    const std::string activate=SourceSection(
+        source,"static void Activate(",
+        "// --------------------------- settings window");
+    CHECK(!activate.empty());
+    CHECK(CountSourceText(activate,"nextCorrelationId()")==1);
+    CHECK(CountSourceText(activate,"DispatchPickerActivation(")==1);
+    CHECK(CountSourceText(
+        activate,"PickerTraceActivationRequestEvent")==1);
+    CHECK(CountSourceText(
+        activate,"PickerTraceActivationResultEvent")==1);
+    CHECK(activate.find("BeginVerifiedPickerMove(index,id)")!=
+          std::string::npos);
+
+    const std::string keyboard=SourceSection(
+        source,"case WM_KEYDOWN:","case WM_KEYUP:");
+    CHECK(CountSourceText(
+        keyboard,"PickerTraceActivationSource::Keyboard")==3);
+    const size_t firstKeyboardActivation=keyboard.find("Activate(");
+    const size_t genericControlledGate=keyboard.find(
+        "if(g_picker.controlledTransition()) return 0;");
+    CHECK(firstKeyboardActivation!=std::string::npos &&
+          genericControlledGate!=std::string::npos &&
+          firstKeyboardActivation<genericControlledGate);
+
+    const std::string mouse=SourceSection(
+        source,"case WM_LBUTTONDOWN:","case WM_MOUSEMOVE:");
+    const size_t ctrlSnapshot=mouse.find(
+        "const bool ctrl=PickerMouseControlHeld(wp);");
+    const size_t mouseEvent=mouse.find("PickerTraceMouseDownEvent mouseEvent;");
+    const size_t hitResolve=mouse.find("ResolvePickerPointerActivation(");
+    const size_t eventTarget=mouse.find(
+        "mouseEvent.target=activation.target;",hitResolve);
+    const size_t eventEmit=mouse.find(
+        "g_pickerTrace.emit(mouseEvent);",eventTarget);
+    const size_t pointerDispatch=mouse.find(
+        "DispatchPickerPointerActivation(",eventEmit);
+    CHECK(ctrlSnapshot!=std::string::npos && mouseEvent!=std::string::npos &&
+          hitResolve!=std::string::npos && eventTarget!=std::string::npos &&
+          eventEmit!=std::string::npos && pointerDispatch!=std::string::npos);
+    CHECK(ctrlSnapshot<mouseEvent && hitResolve<eventTarget &&
+          eventTarget<eventEmit && eventEmit<pointerDispatch);
+    CHECK(CountSourceText(mouse,"g_pickerTrace.emit(mouseEvent);")==2);
+    CHECK(mouse.find(
+        "Activate(index,ctrl,PickerTraceActivationSource::Mouse)")!=
+          std::string::npos);
+    CHECK(mouse.find("GetKeyState(VK_CONTROL)")==std::string::npos);
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
@@ -20703,6 +21038,12 @@ int main(){
     test_picker_trace_runtime_wiring_finalizes_once_and_stays_private();
     test_picker_trace_snapshot_observer_is_ordered_and_equivalent();
     test_picker_trace_snapshot_observer_reports_failures_no_throw();
+    test_picker_trace_activation_dispatches_every_guard_once();
+    test_picker_trace_activation_sources_have_stable_json_names();
+    test_picker_trace_move_begin_reasons_have_stable_json_names();
+    test_picker_trace_move_begin_exception_distinguishes_publication();
+    test_picker_trace_activation_is_trace_behavior_equivalent();
+    test_picker_trace_activation_runtime_wiring_is_causal();
     test_picker_uses_self_contained_gdi_buffer();
     test_picker_icon_loading_is_bounded_and_outside_paint();
     test_picker_enum_publishes_display_only_rows_safely();

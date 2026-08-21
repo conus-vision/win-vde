@@ -328,6 +328,49 @@ struct PickerTraceActivationResultEvent {
     PickerTraceActivationResult result=PickerTraceActivationResult::InvalidTile;
 };
 
+template<class EmitRequest,class Select,class Refresh,class PlainSwitch,
+         class BeginMove,class EmitResult>
+PickerTraceActivationResult DispatchPickerActivation(
+        uint64_t activationId,PickerTraceActivationSource source,
+        bool controlled,int index,int count,bool ctrlMove,
+        EmitRequest emitRequest,
+        Select select,Refresh refresh,PlainSwitch plainSwitch,
+        BeginMove beginMove,EmitResult emitResult) noexcept {
+    static_assert(noexcept(emitRequest(
+        activationId,source,ctrlMove,index)),
+        "activation request emitter must be noexcept");
+    static_assert(noexcept(!select(index)),
+        "activation selection callback must be noexcept");
+    static_assert(noexcept(refresh()),
+        "activation refresh callback must be noexcept");
+    static_assert(noexcept(plainSwitch(index)),
+        "activation plain-switch callback must be noexcept");
+    static_assert(noexcept(beginMove(index,activationId)),
+        "activation move-entry callback must be noexcept");
+    static_assert(noexcept(emitResult(
+        activationId,PickerTraceActivationResult::InvalidTile)),
+        "activation result emitter must be noexcept");
+    emitRequest(activationId,source,ctrlMove,index);
+    const auto finish=[&](PickerTraceActivationResult result) noexcept {
+        emitResult(activationId,result);
+        return result;
+    };
+    if(controlled)
+        return finish(PickerTraceActivationResult::AlreadyControlled);
+    if(index<0 || index>=count)
+        return finish(PickerTraceActivationResult::InvalidTile);
+    if(!select(index))
+        return finish(
+            PickerTraceActivationResult::SelectionPublicationFailed);
+    refresh();
+    if(ctrlMove){
+        beginMove(index,activationId);
+        return finish(PickerTraceActivationResult::DispatchedMoveEntry);
+    }
+    plainSwitch(index);
+    return finish(PickerTraceActivationResult::RoutedPlainSwitch);
+}
+
 struct PickerTraceMoveBeginEvent {
     uint64_t activationId=0;
     uint64_t generation=0;
