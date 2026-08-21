@@ -1778,6 +1778,29 @@ inline bool PickerForwardSwitchInvocationAllowed(
     return desktopReady && identity==PickerIdentityValidity::Match;
 }
 
+struct PickerForegroundHandoffPlan {
+    bool focusShell=false;
+    bool attachDesktop=false;
+    bool attachForeground=false;
+};
+
+inline PickerForegroundHandoffPlan PlanPickerForegroundHandoff(
+        bool shellFound,uint32_t desktopThread,
+        uint32_t foregroundThread,uint32_t currentThread) noexcept {
+    PickerForegroundHandoffPlan plan;
+    if(!shellFound || desktopThread==0 || currentThread==0) return plan;
+    plan.focusShell=true;
+    plan.attachDesktop=desktopThread!=currentThread;
+    plan.attachForeground=foregroundThread!=0 &&
+        foregroundThread!=currentThread &&
+        foregroundThread!=desktopThread;
+    return plan;
+}
+
+inline bool PickerMouseControlHeld(WPARAM buttonState) noexcept {
+    return (buttonState&MK_CONTROL)!=0;
+}
+
 inline GUID PickerEffectDesktop(const PickerTransition& transition,
                                 PickerEffectKind kind) noexcept {
     switch(kind){

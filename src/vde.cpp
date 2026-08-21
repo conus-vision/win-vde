@@ -6537,6 +6537,47 @@ static bool RefreshPickerModelPreservingUi() noexcept {
     } catch(...) { return false; }
 }
 
+static HRESULT SwitchDesktopWithForegroundHandoff(
+        const GUID& destinationGuid,bool& invoked) noexcept {
+    invoked=false;
+    if(GuidIsZero(destinationGuid) || !g_vdmi) return E_INVALIDARG;
+    ScopedComPtr<IVirtualDesktop> desktop;
+    try { desktop=GetDesktopByGuid(destinationGuid); }
+    catch(...) { return E_FAIL; }
+    if(!desktop) return E_INVALIDARG;
+
+    HWND prog=FindWindowW(L"Progman",L"Program Manager");
+    DWORD ignored=0;
+    const DWORD desktopThread=prog
+        ?GetWindowThreadProcessId(prog,&ignored):0;
+    const DWORD foregroundThread=
+        GetWindowThreadProcessId(GetForegroundWindow(),&ignored);
+    const DWORD currentThread=GetCurrentThreadId();
+    const PickerForegroundHandoffPlan plan=PlanPickerForegroundHandoff(
+        prog!=nullptr,desktopThread,foregroundThread,currentThread);
+    bool desktopAttached=false;
+    bool foregroundAttached=false;
+    if(plan.attachDesktop)
+        desktopAttached=AttachThreadInput(
+            desktopThread,currentThread,TRUE)!=FALSE;
+    if(plan.attachForeground)
+        foregroundAttached=AttachThreadInput(
+            foregroundThread,currentThread,TRUE)!=FALSE;
+    if(plan.focusShell) SetForegroundWindow(prog);
+
+    HRESULT result=E_FAIL;
+    invoked=true;
+    try { result=g_vdmi->SwitchDesktop(desktop.get()); }
+    catch(...) { result=E_FAIL; }
+
+    if(foregroundAttached)
+        AttachThreadInput(foregroundThread,currentThread,FALSE);
+    if(desktopAttached)
+        AttachThreadInput(desktopThread,currentThread,FALSE);
+    if(prog) ShowWindow(prog,SW_MINIMIZE);
+    return result;
+}
+
 static PickerObservation ExecutePickerEffect(
         const PickerEffect& effect) noexcept {
     PickerObservation observation;
@@ -6613,8 +6654,10 @@ static PickerObservation ExecutePickerEffect(
             if(PickerForwardSwitchInvocationAllowed(
                     observation.identity,desktop && g_vdmi) ||
                (rollback && desktop && g_vdmi)){
-                observation.apiInvoked=true;
-                result=g_vdmi->SwitchDesktop(desktop.get());
+                bool invoked=false;
+                result=SwitchDesktopWithForegroundHandoff(
+                    effect.desktop,invoked);
+                observation.apiInvoked=invoked;
             }
             observation.apiAccepted=SUCCEEDED(result);
             break;
@@ -7622,23 +7665,9 @@ static void GoToDesktop(int idx){
     if(g_picker.controlledTransition()) return;
     if(idx<0||idx>=(int)g_tiles.size())return;
     HidePicker();
-    ScopedComPtr<IVirtualDesktop> desktop=
-        GetDesktopByIndex((UINT)g_tiles[idx].index);
-    if(!desktop)return;
-    HWND prog=FindWindowW(L"Progman",L"Program Manager");
-    DWORD dummy=0;
-    DWORD deskTh=prog?GetWindowThreadProcessId(prog,&dummy):0;
-    DWORD fgTh=GetWindowThreadProcessId(GetForegroundWindow(),&dummy);
-    DWORD curTh=GetCurrentThreadId();
-    if(prog&&deskTh&&fgTh&&fgTh!=curTh){
-        AttachThreadInput(deskTh,curTh,TRUE);
-        AttachThreadInput(fgTh,curTh,TRUE);
-        SetForegroundWindow(prog);
-        AttachThreadInput(fgTh,curTh,FALSE);
-        AttachThreadInput(deskTh,curTh,FALSE);
-    }
-    g_vdmi->SwitchDesktop(desktop.get());
-    if(prog) ShowWindow(prog,SW_MINIMIZE);
+    bool invoked=false;
+    (void)SwitchDesktopWithForegroundHandoff(
+        g_tiles[idx].guid,invoked);
 }
 // Клик = переключение на десктоп; Ctrl = перенести активное окно туда.
 static void Activate(int idx, bool ctrlMove){
@@ -8022,6 +8051,7 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         if(wp==VK_CONTROL) InvalidateRect(hwnd,nullptr,FALSE);
         return 0;
     case WM_LBUTTONDOWN:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+        const bool ctrl=PickerMouseControlHeld(wp);
         if(g_picker.controlledTransition()) return 0;
         const bool cacheReady=PickerPaintCacheMatches(g_picker,g_pickerPaintCache.generation);
         const PickerFooterActivation footerActivation=
@@ -8064,8 +8094,6 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                     RefreshPickerPaintCache();
                     InvalidateRect(hwnd,nullptr,FALSE);
                 }
-                const bool ctrl=
-                    (GetKeyState(VK_CONTROL)&0x8000)!=0;
                 Activate(index,ctrl);
             })) return 0;
         if(g_picker.searchActive){

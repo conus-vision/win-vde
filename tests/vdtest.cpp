@@ -1765,6 +1765,33 @@ static void test_picker_commit_requires_exact_active_identity(){
         0x1234,active,active,WindowIdentityRecapture::Indeterminate));
 }
 
+static void test_picker_foreground_handoff_covers_popup_and_external_focus(){
+    PickerForegroundHandoffPlan popup=PlanPickerForegroundHandoff(
+        true,10,20,20);
+    CHECK(popup.focusShell);
+    CHECK(popup.attachDesktop);
+    CHECK(!popup.attachForeground);
+
+    PickerForegroundHandoffPlan external=PlanPickerForegroundHandoff(
+        true,10,30,20);
+    CHECK(external.focusShell);
+    CHECK(external.attachDesktop);
+    CHECK(external.attachForeground);
+
+    PickerForegroundHandoffPlan unavailable=PlanPickerForegroundHandoff(
+        false,10,30,20);
+    CHECK(!unavailable.focusShell);
+    CHECK(!unavailable.attachDesktop);
+    CHECK(!unavailable.attachForeground);
+}
+
+static void test_picker_mouse_ctrl_uses_button_message_snapshot(){
+    CHECK(!PickerMouseControlHeld(0));
+    CHECK(PickerMouseControlHeld(MK_CONTROL));
+    CHECK(!PickerMouseControlHeld(MK_SHIFT));
+    CHECK(PickerMouseControlHeld(MK_CONTROL|MK_LBUTTON));
+}
+
 static void test_picker_model_publish_invalidates_cache_before_reentry(){
     PickerState state;
     state.paintGeneration=41;
@@ -11694,6 +11721,39 @@ static void test_picker_enum_publishes_display_only_rows_safely(){
           cachedIcon<fallbackIcon);
 }
 
+static void test_picker_ctrl_move_uses_shared_foreground_handoff(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string helper=SourceSection(
+        source,"static HRESULT SwitchDesktopWithForegroundHandoff(",
+        "static PickerObservation ExecutePickerEffect(");
+    const std::string effects=SourceSection(
+        source,"static PickerObservation ExecutePickerEffect(",
+        "static void PumpPickerTransitionWork()");
+    const std::string ordinary=SourceSection(
+        source,"static void GoToDesktop(",
+        "// Клик = переключение");
+    const std::string mouse=SourceSection(
+        source,"case WM_LBUTTONDOWN:","case WM_MOUSEMOVE:");
+
+    CHECK(!helper.empty());
+    CHECK(helper.find("PlanPickerForegroundHandoff(")!=std::string::npos);
+    CHECK(helper.find("SetForegroundWindow(prog)")!=std::string::npos);
+    CHECK(helper.find("g_vdmi->SwitchDesktop(desktop.get())")!=
+          std::string::npos);
+    CHECK(effects.find("SwitchDesktopWithForegroundHandoff(")!=
+          std::string::npos);
+    CHECK(effects.find("g_vdmi->SwitchDesktop(")==std::string::npos);
+    CHECK(ordinary.find("SwitchDesktopWithForegroundHandoff(")!=
+          std::string::npos);
+    CHECK(ordinary.find("g_vdmi->SwitchDesktop(")==std::string::npos);
+    const size_t ctrlSnapshot=mouse.find(
+        "const bool ctrl=PickerMouseControlHeld(wp);");
+    const size_t dispatch=mouse.find("DispatchPickerPointerActivation(");
+    CHECK(ctrlSnapshot!=std::string::npos && dispatch!=std::string::npos &&
+          ctrlSnapshot<dispatch);
+    CHECK(mouse.find("GetKeyState(VK_CONTROL)")==std::string::npos);
+}
+
 static void test_picker_preloads_only_laid_out_visible_rows(){
     const std::string source=ReadSourceFile(L"src\\vde.cpp");
     CHECK(!source.empty());
@@ -18712,6 +18772,7 @@ int main(){
     test_picker_uses_self_contained_gdi_buffer();
     test_picker_icon_loading_is_bounded_and_outside_paint();
     test_picker_enum_publishes_display_only_rows_safely();
+    test_picker_ctrl_move_uses_shared_foreground_handoff();
     test_picker_preloads_only_laid_out_visible_rows();
     test_picker_wm_paint_requires_the_owned_buffer();
     test_cli_list_uses_one_atomic_desktop_snapshot();
@@ -18771,6 +18832,8 @@ int main(){
     test_picker_com_output_is_owned_even_on_failed_call();
     test_picker_cache_publication_resets_hover_and_invalidates_failures();
     test_picker_commit_requires_exact_active_identity();
+    test_picker_foreground_handoff_covers_popup_and_external_focus();
+    test_picker_mouse_ctrl_uses_button_message_snapshot();
     test_picker_model_publish_invalidates_cache_before_reentry();
     test_picker_volatile_rows_skip_but_structural_failures_abort();
     test_picker_row_admission_keeps_displayable_unverified_windows();
