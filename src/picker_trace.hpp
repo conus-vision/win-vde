@@ -507,3 +507,44 @@ private:
     bool truncated_=false;
     bool closed_=false;
 };
+
+struct PickerTraceDirectoryEntry {
+    PickerTraceDirectoryEntry() noexcept=default;
+    PickerTraceDirectoryEntry(std::wstring entryName,DWORD entryAttributes,
+                              uint64_t entryLastWrite)
+        :name(std::move(entryName)),attributes(entryAttributes),
+         lastWrite100ns(entryLastWrite){}
+    std::wstring name;
+    DWORD attributes=0;
+    uint64_t lastWrite100ns=0;
+};
+
+bool IsPickerTraceFileName(const std::wstring& value) noexcept;
+bool PlanPickerTraceRetention(
+    const std::vector<PickerTraceDirectoryEntry>& entries,
+    uint64_t now100ns,size_t oldFilesToKeep,
+    std::vector<size_t>& remove) noexcept;
+
+struct PickerTraceStorageOps {
+    std::function<bool(std::wstring&)> localAppData;
+    std::function<DWORD(const std::wstring&)> getAttributes;
+    std::function<BOOL(const std::wstring&)> createDirectory;
+    std::function<bool(const std::wstring&,
+                       std::vector<PickerTraceDirectoryEntry>&)> listDirectory;
+    std::function<BOOL(const std::wstring&)> deleteFile;
+    std::function<HANDLE(const std::wstring&,DWORD)> createNew;
+    std::function<BOOL(HANDLE,const void*,DWORD,DWORD&)> writeFile;
+    std::function<BOOL(HANDLE)> flushFile;
+    std::function<BOOL(HANDLE)> closeHandle;
+    std::function<uint64_t()> utcFileTime100ns;
+    std::function<uint64_t()> monotonicMs;
+};
+
+struct PickerTraceOpenedFile {
+    HANDLE handle=INVALID_HANDLE_VALUE;
+    std::wstring path;
+};
+
+PickerTraceStorageOps DefaultPickerTraceStorageOps() noexcept;
+bool OpenPickerTraceStorage(const PickerTraceStorageOps& ops,DWORD processId,
+                            PickerTraceOpenedFile& output) noexcept;

@@ -1174,3 +1174,347 @@ VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceTerminalizationAttemptEvent)
 VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceTransitionTerminalEvent)
 
 #undef VDE_DEFINE_PICKER_TRACE_EMIT
+
+static bool PickerTraceFixedDecimal(const std::wstring& value,size_t begin,
+                                    size_t count,unsigned& output) noexcept {
+    output=0;
+    if(begin>value.size() || count>value.size()-begin) return false;
+    for(size_t index=0;index<count;++index){
+        const wchar_t digit=value[begin+index];
+        if(digit<L'0' || digit>L'9') return false;
+        output=output*10+static_cast<unsigned>(digit-L'0');
+    }
+    return true;
+}
+
+static bool PickerTraceLeapYear(unsigned year) noexcept {
+    return (year%4==0 && year%100!=0) || year%400==0;
+}
+
+bool IsPickerTraceFileName(const std::wstring& value) noexcept {
+    try {
+        static const std::wstring prefix=L"picker-";
+        static const std::wstring suffix=L".jsonl";
+        if(value.size()<35 || value.size()>44 ||
+           value.compare(0,prefix.size(),prefix)!=0 ||
+           value.compare(value.size()-suffix.size(),suffix.size(),suffix)!=0 ||
+           value[15]!=L'T' || value[22]!=L'.' ||
+           value[26]!=L'Z' || value[27]!=L'-') return false;
+        unsigned year=0,month=0,day=0,hour=0,minute=0,second=0,millis=0;
+        if(!PickerTraceFixedDecimal(value,7,4,year) ||
+           !PickerTraceFixedDecimal(value,11,2,month) ||
+           !PickerTraceFixedDecimal(value,13,2,day) ||
+           !PickerTraceFixedDecimal(value,16,2,hour) ||
+           !PickerTraceFixedDecimal(value,18,2,minute) ||
+           !PickerTraceFixedDecimal(value,20,2,second) ||
+           !PickerTraceFixedDecimal(value,23,3,millis)) return false;
+        if(year==0 || month<1 || month>12 || hour>23 ||
+           minute>59 || second>59 || millis>999) return false;
+        static const unsigned daysByMonth[]={
+            0,31,28,31,30,31,30,31,31,30,31,30,31
+        };
+        unsigned maximumDay=daysByMonth[month];
+        if(month==2 && PickerTraceLeapYear(year)) maximumDay=29;
+        if(day<1 || day>maximumDay) return false;
+
+        const size_t pidBegin=28;
+        const size_t pidEnd=value.size()-suffix.size();
+        const size_t pidDigits=pidEnd-pidBegin;
+        if(pidDigits<1 || pidDigits>10 || value[pidBegin]==L'0') return false;
+        uint64_t pid=0;
+        for(size_t index=pidBegin;index<pidEnd;++index){
+            if(value[index]<L'0' || value[index]>L'9') return false;
+            pid=pid*10+static_cast<unsigned>(value[index]-L'0');
+        }
+        return pid!=0;
+    } catch(...) {
+        return false;
+    }
+}
+
+bool PlanPickerTraceRetention(
+        const std::vector<PickerTraceDirectoryEntry>& entries,
+        uint64_t now100ns,size_t oldFilesToKeep,
+        std::vector<size_t>& remove) noexcept {
+    remove.clear();
+    try {
+        const uint64_t sevenDays=7ULL*24ULL*60ULL*60ULL*10000000ULL;
+        std::vector<size_t> retained;
+        std::vector<bool> selected(entries.size(),false);
+        for(size_t index=0;index<entries.size();++index){
+            const PickerTraceDirectoryEntry& entry=entries[index];
+            const bool regular=
+                (entry.attributes&FILE_ATTRIBUTE_DIRECTORY)==0 &&
+                (entry.attributes&FILE_ATTRIBUTE_REPARSE_POINT)==0;
+            if(!regular || !IsPickerTraceFileName(entry.name)) continue;
+            const bool expired=now100ns>entry.lastWrite100ns &&
+                now100ns-entry.lastWrite100ns>sevenDays;
+            if(expired) selected[index]=true;
+            else retained.push_back(index);
+        }
+        std::sort(retained.begin(),retained.end(),[&](size_t left,size_t right){
+            if(entries[left].lastWrite100ns!=entries[right].lastWrite100ns)
+                return entries[left].lastWrite100ns>
+                       entries[right].lastWrite100ns;
+            if(entries[left].name!=entries[right].name)
+                return entries[left].name>entries[right].name;
+            return left<right;
+        });
+        for(size_t index=oldFilesToKeep;index<retained.size();++index)
+            selected[retained[index]]=true;
+        for(size_t index=0;index<selected.size();++index)
+            if(selected[index]) remove.push_back(index);
+        return true;
+    } catch(...) {
+        remove.clear();
+        return false;
+    }
+}
+
+static uint64_t PickerTraceFileTimeValue(const FILETIME& value) noexcept {
+    ULARGE_INTEGER integer{};
+    integer.LowPart=value.dwLowDateTime;
+    integer.HighPart=value.dwHighDateTime;
+    return integer.QuadPart;
+}
+
+static bool PickerTraceIsAbsoluteDirectoryPath(
+        const std::wstring& value) noexcept {
+    if(value.size()>=3 &&
+       ((value[0]>=L'A' && value[0]<=L'Z') ||
+        (value[0]>=L'a' && value[0]<=L'z')) &&
+       value[1]==L':' && (value[2]==L'\\' || value[2]==L'/')) return true;
+    if(value.size()>=5 &&
+       (value[0]==L'\\' || value[0]==L'/') &&
+       (value[1]==L'\\' || value[1]==L'/')){
+        const size_t serverEnd=value.find_first_of(L"\\/",2);
+        return serverEnd!=std::wstring::npos && serverEnd>2 &&
+               serverEnd+1<value.size();
+    }
+    return false;
+}
+
+static bool PickerTraceHasDotDotComponent(
+        const std::wstring& value) noexcept {
+    size_t begin=0;
+    while(begin<=value.size()){
+        const size_t end=value.find_first_of(L"\\/",begin);
+        const size_t count=(end==std::wstring::npos ? value.size() : end)-begin;
+        if(count==2 && value[begin]==L'.' && value[begin+1]==L'.') return true;
+        if(end==std::wstring::npos) break;
+        begin=end+1;
+    }
+    return false;
+}
+
+static bool PickerTraceValidateDirectoryAttributes(DWORD attributes) noexcept {
+    return attributes!=INVALID_FILE_ATTRIBUTES &&
+           (attributes&FILE_ATTRIBUTE_DIRECTORY)!=0 &&
+           (attributes&FILE_ATTRIBUTE_REPARSE_POINT)==0;
+}
+
+static bool PickerTraceEnsureDirectory(const PickerTraceStorageOps& ops,
+                                       const std::wstring& path,
+                                       bool mayCreate) noexcept {
+    try {
+        DWORD attributes=ops.getAttributes(path);
+        if(attributes==INVALID_FILE_ATTRIBUTES && mayCreate){
+            (void)ops.createDirectory(path);
+            attributes=ops.getAttributes(path);
+        }
+        return PickerTraceValidateDirectoryAttributes(attributes);
+    } catch(...) {
+        return false;
+    }
+}
+
+static std::wstring PickerTraceJoinPath(const std::wstring& parent,
+                                        const wchar_t* child) {
+    std::wstring result=parent;
+    if(!result.empty() && result.back()!=L'\\' && result.back()!=L'/')
+        result.push_back(L'\\');
+    result+=child;
+    return result;
+}
+
+static bool PickerTraceFileNameForTime(uint64_t fileTime100ns,DWORD processId,
+                                       std::wstring& output) noexcept {
+    output.clear();
+    if(processId==0) return false;
+    try {
+        ULARGE_INTEGER integer{};
+        integer.QuadPart=fileTime100ns;
+        FILETIME fileTime{};
+        fileTime.dwLowDateTime=integer.LowPart;
+        fileTime.dwHighDateTime=integer.HighPart;
+        SYSTEMTIME utc{};
+        if(!FileTimeToSystemTime(&fileTime,&utc)) return false;
+        wchar_t buffer[64]={0};
+        const int written=swprintf_s(
+            buffer,_countof(buffer),
+            L"picker-%04u%02u%02uT%02u%02u%02u.%03uZ-%lu.jsonl",
+            static_cast<unsigned>(utc.wYear),
+            static_cast<unsigned>(utc.wMonth),
+            static_cast<unsigned>(utc.wDay),
+            static_cast<unsigned>(utc.wHour),
+            static_cast<unsigned>(utc.wMinute),
+            static_cast<unsigned>(utc.wSecond),
+            static_cast<unsigned>(utc.wMilliseconds),
+            static_cast<unsigned long>(processId));
+        if(written<=0) return false;
+        output.assign(buffer,static_cast<size_t>(written));
+        return IsPickerTraceFileName(output);
+    } catch(...) {
+        output.clear();
+        return false;
+    }
+}
+
+bool OpenPickerTraceStorage(const PickerTraceStorageOps& ops,DWORD processId,
+                            PickerTraceOpenedFile& output) noexcept {
+    output.handle=INVALID_HANDLE_VALUE;
+    output.path.clear();
+    if(!ops.localAppData || !ops.getAttributes || !ops.createDirectory ||
+       !ops.listDirectory || !ops.deleteFile || !ops.createNew ||
+       !ops.utcFileTime100ns) return false;
+    try {
+        std::wstring base;
+        if(!ops.localAppData(base) ||
+           !PickerTraceIsAbsoluteDirectoryPath(base) ||
+           PickerTraceHasDotDotComponent(base)) return false;
+        std::replace(base.begin(),base.end(),L'/',L'\\');
+        while(base.size()>3 && base.back()==L'\\') base.pop_back();
+        if(!PickerTraceEnsureDirectory(ops,base,false)) return false;
+
+        const std::wstring product=PickerTraceJoinPath(
+            base,L"VirtualDesktopsExtention");
+        if(!PickerTraceEnsureDirectory(ops,product,true)) return false;
+        const std::wstring diagnostics=PickerTraceJoinPath(
+            product,L"diagnostics");
+        if(!PickerTraceEnsureDirectory(ops,diagnostics,true)) return false;
+
+        const uint64_t now=ops.utcFileTime100ns();
+        std::vector<PickerTraceDirectoryEntry> entries;
+        if(!ops.listDirectory(diagnostics,entries)) return false;
+        std::vector<size_t> remove;
+        if(!PlanPickerTraceRetention(entries,now,2,remove)) return false;
+
+        // Names are revalidated immediately before direct-child deletion.
+        // This blocks accidental traversal; it is not a handle-relative
+        // adversarial TOCTOU sandbox.
+        for(size_t index : remove){
+            if(index>=entries.size()) return false;
+            const PickerTraceDirectoryEntry& entry=entries[index];
+            if(!IsPickerTraceFileName(entry.name) ||
+               (entry.attributes&FILE_ATTRIBUTE_DIRECTORY)!=0 ||
+               (entry.attributes&FILE_ATTRIBUTE_REPARSE_POINT)!=0)
+                return false;
+            if(!ops.deleteFile(PickerTraceJoinPath(
+                    diagnostics,entry.name.c_str()))) return false;
+        }
+
+        std::wstring fileName;
+        if(!PickerTraceFileNameForTime(now,processId,fileName)) return false;
+        const std::wstring filePath=PickerTraceJoinPath(
+            diagnostics,fileName.c_str());
+        output.path=filePath;
+        const HANDLE handle=ops.createNew(filePath,CREATE_NEW);
+        if(!handle || handle==INVALID_HANDLE_VALUE){
+            output.path.clear();
+            return false;
+        }
+        output.handle=handle;
+        return true;
+    } catch(...) {
+        output.handle=INVALID_HANDLE_VALUE;
+        output.path.clear();
+        return false;
+    }
+}
+
+PickerTraceStorageOps DefaultPickerTraceStorageOps() noexcept {
+    PickerTraceStorageOps ops;
+    try {
+        ops.localAppData=[](std::wstring& output) noexcept {
+            output.clear();
+            try {
+                const DWORD required=GetEnvironmentVariableW(
+                    L"LOCALAPPDATA",nullptr,0);
+                if(required==0) return false;
+                std::wstring buffer(static_cast<size_t>(required),L'\0');
+                const DWORD written=GetEnvironmentVariableW(
+                    L"LOCALAPPDATA",&buffer[0],required);
+                if(written==0 || written>=required) return false;
+                buffer.resize(written);
+                output.swap(buffer);
+                return true;
+            } catch(...) { output.clear(); return false; }
+        };
+        ops.getAttributes=[](const std::wstring& path) noexcept {
+            return GetFileAttributesW(path.c_str());
+        };
+        ops.createDirectory=[](const std::wstring& path) noexcept {
+            return CreateDirectoryW(path.c_str(),nullptr);
+        };
+        ops.listDirectory=[](const std::wstring& directory,
+                             std::vector<PickerTraceDirectoryEntry>& output) noexcept {
+            output.clear();
+            WIN32_FIND_DATAW data{};
+            HANDLE find=INVALID_HANDLE_VALUE;
+            try {
+                const std::wstring pattern=PickerTraceJoinPath(directory,L"*");
+                find=FindFirstFileW(pattern.c_str(),&data);
+                if(find==INVALID_HANDLE_VALUE)
+                    return GetLastError()==ERROR_FILE_NOT_FOUND;
+                for(;;){
+                    if(wcscmp(data.cFileName,L".")!=0 &&
+                       wcscmp(data.cFileName,L"..")!=0){
+                        ULARGE_INTEGER lastWrite{};
+                        lastWrite.LowPart=data.ftLastWriteTime.dwLowDateTime;
+                        lastWrite.HighPart=data.ftLastWriteTime.dwHighDateTime;
+                        output.emplace_back(data.cFileName,data.dwFileAttributes,
+                                            lastWrite.QuadPart);
+                    }
+                    if(!FindNextFileW(find,&data)) break;
+                }
+                const DWORD error=GetLastError();
+                FindClose(find);
+                find=INVALID_HANDLE_VALUE;
+                return error==ERROR_NO_MORE_FILES;
+            } catch(...) {
+                if(find!=INVALID_HANDLE_VALUE) FindClose(find);
+                output.clear();
+                return false;
+            }
+        };
+        ops.deleteFile=[](const std::wstring& path) noexcept {
+            return DeleteFileW(path.c_str());
+        };
+        ops.createNew=[](const std::wstring& path,DWORD disposition) noexcept {
+            return CreateFileW(path.c_str(),GENERIC_WRITE,FILE_SHARE_READ,
+                               nullptr,disposition,FILE_ATTRIBUTE_NORMAL,nullptr);
+        };
+        ops.writeFile=[](HANDLE handle,const void* bytes,DWORD size,
+                         DWORD& written) noexcept {
+            written=0;
+            return WriteFile(handle,bytes,size,&written,nullptr);
+        };
+        ops.flushFile=[](HANDLE handle) noexcept {
+            return FlushFileBuffers(handle);
+        };
+        ops.closeHandle=[](HANDLE handle) noexcept {
+            return CloseHandle(handle);
+        };
+        ops.utcFileTime100ns=[]() noexcept {
+            FILETIME value{};
+            GetSystemTimeAsFileTime(&value);
+            return PickerTraceFileTimeValue(value);
+        };
+        ops.monotonicMs=[]() noexcept {
+            return static_cast<uint64_t>(GetTickCount64());
+        };
+    } catch(...) {
+        return PickerTraceStorageOps{};
+    }
+    return ops;
+}

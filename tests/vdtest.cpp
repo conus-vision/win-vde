@@ -19601,6 +19601,228 @@ static void test_picker_trace_writer_close_is_once_and_no_throw(){
     CHECK(throwingCloses==1);
 }
 
+static void test_picker_trace_filename_grammar_is_strict(){
+    CHECK(IsPickerTraceFileName(
+        L"picker-20260821T174205.009Z-1.jsonl"));
+    CHECK(IsPickerTraceFileName(
+        L"picker-20240229T235959.999Z-4294967295.jsonl"));
+    CHECK(IsPickerTraceFileName(
+        L"picker-20260821T174205.009Z-9999999999.jsonl"));
+    CHECK(!IsPickerTraceFileName(
+        L"diagnostics\\picker-20260821T174205.009Z-1.jsonl"));
+    CHECK(!IsPickerTraceFileName(L".."));
+    CHECK(!IsPickerTraceFileName(
+        L"Picker-20260821T174205.009Z-1.jsonl"));
+    CHECK(!IsPickerTraceFileName(
+        L"picker-20260821T174205.009Z-1.JSONL"));
+    CHECK(!IsPickerTraceFileName(
+        L"picker-20261321T174205.009Z-1.jsonl"));
+    CHECK(!IsPickerTraceFileName(
+        L"picker-20260230T174205.009Z-1.jsonl"));
+    CHECK(!IsPickerTraceFileName(
+        L"picker-20230229T174205.009Z-1.jsonl"));
+    CHECK(!IsPickerTraceFileName(
+        L"picker-20260821T244205.009Z-1.jsonl"));
+    CHECK(!IsPickerTraceFileName(
+        L"picker-20260821T176005.009Z-1.jsonl"));
+    CHECK(!IsPickerTraceFileName(
+        L"picker-20260821T174260.009Z-1.jsonl"));
+    CHECK(!IsPickerTraceFileName(
+        L"picker-20260821T174205.009Z-0.jsonl"));
+    CHECK(!IsPickerTraceFileName(
+        L"picker-20260821T174205.009Z-01.jsonl"));
+    CHECK(!IsPickerTraceFileName(
+        L"picker-20260821T174205.009Z-1.jsonl.bak"));
+    CHECK(!IsPickerTraceFileName(
+        L"picker-20260821T174205.009Z-12345678901.jsonl"));
+}
+
+static void test_picker_trace_retention_is_age_and_count_bounded(){
+    const uint64_t day=24ULL*60ULL*60ULL*10000000ULL;
+    const uint64_t now=20ULL*day;
+    std::vector<PickerTraceDirectoryEntry> entries={
+        {L"picker-20260801T000000.000Z-1.jsonl",0,now-8*day},
+        {L"picker-20260819T000000.000Z-2.jsonl",0,now-day},
+        {L"picker-20260819T000001.000Z-3.jsonl",0,now-day},
+        {L"picker-20260819T000002.000Z-4.jsonl",0,now-day},
+        {L"keep.txt",0,now-30*day},
+        {L"picker-20260818T000000.000Z-5.jsonl",
+         FILE_ATTRIBUTE_REPARSE_POINT,now-2*day}
+    };
+    std::vector<size_t> remove;
+    CHECK(PlanPickerTraceRetention(entries,now,2,remove));
+    CHECK(remove.size()==2);
+    CHECK(remove[0]==0);
+    CHECK(remove[1]==1);
+}
+
+static void test_picker_trace_retention_keeps_exact_seven_days_and_orders_ties(){
+    const uint64_t day=24ULL*60ULL*60ULL*10000000ULL;
+    const uint64_t now=30ULL*day;
+    std::vector<PickerTraceDirectoryEntry> entries={
+        {L"picker-20260801T000000.000Z-1.jsonl",0,now-7*day},
+        {L"picker-20260801T000001.000Z-2.jsonl",0,now-7*day-1},
+        {L"picker-20260801T000002.000Z-3.jsonl",0,now-day},
+        {L"picker-20260801T000003.000Z-4.jsonl",0,now-day},
+        {L"picker-20260801T000004.000Z-5.jsonl",0,now-day}
+    };
+    std::vector<size_t> remove;
+    CHECK(PlanPickerTraceRetention(entries,now,2,remove));
+    CHECK(remove.size()==3);
+    CHECK(remove[0]==0);
+    CHECK(remove[1]==1);
+    CHECK(remove[2]==2);
+}
+
+static PickerTraceStorageOps PickerTraceStorageOpsForTest(
+        uint64_t now,std::vector<PickerTraceDirectoryEntry> entries,
+        std::vector<std::wstring>& deleted,
+        std::wstring& listed,std::wstring& created,DWORD& disposition,
+        int& directoryCreates){
+    const std::wstring base=L"C:\\Local";
+    const std::wstring product=base+L"\\VirtualDesktopsExtention";
+    const std::wstring diagnostics=product+L"\\diagnostics";
+    PickerTraceStorageOps ops;
+    ops.localAppData=[=](std::wstring& output){ output=base; return true; };
+    ops.getAttributes=[=](const std::wstring& path){
+        return path==base || path==product || path==diagnostics
+            ? FILE_ATTRIBUTE_DIRECTORY : INVALID_FILE_ATTRIBUTES;
+    };
+    ops.createDirectory=[&](const std::wstring&){
+        ++directoryCreates;
+        return TRUE;
+    };
+    ops.listDirectory=[&,entries](const std::wstring& path,
+                                  std::vector<PickerTraceDirectoryEntry>& output){
+        listed=path;
+        output=entries;
+        return true;
+    };
+    ops.deleteFile=[&](const std::wstring& path){
+        deleted.push_back(path);
+        return TRUE;
+    };
+    ops.createNew=[&](const std::wstring& path,DWORD creationDisposition){
+        created=path;
+        disposition=creationDisposition;
+        return reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x1234));
+    };
+    ops.writeFile=[](HANDLE,const void*,DWORD size,DWORD& written){
+        written=size;
+        return TRUE;
+    };
+    ops.flushFile=[](HANDLE){ return TRUE; };
+    ops.closeHandle=[](HANDLE){ return TRUE; };
+    ops.utcFileTime100ns=[now](){ return now; };
+    ops.monotonicMs=[](){ return 1ULL; };
+    return ops;
+}
+
+static void test_picker_trace_storage_reuses_valid_directory_and_is_nonrecursive(){
+    const uint64_t day=24ULL*60ULL*60ULL*10000000ULL;
+    const uint64_t now=200000ULL*day;
+    std::vector<PickerTraceDirectoryEntry> entries={
+        {L"picker-20260801T000000.000Z-1.jsonl",0,now-8*day},
+        {L"keep.txt",0,now-30*day},
+        {L"picker-20260801T000001.000Z-2.jsonl",
+         FILE_ATTRIBUTE_REPARSE_POINT,now-30*day},
+        {L"picker-20260801T000002.000Z-3.jsonl",
+         FILE_ATTRIBUTE_DIRECTORY,now-30*day}
+    };
+    std::vector<std::wstring> deleted;
+    std::wstring listed,created;
+    DWORD disposition=0;
+    int directoryCreates=0;
+    PickerTraceStorageOps ops=PickerTraceStorageOpsForTest(
+        now,entries,deleted,listed,created,disposition,directoryCreates);
+    PickerTraceOpenedFile opened;
+    CHECK(OpenPickerTraceStorage(ops,42,opened));
+    CHECK(opened.handle==reinterpret_cast<HANDLE>(
+        static_cast<uintptr_t>(0x1234)));
+    CHECK(opened.path==created);
+    CHECK(disposition==CREATE_NEW);
+    CHECK(directoryCreates==0);
+    CHECK(listed==L"C:\\Local\\VirtualDesktopsExtention\\diagnostics");
+    CHECK(deleted.size()==1);
+    CHECK(deleted[0]==listed+L"\\picker-20260801T000000.000Z-1.jsonl");
+    CHECK(created.find(listed+L"\\picker-")==0);
+    CHECK(created.find(L"-42.jsonl")!=std::wstring::npos);
+}
+
+static void test_picker_trace_storage_rejects_unsafe_diagnostics_paths(){
+    const DWORD unsafe[]={0,FILE_ATTRIBUTE_DIRECTORY |
+                             FILE_ATTRIBUTE_REPARSE_POINT};
+    for(DWORD diagnosticAttributes : unsafe){
+        int downstream=0;
+        PickerTraceStorageOps ops;
+        ops.localAppData=[](std::wstring& output){
+            output=L"C:\\Local";
+            return true;
+        };
+        ops.getAttributes=[=](const std::wstring& path)->DWORD{
+            if(path==L"C:\\Local" ||
+               path==L"C:\\Local\\VirtualDesktopsExtention")
+                return FILE_ATTRIBUTE_DIRECTORY;
+            return diagnosticAttributes;
+        };
+        ops.createDirectory=[&](const std::wstring&){ ++downstream; return TRUE; };
+        ops.listDirectory=[&](const std::wstring&,
+                              std::vector<PickerTraceDirectoryEntry>&){
+            ++downstream; return true;
+        };
+        ops.deleteFile=[&](const std::wstring&){ ++downstream; return TRUE; };
+        ops.createNew=[&](const std::wstring&,DWORD){
+            ++downstream; return reinterpret_cast<HANDLE>(1);
+        };
+        ops.utcFileTime100ns=[](){ return 1ULL; };
+        PickerTraceOpenedFile opened;
+        CHECK(!OpenPickerTraceStorage(ops,1,opened));
+        CHECK(downstream==0);
+    }
+}
+
+static void test_picker_trace_storage_failures_disable_only_trace(){
+    const uint64_t day=24ULL*60ULL*60ULL*10000000ULL;
+    const uint64_t now=200000ULL*day;
+    std::vector<std::wstring> deleted;
+    std::wstring listed,created;
+    DWORD disposition=0;
+    int directoryCreates=0;
+    PickerTraceOpenedFile opened;
+
+    PickerTraceStorageOps createFailure=PickerTraceStorageOpsForTest(
+        now,{},deleted,listed,created,disposition,directoryCreates);
+    createFailure.getAttributes=[](const std::wstring& path){
+        return path==L"C:\\Local"
+            ? FILE_ATTRIBUTE_DIRECTORY : INVALID_FILE_ATTRIBUTES;
+    };
+    createFailure.createDirectory=[](const std::wstring&){ return FALSE; };
+    CHECK(!OpenPickerTraceStorage(createFailure,7,opened));
+
+    PickerTraceStorageOps listFailure=PickerTraceStorageOpsForTest(
+        now,{},deleted,listed,created,disposition,directoryCreates);
+    listFailure.listDirectory=[](const std::wstring&,
+                                 std::vector<PickerTraceDirectoryEntry>&){
+        return false;
+    };
+    CHECK(!OpenPickerTraceStorage(listFailure,7,opened));
+
+    std::vector<PickerTraceDirectoryEntry> expired={
+        {L"picker-20260801T000000.000Z-1.jsonl",0,now-8*day}
+    };
+    PickerTraceStorageOps deleteFailure=PickerTraceStorageOpsForTest(
+        now,expired,deleted,listed,created,disposition,directoryCreates);
+    deleteFailure.deleteFile=[](const std::wstring&){ return FALSE; };
+    CHECK(!OpenPickerTraceStorage(deleteFailure,7,opened));
+
+    PickerTraceStorageOps fileCreateFailure=PickerTraceStorageOpsForTest(
+        now,{},deleted,listed,created,disposition,directoryCreates);
+    fileCreateFailure.createNew=[](const std::wstring&,DWORD){
+        return INVALID_HANDLE_VALUE;
+    };
+    CHECK(!OpenPickerTraceStorage(fileCreateFailure,7,opened));
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
@@ -19617,6 +19839,12 @@ int main(){
     test_picker_trace_writer_callback_exceptions_do_not_escape();
     test_picker_trace_writer_flush_failure_disables();
     test_picker_trace_writer_close_is_once_and_no_throw();
+    test_picker_trace_filename_grammar_is_strict();
+    test_picker_trace_retention_is_age_and_count_bounded();
+    test_picker_trace_retention_keeps_exact_seven_days_and_orders_ties();
+    test_picker_trace_storage_reuses_valid_directory_and_is_nonrecursive();
+    test_picker_trace_storage_rejects_unsafe_diagnostics_paths();
+    test_picker_trace_storage_failures_disable_only_trace();
     test_picker_uses_self_contained_gdi_buffer();
     test_picker_icon_loading_is_bounded_and_outside_paint();
     test_picker_enum_publishes_display_only_rows_safely();
