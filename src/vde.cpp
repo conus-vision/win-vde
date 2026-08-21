@@ -54,6 +54,7 @@
 #include "gdi_buffer.hpp"
 #include "icon_cache.hpp"
 #include "picker_state.hpp"
+#include "picker_trace.hpp"
 #include "reconcile_worker.hpp"
 #include "session.hpp"    // bounded browser-session decoding primitives
 #include "appprofile.hpp" // AppProfile, BuiltinProfiles
@@ -8615,10 +8616,14 @@ static int RunGui(HINSTANCE hInst){
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int){
     SetProcessDPIAware();
-    int argc=0; LPWSTR* argv=CommandLineToArgvW(GetCommandLineW(),&argc);
-    std::wstring cmd = (argc>=2)?argv[1]:L"";
-    if(argv)LocalFree(argv);
-    bool cli = (cmd==L"save"||cmd==L"restore"||cmd==L"restore-auto"||cmd==L"status"||cmd==L"list"||cmd==L"-h"||cmd==L"--help"||cmd==L"/?");
+    int argc=0;
+    LPWSTR* argv=CommandLineToArgvW(GetCommandLineW(),&argc);
+    const VdeLaunchOptions launch=ParseVdeLaunchOptions(argc,argv);
+    if(argv) LocalFree(argv);
+    const std::wstring cmd=launch.command;
+    const bool cli=launch.cli;
+    const bool tracePicker=launch.tracePicker;
+    (void)tracePicker;
 
     if(FAILED(CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED))) return 1;
     UniqueWinHandle trayMutex;

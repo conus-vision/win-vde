@@ -6,6 +6,7 @@
 #include "gdi_buffer.hpp"
 #include "icon_cache.hpp"
 #include "picker_state.hpp"
+#include "picker_trace.hpp"
 #include "reconcile_worker.hpp"
 #include "session_worker.hpp"
 #include "move_queue.hpp"
@@ -19122,7 +19123,34 @@ static void test_validated_touch_rebase_preserves_external_semantics(){
     CHECK(stale.deferredRecordIds.count(disk.recordId)==1);
 }
 
+static void test_picker_trace_launch_requires_exact_opt_in_flag(){
+    const wchar_t* exact[]={L"vde.exe",L"--trace-picker"};
+    const wchar_t* none[]={L"vde.exe"};
+    const wchar_t* cli[]={L"vde.exe",L"status"};
+    const wchar_t* misspelled[]={L"vde.exe",L"--trace-pick"};
+    const wchar_t* extra[]={L"vde.exe",L"--trace-picker",L"extra"};
+    CHECK(ParseVdeLaunchOptions(2,exact).tracePicker);
+    CHECK(!ParseVdeLaunchOptions(1,none).tracePicker);
+    CHECK(!ParseVdeLaunchOptions(2,cli).tracePicker);
+    CHECK(!ParseVdeLaunchOptions(2,misspelled).tracePicker);
+    CHECK(!ParseVdeLaunchOptions(3,extra).tracePicker);
+}
+
+static void test_picker_trace_launch_preserves_cli_routing(){
+    const wchar_t* status[]={L"vde.exe",L"status"};
+    const wchar_t* restore[]={L"vde.exe",L"restore-auto"};
+    const wchar_t* traced[]={L"vde.exe",L"--trace-picker"};
+    const wchar_t* unknown[]={L"vde.exe",L"unknown"};
+    CHECK(ParseVdeLaunchOptions(2,status).cli);
+    CHECK(ParseVdeLaunchOptions(2,restore).cli);
+    CHECK(!ParseVdeLaunchOptions(2,traced).cli);
+    CHECK(!ParseVdeLaunchOptions(2,unknown).cli);
+    CHECK(ParseVdeLaunchOptions(2,status).command==L"status");
+}
+
 int main(){
+    test_picker_trace_launch_requires_exact_opt_in_flag();
+    test_picker_trace_launch_preserves_cli_routing();
     test_picker_uses_self_contained_gdi_buffer();
     test_picker_icon_loading_is_bounded_and_outside_paint();
     test_picker_enum_publishes_display_only_rows_safely();
