@@ -95,8 +95,13 @@ both ordinary clicks and controlled forward/rollback effects. The helper will:
 1. resolve the destination desktop;
 2. locate Progman and attach the relevant input queues when available;
 3. give the shell foreground ownership;
-4. invoke `SwitchDesktop` exactly once;
-5. detach every input queue it attached and retain the existing Progman cleanup.
+4. immediately detach every input queue it attached, in reverse order;
+5. invoke `SwitchDesktop` exactly once and retain the existing Progman cleanup.
+
+The input queues stay attached only long enough to perform the foreground
+handoff. They are detached before the undocumented COM switch call, preserving
+the established ordinary-click sequence and avoiding cross-thread queue
+coupling while the desktop changes.
 
 The helper reports whether the COM switch was actually invoked and returns its
 HRESULT. The existing controlled reducer remains responsible for readback,

@@ -1783,6 +1783,36 @@ static void test_picker_foreground_handoff_covers_popup_and_external_focus(){
     CHECK(!unavailable.focusShell);
     CHECK(!unavailable.attachDesktop);
     CHECK(!unavailable.attachForeground);
+
+    PickerForegroundHandoffPlan sharedQueue=PlanPickerForegroundHandoff(
+        true,10,10,20);
+    CHECK(sharedQueue.focusShell);
+    CHECK(sharedQueue.attachDesktop);
+    CHECK(!sharedQueue.attachForeground);
+
+    PickerForegroundHandoffPlan desktopIsCurrent=
+        PlanPickerForegroundHandoff(true,20,30,20);
+    CHECK(desktopIsCurrent.focusShell);
+    CHECK(!desktopIsCurrent.attachDesktop);
+    CHECK(desktopIsCurrent.attachForeground);
+
+    PickerForegroundHandoffPlan noDesktop=PlanPickerForegroundHandoff(
+        true,0,30,20);
+    CHECK(!noDesktop.focusShell);
+    CHECK(!noDesktop.attachDesktop);
+    CHECK(!noDesktop.attachForeground);
+
+    PickerForegroundHandoffPlan noCurrent=PlanPickerForegroundHandoff(
+        true,10,30,0);
+    CHECK(!noCurrent.focusShell);
+    CHECK(!noCurrent.attachDesktop);
+    CHECK(!noCurrent.attachForeground);
+
+    PickerForegroundHandoffPlan noForeground=PlanPickerForegroundHandoff(
+        true,10,0,20);
+    CHECK(noForeground.focusShell);
+    CHECK(noForeground.attachDesktop);
+    CHECK(!noForeground.attachForeground);
 }
 
 static void test_picker_mouse_ctrl_uses_button_message_snapshot(){
@@ -11740,6 +11770,35 @@ static void test_picker_ctrl_move_uses_shared_foreground_handoff(){
     CHECK(helper.find("SetForegroundWindow(prog)")!=std::string::npos);
     CHECK(helper.find("g_vdmi->SwitchDesktop(desktop.get())")!=
           std::string::npos);
+    const size_t desktopAttach=helper.find(
+        "desktopAttached=AttachThreadInput(");
+    const size_t desktopAttachTrue=helper.find(
+        "desktopThread,currentThread,TRUE",desktopAttach);
+    const size_t foregroundAttach=helper.find(
+        "foregroundAttached=AttachThreadInput(");
+    const size_t foregroundAttachTrue=helper.find(
+        "foregroundThread,currentThread,TRUE",foregroundAttach);
+    const size_t focusShell=helper.find("SetForegroundWindow(prog)");
+    const size_t foregroundDetach=helper.find(
+        "foregroundThread,currentThread,FALSE)");
+    const size_t desktopDetach=helper.find(
+        "desktopThread,currentThread,FALSE)");
+    const size_t invoked=helper.find("invoked=true;");
+    const size_t switchCall=helper.find(
+        "g_vdmi->SwitchDesktop(desktop.get())");
+    CHECK(desktopAttach!=std::string::npos &&
+          desktopAttachTrue!=std::string::npos &&
+          foregroundAttach!=std::string::npos &&
+          foregroundAttachTrue!=std::string::npos &&
+          focusShell!=std::string::npos &&
+          foregroundDetach!=std::string::npos &&
+          desktopDetach!=std::string::npos && invoked!=std::string::npos &&
+          switchCall!=std::string::npos);
+    CHECK(desktopAttach<desktopAttachTrue && desktopAttachTrue<focusShell &&
+          foregroundAttach<foregroundAttachTrue &&
+          foregroundAttachTrue<focusShell && focusShell<foregroundDetach &&
+          foregroundDetach<desktopDetach && desktopDetach<invoked &&
+          invoked<switchCall);
     CHECK(effects.find("SwitchDesktopWithForegroundHandoff(")!=
           std::string::npos);
     CHECK(effects.find("g_vdmi->SwitchDesktop(")==std::string::npos);

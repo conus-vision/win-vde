@@ -324,6 +324,8 @@ git commit -m "fix(picker): show unverified window rows"
 - Test: `tests/vdtest.cpp:1759-1778`
 - Test: `tests/vdtest.cpp:11921-11931`
 - Test registration: `tests/vdtest.cpp:18703-18715`
+- Modify: `docs/superpowers/specs/2026-08-21-picker-window-routing-fixes-design.md`
+- Modify: `docs/superpowers/plans/2026-08-21-picker-window-routing-fixes.md`
 
 - [ ] **Step 1: Write failing behavior tests for handoff and mouse Ctrl**
 
@@ -348,6 +350,36 @@ static void test_picker_foreground_handoff_covers_popup_and_external_focus(){
     CHECK(!unavailable.focusShell);
     CHECK(!unavailable.attachDesktop);
     CHECK(!unavailable.attachForeground);
+
+    PickerForegroundHandoffPlan sharedQueue=PlanPickerForegroundHandoff(
+        true,10,10,20);
+    CHECK(sharedQueue.focusShell);
+    CHECK(sharedQueue.attachDesktop);
+    CHECK(!sharedQueue.attachForeground);
+
+    PickerForegroundHandoffPlan desktopIsCurrent=
+        PlanPickerForegroundHandoff(true,20,30,20);
+    CHECK(desktopIsCurrent.focusShell);
+    CHECK(!desktopIsCurrent.attachDesktop);
+    CHECK(desktopIsCurrent.attachForeground);
+
+    PickerForegroundHandoffPlan noDesktop=PlanPickerForegroundHandoff(
+        true,0,30,20);
+    CHECK(!noDesktop.focusShell);
+    CHECK(!noDesktop.attachDesktop);
+    CHECK(!noDesktop.attachForeground);
+
+    PickerForegroundHandoffPlan noCurrent=PlanPickerForegroundHandoff(
+        true,10,30,0);
+    CHECK(!noCurrent.focusShell);
+    CHECK(!noCurrent.attachDesktop);
+    CHECK(!noCurrent.attachForeground);
+
+    PickerForegroundHandoffPlan noForeground=PlanPickerForegroundHandoff(
+        true,10,0,20);
+    CHECK(noForeground.focusShell);
+    CHECK(noForeground.attachDesktop);
+    CHECK(!noForeground.attachForeground);
 }
 
 static void test_picker_mouse_ctrl_uses_button_message_snapshot(){
@@ -422,7 +454,7 @@ static void test_picker_ctrl_move_uses_shared_foreground_handoff(){
         "static PickerObservation ExecutePickerEffect(");
     const std::string effects=SourceSection(
         source,"static PickerObservation ExecutePickerEffect(",
-        "static bool RefreshPickerHighlightsLightweight(");
+        "static void PumpPickerTransitionWork()");
     const std::string ordinary=SourceSection(
         source,"static void GoToDesktop(",
         "// Клик = переключение");
@@ -434,6 +466,35 @@ static void test_picker_ctrl_move_uses_shared_foreground_handoff(){
     CHECK(helper.find("SetForegroundWindow(prog)")!=std::string::npos);
     CHECK(helper.find("g_vdmi->SwitchDesktop(desktop.get())")!=
           std::string::npos);
+    const size_t desktopAttach=helper.find(
+        "desktopAttached=AttachThreadInput(");
+    const size_t desktopAttachTrue=helper.find(
+        "desktopThread,currentThread,TRUE",desktopAttach);
+    const size_t foregroundAttach=helper.find(
+        "foregroundAttached=AttachThreadInput(");
+    const size_t foregroundAttachTrue=helper.find(
+        "foregroundThread,currentThread,TRUE",foregroundAttach);
+    const size_t focusShell=helper.find("SetForegroundWindow(prog)");
+    const size_t foregroundDetach=helper.find(
+        "foregroundThread,currentThread,FALSE)");
+    const size_t desktopDetach=helper.find(
+        "desktopThread,currentThread,FALSE)");
+    const size_t invoked=helper.find("invoked=true;");
+    const size_t switchCall=helper.find(
+        "g_vdmi->SwitchDesktop(desktop.get())");
+    CHECK(desktopAttach!=std::string::npos &&
+          desktopAttachTrue!=std::string::npos &&
+          foregroundAttach!=std::string::npos &&
+          foregroundAttachTrue!=std::string::npos &&
+          focusShell!=std::string::npos &&
+          foregroundDetach!=std::string::npos &&
+          desktopDetach!=std::string::npos && invoked!=std::string::npos &&
+          switchCall!=std::string::npos);
+    CHECK(desktopAttach<desktopAttachTrue && desktopAttachTrue<focusShell &&
+          foregroundAttach<foregroundAttachTrue &&
+          foregroundAttachTrue<focusShell && focusShell<foregroundDetach &&
+          foregroundDetach<desktopDetach && desktopDetach<invoked &&
+          invoked<switchCall);
     CHECK(effects.find("SwitchDesktopWithForegroundHandoff(")!=
           std::string::npos);
     CHECK(effects.find("g_vdmi->SwitchDesktop(")==std::string::npos);
@@ -459,8 +520,9 @@ Run:
 cmd.exe /d /c .\build-test.bat
 ```
 
-Expected: the test compiles but fails because controlled switching still calls
-`g_vdmi->SwitchDesktop` directly and mouse Ctrl is still re-read later.
+Expected: the test compiles but fails while controlled switching still calls
+`g_vdmi->SwitchDesktop` directly, mouse Ctrl is re-read later, or attached input
+queues remain connected across the COM switch call.
 
 - [ ] **Step 7: Implement the shared foreground-handoff switch**
 
@@ -494,20 +556,26 @@ static HRESULT SwitchDesktopWithForegroundHandoff(
         foregroundAttached=AttachThreadInput(
             foregroundThread,currentThread,TRUE)!=FALSE;
     if(plan.focusShell) SetForegroundWindow(prog);
+    if(foregroundAttached)
+        AttachThreadInput(foregroundThread,currentThread,FALSE);
+    if(desktopAttached)
+        AttachThreadInput(desktopThread,currentThread,FALSE);
 
     HRESULT result=E_FAIL;
     invoked=true;
     try { result=g_vdmi->SwitchDesktop(desktop.get()); }
     catch(...) { result=E_FAIL; }
 
-    if(foregroundAttached)
-        AttachThreadInput(foregroundThread,currentThread,FALSE);
-    if(desktopAttached)
-        AttachThreadInput(desktopThread,currentThread,FALSE);
     if(prog) ShowWindow(prog,SW_MINIMIZE);
     return result;
 }
 ```
+
+Keep each successful `AttachThreadInput` only through
+`SetForegroundWindow(prog)`, then detach foreground and desktop queues in reverse
+order before setting `invoked` or entering the undocumented COM call. This
+preserves the working ordinary-click sequence and avoids carrying cross-thread
+input coupling through a desktop change.
 
 In the `PickerEffectKind::SwitchDesktop` case, retain the existing target
 identity and rollback gates, then replace the direct COM call with:
@@ -572,7 +640,7 @@ Expected: all tests pass; production compilation ends with
 - [ ] **Step 10: Commit Task 2**
 
 ```powershell
-git add -- src/picker_state.hpp src/vde.cpp tests/vdtest.cpp
+git add -- src/picker_state.hpp src/vde.cpp tests/vdtest.cpp docs/superpowers/specs/2026-08-21-picker-window-routing-fixes-design.md docs/superpowers/plans/2026-08-21-picker-window-routing-fixes.md
 git commit -m "fix(picker): restore reliable ctrl move"
 ```
 
@@ -808,13 +876,13 @@ reports `Built build\vde.exe` with no compiler errors.
 Run:
 
 ```powershell
-git diff main...HEAD -- src/picker_state.hpp src/vde.cpp tests/vdtest.cpp
+git diff main...HEAD -- src/picker_state.hpp src/vde.cpp tests/vdtest.cpp docs/superpowers/specs/2026-08-21-picker-window-routing-fixes-design.md docs/superpowers/plans/2026-08-21-picker-window-routing-fixes.md
 git log --oneline --decorate main..HEAD
 git status --short --branch
 ```
 
-Expected: exactly three focused fix commits, no persistence-scope expansion, and
-a clean worktree.
+Expected: focused task commits (including any review follow-ups), no
+persistence-scope expansion, and a clean worktree.
 
 - [ ] **Step 5: Record manual Windows QA as required handoff evidence**
 

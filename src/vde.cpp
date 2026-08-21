@@ -6564,16 +6564,16 @@ static HRESULT SwitchDesktopWithForegroundHandoff(
         foregroundAttached=AttachThreadInput(
             foregroundThread,currentThread,TRUE)!=FALSE;
     if(plan.focusShell) SetForegroundWindow(prog);
+    if(foregroundAttached)
+        AttachThreadInput(foregroundThread,currentThread,FALSE);
+    if(desktopAttached)
+        AttachThreadInput(desktopThread,currentThread,FALSE);
 
     HRESULT result=E_FAIL;
     invoked=true;
     try { result=g_vdmi->SwitchDesktop(desktop.get()); }
     catch(...) { result=E_FAIL; }
 
-    if(foregroundAttached)
-        AttachThreadInput(foregroundThread,currentThread,FALSE);
-    if(desktopAttached)
-        AttachThreadInput(desktopThread,currentThread,FALSE);
     if(prog) ShowWindow(prog,SW_MINIMIZE);
     return result;
 }
