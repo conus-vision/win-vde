@@ -758,6 +758,8 @@ static void test_picker_show_uses_primary_monitor_only(){
     CHECK(show.find("PickerCenteredOrigin(")!=std::string::npos);
     CHECK(show.find("const BOOL windowPositioned=SetWindowPos(")!=
           std::string::npos);
+    CHECK(show.find("RECT cr={0,0,0,0};")!=std::string::npos);
+    CHECK(show.find("if(!GetClientRect(g_main,&cr))")!=std::string::npos);
     CHECK(show.find("MonitorFromWindow(")==std::string::npos);
 }
 ```
@@ -773,8 +775,8 @@ cmd.exe /d /c .\build-test.bat
 ```
 
 Expected: the new test fails while `ShowPicker` still uses target-monitor
-routing or leaves work-area, adjustment, size, positioning, and cleanup failure
-paths unchecked.
+routing or leaves work-area, adjustment, size, positioning, client-layout, and
+cleanup failure paths unchecked.
 
 - [ ] **Step 7: Add primary work-area lookup and route ShowPicker through it**
 
@@ -817,8 +819,8 @@ static void AbortPickerShowPreparation() noexcept {
 ```
 
 Resolve the work area at the start of `ShowPicker`, before `BuildModel` and any
-target/cache publication. Route every placement failure through the shared
-abort helper:
+target/cache publication. Route every placement or client-layout query failure
+through the shared abort helper:
 
 ```cpp
 RECT workArea={0,0,0,0};
@@ -851,6 +853,12 @@ if(!windowPositioned){
     AbortPickerShowPreparation();
     return;
 }
+RECT cr={0,0,0,0};
+if(!GetClientRect(g_main,&cr)){
+    AbortPickerShowPreparation();
+    return;
+}
+LayoutTiles(cr.right);
 ```
 
 The existing failed `PickerShowPreparationComplete` branch uses the same abort
@@ -865,8 +873,9 @@ cmd.exe /d /c .\build-test.bat
 cmd.exe /d /c .\build.bat
 ```
 
-Expected: all tests pass, including fail-closed lookup and checked placement
-source wiring; production compilation ends with `Built build\vde.exe`.
+Expected: all tests pass, including fail-closed lookup, checked placement, and
+checked client-layout source wiring; production compilation ends with
+`Built build\vde.exe`.
 
 - [ ] **Step 9: Commit Task 3**
 

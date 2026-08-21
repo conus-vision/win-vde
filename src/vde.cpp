@@ -7602,7 +7602,12 @@ static void ShowPicker(PickerTargetCaptureState capture){
         AbortPickerShowPreparation();
         return;
     }
-    RECT cr; GetClientRect(g_main,&cr); LayoutTiles(cr.right);
+    RECT cr={0,0,0,0};
+    if(!GetClientRect(g_main,&cr)){
+        AbortPickerShowPreparation();
+        return;
+    }
+    LayoutTiles(cr.right);
     EnsurePickerChildren();
     if(g_search){ SetWindowTextW(g_search,L""); RECT sb=SearchBoxRect(cr.right);
         int eLeft=sb.left+S(14), eRight=sb.right-S(44), eH=S(22), eTop=sb.top+((sb.bottom-sb.top)-eH)/2;

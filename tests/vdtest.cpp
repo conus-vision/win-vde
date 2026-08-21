@@ -12010,9 +12010,20 @@ static void test_picker_show_uses_primary_monitor_only(){
     const size_t setWindowAbort=show.find(
         "AbortPickerShowPreparation();",setWindowGuard);
     const size_t setWindowReturn=show.find("return;",setWindowAbort);
-    const size_t childLayout=show.find("RECT cr;",setWindowEnd);
+    const size_t clientRectInit=show.find(
+        "RECT cr={0,0,0,0};",setWindowEnd);
+    const size_t clientRectGuard=show.find(
+        "if(!GetClientRect(g_main,&cr))",clientRectInit);
+    const size_t clientRectAbort=show.find(
+        "AbortPickerShowPreparation();",clientRectGuard);
+    const size_t clientRectReturn=show.find("return;",clientRectAbort);
+    const size_t layoutTiles=show.find("LayoutTiles(cr.right)",setWindowEnd);
+    const size_t ensureChildren=show.find(
+        "EnsurePickerChildren()",layoutTiles);
+    const size_t paintPreparation=show.find(
+        "RefreshPickerPaintCache(true)",ensureChildren);
     const size_t paintFailure=show.find(
-        "if(!PickerShowPreparationComplete(",childLayout);
+        "if(!PickerShowPreparationComplete(",paintPreparation);
     const size_t paintAbort=show.find(
         "AbortPickerShowPreparation();",paintFailure);
     const size_t paintReturn=show.find("return;",paintAbort);
@@ -12052,7 +12063,13 @@ static void test_picker_show_uses_primary_monitor_only(){
     CHECK(setWindowGuard!=std::string::npos);
     CHECK(setWindowAbort!=std::string::npos);
     CHECK(setWindowReturn!=std::string::npos);
-    CHECK(childLayout!=std::string::npos);
+    CHECK(clientRectInit!=std::string::npos);
+    CHECK(clientRectGuard!=std::string::npos);
+    CHECK(clientRectAbort!=std::string::npos);
+    CHECK(clientRectReturn!=std::string::npos);
+    CHECK(layoutTiles!=std::string::npos);
+    CHECK(ensureChildren!=std::string::npos);
+    CHECK(paintPreparation!=std::string::npos);
     CHECK(paintFailure!=std::string::npos);
     CHECK(paintAbort!=std::string::npos);
     CHECK(paintReturn!=std::string::npos);
@@ -12068,8 +12085,13 @@ static void test_picker_show_uses_primary_monitor_only(){
           setWindowCoordinates<setWindowSizeAndFlags &&
           setWindowSizeAndFlags<setWindowEnd &&
           setWindowEnd<setWindowGuard && setWindowGuard<setWindowAbort &&
-          setWindowAbort<setWindowReturn && setWindowReturn<childLayout &&
-          childLayout<paintFailure && paintFailure<paintAbort &&
+          setWindowAbort<setWindowReturn &&
+          setWindowReturn<clientRectInit && clientRectInit<clientRectGuard &&
+          clientRectGuard<clientRectAbort &&
+          clientRectAbort<clientRectReturn &&
+          clientRectReturn<layoutTiles && layoutTiles<ensureChildren &&
+          ensureChildren<paintPreparation &&
+          paintPreparation<paintFailure && paintFailure<paintAbort &&
           paintAbort<paintReturn && paintReturn<showWindow);
     CHECK(!placement.empty());
     CHECK(placement.find("MonitorFrom")==std::string::npos);
