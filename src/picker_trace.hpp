@@ -140,6 +140,49 @@ enum class PickerTraceReservationExceptionStage : uint8_t {
     SecondDecision, Erase
 };
 
+struct PickerTraceAltTabFacts {
+    bool visibleObserved=false;
+    bool visible=false;
+    bool firstTitleObserved=false;
+    int firstTitleLength=0;
+    DWORD firstTitleError=ERROR_SUCCESS;
+    bool exStyleObserved=false;
+    LONG_PTR exStyle=0;
+    DWORD exStyleError=ERROR_SUCCESS;
+    bool rootOwnerObserved=false;
+    HWND rootOwner=nullptr;
+    PickerTraceAltTabReason reason=
+        PickerTraceAltTabReason::FirstTitleUnavailable;
+};
+
+struct PickerTraceAltTabOps {
+    void* context=nullptr;
+    BOOL (*isVisible)(void*,HWND)=nullptr;
+    int (*titleLength)(void*,HWND,DWORD&)=nullptr;
+    LONG_PTR (*extendedStyle)(void*,HWND,DWORD&)=nullptr;
+    HWND (*rootOwner)(void*,HWND)=nullptr;
+};
+
+struct PickerTraceDesktopSnapshotFacts {
+    PickerTraceDesktopSnapshotStatus status=
+        PickerTraceDesktopSnapshotStatus::NotAttempted;
+    HRESULT result=E_NOTIMPL;
+    int index=-1;
+    uint32_t count=0;
+};
+
+PickerTraceAltTabReason DecidePickerTraceAltTabReason(
+    bool visible,int titleLength,uint64_t exStyle,
+    uintptr_t hwnd,uintptr_t rootOwner) noexcept;
+PickerTraceAltTabFacts ObservePickerTraceAltTabWindow(
+    HWND hwnd,const PickerTraceAltTabOps& ops) noexcept;
+PickerTraceEnumDecision DecidePickerTraceEnumDecision(
+    PickerTraceAltTabReason altTabReason,bool desktopServiceAvailable,
+    HRESULT desktopResult,bool desktopGuidAvailable,int tileIndex,
+    int secondTitleLength,int secondTitleCopied,bool pidAvailable,
+    bool processStartAvailable,
+    WindowIdentityRecapture recapture) noexcept;
+
 class PickerTraceSafeClassName {
 public:
     PickerTraceSafeClassName() noexcept=default;

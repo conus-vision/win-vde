@@ -19374,6 +19374,35 @@ static void test_picker_trace_json_line_has_exact_canonical_shape(){
         "\"activation_id\":9,\"result\":\"already_controlled\"}\n");
 }
 
+static void test_picker_trace_capture_uses_picker_event_name(){
+    PickerTraceEnvelope envelope;
+    envelope.session.fill(0x22);
+    envelope.seq=1;
+    envelope.ms=2;
+    PickerTraceCaptureEvent event;
+    event.titleLength=17;
+    event.titleRead=true;
+    std::string line;
+    CHECK(SerializePickerTraceLine(envelope,event,line));
+    CHECK(line.find("\"event\":\"picker.capture\"")!=std::string::npos);
+    CHECK(line.find("capture.title")==std::string::npos);
+    CHECK(line.find("title_text")==std::string::npos);
+}
+
+static void test_picker_trace_picker_and_enum_event_names_are_exact(){
+    PickerTraceEnvelope envelope;
+    const auto check=[&](const auto& event,const char* expected){
+        std::string line;
+        CHECK(SerializePickerTraceLine(envelope,event,line));
+        CHECK(line.find(std::string("\"event\":\"")+expected+"\"")!=
+              std::string::npos);
+    };
+    check(PickerTraceOpenEvent{},"picker.open");
+    check(PickerTraceEnumBeginEvent{},"enum.begin");
+    check(PickerTraceEnumWindowEvent{},"enum.window");
+    check(PickerTraceEnumEndEvent{},"enum.end");
+}
+
 static void test_picker_trace_enums_have_stable_names(){
     CHECK(std::string(PickerTraceEnumDecisionName(
         PickerTraceEnumDecision::SkipRootOwnerMismatch))==
@@ -20068,12 +20097,585 @@ static void test_picker_trace_start_event_is_first_and_path_private(){
     CHECK(storageCloses==1);
 }
 
+struct PickerTraceAltTabContextForTest {
+    bool visible=true;
+    int titleLength=1;
+    LONG_PTR exStyle=0;
+    HWND rootOwner=reinterpret_cast<HWND>(static_cast<uintptr_t>(1));
+    DWORD titleError=ERROR_SUCCESS;
+    DWORD styleError=ERROR_SUCCESS;
+    int visibleCalls=0;
+    int titleCalls=0;
+    int styleCalls=0;
+    int rootCalls=0;
+    std::vector<std::string> transcript;
+};
+
+static PickerTraceAltTabOps PickerTraceAltTabOpsForTest(
+        PickerTraceAltTabContextForTest& context){
+    PickerTraceAltTabOps ops;
+    ops.context=&context;
+    ops.isVisible=[](void* opaque,HWND){
+        auto& value=*static_cast<PickerTraceAltTabContextForTest*>(opaque);
+        ++value.visibleCalls;
+        value.transcript.push_back("visible");
+        return value.visible ? TRUE : FALSE;
+    };
+    ops.titleLength=[](void* opaque,HWND,DWORD& error){
+        auto& value=*static_cast<PickerTraceAltTabContextForTest*>(opaque);
+        ++value.titleCalls;
+        value.transcript.push_back("title");
+        error=value.titleError;
+        return value.titleLength;
+    };
+    ops.extendedStyle=[](void* opaque,HWND,DWORD& error){
+        auto& value=*static_cast<PickerTraceAltTabContextForTest*>(opaque);
+        ++value.styleCalls;
+        value.transcript.push_back("style");
+        error=value.styleError;
+        return value.exStyle;
+    };
+    ops.rootOwner=[](void* opaque,HWND){
+        auto& value=*static_cast<PickerTraceAltTabContextForTest*>(opaque);
+        ++value.rootCalls;
+        value.transcript.push_back("root");
+        return value.rootOwner;
+    };
+    return ops;
+}
+
+static void test_picker_trace_alt_tab_reason_preserves_current_decision(){
+    struct Case { bool visible; int title; uint64_t ex;
+                  uintptr_t hwnd; uintptr_t root;
+                  PickerTraceAltTabReason expected;
+                  int calls[4]; };
+    const Case cases[]={
+        {false,9,0,1,1,PickerTraceAltTabReason::NotVisible,{1,0,0,0}},
+        {true,0,0,1,1,PickerTraceAltTabReason::FirstTitleUnavailable,{1,1,0,0}},
+        {true,9,WS_EX_TOOLWINDOW,1,1,PickerTraceAltTabReason::ToolWindow,{1,1,1,0}},
+        {true,9,0,1,2,PickerTraceAltTabReason::RootOwnerMismatch,{1,1,1,1}},
+        {true,9,0,1,1,PickerTraceAltTabReason::Eligible,{1,1,1,1}}
+    };
+    for(const Case& value:cases){
+        CHECK(DecidePickerTraceAltTabReason(
+            value.visible,value.title,value.ex,value.hwnd,value.root)==
+            value.expected);
+        PickerTraceAltTabContextForTest context;
+        context.visible=value.visible;
+        context.titleLength=value.title;
+        context.exStyle=static_cast<LONG_PTR>(value.ex);
+        context.rootOwner=reinterpret_cast<HWND>(value.root);
+        context.titleError=ERROR_INVALID_DATA;
+        context.styleError=ERROR_ACCESS_DENIED;
+        const PickerTraceAltTabFacts facts=ObservePickerTraceAltTabWindow(
+            reinterpret_cast<HWND>(value.hwnd),
+            PickerTraceAltTabOpsForTest(context));
+        CHECK(facts.reason==value.expected);
+        CHECK(context.visibleCalls==value.calls[0]);
+        CHECK(context.titleCalls==value.calls[1]);
+        CHECK(context.styleCalls==value.calls[2]);
+        CHECK(context.rootCalls==value.calls[3]);
+        std::vector<std::string> expectedTranscript;
+        if(value.calls[0]) expectedTranscript.push_back("visible");
+        if(value.calls[1]) expectedTranscript.push_back("title");
+        if(value.calls[2]) expectedTranscript.push_back("style");
+        if(value.calls[3]) expectedTranscript.push_back("root");
+        CHECK(context.transcript==expectedTranscript);
+        CHECK(facts.visibleObserved==(value.calls[0]!=0));
+        CHECK(facts.firstTitleObserved==(value.calls[1]!=0));
+        CHECK(facts.exStyleObserved==(value.calls[2]!=0));
+        CHECK(facts.rootOwnerObserved==(value.calls[3]!=0));
+        if(value.calls[1]) CHECK(facts.firstTitleError==ERROR_INVALID_DATA);
+        if(value.calls[2]) CHECK(facts.exStyleError==ERROR_ACCESS_DENIED);
+    }
+}
+
+static void test_picker_trace_enum_decisions_cover_every_final_branch(){
+    struct Case {
+        PickerTraceAltTabReason alt;
+        bool service;
+        HRESULT desktopResult;
+        bool guid;
+        int tile;
+        int secondLength;
+        int secondCopied;
+        bool pid;
+        bool processStart;
+        WindowIdentityRecapture recapture;
+        PickerTraceEnumDecision expected;
+        const char* name;
+    };
+    const Case cases[]={
+        {PickerTraceAltTabReason::NotVisible,true,S_OK,true,0,1,1,true,true,WindowIdentityRecapture::Match,PickerTraceEnumDecision::SkipNotVisible,"skip_not_visible"},
+        {PickerTraceAltTabReason::FirstTitleUnavailable,true,S_OK,true,0,1,1,true,true,WindowIdentityRecapture::Match,PickerTraceEnumDecision::SkipFirstTitleUnavailable,"skip_first_title_unavailable"},
+        {PickerTraceAltTabReason::ToolWindow,true,S_OK,true,0,1,1,true,true,WindowIdentityRecapture::Match,PickerTraceEnumDecision::SkipToolWindow,"skip_tool_window"},
+        {PickerTraceAltTabReason::RootOwnerMismatch,true,S_OK,true,0,1,1,true,true,WindowIdentityRecapture::Match,PickerTraceEnumDecision::SkipRootOwnerMismatch,"skip_root_owner_mismatch"},
+        {PickerTraceAltTabReason::Eligible,false,S_OK,true,0,1,1,true,true,WindowIdentityRecapture::Match,PickerTraceEnumDecision::SkipDesktopServiceMissing,"skip_desktop_service_missing"},
+        {PickerTraceAltTabReason::Eligible,true,E_FAIL,true,0,1,1,true,true,WindowIdentityRecapture::Match,PickerTraceEnumDecision::SkipDesktopLookupFailed,"skip_desktop_lookup_failed"},
+        {PickerTraceAltTabReason::Eligible,true,S_OK,false,0,1,1,true,true,WindowIdentityRecapture::Match,PickerTraceEnumDecision::SkipDesktopGuidZero,"skip_desktop_guid_zero"},
+        {PickerTraceAltTabReason::Eligible,true,S_OK,true,-1,1,1,true,true,WindowIdentityRecapture::Match,PickerTraceEnumDecision::SkipDesktopTileMissing,"skip_desktop_tile_missing"},
+        {PickerTraceAltTabReason::Eligible,true,S_OK,true,0,0,1,true,true,WindowIdentityRecapture::Match,PickerTraceEnumDecision::SkipSecondTitleUnavailable,"skip_second_title_unavailable"},
+        {PickerTraceAltTabReason::Eligible,true,S_OK,true,0,1,0,true,true,WindowIdentityRecapture::Match,PickerTraceEnumDecision::SkipSecondTitleReadFailed,"skip_second_title_read_failed"},
+        {PickerTraceAltTabReason::Eligible,true,S_OK,true,0,1,1,false,true,WindowIdentityRecapture::Match,PickerTraceEnumDecision::DisplayOnlyPidUnavailable,"display_only_pid_unavailable"},
+        {PickerTraceAltTabReason::Eligible,true,S_OK,true,0,1,1,true,false,WindowIdentityRecapture::Match,PickerTraceEnumDecision::DisplayOnlyProcessStartUnavailable,"display_only_process_start_unavailable"},
+        {PickerTraceAltTabReason::Eligible,true,S_OK,true,0,1,1,true,true,WindowIdentityRecapture::Indeterminate,PickerTraceEnumDecision::DisplayOnlyIdentityIndeterminate,"display_only_identity_indeterminate"},
+        {PickerTraceAltTabReason::Eligible,true,S_OK,true,0,1,1,true,true,WindowIdentityRecapture::Lost,PickerTraceEnumDecision::SkipIdentityLost,"skip_identity_lost"},
+        {PickerTraceAltTabReason::Eligible,true,S_OK,true,0,1,1,true,true,WindowIdentityRecapture::Match,PickerTraceEnumDecision::Verified,"verified"}
+    };
+    static_assert(sizeof(cases)/sizeof(cases[0])==
+        static_cast<size_t>(PickerTraceEnumDecision::Count)-2,
+        "pure decision cases must cover every non-exception outcome");
+    for(const Case& value:cases){
+        const PickerTraceEnumDecision actual=DecidePickerTraceEnumDecision(
+            value.alt,value.service,value.desktopResult,value.guid,value.tile,
+            value.secondLength,value.secondCopied,value.pid,
+            value.processStart,value.recapture);
+        CHECK(actual==value.expected);
+        CHECK(std::string(PickerTraceEnumDecisionName(actual))==value.name);
+        PickerTraceEnumWindowEvent event;
+        event.decision=actual;
+        PickerTraceEnvelope envelope;
+        std::string line;
+        CHECK(SerializePickerTraceLine(envelope,event,line));
+        CHECK(line.find(std::string("\"decision\":\"")+value.name+"\"")!=
+              std::string::npos);
+    }
+    struct NameCase {
+        PickerTraceEnumDecision decision;
+        const char* name;
+    };
+    const NameCase names[]={
+        {PickerTraceEnumDecision::SkipNotVisible,"skip_not_visible"},
+        {PickerTraceEnumDecision::SkipFirstTitleUnavailable,"skip_first_title_unavailable"},
+        {PickerTraceEnumDecision::SkipToolWindow,"skip_tool_window"},
+        {PickerTraceEnumDecision::SkipRootOwnerMismatch,"skip_root_owner_mismatch"},
+        {PickerTraceEnumDecision::SkipDesktopServiceMissing,"skip_desktop_service_missing"},
+        {PickerTraceEnumDecision::SkipDesktopLookupFailed,"skip_desktop_lookup_failed"},
+        {PickerTraceEnumDecision::SkipDesktopGuidZero,"skip_desktop_guid_zero"},
+        {PickerTraceEnumDecision::SkipDesktopTileMissing,"skip_desktop_tile_missing"},
+        {PickerTraceEnumDecision::SkipSecondTitleUnavailable,"skip_second_title_unavailable"},
+        {PickerTraceEnumDecision::SkipSecondTitleReadFailed,"skip_second_title_read_failed"},
+        {PickerTraceEnumDecision::SkipIdentityLost,"skip_identity_lost"},
+        {PickerTraceEnumDecision::DisplayOnlyPidUnavailable,"display_only_pid_unavailable"},
+        {PickerTraceEnumDecision::DisplayOnlyProcessStartUnavailable,"display_only_process_start_unavailable"},
+        {PickerTraceEnumDecision::DisplayOnlyIdentityIndeterminate,"display_only_identity_indeterminate"},
+        {PickerTraceEnumDecision::Verified,"verified"},
+        {PickerTraceEnumDecision::AllocationFailure,"allocation_failure"},
+        {PickerTraceEnumDecision::GlobalSnapshotFailure,"global_snapshot_failure"}
+    };
+    static_assert(sizeof(names)/sizeof(names[0])==
+        static_cast<size_t>(PickerTraceEnumDecision::Count),
+        "stable-name table must cover every serialized enum decision");
+    for(const NameCase& value:names)
+        CHECK(std::string(PickerTraceEnumDecisionName(value.decision))==
+              value.name);
+}
+
+template<class...> using PickerTraceVoidForTest=void;
+template<class Type,class=void>
+struct PickerTraceHasTitleTextForTest : std::false_type {};
+template<class Type>
+struct PickerTraceHasTitleTextForTest<Type,
+    PickerTraceVoidForTest<decltype(&Type::titleText)>> : std::true_type {};
+template<class Type,class=void>
+struct PickerTraceHasTitleForTest : std::false_type {};
+template<class Type>
+struct PickerTraceHasTitleForTest<Type,
+    PickerTraceVoidForTest<decltype(&Type::title)>> : std::true_type {};
+
+static void test_picker_trace_enum_schema_has_no_title_text_member(){
+    static_assert(
+        !PickerTraceHasTitleForTest<PickerTraceEnumWindowEvent>::value,
+        "enum trace must never own a title string");
+    static_assert(
+        !PickerTraceHasTitleTextForTest<PickerTraceEnumWindowEvent>::value,
+        "enum trace must never own title text");
+    CHECK(!PickerTraceHasTitleForTest<PickerTraceEnumWindowEvent>::value);
+    CHECK(!PickerTraceHasTitleTextForTest<PickerTraceEnumWindowEvent>::value);
+    PickerTraceEnumWindowEvent event;
+    event.firstTitleLength=777;
+    event.secondTitleLength=888;
+    std::string line;
+    CHECK(SerializePickerTraceLine(PickerTraceEnvelope{},event,line));
+    CHECK(line.find("title_text")==std::string::npos);
+    CHECK(line.find("sentinel-private-title")==std::string::npos);
+}
+
+static void test_picker_trace_runtime_wiring_finalizes_once_and_stays_private(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string finalizer=SourceSection(
+        source,"static BOOL FinishPickerEnumWindow(",
+        "static BOOL CALLBACK EnumAll(");
+    const std::string enumeration=SourceSection(
+        source,"static BOOL CALLBACK EnumAll(",
+        "static bool PopulatePickerFilteredRows(");
+    CHECK(!finalizer.empty() && !enumeration.empty());
+    CHECK(CountSourceText(finalizer,"g_pickerTrace.emit(event);")==1);
+    CHECK(finalizer.find("const DWORD productLastError=GetLastError();")!=
+          std::string::npos);
+    CHECK(finalizer.find("SetLastError(productLastError);")!=
+          std::string::npos);
+    CHECK(CountSourceText(enumeration,"return finish(")==11);
+    CHECK(enumeration.find("return TRUE;")==std::string::npos);
+    CHECK(enumeration.find("return FALSE;")==std::string::npos);
+    CHECK(enumeration.find("g_pickerTrace.emit(")==std::string::npos);
+
+    const std::string capture=SourceSection(
+        source,"static PickerTargetCaptureState CapturePickerTarget(",
+        "static bool GetPrimaryPickerWorkArea(");
+    CHECK(!capture.empty());
+    CHECK(CountSourceText(
+        capture,"PickerTraceCaptureEmitScope traceScope(")==1);
+    CHECK(capture.find("traceEvent.titleLength=length;")!=
+          std::string::npos);
+    CHECK(capture.find("traceEvent.titleRead=true;")!=std::string::npos);
+    CHECK(capture.find("traceEvent.title=")==std::string::npos);
+    CHECK(capture.find("g_pickerTrace.emit(")==std::string::npos);
+
+    const std::string show=SourceSection(
+        source,"static void ShowPicker(","static void MoveSel(");
+    CHECK(!show.empty());
+    CHECK(CountSourceText(show,"PickerTraceOpenEmitScope traceScope(")==1);
+    CHECK(CountSourceText(show,"traceEvent.result=")==10);
+    CHECK(show.find("g_pickerTrace.emit(")==std::string::npos);
+}
+
+struct PickerTraceObservedDesktopForTest {
+    GUID id={0};
+    HRESULT idResult=S_OK;
+    int releases=0;
+};
+
+struct PickerTraceObservedArrayForTest { int releases=0; };
+
+struct PickerTraceObservedSnapshotOpsForTest {
+    PickerTraceObservedArrayForTest array;
+    HRESULT desktopsResult=S_OK;
+    HRESULT countResult=S_OK;
+    UINT count=0;
+    std::vector<PickerTraceObservedDesktopForTest*> desktops;
+    std::vector<HRESULT> atResults;
+    bool nullArray=false;
+    bool nullDesktop=false;
+    int throwStage=0;
+    bool throwBadAlloc=false;
+    std::vector<std::string> calls;
+
+    void maybeThrow(int stage){
+        if(throwStage!=stage) return;
+        if(throwBadAlloc) throw std::bad_alloc();
+        throw std::runtime_error("snapshot");
+    }
+    HRESULT getDesktops(PickerTraceObservedArrayForTest** output){
+        calls.push_back("get_desktops"); maybeThrow(1);
+        *output=nullArray?nullptr:&array; return desktopsResult;
+    }
+    HRESULT getCount(PickerTraceObservedArrayForTest*,UINT* output){
+        calls.push_back("get_count"); maybeThrow(2);
+        *output=count; return countResult;
+    }
+    HRESULT getAt(PickerTraceObservedArrayForTest*,UINT index,
+                  PickerTraceObservedDesktopForTest** output){
+        calls.push_back("get_at:"+std::to_string(index)); maybeThrow(3);
+        if(index<desktops.size())
+            *output=nullDesktop?nullptr:desktops[index];
+        return index<atResults.size() ? atResults[index] : E_FAIL;
+    }
+    HRESULT getId(PickerTraceObservedDesktopForTest* desktop,GUID* output){
+        calls.push_back("get_id"); maybeThrow(4);
+        *output=desktop->id; return desktop->idResult;
+    }
+    void releaseArray(PickerTraceObservedArrayForTest* value){
+        calls.push_back("release_array"); ++value->releases;
+    }
+    void releaseDesktop(PickerTraceObservedDesktopForTest* value){
+        calls.push_back("release_desktop"); ++value->releases;
+    }
+};
+
+static bool RunPickerTraceObservedSnapshotForTest(
+        PickerTraceObservedSnapshotOpsForTest& ops,
+        std::vector<DesktopCollectionEntry>& output,
+        std::vector<DesktopCollectionSnapshotObservation>* observations){
+    if(!observations)
+        return SnapshotDesktopCollectionOwned<
+            PickerTraceObservedArrayForTest,
+            PickerTraceObservedDesktopForTest>(ops,output);
+    std::function<void(const DesktopCollectionSnapshotObservation&)> observer=
+        [&](const DesktopCollectionSnapshotObservation& value){
+            observations->push_back(value);
+        };
+    return SnapshotDesktopCollectionOwned<
+        PickerTraceObservedArrayForTest,PickerTraceObservedDesktopForTest>(
+            ops,output,&observer);
+}
+
+struct PickerTraceSnapshotRunForTest {
+    bool result=false;
+    std::vector<DesktopCollectionEntry> output;
+    std::vector<DesktopCollectionSnapshotObservation> observations;
+    std::vector<std::string> calls;
+    int arrayReleases=0;
+    int firstReleases=0;
+    int secondReleases=0;
+};
+
+static bool PickerTraceSnapshotEntriesEqualForTest(
+        const std::vector<DesktopCollectionEntry>& left,
+        const std::vector<DesktopCollectionEntry>& right){
+    if(left.size()!=right.size()) return false;
+    for(size_t index=0;index<left.size();++index)
+        if(left[index].index!=right[index].index ||
+           !GuidEq(left[index].guid,right[index].guid)) return false;
+    return true;
+}
+
+template<class Configure>
+static PickerTraceSnapshotRunForTest RunPickerTraceSnapshotCaseForTest(
+        bool observed,Configure configure){
+    PickerTraceObservedDesktopForTest first,second;
+    first.id=G(L"{231A0000-0000-0000-0000-000000000191}");
+    second.id=G(L"{231A0000-0000-0000-0000-000000000192}");
+    PickerTraceObservedSnapshotOpsForTest ops;
+    configure(ops,first,second);
+    PickerTraceSnapshotRunForTest run;
+    run.output.push_back({77,
+        G(L"{231A0000-0000-0000-0000-000000000193}")});
+    run.result=RunPickerTraceObservedSnapshotForTest(
+        ops,run.output,observed?&run.observations:nullptr);
+    run.calls=ops.calls;
+    run.arrayReleases=ops.array.releases;
+    run.firstReleases=first.releases;
+    run.secondReleases=second.releases;
+    return run;
+}
+
+template<class Configure>
+static void CheckPickerTraceSnapshotFailureEquivalenceForTest(
+        Configure configure,
+        DesktopCollectionSnapshotObservationStage expectedStage,
+        HRESULT expectedResult,int expectedIndex,UINT expectedCount,
+        int expectedArrayReleases,int expectedFirstReleases,
+        int expectedSecondReleases){
+    const PickerTraceSnapshotRunForTest plain=
+        RunPickerTraceSnapshotCaseForTest(false,configure);
+    const PickerTraceSnapshotRunForTest observed=
+        RunPickerTraceSnapshotCaseForTest(true,configure);
+    CHECK(!plain.result && !observed.result);
+    CHECK(plain.calls==observed.calls);
+    CHECK(plain.arrayReleases==observed.arrayReleases);
+    CHECK(plain.firstReleases==observed.firstReleases);
+    CHECK(plain.secondReleases==observed.secondReleases);
+    CHECK(plain.arrayReleases==expectedArrayReleases);
+    CHECK(plain.firstReleases==expectedFirstReleases);
+    CHECK(plain.secondReleases==expectedSecondReleases);
+    CHECK(std::count(plain.calls.begin(),plain.calls.end(),
+                     "get_desktops")==1);
+    CHECK(std::count(plain.calls.begin(),plain.calls.end(),
+                     "get_count")<=1);
+    CHECK(std::count(plain.calls.begin(),plain.calls.end(),
+                     "get_at:0")<=1);
+    CHECK(std::count(plain.calls.begin(),plain.calls.end(),
+                     "get_id")<=1);
+    CHECK(PickerTraceSnapshotEntriesEqualForTest(
+        plain.output,observed.output));
+    CHECK(observed.observations.size()>0);
+    if(observed.observations.empty()) return;
+    const DesktopCollectionSnapshotObservation& final=
+        observed.observations.back();
+    CHECK(final.stage==expectedStage);
+    CHECK(final.result==expectedResult);
+    CHECK(final.index==expectedIndex);
+    CHECK(final.count==expectedCount);
+}
+
+static void test_picker_trace_snapshot_observer_is_ordered_and_equivalent(){
+    const GUID first=G(L"{231A0000-0000-0000-0000-000000000181}");
+    const GUID second=G(L"{231A0000-0000-0000-0000-000000000182}");
+    auto run=[&](bool observed,std::vector<std::string>& calls,
+                 std::vector<DesktopCollectionEntry>& output,
+                 std::vector<DesktopCollectionSnapshotObservation>& facts,
+                 int& arrayReleases,int& firstReleases,
+                 int& secondReleases){
+        PickerTraceObservedDesktopForTest a,b;
+        a.id=first; b.id=second;
+        PickerTraceObservedSnapshotOpsForTest ops;
+        ops.count=2;
+        ops.desktops={&a,&b};
+        ops.atResults={S_OK,S_OK};
+        const bool result=RunPickerTraceObservedSnapshotForTest(
+            ops,output,observed ? &facts : nullptr);
+        calls=ops.calls;
+        arrayReleases=ops.array.releases;
+        firstReleases=a.releases;
+        secondReleases=b.releases;
+        return result;
+    };
+    std::vector<std::string> plainCalls,observedCalls;
+    std::vector<DesktopCollectionEntry> plainOutput,observedOutput;
+    std::vector<DesktopCollectionSnapshotObservation> noFacts,facts;
+    int plainArray=0,plainFirst=0,plainSecond=0;
+    int observedArray=0,observedFirst=0,observedSecond=0;
+    CHECK(run(false,plainCalls,plainOutput,noFacts,
+              plainArray,plainFirst,plainSecond));
+    CHECK(run(true,observedCalls,observedOutput,facts,
+              observedArray,observedFirst,observedSecond));
+    const std::vector<std::string> expectedCalls={
+        "get_desktops","get_count","get_at:0","get_id",
+        "release_desktop","get_at:1","get_id",
+        "release_desktop","release_array"};
+    CHECK(plainCalls==expectedCalls);
+    CHECK(plainCalls==observedCalls);
+    CHECK(plainArray==1 && plainFirst==1 && plainSecond==1);
+    CHECK(plainArray==observedArray && plainFirst==observedFirst &&
+          plainSecond==observedSecond);
+    CHECK(plainOutput.size()==observedOutput.size());
+    CHECK(plainOutput.size()==2 &&
+          plainOutput[0].index==0 && plainOutput[1].index==1 &&
+          GuidEq(plainOutput[0].guid,first) &&
+          GuidEq(plainOutput[1].guid,second) &&
+          GuidEq(plainOutput[0].guid,observedOutput[0].guid) &&
+          GuidEq(plainOutput[1].guid,observedOutput[1].guid));
+    CHECK(facts.size()==7);
+    CHECK(facts[0].stage==DesktopCollectionSnapshotObservationStage::GetDesktops);
+    CHECK(facts[1].stage==DesktopCollectionSnapshotObservationStage::GetCount);
+    CHECK(facts[2].stage==DesktopCollectionSnapshotObservationStage::GetAt &&
+          facts[2].index==0);
+    CHECK(facts[3].stage==DesktopCollectionSnapshotObservationStage::GetId &&
+          facts[3].index==0 && GuidEq(facts[3].actual,first));
+    CHECK(facts[4].stage==DesktopCollectionSnapshotObservationStage::GetAt &&
+          facts[4].index==1);
+    CHECK(facts[5].stage==DesktopCollectionSnapshotObservationStage::GetId &&
+          facts[5].index==1 && GuidEq(facts[5].actual,second));
+    CHECK(facts[6].stage==DesktopCollectionSnapshotObservationStage::Complete);
+}
+
+static void test_picker_trace_snapshot_observer_reports_failures_no_throw(){
+    CheckPickerTraceSnapshotFailureEquivalenceForTest(
+        [](PickerTraceObservedSnapshotOpsForTest& ops,
+           PickerTraceObservedDesktopForTest&,
+           PickerTraceObservedDesktopForTest&){
+            ops.desktopsResult=E_FAIL;
+        },DesktopCollectionSnapshotObservationStage::GetDesktops,
+        E_FAIL,-1,0,1,0,0);
+    CheckPickerTraceSnapshotFailureEquivalenceForTest(
+        [](PickerTraceObservedSnapshotOpsForTest& ops,
+           PickerTraceObservedDesktopForTest&,
+           PickerTraceObservedDesktopForTest&){
+            ops.nullArray=true;
+        },DesktopCollectionSnapshotObservationStage::GetDesktops,
+        S_OK,-1,0,0,0,0);
+    CheckPickerTraceSnapshotFailureEquivalenceForTest(
+        [](PickerTraceObservedSnapshotOpsForTest& ops,
+           PickerTraceObservedDesktopForTest&,
+           PickerTraceObservedDesktopForTest&){
+            ops.count=3;
+            ops.countResult=E_FAIL;
+        },DesktopCollectionSnapshotObservationStage::GetCount,
+        E_FAIL,-1,3,1,0,0);
+    CheckPickerTraceSnapshotFailureEquivalenceForTest(
+        [](PickerTraceObservedSnapshotOpsForTest& ops,
+           PickerTraceObservedDesktopForTest&,
+           PickerTraceObservedDesktopForTest&){
+            ops.count=0;
+        },DesktopCollectionSnapshotObservationStage::InvalidCount,
+        S_OK,-1,0,1,0,0);
+    CheckPickerTraceSnapshotFailureEquivalenceForTest(
+        [](PickerTraceObservedSnapshotOpsForTest& ops,
+           PickerTraceObservedDesktopForTest&,
+           PickerTraceObservedDesktopForTest&){
+            ops.count=MAX_VIRTUAL_DESKTOPS+1;
+        },DesktopCollectionSnapshotObservationStage::InvalidCount,
+        S_OK,-1,MAX_VIRTUAL_DESKTOPS+1,1,0,0);
+    CheckPickerTraceSnapshotFailureEquivalenceForTest(
+        [](PickerTraceObservedSnapshotOpsForTest& ops,
+           PickerTraceObservedDesktopForTest& first,
+           PickerTraceObservedDesktopForTest&){
+            ops.count=1;
+            ops.desktops={&first};
+            ops.atResults={E_FAIL};
+        },DesktopCollectionSnapshotObservationStage::GetAt,
+        E_FAIL,0,1,1,1,0);
+    CheckPickerTraceSnapshotFailureEquivalenceForTest(
+        [](PickerTraceObservedSnapshotOpsForTest& ops,
+           PickerTraceObservedDesktopForTest& first,
+           PickerTraceObservedDesktopForTest&){
+            ops.count=1;
+            ops.desktops={&first};
+            ops.atResults={S_OK};
+            ops.nullDesktop=true;
+        },DesktopCollectionSnapshotObservationStage::GetAt,
+        S_OK,0,1,1,0,0);
+    CheckPickerTraceSnapshotFailureEquivalenceForTest(
+        [](PickerTraceObservedSnapshotOpsForTest& ops,
+           PickerTraceObservedDesktopForTest& first,
+           PickerTraceObservedDesktopForTest&){
+            ops.count=1;
+            ops.desktops={&first};
+            ops.atResults={S_OK};
+            first.idResult=E_FAIL;
+        },DesktopCollectionSnapshotObservationStage::GetId,
+        E_FAIL,0,1,1,1,0);
+    CheckPickerTraceSnapshotFailureEquivalenceForTest(
+        [](PickerTraceObservedSnapshotOpsForTest& ops,
+           PickerTraceObservedDesktopForTest& first,
+           PickerTraceObservedDesktopForTest&){
+            first.id=GUID{};
+            ops.count=1;
+            ops.desktops={&first};
+            ops.atResults={S_OK};
+        },DesktopCollectionSnapshotObservationStage::InvalidGuid,
+        S_OK,0,1,1,1,0);
+    CheckPickerTraceSnapshotFailureEquivalenceForTest(
+        [](PickerTraceObservedSnapshotOpsForTest& ops,
+           PickerTraceObservedDesktopForTest&,
+           PickerTraceObservedDesktopForTest&){
+            ops.throwStage=1;
+            ops.throwBadAlloc=true;
+        },DesktopCollectionSnapshotObservationStage::AllocationFailure,
+        E_NOTIMPL,-1,0,0,0,0);
+    CheckPickerTraceSnapshotFailureEquivalenceForTest(
+        [](PickerTraceObservedSnapshotOpsForTest& ops,
+           PickerTraceObservedDesktopForTest& first,
+           PickerTraceObservedDesktopForTest&){
+            ops.count=1;
+            ops.desktops={&first};
+            ops.atResults={S_OK};
+            ops.throwStage=4;
+        },DesktopCollectionSnapshotObservationStage::Exception,
+        E_NOTIMPL,0,1,1,1,0);
+
+    PickerTraceObservedDesktopForTest desktop;
+    desktop.id=G(L"{231A0000-0000-0000-0000-000000000183}");
+    PickerTraceObservedSnapshotOpsForTest observerThrows;
+    observerThrows.count=1;
+    observerThrows.desktops={&desktop};
+    observerThrows.atResults={S_OK};
+    std::vector<DesktopCollectionEntry> output;
+    std::function<void(const DesktopCollectionSnapshotObservation&)> observer=
+        [](const DesktopCollectionSnapshotObservation&){
+            throw std::runtime_error("observer");
+        };
+    CHECK((SnapshotDesktopCollectionOwned<
+        PickerTraceObservedArrayForTest,PickerTraceObservedDesktopForTest>(
+            observerThrows,output,&observer)));
+    CHECK(output.size()==1 && GuidEq(output[0].guid,desktop.id));
+    const std::vector<std::string> expectedObserverThrowCalls={
+        "get_desktops","get_count","get_at:0","get_id",
+        "release_desktop","release_array"};
+    CHECK(observerThrows.calls==expectedObserverThrowCalls);
+    CHECK(observerThrows.array.releases==1);
+    CHECK(desktop.releases==1);
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
     test_picker_trace_safe_foreign_names_are_bounded();
     test_picker_trace_json_line_escapes_only_allowlisted_text();
     test_picker_trace_json_line_has_exact_canonical_shape();
+    test_picker_trace_capture_uses_picker_event_name();
+    test_picker_trace_picker_and_enum_event_names_are_exact();
     test_picker_trace_enums_have_stable_names();
     test_picker_trace_every_schema_event_is_strict_jsonl();
     test_picker_trace_writer_sequences_and_clamps_clock();
@@ -20095,6 +20697,12 @@ int main(){
     test_picker_trace_pe_timestamp_validates_every_boundary();
     test_picker_trace_disabled_session_is_strict_zero_work();
     test_picker_trace_start_event_is_first_and_path_private();
+    test_picker_trace_alt_tab_reason_preserves_current_decision();
+    test_picker_trace_enum_decisions_cover_every_final_branch();
+    test_picker_trace_enum_schema_has_no_title_text_member();
+    test_picker_trace_runtime_wiring_finalizes_once_and_stays_private();
+    test_picker_trace_snapshot_observer_is_ordered_and_equivalent();
+    test_picker_trace_snapshot_observer_reports_failures_no_throw();
     test_picker_uses_self_contained_gdi_buffer();
     test_picker_icon_loading_is_bounded_and_outside_paint();
     test_picker_enum_publishes_display_only_rows_safely();

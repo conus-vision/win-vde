@@ -85,6 +85,113 @@ PickerTraceSafeImageBasename MakePickerTraceSafeImageBasename(
     return result;
 }
 
+PickerTraceAltTabReason DecidePickerTraceAltTabReason(
+        bool visible,int titleLength,uint64_t exStyle,
+        uintptr_t hwnd,uintptr_t rootOwner) noexcept {
+    if(!visible) return PickerTraceAltTabReason::NotVisible;
+    if(titleLength<=0)
+        return PickerTraceAltTabReason::FirstTitleUnavailable;
+    if((exStyle&static_cast<uint64_t>(WS_EX_TOOLWINDOW))!=0)
+        return PickerTraceAltTabReason::ToolWindow;
+    if(rootOwner!=hwnd) return PickerTraceAltTabReason::RootOwnerMismatch;
+    return PickerTraceAltTabReason::Eligible;
+}
+
+PickerTraceAltTabFacts ObservePickerTraceAltTabWindow(
+        HWND hwnd,const PickerTraceAltTabOps& ops) noexcept {
+    PickerTraceAltTabFacts facts;
+    try {
+        if(!ops.isVisible){
+            facts.reason=PickerTraceAltTabReason::NotVisible;
+            return facts;
+        }
+        facts.visibleObserved=true;
+        facts.visible=ops.isVisible(ops.context,hwnd)!=FALSE;
+        if(!facts.visible){
+            facts.reason=PickerTraceAltTabReason::NotVisible;
+            return facts;
+        }
+        if(!ops.titleLength){
+            facts.reason=PickerTraceAltTabReason::FirstTitleUnavailable;
+            return facts;
+        }
+        facts.firstTitleObserved=true;
+        facts.firstTitleLength=ops.titleLength(
+            ops.context,hwnd,facts.firstTitleError);
+        if(facts.firstTitleLength<=0){
+            facts.reason=PickerTraceAltTabReason::FirstTitleUnavailable;
+            return facts;
+        }
+        if(!ops.extendedStyle){
+            facts.reason=PickerTraceAltTabReason::ToolWindow;
+            return facts;
+        }
+        facts.exStyleObserved=true;
+        facts.exStyle=ops.extendedStyle(
+            ops.context,hwnd,facts.exStyleError);
+        if((static_cast<uint64_t>(facts.exStyle)&
+            static_cast<uint64_t>(WS_EX_TOOLWINDOW))!=0){
+            facts.reason=PickerTraceAltTabReason::ToolWindow;
+            return facts;
+        }
+        if(!ops.rootOwner){
+            facts.reason=PickerTraceAltTabReason::RootOwnerMismatch;
+            return facts;
+        }
+        facts.rootOwnerObserved=true;
+        facts.rootOwner=ops.rootOwner(ops.context,hwnd);
+        facts.reason=DecidePickerTraceAltTabReason(
+            facts.visible,facts.firstTitleLength,
+            static_cast<uint64_t>(facts.exStyle),
+            reinterpret_cast<uintptr_t>(hwnd),
+            reinterpret_cast<uintptr_t>(facts.rootOwner));
+        return facts;
+    } catch(...) {
+        return facts;
+    }
+}
+
+PickerTraceEnumDecision DecidePickerTraceEnumDecision(
+        PickerTraceAltTabReason altTabReason,
+        bool desktopServiceAvailable,HRESULT desktopResult,
+        bool desktopGuidAvailable,int tileIndex,
+        int secondTitleLength,int secondTitleCopied,
+        bool pidAvailable,bool processStartAvailable,
+        WindowIdentityRecapture recapture) noexcept {
+    switch(altTabReason){
+    case PickerTraceAltTabReason::NotVisible:
+        return PickerTraceEnumDecision::SkipNotVisible;
+    case PickerTraceAltTabReason::FirstTitleUnavailable:
+        return PickerTraceEnumDecision::SkipFirstTitleUnavailable;
+    case PickerTraceAltTabReason::ToolWindow:
+        return PickerTraceEnumDecision::SkipToolWindow;
+    case PickerTraceAltTabReason::RootOwnerMismatch:
+        return PickerTraceEnumDecision::SkipRootOwnerMismatch;
+    case PickerTraceAltTabReason::Eligible:
+        break;
+    }
+    if(!desktopServiceAvailable)
+        return PickerTraceEnumDecision::SkipDesktopServiceMissing;
+    if(FAILED(desktopResult))
+        return PickerTraceEnumDecision::SkipDesktopLookupFailed;
+    if(!desktopGuidAvailable)
+        return PickerTraceEnumDecision::SkipDesktopGuidZero;
+    if(tileIndex<0) return PickerTraceEnumDecision::SkipDesktopTileMissing;
+    if(secondTitleLength<=0)
+        return PickerTraceEnumDecision::SkipSecondTitleUnavailable;
+    if(secondTitleCopied<=0)
+        return PickerTraceEnumDecision::SkipSecondTitleReadFailed;
+    if(!pidAvailable)
+        return PickerTraceEnumDecision::DisplayOnlyPidUnavailable;
+    if(!processStartAvailable)
+        return PickerTraceEnumDecision::DisplayOnlyProcessStartUnavailable;
+    if(recapture==WindowIdentityRecapture::Lost)
+        return PickerTraceEnumDecision::SkipIdentityLost;
+    if(recapture==WindowIdentityRecapture::Indeterminate)
+        return PickerTraceEnumDecision::DisplayOnlyIdentityIndeterminate;
+    return PickerTraceEnumDecision::Verified;
+}
+
 #define VDE_TRACE_NAME_CASE(Type,Value,Name) case Type::Value: return Name
 
 const char* PickerTraceOpenResultName(PickerTraceOpenResult value) noexcept {
@@ -732,7 +839,7 @@ static bool PickerTraceCountArray(const std::array<uint64_t,Size>& values,
 bool SerializePickerTraceLine(const PickerTraceEnvelope& envelope,
                               const PickerTraceCaptureEvent& event,
                               std::string& output) noexcept {
-    return PickerTraceSerialize(envelope,"capture.title",[&](auto& json){
+    return PickerTraceSerialize(envelope,"picker.capture",[&](auto& json){
         return json.hex64("hwnd",static_cast<uint64_t>(event.hwnd)) &&
             json.unsignedNumber("pid",event.pid) &&
             json.unsignedNumber("tid",event.tid) &&

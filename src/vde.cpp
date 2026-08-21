@@ -660,13 +660,39 @@ static std::map<std::string,AppFastSnapshot> CollectFastSnapshots(){
     return CollectFastSnapshots(ActiveProfiles());
 }
 
-static bool TryReadProcessStart(DWORD pid,uint64_t& started) noexcept {
+struct PickerProcessStartTraceFacts {
+    bool openAttempted=false;
+    bool processOpened=false;
+    DWORD openError=ERROR_SUCCESS;
+    bool timesAttempted=false;
+    bool timesRead=false;
+    DWORD timesError=ERROR_SUCCESS;
+};
+
+static bool TryReadProcessStart(
+        DWORD pid,uint64_t& started,
+        PickerProcessStartTraceFacts* facts=nullptr) noexcept {
+    if(facts) *facts=PickerProcessStartTraceFacts{};
     if(pid==0) return false;
+    if(facts) facts->openAttempted=true;
+    if(facts) SetLastError(ERROR_SUCCESS);
     UniqueWinHandle process(OpenProcess(
         PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid));
+    if(facts){
+        facts->processOpened=static_cast<bool>(process);
+        facts->openError=GetLastError();
+    }
     if(!process) return false;
     FILETIME created{},exited{},kernel{},user{};
-    if(!GetProcessTimes(process.get(),&created,&exited,&kernel,&user))
+    if(facts) facts->timesAttempted=true;
+    if(facts) SetLastError(ERROR_SUCCESS);
+    const BOOL timesRead=GetProcessTimes(
+        process.get(),&created,&exited,&kernel,&user);
+    if(facts){
+        facts->timesRead=timesRead!=FALSE;
+        facts->timesError=GetLastError();
+    }
+    if(!timesRead)
         return false;
     ULARGE_INTEGER ticks{};
     ticks.LowPart=created.dwLowDateTime;
@@ -5289,7 +5315,90 @@ static void FillRoundRect(HDC hdc, RECT r, int rad, COLORREF fill, COLORREF bord
     SelectObject(hdc,ob); SelectObject(hdc,op); DeleteObject(b); DeleteObject(p);
 }
 
-static bool IsAltTabWindow(HWND h){ if(!IsWindowVisible(h))return false; if(GetWindowTextLengthW(h)<=0)return false; LONG_PTR ex=GetWindowLongPtrW(h,GWL_EXSTYLE); if(ex&WS_EX_TOOLWINDOW)return false; if(GetAncestor(h,GA_ROOTOWNER)!=h)return false; return true; }
+static BOOL PickerTraceIsWindowVisible(void*,HWND hwnd) noexcept {
+    return IsWindowVisible(hwnd);
+}
+
+static int PickerTraceWindowTitleLength(
+        void*,HWND hwnd,DWORD& error) noexcept {
+    SetLastError(ERROR_SUCCESS);
+    const int length=GetWindowTextLengthW(hwnd);
+    error=GetLastError();
+    return length;
+}
+
+static LONG_PTR PickerTraceWindowExtendedStyle(
+        void*,HWND hwnd,DWORD& error) noexcept {
+    SetLastError(ERROR_SUCCESS);
+    const LONG_PTR style=GetWindowLongPtrW(hwnd,GWL_EXSTYLE);
+    error=GetLastError();
+    return style;
+}
+
+static HWND PickerTraceWindowRootOwner(void*,HWND hwnd) noexcept {
+    return GetAncestor(hwnd,GA_ROOTOWNER);
+}
+
+static PickerTraceAltTabOps PickerTraceProductAltTabOps() noexcept {
+    PickerTraceAltTabOps ops;
+    ops.isVisible=PickerTraceIsWindowVisible;
+    ops.titleLength=PickerTraceWindowTitleLength;
+    ops.extendedStyle=PickerTraceWindowExtendedStyle;
+    ops.rootOwner=PickerTraceWindowRootOwner;
+    return ops;
+}
+
+static PickerTraceSafeImageBasename ReadPickerTraceImageBasename(
+        DWORD pid) noexcept {
+    try {
+        std::vector<wchar_t> path(32768,L'\0');
+        UniqueWinHandle process(OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid));
+        if(!process) return PickerTraceSafeImageBasename{};
+        DWORD length=static_cast<DWORD>(path.size());
+        if(!QueryFullProcessImageNameW(
+                process.get(),0,path.data(),&length) || length==0)
+            return PickerTraceSafeImageBasename{};
+        size_t begin=static_cast<size_t>(length);
+        while(begin>0 && path[begin-1]!=L'\\' && path[begin-1]!=L'/')
+            --begin;
+        const size_t basenameLength=static_cast<size_t>(length)-begin;
+        if(basenameLength==0 || basenameLength>260)
+            return PickerTraceSafeImageBasename{};
+        return MakePickerTraceSafeImageBasename(
+            path.data()+begin,static_cast<int>(basenameLength));
+    } catch(...) {
+        return PickerTraceSafeImageBasename{};
+    }
+}
+
+static void CollectPickerTraceEnumNonDrivingFacts(
+        HWND hwnd,PickerTraceEnumWindowEvent& event) noexcept {
+    if(!g_pickerTrace.active()) return;
+    try {
+        event.owner=reinterpret_cast<uintptr_t>(GetWindow(hwnd,GW_OWNER));
+        event.lastActivePopup=
+            reinterpret_cast<uintptr_t>(GetLastActivePopup(hwnd));
+        wchar_t className[129]={0};
+        const int classLength=GetClassNameW(
+            hwnd,className,static_cast<int>(_countof(className)));
+        if(classLength>0)
+            event.className=MakePickerTraceSafeClassName(
+                className,classLength);
+        // Do not retry the product PID read after that branch was reached:
+        // a later success would make a pid-unavailable decision look false.
+        if(event.pid==0 && event.secondTitleCopied<=0){
+            DWORD pid=0;
+            event.tid=GetWindowThreadProcessId(hwnd,&pid);
+            event.pid=pid;
+        }
+        if(event.pid!=0)
+            event.imageBasename=ReadPickerTraceImageBasename(event.pid);
+        event.cloakedObserved=true;
+        event.cloakedResult=DwmGetWindowAttribute(
+            hwnd,DWMWA_CLOAKED,&event.cloaked,sizeof(event.cloaked));
+    } catch(...) {}
+}
 static uint64_t NextIconTouch() noexcept {
     if(g_iconTouch!=(std::numeric_limits<uint64_t>::max)()) ++g_iconTouch;
     return g_iconTouch;
@@ -5348,17 +5457,44 @@ static GUID CurrentDesktopGuid() noexcept {
     return candidate;
 }
 
-static WindowIdentityKey CapturePickerWindowIdentity(HWND hwnd) noexcept {
-    WindowIdentityKey identity;
-    if(!hwnd || !IsWindow(hwnd)) return identity;
+struct PickerWindowIdentityCaptureTraceFacts {
     DWORD pid=0;
-    if(!GetWindowThreadProcessId(hwnd,&pid) || pid==0) return identity;
+    DWORD tid=0;
+    bool identityComplete=false;
+    WindowIdentityRecapture recapture=
+        WindowIdentityRecapture::Indeterminate;
+};
+
+static WindowIdentityKey CapturePickerWindowIdentity(
+        HWND hwnd,
+        PickerWindowIdentityCaptureTraceFacts* facts=nullptr) noexcept {
+    if(facts) *facts=PickerWindowIdentityCaptureTraceFacts{};
+    WindowIdentityKey identity;
+    if(!hwnd || !IsWindow(hwnd)){
+        if(facts) facts->recapture=WindowIdentityRecapture::Lost;
+        return identity;
+    }
+    DWORD pid=0;
+    const DWORD tid=GetWindowThreadProcessId(hwnd,&pid);
+    if(facts){
+        facts->pid=pid;
+        facts->tid=tid;
+    }
+    if(!tid || pid==0) return identity;
     uint64_t started=0;
     if(!TryReadProcessStart(pid,started)) return identity;
     identity.hwnd=reinterpret_cast<uintptr_t>(hwnd);
     identity.pid=pid;
     identity.processStart=started;
-    if(RecaptureGenericWindowIdentity(identity)!=WindowIdentityRecapture::Match)
+    const bool complete=SameIdentity(identity,identity);
+    const WindowIdentityRecapture recapture=complete
+        ? RecaptureGenericWindowIdentity(identity)
+        : WindowIdentityRecapture::Lost;
+    if(facts){
+        facts->identityComplete=complete;
+        facts->recapture=recapture;
+    }
+    if(recapture!=WindowIdentityRecapture::Match)
         return WindowIdentityKey{};
     return identity;
 }
@@ -5367,6 +5503,12 @@ struct PickerEnumContext {
     std::vector<Tile>* tiles=nullptr;
     std::set<std::string>* liveKeys=nullptr;
     std::map<DWORD,uint64_t> processStarts;
+    uint64_t modelGeneration=0;
+    uint64_t enumSequence=0;
+    uint64_t candidates=0;
+    std::array<uint64_t,static_cast<size_t>(
+        PickerTraceEnumDecision::Count)> decisionCounts{};
+    bool traceActive=false;
     bool failed=false;
 };
 
@@ -5375,39 +5517,119 @@ static BOOL HandlePickerRowReadResult(
     return ContinuePickerRowEnumeration(result,context.failed)?TRUE:FALSE;
 }
 
+static BOOL FinishPickerEnumWindow(
+        PickerEnumContext& context,HWND hwnd,
+        PickerTraceEnumWindowEvent& event,
+        PickerTraceEnumDecision decision,BOOL productResult) noexcept {
+    if(!context.traceActive) return productResult;
+    const DWORD productLastError=GetLastError();
+    event.decision=decision;
+    if(context.enumSequence!=(std::numeric_limits<uint64_t>::max)())
+        ++context.enumSequence;
+    event.enumSequence=context.enumSequence;
+    if(context.candidates!=(std::numeric_limits<uint64_t>::max)())
+        ++context.candidates;
+    const size_t decisionIndex=static_cast<size_t>(decision);
+    if(decisionIndex<context.decisionCounts.size() &&
+       context.decisionCounts[decisionIndex]!=
+           (std::numeric_limits<uint64_t>::max)())
+        ++context.decisionCounts[decisionIndex];
+    CollectPickerTraceEnumNonDrivingFacts(hwnd,event);
+    g_pickerTrace.emit(event);
+    SetLastError(productLastError);
+    return productResult;
+}
+
 static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
     PickerEnumContext& context=
         *reinterpret_cast<PickerEnumContext*>(parameter);
+    PickerTraceEnumWindowEvent traceEvent;
+    traceEvent.modelGeneration=context.modelGeneration;
+    traceEvent.hwnd=reinterpret_cast<uintptr_t>(hwnd);
+    const auto finish=[&](PickerTraceEnumDecision decision,
+                          BOOL productResult) noexcept {
+        return FinishPickerEnumWindow(
+            context,hwnd,traceEvent,decision,productResult);
+    };
     try {
-        if(!IsAltTabWindow(hwnd)) return TRUE;
+        const PickerTraceAltTabFacts altTab=
+            ObservePickerTraceAltTabWindow(hwnd,PickerTraceProductAltTabOps());
+        traceEvent.visibleObserved=altTab.visibleObserved;
+        traceEvent.visible=altTab.visible;
+        traceEvent.firstTitleObserved=altTab.firstTitleObserved;
+        traceEvent.firstTitleLength=altTab.firstTitleLength;
+        traceEvent.firstTitleError=altTab.firstTitleError;
+        traceEvent.exStyleObserved=altTab.exStyleObserved;
+        traceEvent.exStyle=static_cast<uint64_t>(altTab.exStyle);
+        traceEvent.exStyleError=altTab.exStyleError;
+        traceEvent.toolWindow=altTab.exStyleObserved &&
+            (altTab.exStyle&WS_EX_TOOLWINDOW)!=0;
+        traceEvent.rootOwnerObserved=altTab.rootOwnerObserved;
+        traceEvent.rootOwner=
+            reinterpret_cast<uintptr_t>(altTab.rootOwner);
+        traceEvent.rootOwnerSelf=altTab.rootOwnerObserved &&
+            altTab.rootOwner==hwnd;
+        traceEvent.altTabReason=altTab.reason;
+        if(altTab.reason!=PickerTraceAltTabReason::Eligible)
+            return finish(DecidePickerTraceEnumDecision(
+                altTab.reason,true,S_OK,true,0,1,1,true,true,
+                WindowIdentityRecapture::Match),TRUE);
 
         GUID desktop={0};
-        if(!g_vdmDoc)
-            return HandlePickerRowReadResult(
+        if(!g_vdmDoc){
+            traceEvent.desktopResult=E_NOINTERFACE;
+            const BOOL productResult=HandlePickerRowReadResult(
                 context,PickerRowReadResult::GlobalSnapshotFailure);
-        if(FAILED(g_vdmDoc->GetWindowDesktopId(hwnd,&desktop)) ||
-           GuidIsZero(desktop))
-            return HandlePickerRowReadResult(
-                context,PickerRowReadResult::DesktopUnavailable);
+            return finish(
+                PickerTraceEnumDecision::SkipDesktopServiceMissing,
+                productResult);
+        }
+        traceEvent.desktopResult=
+            g_vdmDoc->GetWindowDesktopId(hwnd,&desktop);
+        traceEvent.desktop=desktop;
+        if(FAILED(traceEvent.desktopResult))
+            return finish(
+                PickerTraceEnumDecision::SkipDesktopLookupFailed,
+                HandlePickerRowReadResult(
+                    context,PickerRowReadResult::DesktopUnavailable));
+        if(GuidIsZero(desktop))
+            return finish(
+                PickerTraceEnumDecision::SkipDesktopGuidZero,
+                HandlePickerRowReadResult(
+                    context,PickerRowReadResult::DesktopUnavailable));
         Tile* tile=nullptr;
         for(Tile& candidate : *context.tiles)
             if(GuidEq(candidate.guid,desktop)){
                 tile=&candidate;
+                traceEvent.tileIndex=candidate.index;
                 break;
             }
         if(!tile)
-            return HandlePickerRowReadResult(
-                context,PickerRowReadResult::DesktopUnavailable);
+            return finish(
+                PickerTraceEnumDecision::SkipDesktopTileMissing,
+                HandlePickerRowReadResult(
+                    context,PickerRowReadResult::DesktopUnavailable));
 
+        traceEvent.secondTitleObserved=true;
+        SetLastError(ERROR_SUCCESS);
         const int length=GetWindowTextLengthW(hwnd);
+        traceEvent.secondTitleLength=length;
+        traceEvent.secondTitleError=GetLastError();
         if(length<=0)
-            return HandlePickerRowReadResult(
-                context,PickerRowReadResult::TitleUnavailable);
+            return finish(
+                PickerTraceEnumDecision::SkipSecondTitleUnavailable,
+                HandlePickerRowReadResult(
+                    context,PickerRowReadResult::TitleUnavailable));
         std::wstring title(static_cast<size_t>(length)+1,L'\0');
+        SetLastError(ERROR_SUCCESS);
         const int copied=GetWindowTextW(hwnd,&title[0],length+1);
+        traceEvent.secondTitleCopied=copied;
+        traceEvent.secondTitleError=GetLastError();
         if(copied<=0)
-            return HandlePickerRowReadResult(
-                context,PickerRowReadResult::TitleUnavailable);
+            return finish(
+                PickerTraceEnumDecision::SkipSecondTitleReadFailed,
+                HandlePickerRowReadResult(
+                    context,PickerRowReadResult::TitleUnavailable));
         title.resize(static_cast<size_t>(copied));
 
         WindowIdentityKey identity;
@@ -5415,14 +5637,22 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
             WindowIdentityRecapture::Indeterminate;
         bool identityComplete=false;
         DWORD pid=0;
-        if(GetWindowThreadProcessId(hwnd,&pid) && pid!=0){
+        traceEvent.tid=GetWindowThreadProcessId(hwnd,&pid);
+        traceEvent.pid=pid;
+        if(traceEvent.tid && pid!=0){
             auto process=context.processStarts.find(pid);
             if(process==context.processStarts.end()){
                 uint64_t started=0;
-                if(TryReadProcessStart(pid,started))
+                PickerProcessStartTraceFacts processFacts;
+                if(TryReadProcessStart(pid,started,&processFacts))
                     process=context.processStarts.emplace(pid,started).first;
+                traceEvent.processStartError=processFacts.timesAttempted
+                    ? processFacts.timesError : processFacts.openError;
+            } else {
+                traceEvent.processStartCacheHit=true;
             }
             if(process!=context.processStarts.end()){
+                traceEvent.processStartAvailable=true;
                 identity.hwnd=reinterpret_cast<uintptr_t>(hwnd);
                 identity.pid=pid;
                 identity.processStart=process->second;
@@ -5431,9 +5661,17 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
                     recapture=RecaptureGenericWindowIdentity(identity);
             }
         }
+        traceEvent.identityComplete=identityComplete;
+        traceEvent.recapture=recapture;
         const PickerRowAdmission admission=DecidePickerRowAdmission(
             true,true,true,identityComplete,recapture);
-        if(admission==PickerRowAdmission::Skip) return TRUE;
+        const PickerTraceEnumDecision decision=DecidePickerTraceEnumDecision(
+            altTab.reason,true,traceEvent.desktopResult,true,
+            traceEvent.tileIndex,length,copied,
+            traceEvent.tid!=0 && pid!=0,
+            traceEvent.processStartAvailable,recapture);
+        if(admission==PickerRowAdmission::Skip)
+            return finish(decision,TRUE);
 
         WinItem item;
         item.hwnd=hwnd;
@@ -5451,17 +5689,23 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
             fast.title=title;
             item.identity=IdentityOf(fast);
             item.runtimeKey=RuntimeKey(fast);
-            if(!context.liveKeys)
-                return HandlePickerRowReadResult(
+            if(!context.liveKeys){
+                const BOOL productResult=HandlePickerRowReadResult(
                     context,PickerRowReadResult::GlobalSnapshotFailure);
+                return finish(
+                    PickerTraceEnumDecision::GlobalSnapshotFailure,
+                    productResult);
+            }
         }
         tile->windows.push_back(std::move(item));
         if(PickerRowUsesStableIdentity(admission))
             context.liveKeys->insert(tile->windows.back().runtimeKey);
-        return TRUE;
+        return finish(decision,TRUE);
     } catch(...) {
-        return HandlePickerRowReadResult(
+        const BOOL productResult=HandlePickerRowReadResult(
             context,PickerRowReadResult::AllocationFailure);
+        return finish(
+            PickerTraceEnumDecision::AllocationFailure,productResult);
     }
 }
 
@@ -5475,14 +5719,84 @@ static bool PopulatePickerFilteredRows(std::vector<Tile>& tiles,
     return true;
 }
 
+struct PickerModelAttemptTraceFacts {
+    GUID currentDesktop{};
+    uint64_t modelGeneration=0;
+    bool currentDesktopAvailable=false;
+};
+
+static uint64_t NextPickerModelGeneration(uint64_t current) noexcept {
+    const uint64_t next=current==(std::numeric_limits<uint64_t>::max)()
+        ? 1 : current+1;
+    return next==0 ? 1 : next;
+}
+
+static void RecordPickerDesktopSnapshotObservation(
+        PickerTraceDesktopSnapshotFacts& facts,
+        const DesktopCollectionSnapshotObservation& observation) noexcept {
+    facts.result=observation.result;
+    facts.index=observation.index;
+    facts.count=observation.count;
+    switch(observation.stage){
+    case DesktopCollectionSnapshotObservationStage::GetDesktops:
+        facts.status=PickerTraceDesktopSnapshotStatus::GetDesktopsFailed;
+        return;
+    case DesktopCollectionSnapshotObservationStage::GetCount:
+        facts.status=PickerTraceDesktopSnapshotStatus::GetCountFailed;
+        return;
+    case DesktopCollectionSnapshotObservationStage::InvalidCount:
+        facts.status=PickerTraceDesktopSnapshotStatus::InvalidCount;
+        return;
+    case DesktopCollectionSnapshotObservationStage::GetAt:
+        facts.status=PickerTraceDesktopSnapshotStatus::GetAtFailed;
+        return;
+    case DesktopCollectionSnapshotObservationStage::GetId:
+        facts.status=PickerTraceDesktopSnapshotStatus::GetIdFailed;
+        return;
+    case DesktopCollectionSnapshotObservationStage::InvalidGuid:
+        facts.status=PickerTraceDesktopSnapshotStatus::InvalidGuid;
+        return;
+    case DesktopCollectionSnapshotObservationStage::Complete:
+        facts.status=PickerTraceDesktopSnapshotStatus::Complete;
+        return;
+    case DesktopCollectionSnapshotObservationStage::AllocationFailure:
+        facts.status=PickerTraceDesktopSnapshotStatus::AllocationFailure;
+        return;
+    case DesktopCollectionSnapshotObservationStage::Exception:
+        facts.status=PickerTraceDesktopSnapshotStatus::Exception;
+        return;
+    }
+}
+
 static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi,
-                       bool selectionFromActual=false){
+                       bool selectionFromActual=false,
+                       PickerTraceDesktopSnapshotFacts* snapshotFacts=nullptr,
+                       PickerModelAttemptTraceFacts* attemptFacts=nullptr){
+    if(snapshotFacts) *snapshotFacts=PickerTraceDesktopSnapshotFacts{};
     const GUID observedCurrent=CurrentDesktopGuid();
+    const uint64_t attemptedGeneration=
+        NextPickerModelGeneration(g_picker.modelGeneration);
+    if(attemptFacts){
+        attemptFacts->currentDesktop=observedCurrent;
+        attemptFacts->currentDesktopAvailable=!GuidIsZero(observedCurrent);
+        attemptFacts->modelGeneration=attemptedGeneration;
+    }
     std::set<std::string> liveKeys;
+    PickerEnumContext enumContext;
+    bool enumAttempted=false;
+    BOOL enumWindowsResult=FALSE;
+    DWORD enumWindowsError=ERROR_SUCCESS;
     const bool published=RunPickerRefreshWithCurrent(
         g_tiles,g_picker,observedCurrent,
         [&](std::vector<Tile>& tiles,PickerState& state){
-            if(!g_vdmi) return false;
+            if(!g_vdmi){
+                if(snapshotFacts){
+                    snapshotFacts->status=
+                        PickerTraceDesktopSnapshotStatus::DesktopServiceMissing;
+                    snapshotFacts->result=E_NOINTERFACE;
+                }
+                return false;
+            }
             if(resetUi){
                 state.searchEditText.clear();
                 state.searchText.clear();
@@ -5491,26 +5805,36 @@ static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi,
             }
             state.activeWindow=activeWindow;
 
-            IObjectArray* rawDesktops=nullptr;
-            const HRESULT desktopsResult=
-                g_vdmi->GetDesktops(&rawDesktops);
-            ScopedComPtr<IObjectArray> desktopArray(rawDesktops);
-            if(FAILED(desktopsResult) || !desktopArray) return false;
-            UINT count=0;
-            if(FAILED(desktopArray->GetCount(&count)) || count==0 ||
-               count>MAX_VIRTUAL_DESKTOPS) return false;
-            tiles.reserve(count);
+            DesktopCollectionComOps desktopOps;
+            std::vector<DesktopCollectionEntry> desktopSnapshot;
+            std::function<void(
+                const DesktopCollectionSnapshotObservation&)> observer;
+            bool observerReady=false;
+            if(snapshotFacts){
+                try {
+                    observer=[snapshotFacts](
+                            const DesktopCollectionSnapshotObservation& value)
+                            noexcept {
+                        RecordPickerDesktopSnapshotObservation(
+                            *snapshotFacts,value);
+                    };
+                    observerReady=true;
+                } catch(...) {}
+            }
+            const bool snapshotReady=observerReady
+                ? SnapshotDesktopCollectionOwned<
+                    IObjectArray,IVirtualDesktop>(
+                        desktopOps,desktopSnapshot,&observer)
+                : SnapshotDesktopCollectionOwned<
+                    IObjectArray,IVirtualDesktop>(
+                        desktopOps,desktopSnapshot);
+            if(!snapshotReady) return false;
+            tiles.reserve(desktopSnapshot.size());
             std::vector<GUID> desktopGuids;
-            desktopGuids.reserve(count);
-            for(UINT index=0;index<count;++index){
-                PickerScopedComOutput<IVirtualDesktop> desktop;
-                const HRESULT desktopResult=desktopArray->GetAt(
-                        index,kIID_IVirtualDesktop,
-                        reinterpret_cast<void**>(desktop.put()));
-                if(FAILED(desktopResult) || !desktop) return false;
-                GUID guid={0};
-                if(FAILED(desktop.get()->GetID(&guid)) || GuidIsZero(guid))
-                    return false;
+            desktopGuids.reserve(desktopSnapshot.size());
+            for(const DesktopCollectionEntry& entry : desktopSnapshot){
+                const UINT index=entry.index;
+                const GUID guid=entry.guid;
                 if(!AppendUniquePickerDesktop(desktopGuids,guid))
                     return false;
                 Tile tile;
@@ -5528,23 +5852,44 @@ static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi,
                 tiles.push_back(std::move(tile));
             }
 
-            PickerEnumContext context;
-            context.tiles=&tiles;
-            context.liveKeys=&liveKeys;
-            if(!EnumWindows(EnumAll,reinterpret_cast<LPARAM>(&context)) ||
-               context.failed) return false;
+            enumContext.tiles=&tiles;
+            enumContext.liveKeys=&liveKeys;
+            enumContext.modelGeneration=attemptedGeneration;
+            enumContext.traceActive=g_pickerTrace.active();
+            if(enumContext.traceActive){
+                try {
+                    PickerTraceEnumBeginEvent event;
+                    event.modelGeneration=attemptedGeneration;
+                    event.desktops=desktopGuids;
+                    g_pickerTrace.emit(event);
+                } catch(...) {}
+            }
+            enumAttempted=true;
+            SetLastError(ERROR_SUCCESS);
+            enumWindowsResult=EnumWindows(
+                EnumAll,reinterpret_cast<LPARAM>(&enumContext));
+            enumWindowsError=GetLastError();
+            if(!enumWindowsResult || enumContext.failed) return false;
             if(!PopulatePickerFilteredRows(tiles,state.searchText))
                 return false;
             if(selectionFromActual)
                 PreparePickerRefreshSelectionFromActual(state);
             ResolvePickerSelection(state,desktopGuids);
             if(!PrunePickerScrollState(state,desktopGuids)) return false;
-            state.modelGeneration=state.modelGeneration==
-                (std::numeric_limits<uint64_t>::max)()
-                ? 1 : state.modelGeneration+1;
-            if(state.modelGeneration==0) state.modelGeneration=1;
+            state.modelGeneration=attemptedGeneration;
             return true;
         });
+    if(enumAttempted && enumContext.traceActive){
+        PickerTraceEnumEndEvent event;
+        event.modelGeneration=attemptedGeneration;
+        event.candidates=enumContext.candidates;
+        event.counts=enumContext.decisionCounts;
+        event.enumWindowsReturned=enumWindowsResult!=FALSE;
+        event.enumWindowsError=enumWindowsError;
+        event.modelPublished=published;
+        g_pickerTrace.emit(event);
+        g_pickerTrace.flushBoundary();
+    }
     if(published) PruneIconCache(liveKeys);
     if(published) MarkPickerIconPreloadDirty();
     return published;
@@ -7496,25 +7841,52 @@ static void BeginVerifiedPickerMove(int index) noexcept {
         // exact guard and the durable pump will finish or roll it back.
     }
 }
+class PickerTraceCaptureEmitScope {
+public:
+    explicit PickerTraceCaptureEmitScope(
+            PickerTraceCaptureEvent* event) noexcept:event_(event){}
+    ~PickerTraceCaptureEmitScope() noexcept {
+        if(event_ && g_pickerTrace.active()) g_pickerTrace.emit(*event_);
+    }
+    PickerTraceCaptureEmitScope(const PickerTraceCaptureEmitScope&)=delete;
+    PickerTraceCaptureEmitScope& operator=(
+        const PickerTraceCaptureEmitScope&)=delete;
+private:
+    PickerTraceCaptureEvent* event_=nullptr;
+};
+
 static PickerTargetCaptureState CapturePickerTarget() noexcept {
     PickerTargetCaptureState capture;
+    PickerTraceCaptureEvent traceEvent;
+    PickerTraceCaptureEmitScope traceScope(
+        g_pickerTrace.active()?&traceEvent:nullptr);
     HWND window=GetForegroundWindow();
+    traceEvent.hwnd=reinterpret_cast<uintptr_t>(window);
     if(window==g_main) window=nullptr;
-    if(!window || !IsWindow(window)) return capture;
+    if(!window) return capture;
+    traceEvent.windowValid=IsWindow(window)!=FALSE;
+    if(!traceEvent.windowValid) return capture;
     capture.hwnd=reinterpret_cast<uintptr_t>(window);
-    capture.identity=CapturePickerWindowIdentity(window);
+    PickerWindowIdentityCaptureTraceFacts identityFacts;
+    capture.identity=CapturePickerWindowIdentity(window,&identityFacts);
+    traceEvent.pid=identityFacts.pid;
+    traceEvent.tid=identityFacts.tid;
+    traceEvent.identityComplete=identityFacts.identityComplete;
+    traceEvent.recapture=identityFacts.recapture;
     if(!SameIdentity(capture.identity,capture.identity)){
-        CompletePickerTargetRecapture(
-            capture,WindowIdentityRecapture::Lost);
+        traceEvent.targetPublished=CompletePickerTargetRecapture(
+            capture,identityFacts.recapture);
         return capture;
     }
     try {
         const int length=GetWindowTextLengthW(window);
+        traceEvent.titleLength=length;
         if(length>0){
             std::wstring title(static_cast<size_t>(length)+1,L'\0');
             const int copied=GetWindowTextW(
                 window,&title[0],length+1);
             if(copied>0){
+                traceEvent.titleRead=true;
                 title.resize(static_cast<size_t>(copied));
                 capture.title.swap(title);
             }
@@ -7522,8 +7894,9 @@ static PickerTargetCaptureState CapturePickerTarget() noexcept {
     } catch(...) {
         capture.title.clear();
     }
-    CompletePickerTargetRecapture(
-        capture,RecaptureGenericWindowIdentity(capture.identity));
+    traceEvent.recapture=RecaptureGenericWindowIdentity(capture.identity);
+    traceEvent.targetPublished=CompletePickerTargetRecapture(
+        capture,traceEvent.recapture);
     return capture;
 }
 
@@ -7563,15 +7936,59 @@ static void AbortPickerShowPreparation() noexcept {
     g_targetTitle.clear();
 }
 
+class PickerTraceOpenEmitScope {
+public:
+    explicit PickerTraceOpenEmitScope(
+            PickerTraceOpenEvent* event) noexcept:event_(event){}
+    ~PickerTraceOpenEmitScope() noexcept {
+        if(event_ && g_pickerTrace.active()) g_pickerTrace.emit(*event_);
+    }
+    PickerTraceOpenEmitScope(const PickerTraceOpenEmitScope&)=delete;
+    PickerTraceOpenEmitScope& operator=(
+        const PickerTraceOpenEmitScope&)=delete;
+private:
+    PickerTraceOpenEvent* event_=nullptr;
+};
+
 static void ShowPicker(PickerTargetCaptureState capture){
-    if(g_degraded || g_picker.controlledTransition()) return;   // desktop COM unavailable; startup dialog + tray tip already explain
+    PickerTraceOpenEvent traceEvent;
+    PickerTraceOpenEmitScope traceScope(
+        g_pickerTrace.active()?&traceEvent:nullptr);
+    traceEvent.targetIdentityPresent=capture.hwnd!=0 &&
+        SameIdentity(capture.identity,capture.identity);
+    if(g_degraded){
+        traceEvent.result=PickerTraceOpenResult::Degraded;
+        return;   // desktop COM unavailable; startup dialog + tray tip already explain
+    }
+    if(g_picker.controlledTransition()){
+        traceEvent.result=PickerTraceOpenResult::ControlledTransition;
+        return;
+    }
     RECT workArea={0,0,0,0};
     if(!GetPrimaryPickerWorkArea(workArea)){
+        traceEvent.result=PickerTraceOpenResult::WorkAreaUnavailable;
         AbortPickerShowPreparation();
         return;
     }
-    const bool modelReady=BuildModel(capture.identity,true);
+    PickerTraceDesktopSnapshotFacts snapshotFacts;
+    PickerModelAttemptTraceFacts attemptFacts;
+    const bool traceActive=g_pickerTrace.active();
+    const bool modelReady=BuildModel(
+        capture.identity,true,false,
+        traceActive?&snapshotFacts:nullptr,
+        traceActive?&attemptFacts:nullptr);
+    if(traceActive){
+        traceEvent.desktopSnapshot=snapshotFacts.status;
+        traceEvent.desktopSnapshotResult=snapshotFacts.result;
+        traceEvent.desktopSnapshotIndex=snapshotFacts.index;
+        traceEvent.desktopSnapshotCount=snapshotFacts.count;
+        traceEvent.currentDesktop=attemptFacts.currentDesktop;
+        traceEvent.currentDesktopAvailable=
+            attemptFacts.currentDesktopAvailable;
+        traceEvent.modelGeneration=attemptFacts.modelGeneration;
+    }
     if(!modelReady){
+        traceEvent.result=PickerTraceOpenResult::ModelUnavailable;
         RefreshPickerPaintCache();
         return;
     }
@@ -7585,6 +8002,7 @@ static void ShowPicker(PickerTargetCaptureState capture){
     const BOOL windowAdjusted=AdjustWindowRectEx(
         &windowRect,WS_POPUP,FALSE,WS_EX_TOOLWINDOW|WS_EX_TOPMOST);
     if(!windowAdjusted){
+        traceEvent.result=PickerTraceOpenResult::AdjustRectFailed;
         AbortPickerShowPreparation();
         return;
     }
@@ -7593,6 +8011,7 @@ static void ShowPicker(PickerTargetCaptureState capture){
         windowRect.bottom-windowRect.top
     };
     if(!PickerOuterSizeValid(outer)){
+        traceEvent.result=PickerTraceOpenResult::OuterSizeInvalid;
         AbortPickerShowPreparation();
         return;
     }
@@ -7601,11 +8020,13 @@ static void ShowPicker(PickerTargetCaptureState capture){
         g_main,HWND_TOPMOST,origin.x,origin.y,
         outer.cx,outer.cy,SWP_NOACTIVATE);
     if(!windowPositioned){
+        traceEvent.result=PickerTraceOpenResult::PositionFailed;
         AbortPickerShowPreparation();
         return;
     }
     RECT cr={0,0,0,0};
     if(!GetClientRect(g_main,&cr)){
+        traceEvent.result=PickerTraceOpenResult::ClientRectFailed;
         AbortPickerShowPreparation();
         return;
     }
@@ -7617,6 +8038,7 @@ static void ShowPicker(PickerTargetCaptureState capture){
     MarkPickerIconPreloadDirty(g_picker.selectedIndex);
     const bool paintCacheReady=RefreshPickerPaintCache(true);
     if(!PickerShowPreparationComplete(modelReady,paintCacheReady)){
+        traceEvent.result=PickerTraceOpenResult::PaintCacheFailed;
         AbortPickerShowPreparation();
         return;
     }
@@ -7624,6 +8046,7 @@ static void ShowPicker(PickerTargetCaptureState capture){
     if(g_search) SetFocus(g_search);
     InvalidateRect(g_main,nullptr,FALSE);
     ArmPickerIdleRefresh();
+    traceEvent.result=PickerTraceOpenResult::Shown;
 }
 static void MoveSel(int dx,int dy){ if(g_picker.controlledTransition()||g_tiles.empty())return; int selected=g_picker.selectedIndex; if(selected<0||selected>=(int)g_tiles.size())selected=0; int r=selected/g_cols,c=selected%g_cols; c+=dx;r+=dy; int n=(int)g_tiles.size();
     if(c<0)c=0; if(c>=g_cols)c=g_cols-1; if(r<0)r=0; int idx=r*g_cols+c; if(idx>=n)idx=n-1; if(idx<0)idx=0; SetPickerSelectionCurrent(idx); RefreshPickerPaintCache(); InvalidateRect(g_main,nullptr,FALSE); }

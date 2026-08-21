@@ -8,6 +8,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <new>
 #include <set>
 #include <string>
 #include <type_traits>
@@ -1500,38 +1501,117 @@ struct DesktopCollectionEntry {
     GUID guid;
 };
 
+enum class DesktopCollectionSnapshotObservationStage {
+    GetDesktops, GetCount, InvalidCount, GetAt, GetId,
+    InvalidGuid, Complete, AllocationFailure, Exception
+};
+
+struct DesktopCollectionSnapshotObservation {
+    DesktopCollectionSnapshotObservationStage stage=
+        DesktopCollectionSnapshotObservationStage::GetDesktops;
+    HRESULT result=E_NOTIMPL;
+    UINT count=0;
+    int index=-1;
+    GUID actual{};
+};
+
+inline void ObserveDesktopCollectionSnapshot(
+        const std::function<void(
+            const DesktopCollectionSnapshotObservation&)>* observer,
+        const DesktopCollectionSnapshotObservation& observation) noexcept {
+    if(!observer) return;
+    try { (*observer)(observation); }
+    catch(...) {}
+}
+
 template<class Array,class Desktop,class Ops>
 inline bool SnapshotDesktopCollectionOwned(
-        Ops& ops,std::vector<DesktopCollectionEntry>& snapshotOut) noexcept {
+        Ops& ops,std::vector<DesktopCollectionEntry>& snapshotOut,
+        const std::function<void(
+            const DesktopCollectionSnapshotObservation&)>* observer) noexcept {
+    DesktopCollectionSnapshotObservation observation;
     try {
         Array* array=nullptr;
         DesktopCollectionArrayOutputOwner<Array,Ops> arrayOwner(array,ops);
+        observation=DesktopCollectionSnapshotObservation{};
+        observation.stage=DesktopCollectionSnapshotObservationStage::GetDesktops;
         const HRESULT desktopsResult=ops.getDesktops(&array);
+        observation.result=desktopsResult;
+        ObserveDesktopCollectionSnapshot(observer,observation);
         if(FAILED(desktopsResult) || !array) return false;
 
         UINT count=0;
+        observation=DesktopCollectionSnapshotObservation{};
+        observation.stage=DesktopCollectionSnapshotObservationStage::GetCount;
+        observation.result=E_NOTIMPL;
         const HRESULT countResult=ops.getCount(array,&count);
-        if(FAILED(countResult) || count==0 ||
-           count>MAX_VIRTUAL_DESKTOPS) return false;
+        observation.result=countResult;
+        observation.count=count;
+        ObserveDesktopCollectionSnapshot(observer,observation);
+        if(FAILED(countResult)) return false;
+        if(count==0 || count>MAX_VIRTUAL_DESKTOPS){
+            observation.stage=
+                DesktopCollectionSnapshotObservationStage::InvalidCount;
+            ObserveDesktopCollectionSnapshot(observer,observation);
+            return false;
+        }
         std::vector<DesktopCollectionEntry> staged;
         staged.reserve(count);
         for(UINT i=0;i<count;++i){
             Desktop* desktop=nullptr;
             DesktopCollectionItemOutputOwner<Desktop,Ops> desktopOwner(
                 desktop,ops);
+            observation=DesktopCollectionSnapshotObservation{};
+            observation.stage=DesktopCollectionSnapshotObservationStage::GetAt;
+            observation.result=E_NOTIMPL;
+            observation.count=count;
+            observation.index=static_cast<int>(i);
             const HRESULT atResult=ops.getAt(array,i,&desktop);
+            observation.result=atResult;
+            ObserveDesktopCollectionSnapshot(observer,observation);
             if(FAILED(atResult) || !desktop) return false;
             GUID id={0};
+            observation.stage=DesktopCollectionSnapshotObservationStage::GetId;
+            observation.result=E_NOTIMPL;
+            observation.actual=GUID{};
             const HRESULT idResult=ops.getId(desktop,&id);
-            if(FAILED(idResult) || GuidIsZero(id)) return false;
+            observation.result=idResult;
+            observation.actual=id;
+            ObserveDesktopCollectionSnapshot(observer,observation);
+            if(FAILED(idResult)) return false;
+            if(GuidIsZero(id)){
+                observation.stage=
+                    DesktopCollectionSnapshotObservationStage::InvalidGuid;
+                ObserveDesktopCollectionSnapshot(observer,observation);
+                return false;
+            }
             DesktopCollectionEntry entry={i,id};
             staged.push_back(entry);
         }
         snapshotOut.swap(staged);
+        observation.stage=DesktopCollectionSnapshotObservationStage::Complete;
+        observation.index=-1;
+        observation.actual=GUID{};
+        observation.count=static_cast<UINT>(snapshotOut.size());
+        ObserveDesktopCollectionSnapshot(observer,observation);
         return true;
+    } catch(const std::bad_alloc&) {
+        observation.stage=
+            DesktopCollectionSnapshotObservationStage::AllocationFailure;
+        ObserveDesktopCollectionSnapshot(observer,observation);
+        return false;
     } catch(...) {
+        observation.stage=DesktopCollectionSnapshotObservationStage::Exception;
+        ObserveDesktopCollectionSnapshot(observer,observation);
         return false;
     }
+}
+
+template<class Array,class Desktop,class Ops>
+inline bool SnapshotDesktopCollectionOwned(
+        Ops& ops,std::vector<DesktopCollectionEntry>& snapshotOut) noexcept {
+    return SnapshotDesktopCollectionOwned<Array,Desktop>(
+        ops,snapshotOut,nullptr);
 }
 
 template<class Array,class Desktop,class Ops,class DesktopOwner>
