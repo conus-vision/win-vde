@@ -1,7 +1,7 @@
 # Picker Runtime Trace — Design
 
 Date: 2026-08-21
-Status: approach approved; design-document review pending
+Status: approved for implementation planning
 Scope: opt-in diagnostics for the desktop picker only
 
 ## Context
