@@ -2620,13 +2620,6 @@ inline bool CompletePickerTargetRecapture(
     return false;
 }
 
-inline bool AcceptPickerRowIdentity(
-        const WindowIdentityKey& identity,
-        WindowIdentityRecapture recapture) noexcept {
-    return recapture==WindowIdentityRecapture::Match &&
-           SameIdentity(identity,identity);
-}
-
 enum class PickerRowAdmission { Skip, DisplayOnly, Verified };
 
 inline PickerRowAdmission DecidePickerRowAdmission(

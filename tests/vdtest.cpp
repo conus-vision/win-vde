@@ -798,18 +798,6 @@ static void test_picker_target_failed_recapture_clears_entire_capture(){
           capture.title.empty());
 }
 
-static void test_picker_row_requires_complete_stable_identity(){
-    const WindowIdentityKey complete=IK(0x1234,77,9001);
-    CHECK(AcceptPickerRowIdentity(
-        complete,WindowIdentityRecapture::Match));
-    CHECK(!AcceptPickerRowIdentity(
-        complete,WindowIdentityRecapture::Lost));
-    CHECK(!AcceptPickerRowIdentity(
-        complete,WindowIdentityRecapture::Indeterminate));
-    CHECK(!AcceptPickerRowIdentity(
-        IK(0x1234,77,0),WindowIdentityRecapture::Match));
-}
-
 static void test_picker_failed_current_read_clears_only_current(){
     PickerState state;
     const GUID current=G(L"{231A0000-0000-0000-0000-000000000001}");
@@ -11690,8 +11678,20 @@ static void test_picker_enum_publishes_display_only_rows_safely(){
     const std::string paint=SourceSection(
         source,"static void Paint(","static void TipDeactivate(");
     CHECK(!paint.empty());
-    CHECK(paint.find("PickerRowUsesStableIdentity(window.admission)")!=
-          std::string::npos);
+    const size_t activeGuard=paint.find(
+        "PickerRowUsesStableIdentity(window.admission) &&\n"
+        "               IsActiveWindow(g_picker,window.identity)");
+    const size_t activeFill=paint.find("FillRoundRect",activeGuard);
+    CHECK(activeGuard!=std::string::npos && activeFill!=std::string::npos &&
+          activeGuard<activeFill);
+    const size_t iconGuard=paint.find(
+        "HICON icon=PickerRowUsesStableIdentity(window.admission)");
+    const size_t cachedIcon=paint.find(
+        "CachedWindowIcon(window.runtimeKey)",iconGuard);
+    const size_t fallbackIcon=paint.find("g_sharedFallbackIcon",iconGuard);
+    CHECK(iconGuard!=std::string::npos && cachedIcon!=std::string::npos &&
+          fallbackIcon!=std::string::npos && iconGuard<cachedIcon &&
+          cachedIcon<fallbackIcon);
 }
 
 static void test_picker_preloads_only_laid_out_visible_rows(){
@@ -18741,7 +18741,6 @@ int main(){
     test_picker_visible_scroll_clamps_without_mutating_saved_value();
     test_picker_wheel_scroll_saturates_at_integer_bounds();
     test_picker_target_failed_recapture_clears_entire_capture();
-    test_picker_row_requires_complete_stable_identity();
     test_picker_failed_current_read_clears_only_current();
     test_picker_desktop_snapshot_rejects_zero_and_duplicates();
     test_picker_filter_cache_is_transactional_and_precomputed();
