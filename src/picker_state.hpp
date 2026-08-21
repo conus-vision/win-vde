@@ -2627,6 +2627,25 @@ inline bool AcceptPickerRowIdentity(
            SameIdentity(identity,identity);
 }
 
+enum class PickerRowAdmission { Skip, DisplayOnly, Verified };
+
+inline PickerRowAdmission DecidePickerRowAdmission(
+        bool altTabEligible,bool desktopAvailable,bool titleAvailable,
+        bool identityComplete,WindowIdentityRecapture recapture) noexcept {
+    if(!altTabEligible || !desktopAvailable || !titleAvailable)
+        return PickerRowAdmission::Skip;
+    if(identityComplete && recapture==WindowIdentityRecapture::Lost)
+        return PickerRowAdmission::Skip;
+    return identityComplete && recapture==WindowIdentityRecapture::Match
+        ? PickerRowAdmission::Verified
+        : PickerRowAdmission::DisplayOnly;
+}
+
+inline bool PickerRowUsesStableIdentity(
+        PickerRowAdmission admission) noexcept {
+    return admission==PickerRowAdmission::Verified;
+}
+
 inline bool PickerTargetMatchesActive(
         uintptr_t target,const WindowIdentityKey& active) noexcept {
     return target!=0 && target==active.hwnd &&

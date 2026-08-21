@@ -5146,7 +5146,15 @@ static int CliRun(const std::wstring& cmd){
 }
 
 // ================================ GUI: picker ================================
-struct WinItem { HWND hwnd; WindowIdentityKey identity; std::string runtimeKey; std::wstring title; std::wstring titleLC; std::wstring search; };   // search = titleLC (+ all-tab text for browser windows)
+struct WinItem {
+    HWND hwnd=nullptr;
+    WindowIdentityKey identity={};
+    std::string runtimeKey;
+    std::wstring title;
+    std::wstring titleLC;
+    std::wstring search;
+    PickerRowAdmission admission=PickerRowAdmission::DisplayOnly;
+};   // search = titleLC (+ all-tab text for browser windows)
 struct Tile { GUID guid; std::string guidKey; std::wstring name; std::wstring displayName; int index; std::vector<WinItem> windows; std::vector<size_t> filtered; RECT rc; int scroll=0; };
 static std::vector<Tile> g_tiles;
 static PickerEffect g_pickerScheduledEffect;
@@ -5286,6 +5294,8 @@ static uint64_t NextIconTouch() noexcept {
 }
 
 static HICON LoadWindowIconOutsidePaint(const WinItem& window) noexcept {
+    if(!PickerRowUsesStableIdentity(window.admission))
+        return g_sharedFallbackIcon;
     HICON cached=g_windowIconCache.getAndTouch(
         window.runtimeKey,NextIconTouch());
     if(cached) return cached;
@@ -5369,27 +5379,6 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
     try {
         if(!IsAltTabWindow(hwnd)) return TRUE;
 
-        DWORD pid=0;
-        if(!GetWindowThreadProcessId(hwnd,&pid) || pid==0)
-            return HandlePickerRowReadResult(
-                context,PickerRowReadResult::IdentityUnavailable);
-        auto process=context.processStarts.find(pid);
-        if(process==context.processStarts.end()){
-            uint64_t started=0;
-            if(!TryReadProcessStart(pid,started))
-                return HandlePickerRowReadResult(
-                    context,PickerRowReadResult::IdentityUnavailable);
-            process=context.processStarts.emplace(pid,started).first;
-        }
-        WindowIdentityKey identity;
-        identity.hwnd=reinterpret_cast<uintptr_t>(hwnd);
-        identity.pid=pid;
-        identity.processStart=process->second;
-        if(!AcceptPickerRowIdentity(
-                identity,WindowIdentityRecapture::Match))
-            return HandlePickerRowReadResult(
-                context,PickerRowReadResult::IdentityUnavailable);
-
         GUID desktop={0};
         if(!g_vdmDoc)
             return HandlePickerRowReadResult(
@@ -5419,29 +5408,54 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
                 context,PickerRowReadResult::TitleUnavailable);
         title.resize(static_cast<size_t>(copied));
 
-        FastWin fast;
-        fast.hwnd=hwnd;
-        fast.pid=pid;
-        fast.processStart=process->second;
-        fast.desktop=desktop;
-        fast.title=title;
+        WindowIdentityKey identity;
+        WindowIdentityRecapture recapture=
+            WindowIdentityRecapture::Indeterminate;
+        bool identityComplete=false;
+        DWORD pid=0;
+        if(GetWindowThreadProcessId(hwnd,&pid) && pid!=0){
+            auto process=context.processStarts.find(pid);
+            if(process==context.processStarts.end()){
+                uint64_t started=0;
+                if(TryReadProcessStart(pid,started))
+                    process=context.processStarts.emplace(pid,started).first;
+            }
+            if(process!=context.processStarts.end()){
+                identity.hwnd=reinterpret_cast<uintptr_t>(hwnd);
+                identity.pid=pid;
+                identity.processStart=process->second;
+                identityComplete=SameIdentity(identity,identity);
+                if(identityComplete)
+                    recapture=RecaptureGenericWindowIdentity(identity);
+            }
+        }
+        const PickerRowAdmission admission=DecidePickerRowAdmission(
+            true,true,true,identityComplete,recapture);
+        if(admission==PickerRowAdmission::Skip) return TRUE;
+
         WinItem item;
         item.hwnd=hwnd;
-        item.identity=IdentityOf(fast);
-        item.runtimeKey=RuntimeKey(fast);
+        item.admission=admission;
         item.title=title;
         item.titleLC=title;
         if(!item.titleLC.empty()) CharLowerW(&item.titleLC[0]);
         item.search=item.titleLC;
-        if(!AcceptPickerRowIdentity(
-                item.identity,RecaptureGenericWindowIdentity(item.identity)))
-            return HandlePickerRowReadResult(
-                context,PickerRowReadResult::IdentityChanged);
-        if(!context.liveKeys)
-            return HandlePickerRowReadResult(
-                context,PickerRowReadResult::GlobalSnapshotFailure);
+        if(PickerRowUsesStableIdentity(admission)){
+            FastWin fast;
+            fast.hwnd=hwnd;
+            fast.pid=pid;
+            fast.processStart=identity.processStart;
+            fast.desktop=desktop;
+            fast.title=title;
+            item.identity=IdentityOf(fast);
+            item.runtimeKey=RuntimeKey(fast);
+            if(!context.liveKeys)
+                return HandlePickerRowReadResult(
+                    context,PickerRowReadResult::GlobalSnapshotFailure);
+        }
         tile->windows.push_back(std::move(item));
-        context.liveKeys->insert(tile->windows.back().runtimeKey);
+        if(PickerRowUsesStableIdentity(admission))
+            context.liveKeys->insert(tile->windows.back().runtimeKey);
         return TRUE;
     } catch(...) {
         return HandlePickerRowReadResult(
@@ -5951,6 +5965,8 @@ static void PreloadVisiblePickerIcons(bool continuation=false) noexcept {
                ref.window>=g_tiles[ref.tile].windows.size())
                 return IconPreloadStep::Cached;
             const WinItem& window=g_tiles[ref.tile].windows[ref.window];
+            if(!PickerRowUsesStableIdentity(window.admission))
+                return IconPreloadStep::Cached;
             if(g_windowIconCache.getAndTouch(
                     window.runtimeKey,NextIconTouch()))
                 return IconPreloadStep::Cached;
@@ -6275,14 +6291,16 @@ static void Paint(HDC hdcReal,HDC hdc,RECT client){
             const size_t windowIndex=t.filtered[position];
             if(windowIndex>=t.windows.size()) break;
             const WinItem& window=t.windows[windowIndex];
-            if(IsActiveWindow(g_picker,window.identity)){
+            if(PickerRowUsesStableIdentity(window.admission) &&
+               IsActiveWindow(g_picker,window.identity)){
                 RECT activeRect={t.rc.left+S(8),y-S(2),rowRight,y+S(19)};
                 FillRoundRect(hdc,activeRect,S(5),activeRow,activeRow,S(1));
                 RECT activeBar={activeRect.left+S(2),activeRect.top+S(3),
                                 activeRect.left+S(5),activeRect.bottom-S(3)};
                 FillRoundRect(hdc,activeBar,S(2),CLR_ACTIVE,CLR_ACTIVE,S(1));
             }
-            HICON icon=CachedWindowIcon(window.runtimeKey);
+            HICON icon=PickerRowUsesStableIdentity(window.admission)
+                ? CachedWindowIcon(window.runtimeKey):g_sharedFallbackIcon;
             if(icon)DrawIconEx(hdc,t.rc.left+S(14),y,icon,S(16),S(16),0,nullptr,DI_NORMAL);
             RECT ir; ir.left=t.rc.left+S(38); ir.top=y; ir.right=rowRight; ir.bottom=y+S(18);
             DrawTextW(hdc,window.title.c_str(),-1,&ir,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);

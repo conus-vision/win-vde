@@ -1840,6 +1840,33 @@ static void test_picker_volatile_rows_skip_but_structural_failures_abort(){
     }
 }
 
+static void test_picker_row_admission_keeps_displayable_unverified_windows(){
+    CHECK(DecidePickerRowAdmission(
+              true,true,true,true,WindowIdentityRecapture::Match)==
+          PickerRowAdmission::Verified);
+    CHECK(DecidePickerRowAdmission(
+              true,true,true,false,WindowIdentityRecapture::Indeterminate)==
+          PickerRowAdmission::DisplayOnly);
+    CHECK(DecidePickerRowAdmission(
+              true,true,true,true,WindowIdentityRecapture::Indeterminate)==
+          PickerRowAdmission::DisplayOnly);
+    CHECK(DecidePickerRowAdmission(
+              true,true,true,true,WindowIdentityRecapture::Lost)==
+          PickerRowAdmission::Skip);
+    CHECK(DecidePickerRowAdmission(
+              false,true,true,true,WindowIdentityRecapture::Match)==
+          PickerRowAdmission::Skip);
+    CHECK(DecidePickerRowAdmission(
+              true,false,true,true,WindowIdentityRecapture::Match)==
+          PickerRowAdmission::Skip);
+    CHECK(DecidePickerRowAdmission(
+              true,true,false,true,WindowIdentityRecapture::Match)==
+          PickerRowAdmission::Skip);
+    CHECK(PickerRowUsesStableIdentity(PickerRowAdmission::Verified));
+    CHECK(!PickerRowUsesStableIdentity(PickerRowAdmission::DisplayOnly));
+    CHECK(!PickerRowUsesStableIdentity(PickerRowAdmission::Skip));
+}
+
 static void test_picker_async_search_joins_by_full_identity(){
     const WindowIdentityKey row=IK(0x1234,77,9001);
     CHECK(PickerSearchResultMatches(row,row));
@@ -11624,6 +11651,49 @@ static void test_picker_icon_loading_is_bounded_and_outside_paint(){
           std::string::npos);
 }
 
+static void test_picker_enum_publishes_display_only_rows_safely(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    CHECK(!source.empty());
+    const std::string row=SourceSection(
+        source,"struct WinItem {","struct Tile {");
+    CHECK(!row.empty());
+    CHECK(row.find("PickerRowAdmission admission")!=std::string::npos);
+
+    const std::string enumerate=SourceSection(
+        source,"static BOOL CALLBACK EnumAll(",
+        "static bool PopulatePickerFilteredRows(");
+    CHECK(!enumerate.empty());
+    CHECK(enumerate.find("DecidePickerRowAdmission")!=std::string::npos);
+    CHECK(enumerate.find("PickerRowAdmission::Skip")!=std::string::npos);
+    CHECK(enumerate.find("PickerRowUsesStableIdentity(admission)")!=
+          std::string::npos);
+    CHECK(enumerate.find("ActiveProfiles")==std::string::npos);
+    CHECK(enumerate.find("ClassifyBrowserCandidate")==std::string::npos);
+
+    const std::string loader=SourceSection(
+        source,"static HICON LoadWindowIconOutsidePaint(",
+        "static HICON CachedWindowIcon(");
+    CHECK(!loader.empty());
+    const size_t loaderGuard=loader.find(
+        "PickerRowUsesStableIdentity(window.admission)");
+    const size_t loaderCache=loader.find("g_windowIconCache");
+    CHECK(loaderGuard!=std::string::npos && loaderCache!=std::string::npos &&
+          loaderGuard<loaderCache);
+
+    const std::string preload=SourceSection(
+        source,"static void PreloadVisiblePickerIcons(",
+        "class ScopedPickerMeasureDc");
+    CHECK(!preload.empty());
+    CHECK(preload.find("PickerRowUsesStableIdentity(window.admission)")!=
+          std::string::npos);
+
+    const std::string paint=SourceSection(
+        source,"static void Paint(","static void TipDeactivate(");
+    CHECK(!paint.empty());
+    CHECK(paint.find("PickerRowUsesStableIdentity(window.admission)")!=
+          std::string::npos);
+}
+
 static void test_picker_preloads_only_laid_out_visible_rows(){
     const std::string source=ReadSourceFile(L"src\\vde.cpp");
     CHECK(!source.empty());
@@ -18641,6 +18711,7 @@ static void test_validated_touch_rebase_preserves_external_semantics(){
 int main(){
     test_picker_uses_self_contained_gdi_buffer();
     test_picker_icon_loading_is_bounded_and_outside_paint();
+    test_picker_enum_publishes_display_only_rows_safely();
     test_picker_preloads_only_laid_out_visible_rows();
     test_picker_wm_paint_requires_the_owned_buffer();
     test_cli_list_uses_one_atomic_desktop_snapshot();
@@ -18703,6 +18774,7 @@ int main(){
     test_picker_commit_requires_exact_active_identity();
     test_picker_model_publish_invalidates_cache_before_reentry();
     test_picker_volatile_rows_skip_but_structural_failures_abort();
+    test_picker_row_admission_keeps_displayable_unverified_windows();
     test_picker_async_search_joins_by_full_identity();
     test_picker_state_whole_object_swap_includes_generation_sentinel();
     test_picker_transition_success_has_exact_verified_effect_order();
