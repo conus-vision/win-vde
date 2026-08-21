@@ -2516,42 +2516,68 @@ static bool ReleaseMoveReservation(const MoveResult& result){
 }
 
 static bool ConsumeCheckpointAndReleaseMoveReservation(
-        const MoveToken& token,const std::string& runtimeKey){
+        const MoveToken& token,const std::string& runtimeKey,
+        PickerTraceReservationReleaseFacts* facts=nullptr){
     const auto tokenStillReserved=[&]() noexcept {
         for(const auto& reservation : g_reservedAutoIdentities)
             if(SameMoveToken(reservation.second.token,token)) return true;
         return false;
     };
-    auto reserved=g_reservedAutoIdentities.find(runtimeKey);
-    PickerTerminalGuardReleaseAction release=
-        DecidePickerTerminalGuardRelease(
+    PickerTraceReservationExceptionStage currentStage=
+        PickerTraceReservationExceptionStage::FirstDecision;
+    try {
+        currentStage=PickerTraceReservationExceptionStage::FirstDecision;
+        auto reserved=g_reservedAutoIdentities.find(runtimeKey);
+        PickerTerminalGuardReleaseAction release=
+            DecidePickerTerminalGuardRelease(
+                reserved!=g_reservedAutoIdentities.end(),
+                reserved!=g_reservedAutoIdentities.end() &&
+                    SameMoveToken(reserved->second.token,token),
+                tokenStillReserved());
+        if(facts){
+            facts->firstAction=release;
+            facts->firstActionAvailable=true;
+        }
+        if(release==PickerTerminalGuardReleaseAction::ResolvedAbsent)
+            return true;
+        if(release!=PickerTerminalGuardReleaseAction::ConsumeExact)
+            return false;
+        const bool lastReservation=g_reservedAutoIdentities.size()==1;
+        currentStage=
+            PickerTraceReservationExceptionStage::CheckpointCallback;
+        g_checkpointController.acknowledgeReservationBeforeRelease(
+            true,lastReservation,g_autoFix && !g_degraded,g_autoLoaded,
+            [](CheckpointReason reason){ return ExecuteCheckpoint(reason); });
+        // The checkpoint callback must observe the guard.  Re-find afterward
+        // so cleanup stays safe even if injected code altered the map.
+        currentStage=PickerTraceReservationExceptionStage::Refind;
+        reserved=g_reservedAutoIdentities.find(runtimeKey);
+        currentStage=PickerTraceReservationExceptionStage::SecondDecision;
+        if(facts) facts->retried=true;
+        release=DecidePickerTerminalGuardRelease(
             reserved!=g_reservedAutoIdentities.end(),
             reserved!=g_reservedAutoIdentities.end() &&
                 SameMoveToken(reserved->second.token,token),
             tokenStillReserved());
-    if(release==PickerTerminalGuardReleaseAction::ResolvedAbsent)
-        return true;
-    if(release!=PickerTerminalGuardReleaseAction::ConsumeExact)
+        if(facts){
+            facts->retryAction=release;
+            facts->retryActionAvailable=true;
+        }
+        if(release==PickerTerminalGuardReleaseAction::ResolvedAbsent)
+            return true;
+        if(release==PickerTerminalGuardReleaseAction::ConsumeExact){
+            currentStage=PickerTraceReservationExceptionStage::Erase;
+            g_reservedAutoIdentities.erase(reserved);
+            return true;
+        }
         return false;
-    const bool lastReservation=g_reservedAutoIdentities.size()==1;
-    g_checkpointController.acknowledgeReservationBeforeRelease(
-        true,lastReservation,g_autoFix && !g_degraded,g_autoLoaded,
-        [](CheckpointReason reason){ return ExecuteCheckpoint(reason); });
-    // The checkpoint callback must observe the guard.  Re-find afterward so
-    // cleanup stays safe even if injected code altered the reservation map.
-    reserved=g_reservedAutoIdentities.find(runtimeKey);
-    release=DecidePickerTerminalGuardRelease(
-        reserved!=g_reservedAutoIdentities.end(),
-        reserved!=g_reservedAutoIdentities.end() &&
-            SameMoveToken(reserved->second.token,token),
-        tokenStillReserved());
-    if(release==PickerTerminalGuardReleaseAction::ResolvedAbsent)
-        return true;
-    if(release==PickerTerminalGuardReleaseAction::ConsumeExact){
-        g_reservedAutoIdentities.erase(reserved);
-        return true;
+    } catch(...) {
+        if(facts){
+            facts->exceptionStage=currentStage;
+            facts->exceptionStageAvailable=true;
+        }
+        throw;
     }
-    return false;
 }
 
 static bool ConsumeCheckpointAndReleaseMoveReservation(
@@ -5248,6 +5274,10 @@ static bool g_pickerPumpActive=false;
 static bool g_pickerShutdownDrain=false;
 static bool g_pickerDurableKickPending=false;
 static PickerTraceTerminalMetadata g_pickerTraceTerminalMetadata;
+static PickerTracePendingTerminalDelivery
+    g_pickerTracePendingTerminalDelivery;
+static uint64_t g_pickerTraceTerminalizationGeneration=0;
+static uint64_t g_pickerTraceTerminalizationAttempt=0;
 static uint64_t g_pickerTraceDeliveryGeneration=0;
 static uint64_t g_pickerTraceDeliverySerial=0;
 static uint32_t g_pickerTraceDeliveryAttempt=0;
@@ -5309,6 +5339,10 @@ static bool QuiesceRuntime(HWND messageWindow) noexcept {
         g_pickerShutdownDrain=false;
         g_pickerDurableKickPending=false;
         g_pickerTraceTerminalMetadata=PickerTraceTerminalMetadata{};
+        ResetPickerTracePendingTerminalDelivery(
+            g_pickerTracePendingTerminalDelivery);
+        g_pickerTraceTerminalizationGeneration=0;
+        g_pickerTraceTerminalizationAttempt=0;
         g_pickerTraceDeliveryGeneration=0;
         g_pickerTraceDeliverySerial=0;
         g_pickerTraceDeliveryAttempt=0;
@@ -7520,12 +7554,33 @@ static PickerTraceScheduleResult DeferPickerTransitionWork(
     return result;
 }
 
+static void StorePickerTraceTerminalDelivery(
+        const PickerTraceScheduleResult& schedule) noexcept {
+    if(!g_pickerTrace.active() || !schedule.routeAvailable) return;
+    StorePickerTracePendingTerminalDelivery(
+        g_pickerTracePendingTerminalDelivery,
+        g_picker.transition.generation,schedule.route);
+}
+
+static uint64_t NextPickerTraceTerminalizationAttempt(
+        uint64_t generation) noexcept {
+    if(generation!=g_pickerTraceTerminalizationGeneration){
+        g_pickerTraceTerminalizationGeneration=generation;
+        g_pickerTraceTerminalizationAttempt=0;
+    }
+    if(g_pickerTraceTerminalizationAttempt!=
+       (std::numeric_limits<uint64_t>::max)())
+        ++g_pickerTraceTerminalizationAttempt;
+    return g_pickerTraceTerminalizationAttempt;
+}
+
 static void QueuePickerEffect(const PickerEffect& effect) noexcept {
     if(effect.kind==PickerEffectKind::None){
         if(g_picker.transition.terminalAcknowledged){
             g_pickerTerminalizationPending=true;
             const PickerTraceScheduleResult schedule=
                 DeferPickerTransitionWork(false);
+            StorePickerTraceTerminalDelivery(schedule);
             if(!schedule.deferred && !g_pickerPumpActive)
                 PumpPickerTransitionWork();
         }
@@ -7553,27 +7608,141 @@ static void QueuePickerEffect(const PickerEffect& effect) noexcept {
         PumpPickerTransitionWork();
 }
 
-static bool FinalizePickerRuntimeTransition() noexcept {
-    if(!g_picker.transition.terminalAcknowledged ||
-       g_picker.transition.pendingEffect!=PickerEffectKind::None) return false;
+struct PickerRuntimeTerminalTraceSnapshot {
+    PickerTraceTransitionTerminalEvent terminal;
+    HWND target=nullptr;
+    uint64_t effectSerial=0;
+};
+
+struct PickerRuntimeTerminalizationResult {
+    PickerTraceTerminalizationRunResult run;
+    PickerRuntimeTerminalTraceSnapshot snapshot;
+};
+
+static PickerRuntimeTerminalTraceSnapshot
+CapturePickerRuntimeTerminalTraceSnapshot() noexcept {
+    PickerRuntimeTerminalTraceSnapshot result;
+    const PickerTransition& transition=g_picker.transition;
+    result.terminal.generation=transition.generation;
+    result.terminal.outcome=transition.cancelRequested
+        ? PickerTraceTerminalOutcome::Cancelled
+        : transition.failed
+            ? PickerTraceTerminalOutcome::Failed
+            : PickerTraceTerminalOutcome::Succeeded;
+    result.terminal.rollbackTrigger=
+        g_pickerTraceTerminalMetadata.rollbackTrigger;
+    result.terminal.diagnosticCode=
+        g_pickerTraceTerminalMetadata.diagnosticCode;
+    result.terminal.forwardTargetAttempts=
+        transition.forwardTargetAttempts;
+    result.terminal.forwardPopupAttempts=
+        transition.forwardPopupAttempts;
+    result.terminal.forwardSwitchAttempts=
+        transition.forwardSwitchAttempts;
+    result.terminal.rollbackTargetAttempts=
+        transition.rollbackTargetAttempts;
+    result.terminal.rollbackPopupAttempts=
+        transition.rollbackPopupAttempts;
+    result.terminal.rollbackSwitchAttempts=
+        transition.rollbackSwitchAttempts;
+    result.terminal.focusAttempts=transition.focusAttempts;
+    result.terminal.targetRead=transition.observedTargetValidity;
+    result.terminal.popupRead=transition.observedPopupValidity;
+    result.terminal.currentRead=transition.observedCurrentValidity;
+    result.terminal.targetDesktop=transition.observedTargetDesktop;
+    result.terminal.popupDesktop=transition.observedPopupDesktop;
+    result.terminal.currentDesktop=transition.observedCurrentDesktop;
+    result.target=reinterpret_cast<HWND>(transition.target.hwnd);
+    result.effectSerial=transition.effectSerial;
+    return result;
+}
+
+static void ReadPickerRuntimeTerminalTraceSnapshot(
+        PickerRuntimeTerminalTraceSnapshot& snapshot) noexcept {
+    if(!g_pickerTrace.active()) return;
+    PickerTraceWindowDesktopFacts targetFacts;
+    ReadPickerWindowDesktop(
+        snapshot.target,snapshot.terminal.targetRead,
+        snapshot.terminal.targetDesktop,&targetFacts);
+    EmitPickerTraceWindowDesktopFacts(
+        PickerTraceApiKind::GetWindowDesktopIdTarget,snapshot.target,
+        snapshot.terminal.generation,snapshot.effectSerial,targetFacts);
+    PickerTraceWindowDesktopFacts popupFacts;
+    ReadPickerWindowDesktop(
+        g_main,snapshot.terminal.popupRead,
+        snapshot.terminal.popupDesktop,&popupFacts);
+    EmitPickerTraceWindowDesktopFacts(
+        PickerTraceApiKind::GetWindowDesktopIdPopup,g_main,
+        snapshot.terminal.generation,snapshot.effectSerial,popupFacts);
+    PickerTraceCurrentDesktopFacts currentFacts;
+    snapshot.terminal.currentDesktop=CurrentDesktopGuid(&currentFacts);
+    snapshot.terminal.currentRead=currentFacts.validity;
+    EmitPickerTraceCurrentDesktopFacts(
+        snapshot.terminal.generation,snapshot.effectSerial,currentFacts);
+}
+
+static void EmitPickerRuntimeTerminalizationAttempt(
+        void* opaque,
+        const PickerTraceTerminalizationAttemptEvent& event) noexcept {
+    static_cast<PickerTraceSession*>(opaque)->emit(event);
+}
+
+static void EmitPickerRuntimeTerminalEvent(
+        void* opaque,
+        const PickerTraceTransitionTerminalEvent& event) noexcept {
+    static_cast<PickerTraceSession*>(opaque)->emit(event);
+}
+
+static void FlushPickerRuntimeTerminalBoundary(void* opaque) noexcept {
+    static_cast<PickerTraceSession*>(opaque)->flushBoundary();
+}
+
+static PickerTraceTerminalizationEventObserver
+PickerRuntimeTerminalTraceObserver() noexcept {
+    PickerTraceTerminalizationEventObserver observer;
+    observer.context=&g_pickerTrace;
+    observer.emitAttempt=EmitPickerRuntimeTerminalizationAttempt;
+    observer.emitTerminal=EmitPickerRuntimeTerminalEvent;
+    observer.flushBoundary=FlushPickerRuntimeTerminalBoundary;
+    return observer;
+}
+
+static PickerRuntimeTerminalizationResult
+FinalizePickerRuntimeTransition() noexcept {
+    PickerRuntimeTerminalizationResult result;
+    result.snapshot=CapturePickerRuntimeTerminalTraceSnapshot();
+    const bool terminalAcknowledged=
+        g_picker.transition.terminalAcknowledged;
+    const bool pendingEffectNone=
+        g_picker.transition.pendingEffect==PickerEffectKind::None;
+    const bool runtimeKeyPresent=!g_picker.transition.runtimeKey.empty();
     bool reservationReleased=false;
-    try {
-        reservationReleased=ConsumeCheckpointAndReleaseMoveReservation(
-            g_picker.transition.reservationToken,
-            g_picker.transition.runtimeKey);
-    } catch(...) { return false; }
-    if(!PickerRuntimeTerminalizationReady(
-            g_picker.transition,reservationReleased)) return false;
-    MarkPickerOperationClaimsTerminalOutcome(
-        g_picker.transition.runtimeKey,
-        g_picker.transition.pendingRecordId,
-        PickerTransitionTargetRestoredToOrigin(g_picker.transition));
     std::string claimedRuntime;
-    claimedRuntime.swap(g_picker.transition.runtimeKey);
-    if(!FinalizePickerTransition(g_picker)){
-        claimedRuntime.swap(g_picker.transition.runtimeKey);
-        return false;
-    }
+    result.run=DrivePickerTraceTerminalization(
+        terminalAcknowledged,pendingEffectNone,runtimeKeyPresent,
+        [&](PickerTraceReservationReleaseFacts& facts){
+            reservationReleased=
+                ConsumeCheckpointAndReleaseMoveReservation(
+                    g_picker.transition.reservationToken,
+                    g_picker.transition.runtimeKey,&facts);
+            return reservationReleased;
+        },[&](){
+            return PickerRuntimeTerminalizationReady(
+                g_picker.transition,reservationReleased);
+        },[&](){
+            MarkPickerOperationClaimsTerminalOutcome(
+                g_picker.transition.runtimeKey,
+                g_picker.transition.pendingRecordId,
+                PickerTransitionTargetRestoredToOrigin(
+                    g_picker.transition));
+            claimedRuntime.swap(g_picker.transition.runtimeKey);
+            if(!FinalizePickerTransition(g_picker)){
+                claimedRuntime.swap(g_picker.transition.runtimeKey);
+                return false;
+            }
+            return true;
+        });
+    if(!result.run.completed) return result;
     FinishAutoOperationsClaimedByPicker(claimedRuntime);
     bool resumeTabSearch=false;
     if(g_pickerShutdownDrain || !g_runtimeQuiescence.acceptsDispatch())
@@ -7596,7 +7765,7 @@ static bool FinalizePickerRuntimeTransition() noexcept {
     } catch(...) {
         if(!g_pickerShutdownDrain) SchedulePickerTabSearchRetry();
     }
-    return true;
+    return result;
 }
 
 static void PumpPickerTransitionWork() noexcept {
@@ -7606,6 +7775,10 @@ static void PumpPickerTransitionWork() noexcept {
     bool terminalRetryNoProgress=false;
     bool terminalRetryDeferred=false;
     bool effectDeferredUntilDue=false;
+    bool terminalAttemptCaptured=false;
+    uint64_t terminalAttempt=0;
+    PickerTraceTerminalDeliveryFacts terminalDelivery;
+    PickerRuntimeTerminalizationResult terminalization;
     if(g_main) KillTimer(g_main,TIMER_PICKER_TRANSITION);
     for(unsigned budget=0;budget<256;++budget){
         if(g_pickerObservationKick.pending){
@@ -7633,6 +7806,7 @@ static void PumpPickerTransitionWork() noexcept {
                 g_pickerTerminalizationPending=true;
                 const PickerTraceScheduleResult schedule=
                     DeferPickerTransitionWork(false);
+                StorePickerTraceTerminalDelivery(schedule);
                 if(schedule.deferred) break;
             }
             continue;
@@ -7698,7 +7872,19 @@ static void PumpPickerTransitionWork() noexcept {
             continue;
         }
         if(g_pickerTerminalizationPending){
-            if(!FinalizePickerRuntimeTransition()){
+            terminalAttemptCaptured=g_pickerTrace.active();
+            if(terminalAttemptCaptured){
+                const uint64_t generation=
+                    g_picker.transition.generation;
+                terminalAttempt=
+                    NextPickerTraceTerminalizationAttempt(generation);
+                terminalDelivery.incomingAvailable=
+                    ConsumePickerTracePendingTerminalDelivery(
+                        g_pickerTracePendingTerminalDelivery,generation,
+                        terminalDelivery.incoming);
+            }
+            terminalization=FinalizePickerRuntimeTransition();
+            if(!terminalization.run.completed){
                 terminalRetryNoProgress=true;
                 if(!g_pickerShutdownDrain && g_main)
                     terminalRetryDeferred=SetTimer(
@@ -7706,6 +7892,24 @@ static void PumpPickerTransitionWork() noexcept {
                         MOVE_VERIFY_INTERVAL_MS,nullptr)!=0;
                 break;
             }
+            if(terminalAttemptCaptured){
+                ReadPickerRuntimeTerminalTraceSnapshot(
+                    terminalization.snapshot);
+                const PickerTraceTerminalizationEmission emission=
+                    MapPickerTraceTerminalization(
+                        terminalization.run,
+                        terminalization.snapshot.terminal.generation,
+                        terminalAttempt,terminalDelivery);
+                const PickerTraceTerminalizationEventObserver observer=
+                    PickerRuntimeTerminalTraceObserver();
+                PublishPickerTraceTerminalization(
+                    emission,&terminalization.snapshot.terminal,&observer);
+            }
+            ResetPickerTracePendingTerminalDelivery(
+                g_pickerTracePendingTerminalDelivery);
+            g_pickerTraceTerminalizationGeneration=0;
+            g_pickerTraceTerminalizationAttempt=0;
+            g_pickerTraceTerminalMetadata=PickerTraceTerminalMetadata{};
             continue;
         }
         break;
@@ -7721,6 +7925,26 @@ static void PumpPickerTransitionWork() noexcept {
                     g_pickerShutdownDrain,terminalRetryDeferred)==
                     PickerTerminalNoProgressRoute::DurableExternalKick)
                 g_pickerDurableKickPending=true;
+            if(terminalAttemptCaptured){
+                terminalDelivery.retry=
+                    DecidePickerTraceDeliveryRoute(
+                        g_pickerShutdownDrain,terminalRetryDeferred,
+                        false,false,false,!terminalRetryDeferred);
+                terminalDelivery.retryAvailable=true;
+                StorePickerTracePendingTerminalDelivery(
+                    g_pickerTracePendingTerminalDelivery,
+                    terminalization.snapshot.terminal.generation,
+                    terminalDelivery.retry);
+                const PickerTraceTerminalizationEmission emission=
+                    MapPickerTraceTerminalization(
+                        terminalization.run,
+                        terminalization.snapshot.terminal.generation,
+                        terminalAttempt,terminalDelivery);
+                const PickerTraceTerminalizationEventObserver observer=
+                    PickerRuntimeTerminalTraceObserver();
+                PublishPickerTraceTerminalization(
+                    emission,nullptr,&observer);
+            }
         } else {
             const PickerTraceScheduleResult schedule=
                 DeferPickerTransitionWork(false);
@@ -7728,6 +7952,8 @@ static void PumpPickerTransitionWork() noexcept {
                 DecidePickerTracePumpRearm(schedule);
             if(decision.claimDurableKickAtCaller)
                 g_pickerDurableKickPending=true;
+            if(g_pickerTerminalizationPending)
+                StorePickerTraceTerminalDelivery(decision.delivery);
             if(g_pickerEffectScheduled)
                 EmitPickerTraceEffectQueue(
                     g_pickerScheduledEffect,decision.delivery);
@@ -7769,6 +7995,8 @@ static bool DrainPickerForShutdown() noexcept {
                 schedule.deferred,g_pickerDurableKickPending);
         if(g_pickerDurableKickPending)
             schedule=MarkPickerTraceDurableKick(schedule);
+        if(g_pickerTerminalizationPending)
+            StorePickerTraceTerminalDelivery(schedule);
         if(g_pickerEffectScheduled)
             EmitPickerTraceEffectQueue(
                 g_pickerScheduledEffect,schedule);
@@ -8359,6 +8587,11 @@ static PickerTraceMoveBeginReason BeginVerifiedPickerMove(
         });
         if(!staged) return finish(stagingFailure);
         transitionPublishedForTrace=true;
+        ResetPickerTracePendingTerminalDelivery(
+            g_pickerTracePendingTerminalDelivery);
+        g_pickerTraceTerminalizationGeneration=
+            g_picker.transition.generation;
+        g_pickerTraceTerminalizationAttempt=0;
         g_pickerTraceTerminalMetadata=PickerTraceTerminalMetadata{};
         g_pickerTraceTerminalMetadata.generation=
             g_picker.transition.generation;
@@ -8386,6 +8619,11 @@ static PickerTraceMoveBeginReason BeginVerifiedPickerMove(
             terminal.recordId=g_picker.transition.pendingRecordId;
             ConsumeCheckpointAndReleaseMoveReservation(terminal);
             g_picker.transition.swap(prepared);
+            ResetPickerTracePendingTerminalDelivery(
+                g_pickerTracePendingTerminalDelivery);
+            g_pickerTraceTerminalizationGeneration=0;
+            g_pickerTraceTerminalizationAttempt=0;
+            g_pickerTraceTerminalMetadata=PickerTraceTerminalMetadata{};
             return finish(PickerTraceMoveBeginReason::NoInitialEffect);
         }
         traceEvent.firstEffect=effect.kind;

@@ -22405,7 +22405,7 @@ static void test_picker_trace_task8_runtime_wiring_is_explicit(){
         "static PickerObservation ExecutePickerEffect(");
     const std::string queue=SourceSection(
         source,"static void QueuePickerEffect(",
-        "static bool FinalizePickerRuntimeTransition(");
+        "struct PickerRuntimeTerminalTraceSnapshot");
     const std::string pump=SourceSection(
         source,"static void PumpPickerTransitionWork() noexcept {",
         "static void RequestPickerCancellation(");
@@ -22472,6 +22472,1154 @@ static void test_picker_trace_task8_runtime_wiring_is_explicit(){
     CHECK(executor.find("GetLastError(")==std::string::npos);
 }
 
+struct PickerTraceTerminalPublishMemoryForTest {
+    std::string order;
+    size_t attempts=0;
+    size_t terminals=0;
+    size_t flushes=0;
+    PickerTraceTerminalizationAttemptEvent attempt;
+    PickerTraceTransitionTerminalEvent terminal;
+};
+
+static void PickerTraceTerminalAttemptForTest(
+        void* opaque,
+        const PickerTraceTerminalizationAttemptEvent& event) noexcept {
+    auto& memory=
+        *static_cast<PickerTraceTerminalPublishMemoryForTest*>(opaque);
+    memory.order.push_back('a');
+    ++memory.attempts;
+    memory.attempt=event;
+}
+
+static void PickerTraceTerminalEventForTest(
+        void* opaque,
+        const PickerTraceTransitionTerminalEvent& event) noexcept {
+    auto& memory=
+        *static_cast<PickerTraceTerminalPublishMemoryForTest*>(opaque);
+    memory.order.push_back('t');
+    ++memory.terminals;
+    memory.terminal=event;
+}
+
+static void PickerTraceTerminalFlushForTest(void* opaque) noexcept {
+    auto& memory=
+        *static_cast<PickerTraceTerminalPublishMemoryForTest*>(opaque);
+    memory.order.push_back('f');
+    ++memory.flushes;
+}
+
+static PickerTraceTerminalizationEventObserver
+PickerTraceTerminalObserverForTest(
+        PickerTraceTerminalPublishMemoryForTest& memory) noexcept {
+    PickerTraceTerminalizationEventObserver observer;
+    observer.context=&memory;
+    observer.emitAttempt=PickerTraceTerminalAttemptForTest;
+    observer.emitTerminal=PickerTraceTerminalEventForTest;
+    observer.flushBoundary=PickerTraceTerminalFlushForTest;
+    return observer;
+}
+
+static void test_picker_trace_terminalization_driver_reports_every_boundary(){
+    std::vector<PickerTraceTerminalizationRunResult> failures;
+    std::string order;
+    const auto terminalGuard=DrivePickerTraceTerminalization(
+        false,true,true,
+        [&](PickerTraceReservationReleaseFacts&){
+            order.push_back('r'); return true;
+        },[&](){ order.push_back('y'); return true; },
+        [&](){ order.push_back('f'); return true; });
+    CHECK(order.empty());
+    CHECK(terminalGuard.reason==
+          PickerTraceTerminalizationReason::TerminalNotAcknowledged);
+    CHECK(!terminalGuard.release.attempted);
+    failures.push_back(terminalGuard);
+
+    order.clear();
+    const auto pending=DrivePickerTraceTerminalization(
+        true,false,true,
+        [&](PickerTraceReservationReleaseFacts&){
+            order.push_back('r'); return true;
+        },[&](){ order.push_back('y'); return true; },
+        [&](){ order.push_back('f'); return true; });
+    CHECK(order.empty());
+    CHECK(pending.reason==PickerTraceTerminalizationReason::PendingEffect);
+    CHECK(!pending.release.attempted);
+    failures.push_back(pending);
+
+    order.clear();
+    const auto throwBeforeFirst=DrivePickerTraceTerminalization(
+        true,true,true,
+        [&](PickerTraceReservationReleaseFacts& facts)->bool {
+            order.push_back('r');
+            facts.exceptionStage=
+                PickerTraceReservationExceptionStage::FirstDecision;
+            facts.exceptionStageAvailable=true;
+            throw std::runtime_error("before first action");
+        },[&](){ order.push_back('y'); return true; },
+        [&](){ order.push_back('f'); return true; });
+    CHECK(order=="r");
+    CHECK(throwBeforeFirst.reason==
+          PickerTraceTerminalizationReason::ReservationReleaseException);
+    CHECK(throwBeforeFirst.release.attempted &&
+          throwBeforeFirst.release.threw);
+    CHECK(!throwBeforeFirst.release.firstActionAvailable);
+    CHECK(!throwBeforeFirst.release.retryActionAvailable);
+    CHECK(throwBeforeFirst.release.exceptionStageAvailable);
+    CHECK(throwBeforeFirst.release.exceptionStage==
+          PickerTraceReservationExceptionStage::FirstDecision);
+    failures.push_back(throwBeforeFirst);
+
+    order.clear();
+    const auto throwAfterFirst=DrivePickerTraceTerminalization(
+        true,true,true,
+        [&](PickerTraceReservationReleaseFacts& facts)->bool {
+            order.push_back('r');
+            facts.firstAction=
+                PickerTerminalGuardReleaseAction::ConsumeExact;
+            facts.firstActionAvailable=true;
+            facts.exceptionStage=
+                PickerTraceReservationExceptionStage::CheckpointCallback;
+            facts.exceptionStageAvailable=true;
+            throw std::runtime_error("after first action");
+        },[&](){ order.push_back('y'); return true; },
+        [&](){ order.push_back('f'); return true; });
+    CHECK(order=="r");
+    CHECK(throwAfterFirst.release.firstActionAvailable);
+    CHECK(!throwAfterFirst.release.retryActionAvailable);
+    CHECK(throwAfterFirst.release.exceptionStageAvailable);
+    CHECK(throwAfterFirst.release.exceptionStage==
+          PickerTraceReservationExceptionStage::CheckpointCallback);
+    failures.push_back(throwAfterFirst);
+
+    order.clear();
+    const auto throwAtRefind=DrivePickerTraceTerminalization(
+        true,true,true,
+        [&](PickerTraceReservationReleaseFacts& facts)->bool {
+            order.push_back('r');
+            facts.firstAction=
+                PickerTerminalGuardReleaseAction::ConsumeExact;
+            facts.firstActionAvailable=true;
+            facts.exceptionStage=PickerTraceReservationExceptionStage::Refind;
+            facts.exceptionStageAvailable=true;
+            throw std::runtime_error("refind");
+        },[&](){ order.push_back('y'); return true; },
+        [&](){ order.push_back('f'); return true; });
+    CHECK(order=="r");
+    CHECK(throwAtRefind.release.firstActionAvailable);
+    CHECK(!throwAtRefind.release.retried);
+    CHECK(!throwAtRefind.release.retryActionAvailable);
+    CHECK(throwAtRefind.release.exceptionStage==
+          PickerTraceReservationExceptionStage::Refind);
+    failures.push_back(throwAtRefind);
+
+    order.clear();
+    const auto throwAtSecondDecision=DrivePickerTraceTerminalization(
+        true,true,true,
+        [&](PickerTraceReservationReleaseFacts& facts)->bool {
+            order.push_back('r');
+            facts.firstAction=
+                PickerTerminalGuardReleaseAction::ConsumeExact;
+            facts.firstActionAvailable=true;
+            facts.retried=true;
+            facts.exceptionStage=
+                PickerTraceReservationExceptionStage::SecondDecision;
+            facts.exceptionStageAvailable=true;
+            throw std::runtime_error("second decision");
+        },[&](){ order.push_back('y'); return true; },
+        [&](){ order.push_back('f'); return true; });
+    CHECK(order=="r");
+    CHECK(throwAtSecondDecision.release.firstActionAvailable);
+    CHECK(throwAtSecondDecision.release.retried);
+    CHECK(!throwAtSecondDecision.release.retryActionAvailable);
+    CHECK(throwAtSecondDecision.release.exceptionStage==
+          PickerTraceReservationExceptionStage::SecondDecision);
+    failures.push_back(throwAtSecondDecision);
+
+    order.clear();
+    const auto throwAfterRetry=DrivePickerTraceTerminalization(
+        true,true,true,
+        [&](PickerTraceReservationReleaseFacts& facts)->bool {
+            order.push_back('r');
+            facts.firstAction=
+                PickerTerminalGuardReleaseAction::ConsumeExact;
+            facts.firstActionAvailable=true;
+            facts.retried=true;
+            facts.retryAction=
+                PickerTerminalGuardReleaseAction::ConsumeExact;
+            facts.retryActionAvailable=true;
+            facts.exceptionStage=PickerTraceReservationExceptionStage::Erase;
+            facts.exceptionStageAvailable=true;
+            throw std::runtime_error("after retry action");
+        },[&](){ order.push_back('y'); return true; },
+        [&](){ order.push_back('f'); return true; });
+    CHECK(order=="r");
+    CHECK(throwAfterRetry.release.firstActionAvailable);
+    CHECK(throwAfterRetry.release.retryActionAvailable);
+    CHECK(throwAfterRetry.release.retried);
+    CHECK(throwAfterRetry.release.exceptionStage==
+          PickerTraceReservationExceptionStage::Erase);
+    failures.push_back(throwAfterRetry);
+
+    order.clear();
+    const auto notReleased=DrivePickerTraceTerminalization(
+        true,true,true,
+        [&](PickerTraceReservationReleaseFacts& facts){
+            order.push_back('r');
+            facts.firstAction=
+                PickerTerminalGuardReleaseAction::ConsumeExact;
+            facts.firstActionAvailable=true;
+            facts.retried=true;
+            facts.retryAction=
+                PickerTerminalGuardReleaseAction::RetryExactOwner;
+            facts.retryActionAvailable=true;
+            return false;
+        },[&](){ order.push_back('y'); return true; },
+        [&](){ order.push_back('f'); return true; });
+    CHECK(order=="r");
+    CHECK(notReleased.reason==
+          PickerTraceTerminalizationReason::ReservationNotReleased);
+    CHECK(!notReleased.release.released);
+    CHECK(notReleased.release.firstActionAvailable &&
+          notReleased.release.retryActionAvailable &&
+          notReleased.release.retried);
+    failures.push_back(notReleased);
+
+    order.clear();
+    const auto keyMissing=DrivePickerTraceTerminalization(
+        true,true,false,
+        [&](PickerTraceReservationReleaseFacts& facts){
+            order.push_back('r');
+            facts.firstAction=
+                PickerTerminalGuardReleaseAction::ResolvedAbsent;
+            facts.firstActionAvailable=true;
+            return true;
+        },[&](){ order.push_back('y'); return true; },
+        [&](){ order.push_back('f'); return true; });
+    CHECK(order=="r");
+    CHECK(keyMissing.reason==
+          PickerTraceTerminalizationReason::RuntimeKeyMissing);
+    CHECK(!keyMissing.runtimeKeyPresent);
+    failures.push_back(keyMissing);
+
+    order.clear();
+    const auto notReady=DrivePickerTraceTerminalization(
+        true,true,true,
+        [&](PickerTraceReservationReleaseFacts& facts){
+            order.push_back('r');
+            facts.firstAction=
+                PickerTerminalGuardReleaseAction::ResolvedAbsent;
+            facts.firstActionAvailable=true;
+            return true;
+        },[&](){ order.push_back('y'); return false; },
+        [&](){ order.push_back('f'); return true; });
+    CHECK(order=="ry");
+    CHECK(notReady.reason==
+          PickerTraceTerminalizationReason::RuntimeNotReady);
+    CHECK(!notReady.ready);
+    failures.push_back(notReady);
+
+    order.clear();
+    const auto readyThrew=DrivePickerTraceTerminalization(
+        true,true,true,
+        [&](PickerTraceReservationReleaseFacts& facts){
+            order.push_back('r');
+            facts.firstAction=
+                PickerTerminalGuardReleaseAction::ResolvedAbsent;
+            facts.firstActionAvailable=true;
+            return true;
+        },[&]()->bool {
+            order.push_back('y');
+            throw std::runtime_error("ready");
+        },[&](){ order.push_back('f'); return true; });
+    CHECK(order=="ry");
+    CHECK(readyThrew.reason==
+          PickerTraceTerminalizationReason::RuntimeNotReady);
+    failures.push_back(readyThrew);
+
+    order.clear();
+    const auto finalizeFailed=DrivePickerTraceTerminalization(
+        true,true,true,
+        [&](PickerTraceReservationReleaseFacts& facts){
+            order.push_back('r');
+            facts.firstAction=
+                PickerTerminalGuardReleaseAction::ResolvedAbsent;
+            facts.firstActionAvailable=true;
+            return true;
+        },[&](){ order.push_back('y'); return true; },
+        [&](){ order.push_back('f'); return false; });
+    CHECK(order=="ryf");
+    CHECK(finalizeFailed.reason==
+          PickerTraceTerminalizationReason::FinalizeStateFailed);
+    CHECK(finalizeFailed.ready && !finalizeFailed.finalized);
+    failures.push_back(finalizeFailed);
+
+    order.clear();
+    const auto finalizeThrew=DrivePickerTraceTerminalization(
+        true,true,true,
+        [&](PickerTraceReservationReleaseFacts& facts){
+            order.push_back('r');
+            facts.firstAction=
+                PickerTerminalGuardReleaseAction::ResolvedAbsent;
+            facts.firstActionAvailable=true;
+            return true;
+        },[&](){ order.push_back('y'); return true; },
+        [&]()->bool {
+            order.push_back('f');
+            throw std::runtime_error("finalize");
+        });
+    CHECK(order=="ryf");
+    CHECK(finalizeThrew.reason==
+          PickerTraceTerminalizationReason::FinalizeStateFailed);
+    failures.push_back(finalizeThrew);
+
+    order.clear();
+    const auto success=DrivePickerTraceTerminalization(
+        true,true,true,
+        [&](PickerTraceReservationReleaseFacts& facts){
+            order.push_back('r');
+            facts.firstAction=
+                PickerTerminalGuardReleaseAction::ConsumeExact;
+            facts.firstActionAvailable=true;
+            facts.retried=true;
+            facts.retryAction=
+                PickerTerminalGuardReleaseAction::ConsumeExact;
+            facts.retryActionAvailable=true;
+            return true;
+        },[&](){ order.push_back('y'); return true; },
+        [&](){ order.push_back('f'); return true; });
+    CHECK(order=="ryf");
+    CHECK(success.reason==PickerTraceTerminalizationReason::Completed);
+    CHECK(success.completed && success.finalized && success.ready);
+
+    PickerTraceTerminalDeliveryFacts delivery;
+    delivery.incoming=PickerTraceDeliveryRoute::Posted;
+    delivery.retry=PickerTraceDeliveryRoute::DelayedTimer;
+    delivery.incomingAvailable=true;
+    delivery.retryAvailable=true;
+    PickerTraceTransitionTerminalEvent terminal;
+    terminal.generation=91;
+    terminal.outcome=PickerTraceTerminalOutcome::Succeeded;
+    PickerTraceTerminalizationRunResult maximal;
+    maximal.reason=
+        PickerTraceTerminalizationReason::ReservationReleaseException;
+    maximal.terminalAcknowledged=true;
+    maximal.pendingEffectNone=false;
+    maximal.runtimeKeyPresent=true;
+    maximal.ready=false;
+    maximal.finalized=true;
+    maximal.release.attempted=true;
+    maximal.release.firstAction=
+        PickerTerminalGuardReleaseAction::ConsumeExact;
+    maximal.release.retryAction=
+        PickerTerminalGuardReleaseAction::RetryExactOwner;
+    maximal.release.exceptionStage=
+        PickerTraceReservationExceptionStage::Erase;
+    maximal.release.firstActionAvailable=true;
+    maximal.release.retryActionAvailable=true;
+    maximal.release.exceptionStageAvailable=true;
+    maximal.release.retried=true;
+    maximal.release.threw=true;
+    maximal.release.released=false;
+    PickerTraceTerminalDeliveryFacts asymmetricDelivery;
+    asymmetricDelivery.incoming=PickerTraceDeliveryRoute::TimerArmed;
+    asymmetricDelivery.retry=PickerTraceDeliveryRoute::ShutdownDrain;
+    asymmetricDelivery.incomingAvailable=false;
+    asymmetricDelivery.retryAvailable=true;
+    const auto maximalEmission=MapPickerTraceTerminalization(
+        maximal,123,456,asymmetricDelivery);
+    const auto& mapped=maximalEmission.attempt;
+    CHECK(mapped.generation==123 && mapped.attempt==456);
+    CHECK(mapped.reason==maximal.reason);
+    CHECK(mapped.incomingDelivery==asymmetricDelivery.incoming);
+    CHECK(mapped.retryDelivery==asymmetricDelivery.retry);
+    CHECK(mapped.incomingDeliveryAvailable==
+          asymmetricDelivery.incomingAvailable);
+    CHECK(mapped.retryDeliveryAvailable==
+          asymmetricDelivery.retryAvailable);
+    CHECK(mapped.terminalAcknowledged==maximal.terminalAcknowledged);
+    CHECK(mapped.pendingEffectNone==maximal.pendingEffectNone);
+    CHECK(mapped.runtimeKeyPresent==maximal.runtimeKeyPresent);
+    CHECK(mapped.firstReleaseAction==maximal.release.firstAction);
+    CHECK(mapped.retryReleaseAction==maximal.release.retryAction);
+    CHECK(mapped.releaseExceptionStage==maximal.release.exceptionStage);
+    CHECK(mapped.releaseAttempted==maximal.release.attempted);
+    CHECK(mapped.firstReleaseActionAvailable==
+          maximal.release.firstActionAvailable);
+    CHECK(mapped.retryReleaseActionAvailable==
+          maximal.release.retryActionAvailable);
+    CHECK(mapped.releaseExceptionStageAvailable==
+          maximal.release.exceptionStageAvailable);
+    CHECK(mapped.releaseRetried==maximal.release.retried);
+    CHECK(mapped.releaseThrew==maximal.release.threw);
+    CHECK(mapped.reservationReleased==maximal.release.released);
+    CHECK(mapped.ready==maximal.ready && mapped.finalized==maximal.finalized);
+    CHECK(!maximalEmission.terminalAllowed);
+    uint64_t attempt=0;
+    for(const auto& failed:failures){
+        const auto emission=MapPickerTraceTerminalization(
+            failed,91,++attempt,delivery);
+        CHECK(!emission.terminalAllowed);
+        CHECK(emission.attempt.generation==91);
+        CHECK(emission.attempt.attempt==attempt);
+        CHECK(emission.attempt.reason==failed.reason);
+        CHECK(emission.attempt.terminalAcknowledged==
+              failed.terminalAcknowledged);
+        CHECK(emission.attempt.pendingEffectNone==
+              failed.pendingEffectNone);
+        CHECK(emission.attempt.runtimeKeyPresent==
+              failed.runtimeKeyPresent);
+        PublishPickerTraceTerminalization(
+            emission,&terminal,nullptr);
+        PickerTraceTerminalPublishMemoryForTest memory;
+        const auto observer=PickerTraceTerminalObserverForTest(memory);
+        PublishPickerTraceTerminalization(
+            emission,&terminal,&observer);
+        CHECK(memory.order=="a");
+        CHECK(memory.attempts==1 && memory.terminals==0 &&
+              memory.flushes==0);
+    }
+
+    const auto completed=MapPickerTraceTerminalization(
+        success,91,++attempt,delivery);
+    CHECK(completed.terminalAllowed);
+    CHECK(completed.attempt.firstReleaseActionAvailable);
+    CHECK(completed.attempt.firstReleaseAction==
+          PickerTerminalGuardReleaseAction::ConsumeExact);
+    CHECK(completed.attempt.incomingDeliveryAvailable &&
+          completed.attempt.incomingDelivery==
+              PickerTraceDeliveryRoute::Posted);
+    CHECK(completed.attempt.retryDeliveryAvailable &&
+          completed.attempt.retryDelivery==
+              PickerTraceDeliveryRoute::DelayedTimer);
+    PickerTraceTerminalPublishMemoryForTest completedMemory;
+    const auto completedObserver=
+        PickerTraceTerminalObserverForTest(completedMemory);
+    PublishPickerTraceTerminalization(
+        completed,&terminal,&completedObserver);
+    CHECK(completedMemory.order=="atf");
+    CHECK(completedMemory.attempts==1 && completedMemory.terminals==1 &&
+          completedMemory.flushes==1);
+
+    PickerTraceTerminalPublishMemoryForTest missingTerminalMemory;
+    const auto missingTerminalObserver=
+        PickerTraceTerminalObserverForTest(missingTerminalMemory);
+    PublishPickerTraceTerminalization(
+        completed,nullptr,&missingTerminalObserver);
+    CHECK(missingTerminalMemory.order=="a");
+    CHECK(missingTerminalMemory.attempts==1 &&
+          missingTerminalMemory.terminals==0 &&
+          missingTerminalMemory.flushes==0);
+
+    PickerTraceTerminalPublishMemoryForTest nullMemory;
+    PublishPickerTraceTerminalization(completed,&terminal,nullptr);
+    CHECK(nullMemory.order.empty());
+}
+
+static void test_picker_trace_terminal_delivery_is_one_shot_and_exact(){
+    PickerTracePendingTerminalDelivery pending;
+    PickerTraceDeliveryRoute route=PickerTraceDeliveryRoute::None;
+    StorePickerTracePendingTerminalDelivery(
+        pending,7,PickerTraceDeliveryRoute::Posted);
+    CHECK(pending.available && pending.generation==7);
+    CHECK(ConsumePickerTracePendingTerminalDelivery(pending,7,route));
+    CHECK(route==PickerTraceDeliveryRoute::Posted);
+    CHECK(!pending.available);
+    route=PickerTraceDeliveryRoute::None;
+    CHECK(!ConsumePickerTracePendingTerminalDelivery(pending,7,route));
+    CHECK(route==PickerTraceDeliveryRoute::None);
+
+    StorePickerTracePendingTerminalDelivery(
+        pending,8,PickerTraceDeliveryRoute::TimerArmed);
+    CHECK(!ConsumePickerTracePendingTerminalDelivery(pending,9,route));
+    CHECK(!pending.available && route==PickerTraceDeliveryRoute::None);
+
+    StorePickerTracePendingTerminalDelivery(
+        pending,10,PickerTraceDeliveryRoute::DelayedTimer);
+    CHECK(ConsumePickerTracePendingTerminalDelivery(pending,10,route));
+    CHECK(route==PickerTraceDeliveryRoute::DelayedTimer);
+    StorePickerTracePendingTerminalDelivery(
+        pending,10,PickerTraceDeliveryRoute::DurableExternalKick);
+    route=PickerTraceDeliveryRoute::None;
+    CHECK(ConsumePickerTracePendingTerminalDelivery(pending,10,route));
+    CHECK(route==PickerTraceDeliveryRoute::DurableExternalKick);
+
+    PickerTraceTerminalizationRunResult run;
+    run.reason=PickerTraceTerminalizationReason::RuntimeNotReady;
+    PickerTraceTerminalDeliveryFacts attemptNDelivery;
+    attemptNDelivery.retry=PickerTraceDeliveryRoute::DelayedTimer;
+    attemptNDelivery.retryAvailable=true;
+    const auto attemptN=MapPickerTraceTerminalization(
+        run,10,1,attemptNDelivery);
+    StorePickerTracePendingTerminalDelivery(
+        pending,10,attemptN.attempt.retryDelivery);
+    PickerTraceTerminalDeliveryFacts attemptNextDelivery;
+    attemptNextDelivery.incomingAvailable=
+        ConsumePickerTracePendingTerminalDelivery(
+            pending,10,attemptNextDelivery.incoming);
+    const auto attemptNext=MapPickerTraceTerminalization(
+        run,10,2,attemptNextDelivery);
+    CHECK(attemptNext.attempt.incomingDeliveryAvailable);
+    CHECK(attemptNext.attempt.incomingDelivery==
+          attemptN.attempt.retryDelivery);
+
+    StorePickerTracePendingTerminalDelivery(
+        pending,11,PickerTraceDeliveryRoute::ShutdownDrain);
+    ResetPickerTracePendingTerminalDelivery(pending);
+    CHECK(!pending.available && pending.generation==0 &&
+          pending.route==PickerTraceDeliveryRoute::None);
+}
+
+static void test_picker_trace_terminal_delivery_precedence_is_fixed(){
+    struct ReasonCase {
+        bool terminalAcknowledged,pendingEffectNone,releaseThrew;
+        bool reservationReleased,runtimeKeyPresent,ready,finalized;
+        PickerTraceTerminalizationReason expected;
+    };
+    const ReasonCase reasons[]={
+        {false,false,true,false,false,false,false,
+            PickerTraceTerminalizationReason::TerminalNotAcknowledged},
+        {true,false,true,false,false,false,false,
+            PickerTraceTerminalizationReason::PendingEffect},
+        {true,true,true,false,false,false,false,
+            PickerTraceTerminalizationReason::ReservationReleaseException},
+        {true,true,false,false,false,false,false,
+            PickerTraceTerminalizationReason::ReservationNotReleased},
+        {true,true,false,true,false,false,false,
+            PickerTraceTerminalizationReason::RuntimeKeyMissing},
+        {true,true,false,true,true,false,false,
+            PickerTraceTerminalizationReason::RuntimeNotReady},
+        {true,true,false,true,true,true,false,
+            PickerTraceTerminalizationReason::FinalizeStateFailed},
+        {true,true,false,true,true,true,true,
+            PickerTraceTerminalizationReason::Completed}
+    };
+    for(const auto& value:reasons)
+        CHECK(DecidePickerTraceTerminalizationReason(
+            value.terminalAcknowledged,value.pendingEffectNone,
+            value.releaseThrew,value.reservationReleased,
+            value.runtimeKeyPresent,value.ready,value.finalized)==
+            value.expected);
+
+    struct Case {
+        bool shutdownDrain,delayedTimer,posted,timerArmed;
+        bool inlineFallback,durableKick;
+        PickerTraceDeliveryRoute expected;
+    };
+    const Case cases[]={
+        {true,false,false,false,false,false,
+            PickerTraceDeliveryRoute::ShutdownDrain},
+        {false,true,false,false,false,false,
+            PickerTraceDeliveryRoute::DelayedTimer},
+        {false,false,true,false,false,false,
+            PickerTraceDeliveryRoute::Posted},
+        {false,false,false,true,false,false,
+            PickerTraceDeliveryRoute::TimerArmed},
+        {false,false,false,false,true,false,
+            PickerTraceDeliveryRoute::InlineFallback},
+        {false,false,false,false,false,true,
+            PickerTraceDeliveryRoute::DurableExternalKick},
+        {false,false,false,false,false,false,
+            PickerTraceDeliveryRoute::None},
+        {true,true,true,true,true,true,
+            PickerTraceDeliveryRoute::ShutdownDrain}
+    };
+    for(const auto& value:cases)
+        CHECK(DecidePickerTraceDeliveryRoute(
+            value.shutdownDrain,value.delayedTimer,value.posted,
+            value.timerArmed,value.inlineFallback,value.durableKick)==
+            value.expected);
+}
+
+static void test_picker_trace_terminalization_serializes_only_available_facts(){
+    const auto early=DrivePickerTraceTerminalization(
+        false,true,true,
+        [](PickerTraceReservationReleaseFacts&){ return true; },
+        [](){ return true; },[](){ return true; });
+    const PickerTraceTerminalizationEmission earlyEmission=
+        MapPickerTraceTerminalization(
+            early,1,1,PickerTraceTerminalDeliveryFacts{});
+    std::string earlyLine;
+    CHECK(SerializePickerTraceLine(
+        PickerTraceEnvelope{},earlyEmission.attempt,earlyLine));
+    CHECK(earlyLine==
+        "{\"schema\":1,\"session\":\"00000000000000000000000000000000\","
+        "\"seq\":0,\"ms\":0,\"event\":\"terminalization.attempt\","
+        "\"generation\":1,\"attempt\":1,"
+        "\"reason\":\"terminal_not_acknowledged\","
+        "\"incoming_delivery\":\"none\",\"retry_delivery\":\"none\","
+        "\"incoming_delivery_available\":false,"
+        "\"retry_delivery_available\":false,"
+        "\"terminal_acknowledged\":false,\"pending_effect_none\":true,"
+        "\"runtime_key_present\":true,\"release_attempted\":false,"
+        "\"first_release_action_available\":false,"
+        "\"retry_release_action_available\":false,"
+        "\"release_exception_stage_available\":false,"
+        "\"release_retried\":false,\"release_threw\":false,"
+        "\"reservation_released\":false,\"ready\":false,"
+        "\"finalized\":false}\n");
+
+    const auto beforeFirstDecision=DrivePickerTraceTerminalization(
+        true,true,true,
+        [](PickerTraceReservationReleaseFacts& facts)->bool {
+            facts.exceptionStage=
+                PickerTraceReservationExceptionStage::FirstDecision;
+            facts.exceptionStageAvailable=true;
+            throw std::runtime_error("before first decision");
+        },[](){ return true; },[](){ return true; });
+    const auto beforeFirstDecisionEmission=MapPickerTraceTerminalization(
+        beforeFirstDecision,1,2,PickerTraceTerminalDeliveryFacts{});
+    std::string beforeFirstDecisionLine;
+    CHECK(SerializePickerTraceLine(
+        PickerTraceEnvelope{},beforeFirstDecisionEmission.attempt,
+        beforeFirstDecisionLine));
+    CHECK(beforeFirstDecisionLine==
+        "{\"schema\":1,\"session\":\"00000000000000000000000000000000\","
+        "\"seq\":0,\"ms\":0,\"event\":\"terminalization.attempt\","
+        "\"generation\":1,\"attempt\":2,"
+        "\"reason\":\"reservation_release_exception\","
+        "\"incoming_delivery\":\"none\",\"retry_delivery\":\"none\","
+        "\"incoming_delivery_available\":false,"
+        "\"retry_delivery_available\":false,"
+        "\"terminal_acknowledged\":true,\"pending_effect_none\":true,"
+        "\"runtime_key_present\":true,"
+        "\"release_exception_stage\":\"first_decision\","
+        "\"release_attempted\":true,"
+        "\"first_release_action_available\":false,"
+        "\"retry_release_action_available\":false,"
+        "\"release_exception_stage_available\":true,"
+        "\"release_retried\":false,\"release_threw\":true,"
+        "\"reservation_released\":false,\"ready\":false,"
+        "\"finalized\":false}\n");
+    CHECK(beforeFirstDecisionLine.find("first_release_action\":") ==
+          std::string::npos);
+    CHECK(beforeFirstDecisionLine.find("retry_release_action\":") ==
+          std::string::npos);
+
+    const auto partial=DrivePickerTraceTerminalization(
+        true,true,true,
+        [](PickerTraceReservationReleaseFacts& facts)->bool {
+            facts.firstAction=
+                PickerTerminalGuardReleaseAction::ConsumeExact;
+            facts.firstActionAvailable=true;
+            facts.exceptionStage=
+                PickerTraceReservationExceptionStage::CheckpointCallback;
+            facts.exceptionStageAvailable=true;
+            throw std::runtime_error("partial");
+        },[](){ return true; },[](){ return true; });
+    const auto partialEmission=MapPickerTraceTerminalization(
+        partial,2,3,PickerTraceTerminalDeliveryFacts{});
+    std::string partialLine;
+    CHECK(SerializePickerTraceLine(
+        PickerTraceEnvelope{},partialEmission.attempt,partialLine));
+    CHECK(partialLine==
+        "{\"schema\":1,\"session\":\"00000000000000000000000000000000\","
+        "\"seq\":0,\"ms\":0,\"event\":\"terminalization.attempt\","
+        "\"generation\":2,\"attempt\":3,"
+        "\"reason\":\"reservation_release_exception\","
+        "\"incoming_delivery\":\"none\",\"retry_delivery\":\"none\","
+        "\"incoming_delivery_available\":false,"
+        "\"retry_delivery_available\":false,"
+        "\"terminal_acknowledged\":true,\"pending_effect_none\":true,"
+        "\"runtime_key_present\":true,"
+        "\"first_release_action\":\"consume_exact\","
+        "\"release_exception_stage\":\"checkpoint_callback\","
+        "\"release_attempted\":true,"
+        "\"first_release_action_available\":true,"
+        "\"retry_release_action_available\":false,"
+        "\"release_exception_stage_available\":true,"
+        "\"release_retried\":false,\"release_threw\":true,"
+        "\"reservation_released\":false,\"ready\":false,"
+        "\"finalized\":false}\n");
+    CHECK(partialLine.find("resolved_absent")==std::string::npos);
+
+    const auto full=DrivePickerTraceTerminalization(
+        true,true,true,
+        [](PickerTraceReservationReleaseFacts& facts)->bool {
+            facts.firstAction=
+                PickerTerminalGuardReleaseAction::ConsumeExact;
+            facts.firstActionAvailable=true;
+            facts.retried=true;
+            facts.retryAction=
+                PickerTerminalGuardReleaseAction::ConsumeExact;
+            facts.retryActionAvailable=true;
+            facts.exceptionStage=PickerTraceReservationExceptionStage::Erase;
+            facts.exceptionStageAvailable=true;
+            throw std::runtime_error("full");
+        },[](){ return true; },[](){ return true; });
+    const auto fullEmission=MapPickerTraceTerminalization(
+        full,4,5,PickerTraceTerminalDeliveryFacts{});
+    std::string fullLine;
+    CHECK(SerializePickerTraceLine(
+        PickerTraceEnvelope{},fullEmission.attempt,fullLine));
+    CHECK(fullLine==
+        "{\"schema\":1,\"session\":\"00000000000000000000000000000000\","
+        "\"seq\":0,\"ms\":0,\"event\":\"terminalization.attempt\","
+        "\"generation\":4,\"attempt\":5,"
+        "\"reason\":\"reservation_release_exception\","
+        "\"incoming_delivery\":\"none\",\"retry_delivery\":\"none\","
+        "\"incoming_delivery_available\":false,"
+        "\"retry_delivery_available\":false,"
+        "\"terminal_acknowledged\":true,\"pending_effect_none\":true,"
+        "\"runtime_key_present\":true,"
+        "\"first_release_action\":\"consume_exact\","
+        "\"retry_release_action\":\"consume_exact\","
+        "\"release_exception_stage\":\"erase\","
+        "\"release_attempted\":true,"
+        "\"first_release_action_available\":true,"
+        "\"retry_release_action_available\":true,"
+        "\"release_exception_stage_available\":true,"
+        "\"release_retried\":true,\"release_threw\":true,"
+        "\"reservation_released\":false,\"ready\":false,"
+        "\"finalized\":false}\n");
+
+    PickerTraceTransitionTerminalEvent terminal;
+    terminal.diagnosticCode=PickerTraceDiagnosticCode::Exception;
+    std::string terminalLine;
+    CHECK(SerializePickerTraceLine(
+        PickerTraceEnvelope{},terminal,terminalLine));
+    CHECK(terminalLine.find("diagnostic_text")==std::string::npos);
+}
+
+template<class Type,class=void>
+struct PickerTraceHasDiagnosticForTest : std::false_type {};
+template<class Type>
+struct PickerTraceHasDiagnosticForTest<Type,
+    PickerTraceVoidForTest<decltype(&Type::diagnostic)>> : std::true_type {};
+template<class Type,class=void>
+struct PickerTraceHasDiagnosticTextForTest : std::false_type {};
+template<class Type>
+struct PickerTraceHasDiagnosticTextForTest<Type,
+    PickerTraceVoidForTest<decltype(&Type::diagnosticText)>>
+    : std::true_type {};
+
+static void test_picker_trace_task9_vocabulary_is_exhaustive(){
+    struct ReasonCase {
+        PickerTraceTerminalizationReason value;
+        const char* name;
+    };
+    const ReasonCase reasons[]={
+        {PickerTraceTerminalizationReason::Completed,"completed"},
+        {PickerTraceTerminalizationReason::TerminalNotAcknowledged,
+            "terminal_not_acknowledged"},
+        {PickerTraceTerminalizationReason::PendingEffect,"pending_effect"},
+        {PickerTraceTerminalizationReason::ReservationReleaseException,
+            "reservation_release_exception"},
+        {PickerTraceTerminalizationReason::ReservationNotReleased,
+            "reservation_not_released"},
+        {PickerTraceTerminalizationReason::RuntimeKeyMissing,
+            "runtime_key_missing"},
+        {PickerTraceTerminalizationReason::RuntimeNotReady,
+            "runtime_not_ready"},
+        {PickerTraceTerminalizationReason::FinalizeStateFailed,
+            "finalize_state_failed"}
+    };
+    static_assert(sizeof(reasons)/sizeof(reasons[0])==
+            static_cast<size_t>(PickerTraceTerminalizationReason::Count),
+        "terminalization reason vocabulary must stay exhaustive");
+    for(size_t index=0;index<sizeof(reasons)/sizeof(reasons[0]);++index){
+        CHECK(static_cast<size_t>(reasons[index].value)==index);
+        CHECK(std::string(PickerTraceTerminalizationReasonName(
+            reasons[index].value))==reasons[index].name);
+        PickerTraceTerminalizationAttemptEvent event;
+        event.reason=reasons[index].value;
+        CHECK(SerializedTraceContains(event,
+            std::string("\"reason\":\"")+reasons[index].name+"\""));
+    }
+
+    struct OutcomeCase { PickerTraceTerminalOutcome value; const char* name; };
+    const OutcomeCase outcomes[]={
+        {PickerTraceTerminalOutcome::Succeeded,"succeeded"},
+        {PickerTraceTerminalOutcome::Cancelled,"cancelled"},
+        {PickerTraceTerminalOutcome::Failed,"failed"}
+    };
+    static_assert(sizeof(outcomes)/sizeof(outcomes[0])==
+            static_cast<size_t>(PickerTraceTerminalOutcome::Count),
+        "terminal outcome vocabulary must stay exhaustive");
+    for(size_t index=0;index<sizeof(outcomes)/sizeof(outcomes[0]);++index){
+        CHECK(static_cast<size_t>(outcomes[index].value)==index);
+        CHECK(std::string(PickerTraceTerminalOutcomeName(
+            outcomes[index].value))==outcomes[index].name);
+        PickerTraceTransitionTerminalEvent event;
+        event.outcome=outcomes[index].value;
+        CHECK(SerializedTraceContains(event,
+            std::string("\"outcome\":\"")+outcomes[index].name+"\""));
+    }
+
+    struct StageCase {
+        PickerTraceReservationExceptionStage value;
+        const char* name;
+    };
+    const StageCase stages[]={
+        {PickerTraceReservationExceptionStage::None,"none"},
+        {PickerTraceReservationExceptionStage::FirstDecision,
+            "first_decision"},
+        {PickerTraceReservationExceptionStage::CheckpointCallback,
+            "checkpoint_callback"},
+        {PickerTraceReservationExceptionStage::Refind,"refind"},
+        {PickerTraceReservationExceptionStage::SecondDecision,
+            "second_decision"},
+        {PickerTraceReservationExceptionStage::Erase,"erase"}
+    };
+    static_assert(sizeof(stages)/sizeof(stages[0])==
+            static_cast<size_t>(PickerTraceReservationExceptionStage::Count),
+        "reservation exception vocabulary must stay exhaustive");
+    for(size_t index=0;index<sizeof(stages)/sizeof(stages[0]);++index){
+        CHECK(static_cast<size_t>(stages[index].value)==index);
+        CHECK(std::string(PickerTraceReservationExceptionStageName(
+            stages[index].value))==stages[index].name);
+        PickerTraceTerminalizationAttemptEvent event;
+        event.releaseExceptionStage=stages[index].value;
+        event.releaseExceptionStageAvailable=true;
+        CHECK(SerializedTraceContains(event,
+            std::string("\"release_exception_stage\":\"")+
+                stages[index].name+"\""));
+    }
+
+    struct ActionCase {
+        PickerTerminalGuardReleaseAction value;
+        const char* name;
+    };
+    const ActionCase actions[]={
+        {PickerTerminalGuardReleaseAction::ResolvedAbsent,
+            "resolved_absent"},
+        {PickerTerminalGuardReleaseAction::ConsumeExact,"consume_exact"},
+        {PickerTerminalGuardReleaseAction::RetryExactOwner,
+            "retry_exact_owner"}
+    };
+    static_assert(sizeof(actions)/sizeof(actions[0])==
+            static_cast<size_t>(PickerTerminalGuardReleaseAction::Count),
+        "reservation action vocabulary must stay exhaustive");
+    for(size_t index=0;index<sizeof(actions)/sizeof(actions[0]);++index){
+        CHECK(static_cast<size_t>(actions[index].value)==index);
+        CHECK(std::string(PickerTraceTerminalGuardReleaseActionName(
+            actions[index].value))==actions[index].name);
+        PickerTraceTerminalizationAttemptEvent event;
+        event.firstReleaseAction=actions[index].value;
+        event.firstReleaseActionAvailable=true;
+        CHECK(SerializedTraceContains(event,
+            std::string("\"first_release_action\":\"")+
+                actions[index].name+"\""));
+    }
+}
+
+static void test_picker_trace_task9_runtime_wiring_is_causal_and_private(){
+    static_assert(!PickerTraceHasDiagnosticForTest<
+        PickerTraceTransitionTerminalEvent>::value,
+        "terminal trace must not own diagnostic text");
+    static_assert(!PickerTraceHasDiagnosticTextForTest<
+        PickerTraceTransitionTerminalEvent>::value,
+        "terminal trace must not own diagnostic text");
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string release=SourceSection(
+        source,"static bool ConsumeCheckpointAndReleaseMoveReservation(\n"
+            "        const MoveToken& token,const std::string& runtimeKey,",
+        "static bool ConsumeCheckpointAndReleaseMoveReservation(\n"
+            "        const MoveResult& result)");
+    const std::string queue=SourceSection(
+        source,"static void QueuePickerEffect(const PickerEffect& effect) "
+            "noexcept {",
+        "struct PickerRuntimeTerminalTraceSnapshot {");
+    const std::string snapshot=SourceSection(
+        source,"static PickerRuntimeTerminalTraceSnapshot\n"
+            "CapturePickerRuntimeTerminalTraceSnapshot() noexcept {",
+        "static void ReadPickerRuntimeTerminalTraceSnapshot(");
+    const std::string readback=SourceSection(
+        source,"static void ReadPickerRuntimeTerminalTraceSnapshot(",
+        "static void EmitPickerRuntimeTerminalizationAttempt(");
+    const std::string finalizer=SourceSection(
+        source,"static PickerRuntimeTerminalizationResult\n"
+            "FinalizePickerRuntimeTransition() noexcept {",
+        "static void PumpPickerTransitionWork() noexcept {");
+    const std::string pump=SourceSection(
+        source,"static void PumpPickerTransitionWork() noexcept {",
+        "static void RequestPickerCancellation(");
+    const std::string quiesce=SourceSection(
+        source,"static bool QuiesceRuntime(HWND messageWindow) noexcept {",
+        "static int TILE_W=");
+    const std::string drain=SourceSection(
+        source,"static bool DrainPickerForShutdown() noexcept {",
+        "static bool CaptureFastWindowForMove(");
+    const std::string begin=SourceSection(
+        source,"static PickerTraceMoveBeginReason BeginVerifiedPickerMove(",
+        "class PickerTraceCaptureEmitScope {");
+    CHECK(!release.empty() && !queue.empty() && !snapshot.empty() &&
+          !readback.empty() && !finalizer.empty() && !pump.empty() &&
+          !quiesce.empty() && !drain.empty() && !begin.empty());
+
+    const size_t releaseTry=release.find("try {");
+    const size_t firstStage=release.find(
+        "currentStage=PickerTraceReservationExceptionStage::FirstDecision;",
+        releaseTry);
+    const size_t firstFind=release.find(
+        "g_reservedAutoIdentities.find(runtimeKey)",firstStage);
+    const size_t firstDecision=release.find(
+        "DecidePickerTerminalGuardRelease(",firstFind);
+    const size_t firstAvailable=release.find(
+        "facts->firstActionAvailable=true",firstDecision);
+    const size_t checkpointStage=release.find(
+        "PickerTraceReservationExceptionStage::CheckpointCallback",
+        firstAvailable);
+    const size_t checkpointCall=release.find(
+        "g_checkpointController.acknowledgeReservationBeforeRelease(",
+        checkpointStage);
+    const size_t refindStage=release.find(
+        "currentStage=PickerTraceReservationExceptionStage::Refind;",
+        checkpointCall);
+    const size_t refindCall=release.find(
+        "g_reservedAutoIdentities.find(runtimeKey)",refindStage);
+    const size_t secondStage=release.find(
+        "currentStage=PickerTraceReservationExceptionStage::SecondDecision;",
+        refindCall);
+    const size_t retriedAvailable=release.find(
+        "facts->retried=true",secondStage);
+    const size_t secondDecision=release.find(
+        "DecidePickerTerminalGuardRelease(",retriedAvailable);
+    const size_t retryAvailable=release.find(
+        "facts->retryActionAvailable=true",secondDecision);
+    const size_t eraseStage=release.find(
+        "currentStage=PickerTraceReservationExceptionStage::Erase;",
+        retryAvailable);
+    const size_t eraseCall=release.find(
+        "g_reservedAutoIdentities.erase(reserved)",eraseStage);
+    CHECK(releaseTry!=std::string::npos);
+    CHECK(firstStage!=std::string::npos);
+    CHECK(firstFind!=std::string::npos);
+    CHECK(firstDecision!=std::string::npos);
+    CHECK(firstAvailable!=std::string::npos);
+    CHECK(checkpointStage!=std::string::npos);
+    CHECK(checkpointCall!=std::string::npos);
+    CHECK(refindStage!=std::string::npos);
+    CHECK(refindCall!=std::string::npos);
+    CHECK(secondStage!=std::string::npos);
+    CHECK(retriedAvailable!=std::string::npos);
+    CHECK(secondDecision!=std::string::npos);
+    CHECK(retryAvailable!=std::string::npos);
+    CHECK(eraseStage!=std::string::npos);
+    CHECK(eraseCall!=std::string::npos);
+    CHECK(releaseTry<firstStage && firstStage<firstFind &&
+          firstFind<firstDecision && firstDecision<firstAvailable &&
+          firstAvailable<checkpointStage && checkpointStage<checkpointCall &&
+          checkpointCall<refindStage && refindStage<refindCall &&
+          refindCall<secondStage && secondStage<retriedAvailable &&
+          retriedAvailable<secondDecision && secondDecision<retryAvailable &&
+          retryAvailable<eraseStage && eraseStage<eraseCall);
+    const size_t releaseCatch=release.find("} catch(...) {",eraseCall);
+    const size_t exceptionStageCopy=release.find(
+        "facts->exceptionStage=currentStage",releaseCatch);
+    const size_t exceptionAvailable=release.find(
+        "facts->exceptionStageAvailable=true",exceptionStageCopy);
+    CHECK(releaseCatch!=std::string::npos);
+    CHECK(exceptionStageCopy!=std::string::npos);
+    CHECK(exceptionAvailable!=std::string::npos);
+    CHECK(eraseCall<releaseCatch && releaseCatch<exceptionStageCopy &&
+          exceptionStageCopy<exceptionAvailable);
+
+    const size_t queueSchedule=queue.find("DeferPickerTransitionWork(false)");
+    const size_t queueStore=queue.find("StorePickerTraceTerminalDelivery(",
+                                       queueSchedule);
+    const size_t queueDeferred=queue.find("if(!schedule.deferred",
+                                          queueStore);
+    const size_t queueInlinePump=queue.find("PumpPickerTransitionWork();",
+                                            queueDeferred);
+    CHECK(queueSchedule!=std::string::npos);
+    CHECK(queueStore!=std::string::npos);
+    CHECK(queueDeferred!=std::string::npos);
+    CHECK(queueInlinePump!=std::string::npos);
+    CHECK(queueSchedule<queueStore && queueStore<queueDeferred &&
+          queueDeferred<queueInlinePump);
+
+    const size_t cancelOutcome=snapshot.find("transition.cancelRequested");
+    const size_t failedOutcome=snapshot.find("transition.failed",cancelOutcome);
+    const size_t successOutcome=snapshot.find(
+        "PickerTraceTerminalOutcome::Succeeded",failedOutcome);
+    CHECK(cancelOutcome!=std::string::npos);
+    CHECK(failedOutcome!=std::string::npos);
+    CHECK(successOutcome!=std::string::npos);
+    CHECK(cancelOutcome<failedOutcome && failedOutcome<successOutcome);
+    CHECK(snapshot.find("g_pickerTraceTerminalMetadata.rollbackTrigger")!=
+          std::string::npos);
+    CHECK(snapshot.find("g_pickerTraceTerminalMetadata.diagnosticCode")!=
+          std::string::npos);
+    const char* counters[]={
+        "transition.forwardTargetAttempts",
+        "transition.forwardPopupAttempts",
+        "transition.forwardSwitchAttempts",
+        "transition.rollbackTargetAttempts",
+        "transition.rollbackPopupAttempts",
+        "transition.rollbackSwitchAttempts",
+        "transition.focusAttempts",
+        "transition.observedTargetValidity",
+        "transition.observedPopupValidity",
+        "transition.observedCurrentValidity",
+        "transition.observedTargetDesktop",
+        "transition.observedPopupDesktop",
+        "transition.observedCurrentDesktop"
+    };
+    for(const char* counter:counters)
+        CHECK(CountSourceText(snapshot,counter)==1);
+    CHECK(snapshot.find("transition.diagnostic")==std::string::npos);
+    CHECK(snapshot.find("transition.runtimeKey")==std::string::npos);
+    CHECK(snapshot.find("transition.pendingRecordId")==std::string::npos);
+    CHECK(snapshot.find("transition.capturedTitle")==std::string::npos);
+    CHECK(readback.find("g_picker.transition")==std::string::npos);
+    const size_t targetReadback=readback.find("ReadPickerWindowDesktop(\n"
+        "        snapshot.target");
+    const size_t popupReadback=readback.find("ReadPickerWindowDesktop(\n"
+        "        g_main",targetReadback);
+    const size_t currentReadback=readback.find("CurrentDesktopGuid(",
+                                               popupReadback);
+    CHECK(targetReadback!=std::string::npos);
+    CHECK(popupReadback!=std::string::npos);
+    CHECK(currentReadback!=std::string::npos);
+    CHECK(targetReadback<popupReadback && popupReadback<currentReadback);
+
+    const size_t capture=finalizer.find(
+        "result.snapshot=CapturePickerRuntimeTerminalTraceSnapshot()");
+    const size_t drive=finalizer.find("DrivePickerTraceTerminalization(",
+                                      capture);
+    const size_t releaseCall=finalizer.find(
+        "ConsumeCheckpointAndReleaseMoveReservation(",drive);
+    const size_t finalizeCall=finalizer.find(
+        "FinalizePickerTransition(g_picker)",releaseCall);
+    CHECK(capture!=std::string::npos);
+    CHECK(drive!=std::string::npos);
+    CHECK(releaseCall!=std::string::npos);
+    CHECK(finalizeCall!=std::string::npos);
+    CHECK(capture<drive && drive<releaseCall && releaseCall<finalizeCall);
+
+    const size_t incomingConsume=pump.find(
+        "ConsumePickerTracePendingTerminalDelivery(");
+    const size_t finalizeAttempt=pump.find(
+        "terminalization=FinalizePickerRuntimeTransition()",incomingConsume);
+    const size_t noProgressGuard=pump.find(
+        "if(!terminalization.run.completed)",finalizeAttempt);
+    const size_t finalReadbacks=pump.find(
+        "ReadPickerRuntimeTerminalTraceSnapshot(",noProgressGuard);
+    const size_t successMap=pump.find(
+        "MapPickerTraceTerminalization(",finalReadbacks);
+    const size_t successPublish=pump.find(
+        "PublishPickerTraceTerminalization(",successMap);
+    const size_t successReset=pump.find(
+        "ResetPickerTracePendingTerminalDelivery(",successPublish);
+    CHECK(incomingConsume!=std::string::npos);
+    CHECK(finalizeAttempt!=std::string::npos);
+    CHECK(noProgressGuard!=std::string::npos);
+    CHECK(finalReadbacks!=std::string::npos);
+    CHECK(successMap!=std::string::npos);
+    CHECK(successPublish!=std::string::npos);
+    CHECK(successReset!=std::string::npos);
+    CHECK(incomingConsume<finalizeAttempt &&
+          finalizeAttempt<noProgressGuard &&
+          noProgressGuard<finalReadbacks && finalReadbacks<successMap &&
+          successMap<successPublish && successPublish<successReset);
+    CHECK(CountSourceText(pump,
+        "ReadPickerRuntimeTerminalTraceSnapshot(")==1);
+
+    const size_t observationTerminal=pump.find(
+        "if(g_picker.transition.terminalAcknowledged)");
+    const size_t observationSchedule=pump.find(
+        "DeferPickerTransitionWork(false)",observationTerminal);
+    const size_t observationStore=pump.find(
+        "StorePickerTraceTerminalDelivery(schedule)",observationSchedule);
+    const size_t observationDeferred=pump.find(
+        "if(schedule.deferred) break",observationStore);
+    CHECK(observationTerminal!=std::string::npos);
+    CHECK(observationSchedule!=std::string::npos);
+    CHECK(observationStore!=std::string::npos);
+    CHECK(observationDeferred!=std::string::npos);
+    CHECK(observationTerminal<observationSchedule &&
+          observationSchedule<observationStore &&
+          observationStore<observationDeferred);
+
+    const size_t retryClassify=pump.find(
+        "terminalDelivery.retry=\n"
+        "                    DecidePickerTraceDeliveryRoute(",successReset);
+    const size_t retryStore=pump.find(
+        "StorePickerTracePendingTerminalDelivery(",retryClassify);
+    const size_t retryMap=pump.find(
+        "MapPickerTraceTerminalization(",retryStore);
+    const size_t retryPublish=pump.find(
+        "PublishPickerTraceTerminalization(",retryMap);
+    CHECK(retryClassify!=std::string::npos);
+    CHECK(retryStore!=std::string::npos);
+    CHECK(retryMap!=std::string::npos);
+    CHECK(retryPublish!=std::string::npos);
+    CHECK(retryClassify<retryStore && retryStore<retryMap &&
+          retryMap<retryPublish);
+    CHECK(pump.find("terminalDelivery.retry);",retryStore)<retryMap);
+    CHECK(pump.find("terminalAttempt,terminalDelivery);",retryMap)<
+          retryPublish);
+
+    const size_t rearmSchedule=pump.find(
+        "DeferPickerTransitionWork(false)",retryPublish);
+    const size_t rearmDecision=pump.find(
+        "DecidePickerTracePumpRearm(schedule)",rearmSchedule);
+    const size_t rearmTerminalGuard=pump.find(
+        "if(g_pickerTerminalizationPending)",rearmDecision);
+    const size_t rearmStore=pump.find(
+        "StorePickerTraceTerminalDelivery(decision.delivery)",
+        rearmTerminalGuard);
+    CHECK(rearmSchedule!=std::string::npos);
+    CHECK(rearmDecision!=std::string::npos);
+    CHECK(rearmTerminalGuard!=std::string::npos);
+    CHECK(rearmStore!=std::string::npos);
+    CHECK(rearmSchedule<rearmDecision &&
+          rearmDecision<rearmTerminalGuard &&
+          rearmTerminalGuard<rearmStore);
+    CHECK(CountSourceText(pump,"MapPickerTraceTerminalization(")==2);
+    CHECK(CountSourceText(pump,"PublishPickerTraceTerminalization(")==2);
+    CHECK(CountSourceText(pump,"StorePickerTraceTerminalDelivery(")==2);
+    CHECK(CountSourceText(pump,
+        "StorePickerTracePendingTerminalDelivery(")==1);
+
+    const size_t drainSchedule=drain.find("DeferPickerTransitionWork(delayed)");
+    const size_t drainDurable=drain.find(
+        "PickerDurableKickRequiredAfterDefer(",drainSchedule);
+    const size_t drainMark=drain.find(
+        "schedule=MarkPickerTraceDurableKick(schedule)",drainDurable);
+    const size_t drainTerminalGuard=drain.find(
+        "if(g_pickerTerminalizationPending)",drainMark);
+    const size_t drainStore=drain.find(
+        "StorePickerTraceTerminalDelivery(schedule)",drainTerminalGuard);
+    CHECK(drainSchedule!=std::string::npos);
+    CHECK(drainDurable!=std::string::npos);
+    CHECK(drainMark!=std::string::npos);
+    CHECK(drainTerminalGuard!=std::string::npos);
+    CHECK(drainStore!=std::string::npos);
+    CHECK(drainSchedule<drainDurable && drainDurable<drainMark &&
+          drainMark<drainTerminalGuard && drainTerminalGuard<drainStore);
+
+    const size_t acceptedReset=begin.find(
+        "ResetPickerTracePendingTerminalDelivery(");
+    const size_t acceptedGeneration=begin.find(
+        "g_pickerTraceTerminalizationGeneration=\n"
+        "            g_picker.transition.generation",acceptedReset);
+    const size_t noInitialSwap=begin.find(
+        "g_picker.transition.swap(prepared)",acceptedGeneration);
+    const size_t noInitialReset=begin.find(
+        "ResetPickerTracePendingTerminalDelivery(",noInitialSwap);
+    const size_t noInitialReturn=begin.find(
+        "return finish(PickerTraceMoveBeginReason::NoInitialEffect)",
+        noInitialReset);
+    CHECK(acceptedReset!=std::string::npos);
+    CHECK(acceptedGeneration!=std::string::npos);
+    CHECK(noInitialSwap!=std::string::npos);
+    CHECK(noInitialReset!=std::string::npos);
+    CHECK(noInitialReturn!=std::string::npos);
+    CHECK(acceptedReset<acceptedGeneration &&
+          acceptedGeneration<noInitialSwap && noInitialSwap<noInitialReset &&
+          noInitialReset<noInitialReturn);
+    CHECK(CountSourceText(begin,
+        "ResetPickerTracePendingTerminalDelivery(")==2);
+    CHECK(CountSourceText(quiesce,
+        "ResetPickerTracePendingTerminalDelivery(")==1);
+    CHECK(CountSourceText(source,
+        "ResetPickerTracePendingTerminalDelivery(")==4);
+    CHECK(CountSourceText(source,"StorePickerTraceTerminalDelivery(")==5);
+    CHECK(CountSourceText(source,
+        "StorePickerTracePendingTerminalDelivery(")==2);
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
@@ -22525,6 +23673,12 @@ int main(){
     test_picker_trace_terminal_classifiers_are_fixed();
     test_picker_trace_terminal_classifiers_follow_real_reductions();
     test_picker_trace_task8_runtime_wiring_is_explicit();
+    test_picker_trace_terminalization_driver_reports_every_boundary();
+    test_picker_trace_terminal_delivery_is_one_shot_and_exact();
+    test_picker_trace_terminal_delivery_precedence_is_fixed();
+    test_picker_trace_terminalization_serializes_only_available_facts();
+    test_picker_trace_task9_vocabulary_is_exhaustive();
+    test_picker_trace_task9_runtime_wiring_is_causal_and_private();
     test_picker_uses_self_contained_gdi_buffer();
     test_picker_icon_loading_is_bounded_and_outside_paint();
     test_picker_enum_publishes_display_only_rows_safely();

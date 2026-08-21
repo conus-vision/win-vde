@@ -637,7 +637,7 @@ inline bool PickerRuntimeTerminalizationReady(
 }
 
 enum class PickerTerminalGuardReleaseAction {
-    ResolvedAbsent, ConsumeExact, RetryExactOwner
+    ResolvedAbsent, ConsumeExact, RetryExactOwner, Count
 };
 
 inline PickerTerminalGuardReleaseAction DecidePickerTerminalGuardRelease(

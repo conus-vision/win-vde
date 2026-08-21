@@ -115,11 +115,11 @@ enum class PickerTraceDeliveryRoute : uint8_t {
 enum class PickerTraceTerminalizationReason : uint8_t {
     Completed, TerminalNotAcknowledged, PendingEffect,
     ReservationReleaseException, ReservationNotReleased,
-    RuntimeKeyMissing, RuntimeNotReady, FinalizeStateFailed
+    RuntimeKeyMissing, RuntimeNotReady, FinalizeStateFailed, Count
 };
 
 enum class PickerTraceTerminalOutcome : uint8_t {
-    Succeeded, Cancelled, Failed
+    Succeeded, Cancelled, Failed, Count
 };
 
 enum class PickerTraceRollbackTrigger : uint8_t {
@@ -137,7 +137,7 @@ enum class PickerTraceDiagnosticCode : uint8_t {
 
 enum class PickerTraceReservationExceptionStage : uint8_t {
     None, FirstDecision, CheckpointCallback, Refind,
-    SecondDecision, Erase
+    SecondDecision, Erase, Count
 };
 
 struct PickerTraceAltTabFacts {
@@ -602,6 +602,119 @@ PickerEffect AdvancePickerTransitionTraced(
     PickerTraceSession* trace,PickerTraceTerminalMetadata* metadata)
     noexcept;
 
+struct PickerTraceReservationReleaseFacts {
+    PickerTerminalGuardReleaseAction firstAction=
+        PickerTerminalGuardReleaseAction::ResolvedAbsent;
+    PickerTerminalGuardReleaseAction retryAction=
+        PickerTerminalGuardReleaseAction::ResolvedAbsent;
+    PickerTraceReservationExceptionStage exceptionStage=
+        PickerTraceReservationExceptionStage::None;
+    bool attempted=false;
+    bool firstActionAvailable=false;
+    bool retryActionAvailable=false;
+    bool exceptionStageAvailable=false;
+    bool retried=false;
+    bool threw=false;
+    bool released=false;
+};
+
+struct PickerTraceTerminalizationRunResult {
+    PickerTraceTerminalizationReason reason=
+        PickerTraceTerminalizationReason::RuntimeNotReady;
+    PickerTraceReservationReleaseFacts release;
+    bool terminalAcknowledged=false;
+    bool pendingEffectNone=false;
+    bool runtimeKeyPresent=false;
+    bool ready=false;
+    bool finalized=false;
+    bool completed=false;
+};
+
+struct PickerTraceTerminalDeliveryFacts {
+    PickerTraceDeliveryRoute incoming=PickerTraceDeliveryRoute::None;
+    PickerTraceDeliveryRoute retry=PickerTraceDeliveryRoute::None;
+    bool incomingAvailable=false;
+    bool retryAvailable=false;
+};
+
+struct PickerTracePendingTerminalDelivery {
+    uint64_t generation=0;
+    PickerTraceDeliveryRoute route=PickerTraceDeliveryRoute::None;
+    bool available=false;
+};
+
+void StorePickerTracePendingTerminalDelivery(
+    PickerTracePendingTerminalDelivery&,uint64_t generation,
+    PickerTraceDeliveryRoute) noexcept;
+bool ConsumePickerTracePendingTerminalDelivery(
+    PickerTracePendingTerminalDelivery&,uint64_t generation,
+    PickerTraceDeliveryRoute& route) noexcept;
+void ResetPickerTracePendingTerminalDelivery(
+    PickerTracePendingTerminalDelivery&) noexcept;
+
+PickerTraceTerminalizationReason DecidePickerTraceTerminalizationReason(
+    bool terminalAcknowledged,bool pendingEffectNone,
+    bool releaseThrew,bool reservationReleased,
+    bool runtimeKeyPresent,bool ready,bool finalized) noexcept;
+
+PickerTraceDeliveryRoute DecidePickerTraceDeliveryRoute(
+    bool shutdownDrain,bool delayedTimer,bool posted,bool timerArmed,
+    bool inlineFallback,bool durableKick) noexcept;
+
+template<class Release,class Ready,class Finalize>
+PickerTraceTerminalizationRunResult DrivePickerTraceTerminalization(
+        bool terminalAcknowledged,bool pendingEffectNone,
+        bool runtimeKeyPresent,Release release,Ready ready,
+        Finalize finalize) noexcept {
+    PickerTraceTerminalizationRunResult result;
+    result.terminalAcknowledged=terminalAcknowledged;
+    result.pendingEffectNone=pendingEffectNone;
+    result.runtimeKeyPresent=runtimeKeyPresent;
+    if(!terminalAcknowledged){
+        result.reason=
+            PickerTraceTerminalizationReason::TerminalNotAcknowledged;
+        return result;
+    }
+    if(!pendingEffectNone){
+        result.reason=PickerTraceTerminalizationReason::PendingEffect;
+        return result;
+    }
+    result.release.attempted=true;
+    try {
+        result.release.released=release(result.release);
+    } catch(...) {
+        result.release.threw=true;
+        result.reason=
+            PickerTraceTerminalizationReason::ReservationReleaseException;
+        return result;
+    }
+    if(!result.release.released){
+        result.reason=
+            PickerTraceTerminalizationReason::ReservationNotReleased;
+        return result;
+    }
+    if(!runtimeKeyPresent){
+        result.reason=PickerTraceTerminalizationReason::RuntimeKeyMissing;
+        return result;
+    }
+    try { result.ready=ready(); }
+    catch(...) { result.ready=false; }
+    if(!result.ready){
+        result.reason=PickerTraceTerminalizationReason::RuntimeNotReady;
+        return result;
+    }
+    try { result.finalized=finalize(); }
+    catch(...) { result.finalized=false; }
+    if(!result.finalized){
+        result.reason=
+            PickerTraceTerminalizationReason::FinalizeStateFailed;
+        return result;
+    }
+    result.completed=true;
+    result.reason=PickerTraceTerminalizationReason::Completed;
+    return result;
+}
+
 struct PickerTraceTerminalizationAttemptEvent {
     uint64_t generation=0;
     uint64_t attempt=0;
@@ -650,6 +763,29 @@ struct PickerTraceTransitionTerminalEvent {
     GUID popupDesktop{};
     GUID currentDesktop{};
 };
+
+struct PickerTraceTerminalizationEmission {
+    PickerTraceTerminalizationAttemptEvent attempt;
+    bool terminalAllowed=false;
+};
+
+struct PickerTraceTerminalizationEventObserver {
+    void* context=nullptr;
+    void (*emitAttempt)(
+        void*,const PickerTraceTerminalizationAttemptEvent&) noexcept=nullptr;
+    void (*emitTerminal)(
+        void*,const PickerTraceTransitionTerminalEvent&) noexcept=nullptr;
+    void (*flushBoundary)(void*) noexcept=nullptr;
+};
+
+PickerTraceTerminalizationEmission MapPickerTraceTerminalization(
+    const PickerTraceTerminalizationRunResult&,uint64_t generation,
+    uint64_t attempt,const PickerTraceTerminalDeliveryFacts&) noexcept;
+
+void PublishPickerTraceTerminalization(
+    const PickerTraceTerminalizationEmission&,
+    const PickerTraceTransitionTerminalEvent* terminal,
+    const PickerTraceTerminalizationEventObserver* observer) noexcept;
 
 const char* PickerTraceOpenResultName(PickerTraceOpenResult) noexcept;
 const char* PickerTraceDesktopSnapshotStatusName(

@@ -853,6 +853,114 @@ PickerEffect AdvancePickerTransitionTraced(
     return result;
 }
 
+void StorePickerTracePendingTerminalDelivery(
+        PickerTracePendingTerminalDelivery& pending,uint64_t generation,
+        PickerTraceDeliveryRoute route) noexcept {
+    pending.generation=generation;
+    pending.route=route;
+    pending.available=true;
+}
+
+void ResetPickerTracePendingTerminalDelivery(
+        PickerTracePendingTerminalDelivery& pending) noexcept {
+    pending=PickerTracePendingTerminalDelivery{};
+}
+
+bool ConsumePickerTracePendingTerminalDelivery(
+        PickerTracePendingTerminalDelivery& pending,uint64_t generation,
+        PickerTraceDeliveryRoute& route) noexcept {
+    route=PickerTraceDeliveryRoute::None;
+    if(!pending.available) return false;
+    if(pending.generation!=generation){
+        ResetPickerTracePendingTerminalDelivery(pending);
+        return false;
+    }
+    route=pending.route;
+    ResetPickerTracePendingTerminalDelivery(pending);
+    return true;
+}
+
+PickerTraceTerminalizationReason DecidePickerTraceTerminalizationReason(
+        bool terminalAcknowledged,bool pendingEffectNone,
+        bool releaseThrew,bool reservationReleased,
+        bool runtimeKeyPresent,bool ready,bool finalized) noexcept {
+    if(!terminalAcknowledged)
+        return PickerTraceTerminalizationReason::TerminalNotAcknowledged;
+    if(!pendingEffectNone)
+        return PickerTraceTerminalizationReason::PendingEffect;
+    if(releaseThrew)
+        return PickerTraceTerminalizationReason::ReservationReleaseException;
+    if(!reservationReleased)
+        return PickerTraceTerminalizationReason::ReservationNotReleased;
+    if(!runtimeKeyPresent)
+        return PickerTraceTerminalizationReason::RuntimeKeyMissing;
+    if(!ready)
+        return PickerTraceTerminalizationReason::RuntimeNotReady;
+    if(!finalized)
+        return PickerTraceTerminalizationReason::FinalizeStateFailed;
+    return PickerTraceTerminalizationReason::Completed;
+}
+
+PickerTraceDeliveryRoute DecidePickerTraceDeliveryRoute(
+        bool shutdownDrain,bool delayedTimer,bool posted,bool timerArmed,
+        bool inlineFallback,bool durableKick) noexcept {
+    if(shutdownDrain) return PickerTraceDeliveryRoute::ShutdownDrain;
+    if(delayedTimer) return PickerTraceDeliveryRoute::DelayedTimer;
+    if(posted) return PickerTraceDeliveryRoute::Posted;
+    if(timerArmed) return PickerTraceDeliveryRoute::TimerArmed;
+    if(inlineFallback) return PickerTraceDeliveryRoute::InlineFallback;
+    if(durableKick) return PickerTraceDeliveryRoute::DurableExternalKick;
+    return PickerTraceDeliveryRoute::None;
+}
+
+PickerTraceTerminalizationEmission MapPickerTraceTerminalization(
+        const PickerTraceTerminalizationRunResult& run,uint64_t generation,
+        uint64_t attempt,
+        const PickerTraceTerminalDeliveryFacts& delivery) noexcept {
+    PickerTraceTerminalizationEmission result;
+    result.attempt.generation=generation;
+    result.attempt.attempt=attempt;
+    result.attempt.reason=run.reason;
+    result.attempt.incomingDelivery=delivery.incoming;
+    result.attempt.retryDelivery=delivery.retry;
+    result.attempt.incomingDeliveryAvailable=delivery.incomingAvailable;
+    result.attempt.retryDeliveryAvailable=delivery.retryAvailable;
+    result.attempt.terminalAcknowledged=run.terminalAcknowledged;
+    result.attempt.pendingEffectNone=run.pendingEffectNone;
+    result.attempt.runtimeKeyPresent=run.runtimeKeyPresent;
+    result.attempt.releaseAttempted=run.release.attempted;
+    result.attempt.firstReleaseActionAvailable=
+        run.release.firstActionAvailable;
+    result.attempt.retryReleaseActionAvailable=
+        run.release.retryActionAvailable;
+    result.attempt.releaseExceptionStageAvailable=
+        run.release.exceptionStageAvailable;
+    result.attempt.firstReleaseAction=run.release.firstAction;
+    result.attempt.retryReleaseAction=run.release.retryAction;
+    result.attempt.releaseExceptionStage=run.release.exceptionStage;
+    result.attempt.releaseRetried=run.release.retried;
+    result.attempt.releaseThrew=run.release.threw;
+    result.attempt.reservationReleased=run.release.released;
+    result.attempt.ready=run.ready;
+    result.attempt.finalized=run.finalized;
+    result.terminalAllowed=run.completed;
+    return result;
+}
+
+void PublishPickerTraceTerminalization(
+        const PickerTraceTerminalizationEmission& emission,
+        const PickerTraceTransitionTerminalEvent* terminal,
+        const PickerTraceTerminalizationEventObserver* observer) noexcept {
+    if(!observer) return;
+    if(observer->emitAttempt)
+        observer->emitAttempt(observer->context,emission.attempt);
+    if(!emission.terminalAllowed || !terminal) return;
+    if(observer->emitTerminal)
+        observer->emitTerminal(observer->context,*terminal);
+    if(observer->flushBoundary)
+        observer->flushBoundary(observer->context);
+}
+
 const char* PickerTraceRecaptureName(WindowIdentityRecapture value) noexcept {
     switch(value){
     VDE_TRACE_NAME_CASE(WindowIdentityRecapture,Match,"match");
@@ -1351,7 +1459,7 @@ bool SerializePickerTraceLine(
         const PickerTraceTerminalizationAttemptEvent& event,
         std::string& output) noexcept {
     return PickerTraceSerialize(envelope,"terminalization.attempt",[&](auto& json){
-        return json.unsignedNumber("generation",event.generation) &&
+        bool ok=json.unsignedNumber("generation",event.generation) &&
             json.unsignedNumber("attempt",event.attempt) &&
             json.string("reason",PickerTraceTerminalizationReasonName(event.reason)) &&
             json.string("incoming_delivery",PickerTraceDeliveryRouteName(event.incomingDelivery)) &&
@@ -1360,10 +1468,20 @@ bool SerializePickerTraceLine(
             json.boolean("retry_delivery_available",event.retryDeliveryAvailable) &&
             json.boolean("terminal_acknowledged",event.terminalAcknowledged) &&
             json.boolean("pending_effect_none",event.pendingEffectNone) &&
-            json.boolean("runtime_key_present",event.runtimeKeyPresent) &&
-            json.string("first_release_action",PickerTraceTerminalGuardReleaseActionName(event.firstReleaseAction)) &&
-            json.string("retry_release_action",PickerTraceTerminalGuardReleaseActionName(event.retryReleaseAction)) &&
-            json.string("release_exception_stage",PickerTraceReservationExceptionStageName(event.releaseExceptionStage)) &&
+            json.boolean("runtime_key_present",event.runtimeKeyPresent);
+        if(ok && event.firstReleaseActionAvailable)
+            ok=json.string("first_release_action",
+                PickerTraceTerminalGuardReleaseActionName(
+                    event.firstReleaseAction));
+        if(ok && event.retryReleaseActionAvailable)
+            ok=json.string("retry_release_action",
+                PickerTraceTerminalGuardReleaseActionName(
+                    event.retryReleaseAction));
+        if(ok && event.releaseExceptionStageAvailable)
+            ok=json.string("release_exception_stage",
+                PickerTraceReservationExceptionStageName(
+                    event.releaseExceptionStage));
+        return ok &&
             json.boolean("release_attempted",event.releaseAttempted) &&
             json.boolean("first_release_action_available",event.firstReleaseActionAvailable) &&
             json.boolean("retry_release_action_available",event.retryReleaseActionAvailable) &&
