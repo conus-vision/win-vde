@@ -37,6 +37,11 @@ struct FinalizationState {
     void retry(){
         running = false;
     }
+
+    void reopen(){
+        running = false;
+        finished = false;
+    }
 };
 
 enum class AutoRuntimeStartResult {
@@ -502,11 +507,18 @@ public:
     }
 };
 
-template<class Finalize,class Destroy>
-inline bool RunTrayExit(Finalize finalize,Destroy destroy) noexcept {
-    try { (void)finalize(); } catch(...) {}
-    try { destroy(); return true; }
-    catch(...) { return false; }
+template<class Finalize,class Destroy,class Rearm>
+inline bool RunTrayExit(Finalize finalize,Destroy destroy,Rearm rearm) noexcept {
+    bool finalized=false;
+    try { finalized=finalize(); } catch(...) { finalized=false; }
+    if(!finalized) return false;
+    bool destroyed=false;
+    try { destroyed=static_cast<bool>(destroy()); }
+    catch(...) { destroyed=false; }
+    if(destroyed) return true;
+    try { rearm(); }
+    catch(...) {}
+    return false;
 }
 
 class RuntimeQuiescenceState {
@@ -1394,6 +1406,190 @@ inline bool DesktopServicesReady(bool internalManager,
     return internalManager && applicationViews && documentedManager;
 }
 
+template<class Release>
+inline bool ValidateComOutPointerOrRelease(
+        HRESULT result,bool pointerPresent,Release release) noexcept {
+    if(SUCCEEDED(result) && pointerPresent) return true;
+    if(pointerPresent){
+        try { release(); }
+        catch(...) {}
+    }
+    return false;
+}
+
+enum class DesktopCollectionLookupKind { Index, Guid };
+static const UINT MAX_VIRTUAL_DESKTOPS=64U;
+
+struct DesktopCollectionLookupRequest {
+    DesktopCollectionLookupKind kind=DesktopCollectionLookupKind::Index;
+    UINT index=0;
+    GUID guid={0};
+
+    static DesktopCollectionLookupRequest ByIndex(UINT requested) noexcept {
+        DesktopCollectionLookupRequest result;
+        result.kind=DesktopCollectionLookupKind::Index;
+        result.index=requested;
+        return result;
+    }
+
+    static DesktopCollectionLookupRequest ByGuid(
+            const GUID& requested) noexcept {
+        DesktopCollectionLookupRequest result;
+        result.kind=DesktopCollectionLookupKind::Guid;
+        result.guid=requested;
+        return result;
+    }
+};
+
+template<class Array,class Ops>
+class DesktopCollectionArrayOutputOwner {
+public:
+    DesktopCollectionArrayOutputOwner(Array*& value,Ops& ops) noexcept
+        :value_(value),ops_(ops){}
+    ~DesktopCollectionArrayOutputOwner() noexcept { reset(); }
+    DesktopCollectionArrayOutputOwner(
+        const DesktopCollectionArrayOutputOwner&)=delete;
+    DesktopCollectionArrayOutputOwner& operator=(
+        const DesktopCollectionArrayOutputOwner&)=delete;
+
+private:
+    void reset() noexcept {
+        if(!value_) return;
+        Array* value=value_;
+        value_=nullptr;
+        try { ops_.releaseArray(value); }
+        catch(...) {}
+    }
+
+    Array*& value_;
+    Ops& ops_;
+};
+
+template<class Desktop,class Ops>
+class DesktopCollectionItemOutputOwner {
+public:
+    DesktopCollectionItemOutputOwner(Desktop*& value,Ops& ops) noexcept
+        :value_(value),ops_(ops){}
+    ~DesktopCollectionItemOutputOwner() noexcept { reset(); }
+    DesktopCollectionItemOutputOwner(
+        const DesktopCollectionItemOutputOwner&)=delete;
+    DesktopCollectionItemOutputOwner& operator=(
+        const DesktopCollectionItemOutputOwner&)=delete;
+
+    Desktop* release() noexcept {
+        Desktop* value=value_;
+        value_=nullptr;
+        return value;
+    }
+
+private:
+    void reset() noexcept {
+        if(!value_) return;
+        Desktop* value=value_;
+        value_=nullptr;
+        try { ops_.releaseDesktop(value); }
+        catch(...) {}
+    }
+
+    Desktop*& value_;
+    Ops& ops_;
+};
+
+struct DesktopCollectionEntry {
+    UINT index;
+    GUID guid;
+};
+
+template<class Array,class Desktop,class Ops>
+inline bool SnapshotDesktopCollectionOwned(
+        Ops& ops,std::vector<DesktopCollectionEntry>& snapshotOut) noexcept {
+    try {
+        Array* array=nullptr;
+        DesktopCollectionArrayOutputOwner<Array,Ops> arrayOwner(array,ops);
+        const HRESULT desktopsResult=ops.getDesktops(&array);
+        if(FAILED(desktopsResult) || !array) return false;
+
+        UINT count=0;
+        const HRESULT countResult=ops.getCount(array,&count);
+        if(FAILED(countResult) || count==0 ||
+           count>MAX_VIRTUAL_DESKTOPS) return false;
+        std::vector<DesktopCollectionEntry> staged;
+        staged.reserve(count);
+        for(UINT i=0;i<count;++i){
+            Desktop* desktop=nullptr;
+            DesktopCollectionItemOutputOwner<Desktop,Ops> desktopOwner(
+                desktop,ops);
+            const HRESULT atResult=ops.getAt(array,i,&desktop);
+            if(FAILED(atResult) || !desktop) return false;
+            GUID id={0};
+            const HRESULT idResult=ops.getId(desktop,&id);
+            if(FAILED(idResult) || GuidIsZero(id)) return false;
+            DesktopCollectionEntry entry={i,id};
+            staged.push_back(entry);
+        }
+        snapshotOut.swap(staged);
+        return true;
+    } catch(...) {
+        return false;
+    }
+}
+
+template<class Array,class Desktop,class Ops,class DesktopOwner>
+inline bool LookupDesktopCollectionOwned(
+        const DesktopCollectionLookupRequest& request,Ops& ops,
+        DesktopOwner& desktopOut,int& indexOut) noexcept {
+    static_assert(noexcept(desktopOut.reset()),
+                  "desktop output owner reset must be noexcept");
+    static_assert(noexcept(desktopOut.reset(static_cast<Desktop*>(nullptr))),
+                  "desktop output owner adoption must be noexcept");
+    desktopOut.reset();
+    indexOut=-1;
+    if(request.kind==DesktopCollectionLookupKind::Guid &&
+       GuidIsZero(request.guid)) return false;
+
+    try {
+        Array* array=nullptr;
+        DesktopCollectionArrayOutputOwner<Array,Ops> arrayOwner(array,ops);
+        const HRESULT desktopsResult=ops.getDesktops(&array);
+        if(FAILED(desktopsResult) || !array) return false;
+
+        UINT count=0;
+        const HRESULT countResult=ops.getCount(array,&count);
+        if(FAILED(countResult) || count==0 ||
+           count>MAX_VIRTUAL_DESKTOPS) return false;
+        if(request.kind==DesktopCollectionLookupKind::Index &&
+           request.index>=count) return false;
+        if(request.kind!=DesktopCollectionLookupKind::Index &&
+           request.kind!=DesktopCollectionLookupKind::Guid) return false;
+
+        const UINT begin=request.kind==DesktopCollectionLookupKind::Index
+            ? request.index : 0U;
+        const UINT end=request.kind==DesktopCollectionLookupKind::Index
+            ? request.index+1U : count;
+        for(UINT i=begin;i<end;++i){
+            Desktop* desktop=nullptr;
+            DesktopCollectionItemOutputOwner<Desktop,Ops> desktopOwner(
+                desktop,ops);
+            const HRESULT atResult=ops.getAt(array,i,&desktop);
+            if(FAILED(atResult) || !desktop) return false;
+            GUID id={0};
+            const HRESULT idResult=ops.getId(desktop,&id);
+            if(FAILED(idResult) || GuidIsZero(id)) return false;
+            const bool matches=
+                request.kind==DesktopCollectionLookupKind::Index ||
+                IsEqualGUID(id,request.guid);
+            if(!matches) continue;
+            desktopOut.reset(desktop);
+            desktopOwner.release();
+            indexOut=static_cast<int>(i);
+            return true;
+        }
+        return false;
+    } catch(...) {
+        return false;
+    }
+}
+
 template<class Initialize,class Sanity,class Release>
 inline bool InitializeServicesWithRollback(Initialize initialize,
                                            Sanity sanity,Release release){
@@ -1620,22 +1816,87 @@ inline ReconcilePlan PlanAppReconcile(
             if(live[i].app==app && !matchedLive[i])
                 unmatchedLive.push_back(i);
         if(!unmatchedProvisionals.empty() && !unmatchedLive.empty()){
-            if(unmatchedProvisionals.size()!=1 || unmatchedLive.size()!=1)
-                return deferredPlan();
-            LayoutMatch adopted;
-            adopted.savedIndex=unmatchedProvisionals[0];
-            adopted.liveIndex=unmatchedLive[0];
-            adopted.score=1.0;
-            plan.matches.push_back(adopted);
-            matchedSaved[adopted.savedIndex]=true;
-            matchedLive[adopted.liveIndex]=true;
-            if(!GuidEq(existing[adopted.savedIndex].desktop,
-                       live[adopted.liveIndex].desktop)){
-                RestoreRequest restore;
-                restore.savedIndex=adopted.savedIndex;
-                restore.liveIndex=adopted.liveIndex;
-                restore.destination=existing[adopted.savedIndex].desktop;
-                plan.restores.push_back(restore);
+            bool unresolvedEstablished=false;
+            for(size_t i=0;i<existing.size();++i)
+                if(existing[i].app==app && !existing[i].provisional &&
+                   !IsExpired(existing[i],nowUtc) && !isReserved(i) &&
+                   !matchedSaved[i])
+                    unresolvedEstablished=true;
+
+            std::vector<std::pair<size_t,size_t> > adoptions;
+            if(unmatchedProvisionals.size()==1 && unmatchedLive.size()==1){
+                adoptions.push_back(std::make_pair(
+                    unmatchedProvisionals[0],unmatchedLive[0]));
+            } else {
+                std::map<std::string,size_t> provisionalTitleCounts;
+                std::map<std::string,size_t> liveTitleCounts;
+                std::map<std::string,size_t> liveByTitle;
+                for(size_t index : unmatchedProvisionals){
+                    const std::string title=NormalizeProvisionalAdoptionTitle(
+                        existing[index].activeTitle);
+                    if(!title.empty()) ++provisionalTitleCounts[title];
+                }
+                for(size_t index : unmatchedLive){
+                    const std::string title=NormalizeProvisionalAdoptionTitle(
+                        live[index].activeTitle);
+                    if(!title.empty()){
+                        ++liveTitleCounts[title];
+                        liveByTitle[title]=index;
+                    }
+                }
+                for(size_t index : unmatchedProvisionals){
+                    const std::string title=NormalizeProvisionalAdoptionTitle(
+                        existing[index].activeTitle);
+                    if(!title.empty() && provisionalTitleCounts[title]==1 &&
+                       liveTitleCounts[title]==1)
+                        adoptions.push_back(std::make_pair(
+                            index,liveByTitle[title]));
+                }
+                if(adoptions.size()<unmatchedProvisionals.size() &&
+                   adoptions.size()<unmatchedLive.size()){
+                    std::set<size_t> adoptedSaved,adoptedLive;
+                    for(const auto& adoption : adoptions){
+                        adoptedSaved.insert(adoption.first);
+                        adoptedLive.insert(adoption.second);
+                    }
+                    std::set<std::string> residualProvisionalTitles;
+                    for(size_t index : unmatchedProvisionals){
+                        if(adoptedSaved.count(index)!=0) continue;
+                        const std::string title=NormalizeProvisionalAdoptionTitle(
+                            existing[index].activeTitle);
+                        if(title.empty()) return deferredPlan();
+                        residualProvisionalTitles.insert(title);
+                    }
+                    for(size_t index : unmatchedLive){
+                        if(adoptedLive.count(index)!=0) continue;
+                        const std::string title=NormalizeProvisionalAdoptionTitle(
+                            live[index].activeTitle);
+                        if(title.empty() ||
+                           residualProvisionalTitles.count(title)!=0)
+                            return deferredPlan();
+                    }
+                }
+            }
+            if(unresolvedEstablished)
+                for(size_t index : unmatchedLive)
+                    if(live[index].counts.empty())
+                        return deferredPlan();
+            for(const auto& adoption : adoptions){
+                LayoutMatch adopted;
+                adopted.savedIndex=adoption.first;
+                adopted.liveIndex=adoption.second;
+                adopted.score=1.0;
+                plan.matches.push_back(adopted);
+                matchedSaved[adopted.savedIndex]=true;
+                matchedLive[adopted.liveIndex]=true;
+                if(!GuidEq(existing[adopted.savedIndex].desktop,
+                           live[adopted.liveIndex].desktop)){
+                    RestoreRequest restore;
+                    restore.savedIndex=adopted.savedIndex;
+                    restore.liveIndex=adopted.liveIndex;
+                    restore.destination=existing[adopted.savedIndex].desktop;
+                    plan.restores.push_back(restore);
+                }
             }
         }
     }
@@ -1676,6 +1937,57 @@ inline ReconcilePlan PlanAppReconcile(
         }
     }
     return plan;
+}
+
+enum class CliRestoreMatchStatus {
+    Ready,
+    Deferred,
+    TooComplex
+};
+
+struct CliRestoreMatchPlan {
+    CliRestoreMatchStatus status=CliRestoreMatchStatus::Deferred;
+    std::vector<LayoutMatch> matches;
+};
+
+inline CliRestoreMatchPlan PlanCliCheckpointRestoreMatches(
+        bool manual,const std::vector<LayoutWin>& saved,
+        const std::vector<LayoutWin>& live,
+        const std::vector<std::string>& enabledApps,UnixSeconds nowUtc) noexcept {
+    CliRestoreMatchPlan output;
+    if(saved.size()>MAX_LAYOUT_RECORDS || live.size()>MAX_LAYOUT_RECORDS ||
+       enabledApps.size()>MAX_LAYOUT_RECORDS) return output;
+    try {
+        if(manual){
+            bool tooComplex=false;
+            output.matches=MatchOneToOne(saved,live,0.55,&tooComplex);
+            output.status=tooComplex ? CliRestoreMatchStatus::TooComplex
+                                     : CliRestoreMatchStatus::Ready;
+            if(tooComplex) output.matches.clear();
+            return output;
+        }
+        if(nowUtc<=0) return output;
+        std::set<std::string> plannedApps;
+        for(const std::string& app : enabledApps){
+            if(!IsSupportedLayoutApp(app) || !plannedApps.insert(app).second)
+                return CliRestoreMatchPlan();
+            const ReconcilePlan plan=PlanAppReconcile(
+                saved,live,app,nowUtc);
+            if(plan.deferred){
+                output.status=plan.tooComplex
+                    ? CliRestoreMatchStatus::TooComplex
+                    : CliRestoreMatchStatus::Deferred;
+                output.matches.clear();
+                return output;
+            }
+            if(plan.matches.size()>MAX_LAYOUT_RECORDS-output.matches.size())
+                return CliRestoreMatchPlan();
+            output.matches.insert(
+                output.matches.end(),plan.matches.begin(),plan.matches.end());
+        }
+        output.status=CliRestoreMatchStatus::Ready;
+        return output;
+    } catch(...) { return CliRestoreMatchPlan(); }
 }
 
 inline std::vector<LayoutWin> CommitAppReconcile(

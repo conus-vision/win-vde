@@ -68,6 +68,22 @@ restart, and moves each matched window to the desktop it was saved on.
   interfaces, the app explains what happened and runs in a limited mode instead
   of failing silently.
 
+### Window memory and desktop picker
+
+- Automatic window memory covers every Firefox, Google Chrome, and Microsoft
+  Edge top-level browser window, and no other application.
+- A closed browser window remains remembered for exactly 30 days. Reopening it
+  before expiry restores its remembered virtual desktop before the rolling
+  layout is updated; records expire at the 30-day boundary.
+- Ctrl+Click moves the active window, switches to the target desktop, and keeps
+  the picker open with the current desktop and active window highlighted.
+  Ordinary click switches desktops and closes the picker.
+- The footer links to [Virtual Desktop Extension](https://github.com/conus-vision/win-vde)
+  and [Conus Vision](https://conus.vision).
+- Layout v4 is migrated automatically from v2/v3. The legacy
+  `%LOCALAPPDATA%\VirtualDesktopsExtention` directory and matching registry key
+  keep their historical spelling for compatibility.
+
 ## Install / Build
 
 Requires **Visual Studio 2022 or 2017** with the x64 build tools. From a normal

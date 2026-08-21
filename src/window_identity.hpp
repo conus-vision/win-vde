@@ -25,6 +25,16 @@ enum class WindowIdentityRecapture {
     Indeterminate
 };
 
+inline bool FinalFastWindowIdentityCanPublish(
+        WindowIdentityRecapture recapture) noexcept {
+    return recapture==WindowIdentityRecapture::Match;
+}
+
+inline bool FinalFastWindowIdentityFailureInvalidatesEveryProfile(
+        WindowIdentityRecapture recapture) noexcept {
+    return recapture!=WindowIdentityRecapture::Match;
+}
+
 enum class PopupBrowserClassification {
     Tracked,
     NotTracked,
@@ -243,14 +253,21 @@ inline const Profile* ClassifyBrowserCandidate(
 }
 
 template<class Profile>
-inline bool AcceptFastClassNameRead(
-        int copiedCharacters,const std::vector<Profile>& enabledProfiles,
+inline void MarkFastSnapshotCaptureIncomplete(
+        const std::vector<Profile>& enabledProfiles,
         std::map<std::string,AppFastSnapshot>& snapshots) noexcept {
-    if(copiedCharacters>0) return true;
     for(const Profile& profile : enabledProfiles){
         const auto found=snapshots.find(profile.id);
         if(found!=snapshots.end()) found->second.enumerationComplete=false;
     }
+}
+
+template<class Profile>
+inline bool AcceptFastClassNameRead(
+        int copiedCharacters,const std::vector<Profile>& enabledProfiles,
+        std::map<std::string,AppFastSnapshot>& snapshots) noexcept {
+    if(copiedCharacters>0) return true;
+    MarkFastSnapshotCaptureIncomplete(enabledProfiles,snapshots);
     return false;
 }
 

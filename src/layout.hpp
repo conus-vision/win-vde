@@ -45,6 +45,13 @@ inline int ResolveSavedDesktop(const LayoutWin& saved,
     return -1;
 }
 
+inline bool SavedRestoreDestinationAvailable(
+        const LayoutWin& saved,const GUID& destination,
+        const std::vector<DeskRec>& preparedDesktops){
+    return GuidEq(saved.desktop,destination) &&
+        ResolveSavedDesktop(saved,preparedDesktops)>=0;
+}
+
 struct LayoutMatch {
     size_t savedIndex=0;
     size_t liveIndex=0;
@@ -111,8 +118,61 @@ inline std::vector<LayoutWin> PruneExpired(const std::vector<LayoutWin>& input, 
     return output;
 }
 
+inline std::vector<LayoutWin> MarkOnlyObservedAppsMissing(
+        const std::vector<LayoutWin>& records,
+        const std::set<std::string>& liveRecordIds,
+        const std::set<std::string>& observedApps,
+        UnixSeconds nowUtc){
+    std::vector<LayoutWin> output = records;
+    for(auto& record : output)
+        if(observedApps.count(record.app) && !liveRecordIds.count(record.recordId))
+            MarkMissing(record, nowUtc);
+    return PruneExpired(output, nowUtc);
+}
+
+inline bool CanBindFinalProvisional(
+        const std::vector<LayoutWin>& records,
+        const std::set<std::string>& claimedRecordIds,
+        const LayoutWin& provisional,bool runtimeHasPendingClaim,
+        bool runtimeHasBoundClaim,UnixSeconds nowUtc){
+    if(!provisional.provisional || provisional.app.empty() || nowUtc<=0)
+        return false;
+    if(runtimeHasPendingClaim || runtimeHasBoundClaim) return false;
+    for(const LayoutWin& record : records)
+        if(record.app==provisional.app && !record.provisional &&
+           !IsExpired(record,nowUtc) &&
+           claimedRecordIds.count(record.recordId)==0)
+            return false;
+    return true;
+}
+
+inline std::string NormalizeProvisionalAdoptionTitle(
+        const std::string& title){
+    std::string normalized;
+    normalized.reserve(title.size());
+    bool pendingSpace=false;
+    for(unsigned char value : title){
+        const bool space=value==' ' || value=='\t' || value=='\r' ||
+            value=='\n' || value=='\f' || value=='\v';
+        if(space){
+            if(!normalized.empty()) pendingSpace=true;
+            continue;
+        }
+        if(pendingSpace){
+            normalized.push_back(' ');
+            pendingSpace=false;
+        }
+        if(value>='A' && value<='Z') value=static_cast<unsigned char>(
+            value-static_cast<unsigned char>('A')+
+            static_cast<unsigned char>('a'));
+        normalized.push_back(static_cast<char>(value));
+    }
+    return normalized;
+}
+
 inline double LayoutScore(const LayoutWin& saved, const LayoutWin& live){
     if(saved.app!=live.app) return 0;
+    if(saved.provisional && saved.counts.empty()) return 0;
     if(saved.counts.empty() || live.counts.empty())
         return !saved.activeTitle.empty() && saved.activeTitle==live.activeTitle ? 1.0 : 0.0;
 

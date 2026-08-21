@@ -108,7 +108,7 @@ static bool g_appFirefox = true, g_appChrome = true, g_appEdge = true;  // ка�
 #define IDC_LINK_REPO 1102
 #define IDC_ABOUT_COPY 1103
 #define IDC_HELP_TEXT 1104
-static const wchar_t* APP_VERSION = L"1.0.0";
+static const wchar_t* APP_VERSION = L"1.1.0";
 
 static HWND g_main=nullptr;
 static void Balloon(const std::wstring& text);
@@ -185,6 +185,7 @@ struct AutoRestoreOperation {
     bool reconcileFastKnown=false;
     ReconcileWorkMode reconcileMode=ReconcileWorkMode::Plan;
     std::vector<FastWin> reconcileFast;
+    std::vector<DeskRec> currentDesktops;
     std::unique_ptr<ReconcileResult> reconcile;
     std::map<std::string,PickerOperationLifetimeClaim>
         pickerClaimedRecordByRuntime;
@@ -349,11 +350,26 @@ static IServiceProvider*               g_shell  = nullptr;
 static IVirtualDesktopManagerInternal* g_vdmi   = nullptr;
 static IApplicationViewCollection*     g_avc    = nullptr;
 static IVirtualDesktopManager*         g_vdmDoc = nullptr;
+static void ReleaseServices();
 static bool InitServices(){
-    if(FAILED(CoCreateInstance(kCLSID_ImmersiveShell,nullptr,CLSCTX_LOCAL_SERVER,__uuidof(IServiceProvider),(void**)&g_shell)))return false;
-    if(FAILED(g_shell->QueryService(kCLSID_VirtualDesktopManagerInternal,kIID_IVirtualDesktopManagerInternal,(void**)&g_vdmi)))return false;
-    if(FAILED(g_shell->QueryService(kIID_IApplicationViewCollection,kIID_IApplicationViewCollection,(void**)&g_avc)))return false;
-    CoCreateInstance(CLSID_VirtualDesktopManager,nullptr,CLSCTX_INPROC_SERVER,IID_IVirtualDesktopManager,(void**)&g_vdmDoc);
+    HRESULT result=CoCreateInstance(
+        kCLSID_ImmersiveShell,nullptr,CLSCTX_LOCAL_SERVER,
+        __uuidof(IServiceProvider),reinterpret_cast<void**>(&g_shell));
+    if(SUCCEEDED(result) && g_shell) result=g_shell->QueryService(
+        kCLSID_VirtualDesktopManagerInternal,kIID_IVirtualDesktopManagerInternal,
+        reinterpret_cast<void**>(&g_vdmi));
+    else if(SUCCEEDED(result)) result=E_NOINTERFACE;
+    if(SUCCEEDED(result)) result=g_shell->QueryService(
+        kIID_IApplicationViewCollection,kIID_IApplicationViewCollection,
+        reinterpret_cast<void**>(&g_avc));
+    if(SUCCEEDED(result)) result=CoCreateInstance(
+        CLSID_VirtualDesktopManager,nullptr,CLSCTX_INPROC_SERVER,
+        IID_IVirtualDesktopManager,reinterpret_cast<void**>(&g_vdmDoc));
+    if(FAILED(result) ||
+       !DesktopServicesReady(g_vdmi!=nullptr,g_avc!=nullptr,g_vdmDoc!=nullptr)){
+        ReleaseServices();
+        return false;
+    }
     return true;
 }
 static void ReleaseServices(){
@@ -362,14 +378,44 @@ static void ReleaseServices(){
     if(g_vdmi){ g_vdmi->Release(); g_vdmi=nullptr; }
     if(g_shell){ g_shell->Release(); g_shell=nullptr; }
 }
+
+template<class T>
+class ScopedComPtr {
+public:
+    ScopedComPtr()=default;
+    explicit ScopedComPtr(T* value):value_(value){}
+    ~ScopedComPtr() noexcept { reset(); }
+    ScopedComPtr(const ScopedComPtr&)=delete;
+    ScopedComPtr& operator=(const ScopedComPtr&)=delete;
+    ScopedComPtr(ScopedComPtr&& other) noexcept :value_(other.release()){}
+    ScopedComPtr& operator=(ScopedComPtr&& other) noexcept {
+        if(this!=&other) reset(other.release());
+        return *this;
+    }
+    T* get() const { return value_; }
+    T* operator->() const { return value_; }
+    explicit operator bool() const { return value_!=nullptr; }
+    T* release() noexcept { T* value=value_; value_=nullptr; return value; }
+    void reset(T* value=nullptr) noexcept {
+        if(value_) value_->Release();
+        value_=value;
+    }
+private:
+    T* value_=nullptr;
+};
+
 // After a Windows update the undocumented vtable/IIDs can shift: QueryService may
 // still succeed but calls return garbage. Verify a couple of calls make sense.
 static bool SanityCheckServices(){
     if(!DesktopServicesReady(g_vdmi!=nullptr,g_avc!=nullptr,g_vdmDoc!=nullptr))
         return false;
     UINT n=0; if(FAILED(g_vdmi->GetCount(&n))) return false;
-    if(n<1 || n>64) return false;
-    IVirtualDesktop* d=nullptr; if(FAILED(g_vdmi->GetCurrentDesktop(&d))||!d) return false;
+    if(n<1 || n>MAX_VIRTUAL_DESKTOPS) return false;
+    IVirtualDesktop* d=nullptr;
+    const HRESULT currentResult=g_vdmi->GetCurrentDesktop(&d);
+    if(!ValidateComOutPointerOrRelease(
+            currentResult,d!=nullptr,[&](){ d->Release(); d=nullptr; }))
+        return false;
     GUID g={0}; bool ok=SUCCEEDED(d->GetID(&g)) && !GuidIsZero(g); d->Release(); return ok;
 }
 static DWORD ReadLastGoodBuild(){ HKEY hk; DWORD v=0,cb=sizeof(v);
@@ -388,11 +434,57 @@ static void SetRunAtLogon(bool on){ HKEY hk;
     else RegDeleteValueW(hk,RUN_VAL);
     RegCloseKey(hk);
 }
-static IVirtualDesktop* GetDesktopByIndex(UINT index){ IObjectArray* a=nullptr; if(FAILED(g_vdmi->GetDesktops(&a))||!a)return nullptr; IVirtualDesktop* d=nullptr; a->GetAt(index,kIID_IVirtualDesktop,(void**)&d); a->Release(); return d; }
-static IVirtualDesktop* GetDesktopByGuid(const GUID& t){ IObjectArray* a=nullptr; if(FAILED(g_vdmi->GetDesktops(&a))||!a)return nullptr; UINT n=0;a->GetCount(&n); IVirtualDesktop* r=nullptr;
-    for(UINT i=0;i<n;++i){ IVirtualDesktop* d=nullptr; if(SUCCEEDED(a->GetAt(i,kIID_IVirtualDesktop,(void**)&d))&&d){ GUID g={0};d->GetID(&g); if(IsEqualGUID(g,t)){r=d;break;} d->Release(); } } a->Release(); return r; }
-static int GetDesktopIndexByGuid(const GUID& t){ IObjectArray* a=nullptr; if(FAILED(g_vdmi->GetDesktops(&a))||!a)return -1; UINT n=0;a->GetCount(&n); int idx=-1;
-    for(UINT i=0;i<n;++i){ IVirtualDesktop* d=nullptr; if(SUCCEEDED(a->GetAt(i,kIID_IVirtualDesktop,(void**)&d))&&d){ GUID g={0};d->GetID(&g); if(IsEqualGUID(g,t)){idx=(int)i;d->Release();break;} d->Release(); } } a->Release(); return idx; }
+
+struct DesktopCollectionComOps {
+    HRESULT getDesktops(IObjectArray** output) const noexcept {
+        return g_vdmi ? g_vdmi->GetDesktops(output) : E_NOINTERFACE;
+    }
+    HRESULT getCount(IObjectArray* array,UINT* output) const noexcept {
+        return array->GetCount(output);
+    }
+    HRESULT getAt(IObjectArray* array,UINT index,
+                  IVirtualDesktop** output) const noexcept {
+        return array->GetAt(index,kIID_IVirtualDesktop,
+                            reinterpret_cast<void**>(output));
+    }
+    HRESULT getId(IVirtualDesktop* desktop,GUID* output) const noexcept {
+        return desktop->GetID(output);
+    }
+    void releaseArray(IObjectArray* value) const noexcept { value->Release(); }
+    void releaseDesktop(IVirtualDesktop* value) const noexcept {
+        value->Release();
+    }
+};
+
+static ScopedComPtr<IVirtualDesktop> GetDesktopByIndex(UINT index){
+    DesktopCollectionComOps ops;
+    ScopedComPtr<IVirtualDesktop> desktop;
+    int matchedIndex=-1;
+    LookupDesktopCollectionOwned<IObjectArray,IVirtualDesktop>(
+        DesktopCollectionLookupRequest::ByIndex(index),
+        ops,desktop,matchedIndex);
+    return desktop;
+}
+
+static ScopedComPtr<IVirtualDesktop> GetDesktopByGuid(const GUID& target){
+    DesktopCollectionComOps ops;
+    ScopedComPtr<IVirtualDesktop> desktop;
+    int matchedIndex=-1;
+    LookupDesktopCollectionOwned<IObjectArray,IVirtualDesktop>(
+        DesktopCollectionLookupRequest::ByGuid(target),
+        ops,desktop,matchedIndex);
+    return desktop;
+}
+
+static int GetDesktopIndexByGuid(const GUID& target){
+    DesktopCollectionComOps ops;
+    ScopedComPtr<IVirtualDesktop> desktop;
+    int matchedIndex=-1;
+    if(!LookupDesktopCollectionOwned<IObjectArray,IVirtualDesktop>(
+            DesktopCollectionLookupRequest::ByGuid(target),
+            ops,desktop,matchedIndex)) return -1;
+    return matchedIndex;
+}
 
 class UniqueWinHandle {
 public:
@@ -415,28 +507,6 @@ public:
     }
 private:
     HANDLE handle_=nullptr;
-};
-
-template<class T>
-class ScopedComPtr {
-public:
-    ScopedComPtr()=default;
-    explicit ScopedComPtr(T* value):value_(value){}
-    ~ScopedComPtr(){ reset(); }
-    ScopedComPtr(const ScopedComPtr&)=delete;
-    ScopedComPtr& operator=(const ScopedComPtr&)=delete;
-    ScopedComPtr(ScopedComPtr&& other) noexcept :value_(other.release()){}
-    ScopedComPtr& operator=(ScopedComPtr&& other) noexcept {
-        if(this!=&other) reset(other.release());
-        return *this;
-    }
-    T* get() const { return value_; }
-    T* operator->() const { return value_; }
-    explicit operator bool() const { return value_!=nullptr; }
-    T* release(){ T* value=value_; value_=nullptr; return value; }
-    void reset(T* value=nullptr){ if(value_) value_->Release(); value_=value; }
-private:
-    T* value_=nullptr;
 };
 
 struct ProcessSnapshot {
@@ -487,12 +557,12 @@ struct FastEnumContext {
     bool allocationFailure=false;
 };
 
-static void MarkClassProfilesIncomplete(FastEnumContext& context,
-                                        const wchar_t* className){
-    for(const AppProfile& profile : *context.profiles)
-        if(std::find(profile.classNames.begin(),profile.classNames.end(),className)!=
-           profile.classNames.end())
-            (*context.snapshots)[profile.id].enumerationComplete=false;
+static WindowIdentityRecapture RecaptureGenericWindowIdentity(
+    const WindowIdentityKey& expected) noexcept;
+
+static void MarkAllFastProfilesIncomplete(FastEnumContext& context) noexcept {
+    MarkFastSnapshotCaptureIncomplete(
+        *context.profiles,*context.snapshots);
 }
 
 static BOOL CALLBACK EnumFastWindow(HWND hwnd,LPARAM parameter){
@@ -514,14 +584,14 @@ static BOOL CALLBACK EnumFastWindow(HWND hwnd,LPARAM parameter){
 
         DWORD pid=0;
         if(!GetWindowThreadProcessId(hwnd,&pid) || pid==0){
-            MarkClassProfilesIncomplete(context,className);
+            MarkAllFastProfilesIncomplete(context);
             return TRUE;
         }
         auto process=context.processes.find(pid);
         if(process==context.processes.end())
             process=context.processes.emplace(pid,ReadProcessSnapshot(pid)).first;
         if(process->second.image.empty() || process->second.started==0){
-            MarkClassProfilesIncomplete(context,className);
+            MarkAllFastProfilesIncomplete(context);
             return TRUE;
         }
         const AppProfile* profile=ClassifyBrowserCandidate(
@@ -534,7 +604,7 @@ static BOOL CALLBACK EnumFastWindow(HWND hwnd,LPARAM parameter){
             title.resize(static_cast<size_t>(titleLength)+1,L'\0');
             int copied=GetWindowTextW(hwnd,&title[0],titleLength+1);
             if(copied<=0){
-                (*context.snapshots)[profile->id].enumerationComplete=false;
+                MarkAllFastProfilesIncomplete(context);
                 return TRUE;
             }
             title.resize(static_cast<size_t>(copied));
@@ -550,6 +620,13 @@ static BOOL CALLBACK EnumFastWindow(HWND hwnd,LPARAM parameter){
             : E_NOINTERFACE;
         if(FAILED(desktopResult) || GuidIsZero(window.desktop))
             (*context.snapshots)[profile->id].desktopLookupsComplete=false;
+        const WindowIdentityRecapture finalIdentity=
+            RecaptureGenericWindowIdentity(IdentityOf(window));
+        if(FinalFastWindowIdentityFailureInvalidatesEveryProfile(
+                finalIdentity)){
+            MarkAllFastProfilesIncomplete(context);
+            return TRUE;
+        }
         (*context.snapshots)[profile->id].windows.push_back(std::move(window));
         return TRUE;
     } catch(...) {
@@ -674,19 +751,21 @@ static bool MigrateLegacyLayout(){
 static bool CurrentDesktops(std::vector<DeskRec>& desksOut, std::string* errorOut=nullptr){
     auto fail=[&](const std::string& message)->bool{ if(errorOut)*errorOut=message; return false; };
     if(!g_vdmi)return fail("virtual desktop manager is unavailable");
-    UINT count=0; if(FAILED(g_vdmi->GetCount(&count)))return fail("failed to get virtual desktop count");
-    if(count==0 || count>MAX_LAYOUT_RECORDS)return fail("invalid virtual desktop count");
+    DesktopCollectionComOps ops;
+    std::vector<DesktopCollectionEntry> snapshot;
+    if(!SnapshotDesktopCollectionOwned<IObjectArray,IVirtualDesktop>(
+            ops,snapshot))
+        return fail("failed to enumerate virtual desktops");
     std::vector<DeskRec> desks;
-    try { desks.reserve(count); }
+    try { desks.reserve(snapshot.size()); }
     catch(...) { return fail("out of memory collecting virtual desktops"); }
-    for(UINT i=0;i<count;++i){
-        ScopedComPtr<IVirtualDesktop> desktop(GetDesktopByIndex(i));
-        if(!desktop)return fail("failed to get virtual desktop");
-        GUID g={0}; HRESULT idHr=desktop->GetID(&g);
-        if(FAILED(idHr)||GuidIsZero(g)) return fail("failed to get virtual desktop GUID");
+    for(const DesktopCollectionEntry& entry : snapshot){
         try {
-            DeskRec record; record.index=(int)i; record.guid=g;
-            record.name=DesktopNameFromRegistry(g); desks.push_back(std::move(record));
+            DeskRec record;
+            record.index=static_cast<int>(entry.index);
+            record.guid=entry.guid;
+            record.name=DesktopNameFromRegistry(entry.guid);
+            desks.push_back(std::move(record));
         } catch(...) { return fail("out of memory collecting virtual desktops"); }
     }
     desksOut.swap(desks); if(errorOut)errorOut->clear(); return true;
@@ -2130,7 +2209,7 @@ static HRESULT IssueWindowMove(const MoveRuntimeBinding& binding,
     const HWND hwnd=binding.window.hwnd;
     const GUID& destinationGuid=binding.destination;
     if(GuidIsZero(destinationGuid) || !g_vdmi || !g_avc) return E_INVALIDARG;
-    ScopedComPtr<IVirtualDesktop> destination(GetDesktopByGuid(destinationGuid));
+    ScopedComPtr<IVirtualDesktop> destination=GetDesktopByGuid(destinationGuid);
     if(!destination) return E_INVALIDARG;
     identity=RecaptureGenericWindowIdentity(IdentityOf(binding.window));
     if(identity!=WindowIdentityRecapture::Match)
@@ -2928,9 +3007,12 @@ static void HandleAutoSessionResult(const SessionRoute& route,
     request.sessionDataGeneration=result.dataGeneration;
     request.nowUtc=UtcNowSeconds();
     request.freshness=freshness;
-    try { ConfigureWorkerLiveBuild(request,ReconcileWorkMode::PrepareLiveOnly,
-                                   *profile,current->second,result.windows,
-                                   g_autoDesktops); }
+    try {
+        ConfigureWorkerLiveBuild(request,ReconcileWorkMode::PrepareLiveOnly,
+                                 *profile,current->second,result.windows,
+                                 g_autoDesktops);
+        operation->second.currentDesktops=request.desktops;
+    }
     catch(...) { CancelAutoOperation(route.operationId,true); return; }
     operation->second.reconcilePending=true;
     operation->second.reconcileMode=ReconcileWorkMode::PrepareLiveOnly;
@@ -3016,9 +3098,10 @@ static bool QueueAutoMove(AutoRestoreOperation& operation,
     const FastWin& fast=operation.reconcileFast[restore.liveIndex];
     const std::string runtimeKey=RuntimeKey(fast);
     const LayoutWin& saved=result.saved[restore.savedIndex];
+    if(!SavedRestoreDestinationAvailable(
+            saved,restore.destination,operation.currentDesktops)) return false;
     if(g_reservedAutoIdentities.count(runtimeKey)) return false;
     g_pendingRecordByRuntime[runtimeKey]=saved.recordId;
-    if(GetDesktopIndexByGuid(restore.destination)<0) return false;
 
     RestoreBudgetKey budget;
     budget.recordId=saved.recordId;
@@ -3409,7 +3492,11 @@ static void HandleReconcileResult(std::unique_ptr<ReconcileResult> result){
     operation->second.reconcile=std::move(result);
     ReconcileResult& accepted=*operation->second.reconcile;
     for(const RestoreRequest& restore : accepted.plan.restores){
-        if(restore.liveIndex>=operation->second.reconcileFast.size()){
+        if(restore.savedIndex>=accepted.saved.size() ||
+           restore.liveIndex>=operation->second.reconcileFast.size() ||
+           !SavedRestoreDestinationAvailable(
+               accepted.saved[restore.savedIndex],restore.destination,
+               operation->second.currentDesktops)){
             operation->second.hadFailure=true;
             continue;
         }
@@ -3548,12 +3635,24 @@ static bool CommitFinalSnapshots(
             return false;
 
         stagedBindings=g_recordByRuntime;
+        std::set<std::string> claimedRecordIds;
+        for(const FinalAppObservation& app : observations)
+            for(const FinalWindowObservation& window : app.windows){
+                if(!window.boundRecordId.empty())
+                    claimedRecordIds.insert(window.boundRecordId);
+                if(!window.pendingRecordId.empty())
+                    claimedRecordIds.insert(window.pendingRecordId);
+            }
         for(const auto& provisional : staged.provisionalRecordByRuntime){
             auto record=std::find_if(staged.records.begin(),staged.records.end(),
                 [&](const LayoutWin& candidate){
                     return candidate.recordId==provisional.second;
                 });
             if(record==staged.records.end()) continue;
+            if(!CanBindFinalProvisional(
+                    staged.records,claimedRecordIds,*record,
+                    g_pendingRecordByRuntime.count(provisional.first)!=0,
+                    stagedBindings.count(provisional.first)!=0,nowUtc)) continue;
             auto observationsByApp=snapshots.find(record->app);
             if(observationsByApp==snapshots.end()) continue;
             for(const FastWin& fast : observationsByApp->second.windows)
@@ -3564,6 +3663,7 @@ static bool CommitFinalSnapshots(
                     binding.identity=IdentityOf(fast);
                     binding.causalGeneration=observationsByApp->second.generation;
                     stagedBindings[provisional.first]=std::move(binding);
+                    claimedRecordIds.insert(record->recordId);
                     break;
                 }
         }
@@ -4830,10 +4930,20 @@ static bool CliRestoreCheckpoint(bool manual,std::string& summary,
         summary="No browser windows are open to restore.";
         return false;
     }
-    bool tooComplex=false;
-    std::vector<LayoutMatch> matches=MatchOneToOne(
-        loaded.wins,live,0.55,&tooComplex);
-    if(tooComplex){ summary="Restore candidate set is too complex."; return false; }
+    std::vector<std::string> enabledApps;
+    enabledApps.reserve(profiles.size());
+    for(const AppProfile& profile : profiles) enabledApps.push_back(profile.id);
+    const CliRestoreMatchPlan matchPlan=PlanCliCheckpointRestoreMatches(
+        manual,loaded.wins,live,enabledApps,UtcNowSeconds());
+    if(matchPlan.status==CliRestoreMatchStatus::TooComplex){
+        summary="Restore candidate set is too complex.";
+        return false;
+    }
+    if(matchPlan.status!=CliRestoreMatchStatus::Ready){
+        summary="Restore matching was ambiguous; no windows were moved.";
+        return false;
+    }
+    const std::vector<LayoutMatch>& matches=matchPlan.matches;
 
     MoveQueue queue;
     std::map<uint64_t,MoveRuntimeBinding> runtimes;
@@ -4957,14 +5067,22 @@ static bool CliRestoreCheckpoint(bool manual,std::string& summary,
 
 static int CliRun(const std::wstring& cmd){
     if(cmd==L"list"||cmd==L"status"){
-        UINT count=0; g_vdmi->GetCount(&count);
-        printf("Virtual desktops: %u\n",count);
-        for(UINT i=0;i<count;++i){ ScopedComPtr<IVirtualDesktop> d(GetDesktopByIndex(i)); if(!d)continue; GUID g={0};d->GetID(&g);
-            std::wstring nm=DesktopNameFromRegistry(g); std::string nmU8=nm.empty()?std::string():("("+W2U8(nm)+")");
-            printf("  [%u] %s  %s\n",i,W2U8(GuidToString(g)).c_str(),nmU8.c_str()); }
+        std::vector<DeskRec> desks;
+        std::string desktopError;
+        if(!CurrentDesktops(desks,&desktopError)){
+            fprintf(stderr,"Could not enumerate virtual desktops: %s\n",
+                    desktopError.c_str());
+            return 1;
+        }
+        printf("Virtual desktops: %u\n",
+               static_cast<unsigned>(desks.size()));
+        for(const DeskRec& desk : desks){
+            const std::string name=desk.name.empty()
+                ? std::string() : "("+W2U8(desk.name)+")";
+            printf("  [%d] %s  %s\n",desk.index,
+                   W2U8(GuidToString(desk.guid)).c_str(),name.c_str());
+        }
         if(cmd==L"status"){
-            std::vector<DeskRec> desks; std::string error;
-            const bool desktopsReady=CurrentDesktops(desks,&error);
             std::map<std::string,AppFastSnapshot> snapshots=CollectFastSnapshots();
             for(const AppProfile& profile : ActiveProfiles()){
                 auto snapshot=snapshots.find(profile.id);
@@ -4973,11 +5091,10 @@ static int CliRun(const std::wstring& cmd){
                 bool fresh=AcquireCliSession(profile,session);
                 PreparedCliProfileBatch prepared;
                 std::vector<ReconcileRequest> requests;
-                requests.push_back(MakeCliLiveRequest(
+                 requests.push_back(MakeCliLiveRequest(
                     profile,snapshot->second,session,desks));
                  const bool preparationReady=
-                     desktopsReady && fresh &&
-                     BuildCliProfileBatch(requests,prepared);
+                     fresh && BuildCliProfileBatch(requests,prepared);
                  std::vector<CliStatusRow> rows;
                  bool rowsReady=BuildCliStatusRows(
                      snapshot->second,desks,
@@ -5364,8 +5481,8 @@ static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi,
             ScopedComPtr<IObjectArray> desktopArray(rawDesktops);
             if(FAILED(desktopsResult) || !desktopArray) return false;
             UINT count=0;
-            if(FAILED(desktopArray->GetCount(&count)) ||
-               count>MAX_LAYOUT_RECORDS) return false;
+            if(FAILED(desktopArray->GetCount(&count)) || count==0 ||
+               count>MAX_VIRTUAL_DESKTOPS) return false;
             tiles.reserve(count);
             std::vector<GUID> desktopGuids;
             desktopGuids.reserve(count);
@@ -6325,8 +6442,8 @@ static HRESULT IssuePickerWindowMove(
     identity=WindowIdentityRecapture::Indeterminate;
     if(GuidIsZero(destinationGuid) || !g_vdmi) return E_INVALIDARG;
     try {
-        ScopedComPtr<IVirtualDesktop> destination(
-            GetDesktopByGuid(destinationGuid));
+        ScopedComPtr<IVirtualDesktop> destination=
+            GetDesktopByGuid(destinationGuid);
         if(!destination) return E_INVALIDARG;
         const HWND hwnd=reinterpret_cast<HWND>(expected.hwnd);
         if(expected.pid==GetCurrentProcessId()){
@@ -6463,8 +6580,8 @@ static PickerObservation ExecutePickerEffect(
         case PickerEffectKind::SwitchDesktop: {
             observation.event=PickerEvent::ApiCompleted;
             HRESULT result=E_INVALIDARG;
-            ScopedComPtr<IVirtualDesktop> desktop(
-                GetDesktopByGuid(effect.desktop));
+            ScopedComPtr<IVirtualDesktop> desktop=
+                GetDesktopByGuid(effect.desktop);
             const bool rollback=
                 g_picker.transition.phase==
                     PickerPhase::RollbackSwitchIssue;
@@ -7487,8 +7604,9 @@ static void GoToDesktop(int idx){
     if(g_picker.controlledTransition()) return;
     if(idx<0||idx>=(int)g_tiles.size())return;
     HidePicker();
-    IVirtualDesktop* d=GetDesktopByIndex((UINT)g_tiles[idx].index);
-    if(!d)return;
+    ScopedComPtr<IVirtualDesktop> desktop=
+        GetDesktopByIndex((UINT)g_tiles[idx].index);
+    if(!desktop)return;
     HWND prog=FindWindowW(L"Progman",L"Program Manager");
     DWORD dummy=0;
     DWORD deskTh=prog?GetWindowThreadProcessId(prog,&dummy):0;
@@ -7501,9 +7619,8 @@ static void GoToDesktop(int idx){
         AttachThreadInput(fgTh,curTh,FALSE);
         AttachThreadInput(deskTh,curTh,FALSE);
     }
-    g_vdmi->SwitchDesktop(d);
+    g_vdmi->SwitchDesktop(desktop.get());
     if(prog) ShowWindow(prog,SW_MINIMIZE);
-    d->Release();
 }
 // Клик = переключение на десктоп; Ctrl = перенести активное окно туда.
 static void Activate(int idx, bool ctrlMove){
@@ -8183,9 +8300,17 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             else if(cmd==203)OpenSettings();
             else if(cmd==206)OpenHelp();
             else if(cmd==205)OpenAbout();
-            else if(cmd==209) RunTrayExit(
-                [](){ DrainPickerForShutdown(); return FinalizeAutoLayout(); },
-                [=](){ DestroyWindow(hwnd); });
+            else if(cmd==209){
+                if(!RunTrayExit(
+                        [](){
+                            DrainPickerForShutdown();
+                            return FinalizeAutoLayout();
+                        },
+                        [=](){ return DestroyWindow(hwnd)!=FALSE; },
+                        [](){ g_checkpointController.finalization.reopen(); }))
+                    ReportStorageError(
+                        L"Exit could not be completed. VDE is still running; retry Exit.");
+            }
         } else if(LOWORD(lp)==WM_LBUTTONDBLCLK)
             ShowPicker(CapturePickerTarget());
         return 0;

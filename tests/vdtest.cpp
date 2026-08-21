@@ -5308,11 +5308,383 @@ static void test_identity_guard_recaptures_immediately_before_issue_or_verify(){
     CHECK(captures==2 && actions==1 && result==S_FALSE);
 }
 
+static void test_fast_window_publication_requires_exact_final_identity(){
+    CHECK(FinalFastWindowIdentityCanPublish(
+        WindowIdentityRecapture::Match));
+    CHECK(!FinalFastWindowIdentityCanPublish(
+        WindowIdentityRecapture::Lost));
+    CHECK(!FinalFastWindowIdentityCanPublish(
+        WindowIdentityRecapture::Indeterminate));
+}
+
+static void test_fast_window_identity_failure_invalidates_all_enabled_profiles(){
+    for(const WindowIdentityRecapture recapture : {
+            WindowIdentityRecapture::Lost,
+            WindowIdentityRecapture::Indeterminate}){
+        CHECK(FinalFastWindowIdentityFailureInvalidatesEveryProfile(
+            recapture));
+    }
+    CHECK(!FinalFastWindowIdentityFailureInvalidatesEveryProfile(
+        WindowIdentityRecapture::Match));
+
+    const std::vector<AppProfile> profiles=BuiltinProfiles(true,true,true);
+    std::map<std::string,AppFastSnapshot> snapshots;
+    snapshots["firefox"];
+    snapshots["chrome"];
+    snapshots["msedge"];
+    MarkFastSnapshotCaptureIncomplete(profiles,snapshots);
+    CHECK(!snapshots["firefox"].enumerationComplete);
+    CHECK(!snapshots["chrome"].enumerationComplete);
+    CHECK(!snapshots["msedge"].enumerationComplete);
+}
+
 static void test_desktop_services_require_documented_manager(){
     CHECK(DesktopServicesReady(true,true,true));
     CHECK(!DesktopServicesReady(true,true,false));
     CHECK(!DesktopServicesReady(true,false,true));
     CHECK(!DesktopServicesReady(false,true,true));
+}
+
+static void test_failed_com_out_pointer_is_released(){
+    int releases=0;
+    CHECK(!ValidateComOutPointerOrRelease(
+        E_FAIL,true,[&](){ ++releases; }));
+    CHECK(releases==1);
+    CHECK(!ValidateComOutPointerOrRelease(
+        E_FAIL,false,[&](){ ++releases; }));
+    CHECK(!ValidateComOutPointerOrRelease(
+        S_OK,false,[&](){ ++releases; }));
+    CHECK(releases==1);
+    CHECK(ValidateComOutPointerOrRelease(
+        S_OK,true,[&](){ ++releases; }));
+    CHECK(releases==1);
+}
+
+struct FakeDesktopLookupDesktop {
+    GUID id={0};
+    HRESULT idResult=S_OK;
+    int releases=0;
+};
+
+struct FakeDesktopLookupArray {
+    int releases=0;
+};
+
+struct FakeDesktopLookupOps {
+    FakeDesktopLookupArray array;
+    HRESULT desktopsResult=S_OK;
+    bool returnArray=true;
+    HRESULT countResult=S_OK;
+    UINT count=0;
+    std::vector<FakeDesktopLookupDesktop*> desktops;
+    std::vector<HRESULT> atResults;
+    bool returnDesktopOnFailedGetAt=false;
+    int getCountCalls=0;
+    int getAtCalls=0;
+    int getIdCalls=0;
+
+    HRESULT getDesktops(FakeDesktopLookupArray** output){
+        if(returnArray) *output=&array;
+        return desktopsResult;
+    }
+
+    HRESULT getCount(FakeDesktopLookupArray*,UINT* output){
+        ++getCountCalls;
+        *output=count;
+        return countResult;
+    }
+
+    HRESULT getAt(FakeDesktopLookupArray*,UINT index,
+                  FakeDesktopLookupDesktop** output){
+        ++getAtCalls;
+        const HRESULT result=index<atResults.size()
+            ? atResults[index] : E_FAIL;
+        FakeDesktopLookupDesktop* desktop=index<desktops.size()
+            ? desktops[index] : nullptr;
+        if(desktop && (SUCCEEDED(result) || returnDesktopOnFailedGetAt))
+            *output=desktop;
+        return result;
+    }
+
+    HRESULT getId(FakeDesktopLookupDesktop* desktop,GUID* output){
+        ++getIdCalls;
+        *output=desktop->id;
+        return desktop->idResult;
+    }
+
+    void releaseArray(FakeDesktopLookupArray* value){
+        ++value->releases;
+    }
+
+    void releaseDesktop(FakeDesktopLookupDesktop* value){
+        ++value->releases;
+    }
+};
+
+struct FakeDesktopLookupOwner {
+    explicit FakeDesktopLookupOwner(FakeDesktopLookupOps& operations)
+        :ops(&operations){}
+    ~FakeDesktopLookupOwner(){ reset(); }
+    FakeDesktopLookupOwner(const FakeDesktopLookupOwner&)=delete;
+    FakeDesktopLookupOwner& operator=(const FakeDesktopLookupOwner&)=delete;
+
+    void reset(FakeDesktopLookupDesktop* replacement=nullptr) noexcept {
+        if(value) ops->releaseDesktop(value);
+        value=replacement;
+    }
+
+    FakeDesktopLookupOps* ops=nullptr;
+    FakeDesktopLookupDesktop* value=nullptr;
+};
+
+static bool RunFakeDesktopLookup(
+        const DesktopCollectionLookupRequest& request,
+        FakeDesktopLookupOps& ops,FakeDesktopLookupOwner& output,
+        int& index){
+    return LookupDesktopCollectionOwned<
+        FakeDesktopLookupArray,FakeDesktopLookupDesktop>(
+            request,ops,output,index);
+}
+
+static bool RunFakeDesktopSnapshot(
+        FakeDesktopLookupOps& ops,
+        std::vector<DesktopCollectionEntry>& output){
+    return SnapshotDesktopCollectionOwned<
+        FakeDesktopLookupArray,FakeDesktopLookupDesktop>(ops,output);
+}
+
+static void test_desktop_lookup_releases_failed_getdesktops_output(){
+    FakeDesktopLookupOps ops;
+    ops.desktopsResult=E_FAIL;
+    ops.count=1;
+    FakeDesktopLookupOwner output(ops);
+    int index=17;
+    CHECK(!RunFakeDesktopLookup(
+        DesktopCollectionLookupRequest::ByIndex(0),ops,output,index));
+    CHECK(ops.array.releases==1);
+    CHECK(ops.getCountCalls==0);
+    CHECK(output.value==nullptr && index==-1);
+}
+
+static void test_desktop_lookup_rejects_failed_or_oversized_count(){
+    {
+        FakeDesktopLookupOps ops;
+        ops.countResult=E_FAIL;
+        ops.count=1;
+        FakeDesktopLookupOwner output(ops);
+        int index=17;
+        CHECK(!RunFakeDesktopLookup(
+            DesktopCollectionLookupRequest::ByIndex(0),ops,output,index));
+        CHECK(ops.array.releases==1);
+        CHECK(ops.getCountCalls==1 && ops.getAtCalls==0);
+        CHECK(output.value==nullptr && index==-1);
+    }
+    {
+        FakeDesktopLookupOps ops;
+        ops.count=65;
+        FakeDesktopLookupOwner output(ops);
+        int index=17;
+        CHECK(!RunFakeDesktopLookup(
+            DesktopCollectionLookupRequest::ByIndex(0),ops,output,index));
+        CHECK(ops.array.releases==1);
+        CHECK(ops.getCountCalls==1 && ops.getAtCalls==0);
+        CHECK(output.value==nullptr && index==-1);
+    }
+    {
+        FakeDesktopLookupDesktop desktop;
+        desktop.id=G(L"{231A0000-0000-0000-0000-000000000070}");
+        FakeDesktopLookupOps ops;
+        ops.count=MAX_VIRTUAL_DESKTOPS;
+        ops.desktops.resize(MAX_VIRTUAL_DESKTOPS,&desktop);
+        ops.atResults.resize(MAX_VIRTUAL_DESKTOPS,S_OK);
+        int index=-1;
+        {
+            FakeDesktopLookupOwner output(ops);
+            CHECK(RunFakeDesktopLookup(
+                DesktopCollectionLookupRequest::ByIndex(
+                    MAX_VIRTUAL_DESKTOPS-1),ops,output,index));
+            CHECK(index==static_cast<int>(MAX_VIRTUAL_DESKTOPS-1) &&
+                  output.value==&desktop);
+        }
+        CHECK(ops.array.releases==1 && desktop.releases==1);
+    }
+}
+
+static void test_desktop_lookup_releases_failed_getat_output(){
+    FakeDesktopLookupDesktop desktop;
+    desktop.id=G(L"{231A0000-0000-0000-0000-000000000071}");
+    FakeDesktopLookupOps ops;
+    ops.count=1;
+    ops.desktops.push_back(&desktop);
+    ops.atResults.push_back(E_FAIL);
+    ops.returnDesktopOnFailedGetAt=true;
+    FakeDesktopLookupOwner output(ops);
+    int index=17;
+    CHECK(!RunFakeDesktopLookup(
+        DesktopCollectionLookupRequest::ByIndex(0),ops,output,index));
+    CHECK(ops.array.releases==1 && desktop.releases==1);
+    CHECK(ops.getAtCalls==1 && ops.getIdCalls==0);
+    CHECK(output.value==nullptr && index==-1);
+}
+
+static void test_desktop_lookup_rejects_failed_or_zero_getid(){
+    {
+        FakeDesktopLookupDesktop desktop;
+        desktop.id=G(L"{231A0000-0000-0000-0000-000000000072}");
+        desktop.idResult=E_FAIL;
+        FakeDesktopLookupOps ops;
+        ops.count=1;
+        ops.desktops.push_back(&desktop);
+        ops.atResults.push_back(S_OK);
+        FakeDesktopLookupOwner output(ops);
+        int index=17;
+        CHECK(!RunFakeDesktopLookup(
+            DesktopCollectionLookupRequest::ByIndex(0),ops,output,index));
+        CHECK(ops.array.releases==1 && desktop.releases==1);
+        CHECK(output.value==nullptr && index==-1);
+    }
+    {
+        FakeDesktopLookupDesktop desktop;
+        FakeDesktopLookupOps ops;
+        ops.count=1;
+        ops.desktops.push_back(&desktop);
+        ops.atResults.push_back(S_OK);
+        FakeDesktopLookupOwner output(ops);
+        int index=17;
+        CHECK(!RunFakeDesktopLookup(
+            DesktopCollectionLookupRequest::ByIndex(0),ops,output,index));
+        CHECK(ops.array.releases==1 && desktop.releases==1);
+        CHECK(output.value==nullptr && index==-1);
+    }
+}
+
+static void test_desktop_lookup_returns_only_valid_owned_matches(){
+    const GUID firstId=G(L"{231A0000-0000-0000-0000-000000000073}");
+    const GUID secondId=G(L"{231A0000-0000-0000-0000-000000000074}");
+    {
+        FakeDesktopLookupDesktop first,second;
+        first.id=firstId;
+        second.id=secondId;
+        FakeDesktopLookupOps ops;
+        ops.count=2;
+        ops.desktops={&first,&second};
+        ops.atResults={S_OK,S_OK};
+        int index=-1;
+        {
+            FakeDesktopLookupOwner output(ops);
+            CHECK(RunFakeDesktopLookup(
+                DesktopCollectionLookupRequest::ByIndex(1),
+                ops,output,index));
+            CHECK(output.value==&second && index==1);
+            CHECK(first.releases==0 && second.releases==0);
+        }
+        CHECK(ops.array.releases==1 && second.releases==1);
+    }
+    {
+        FakeDesktopLookupDesktop first,second;
+        first.id=firstId;
+        second.id=secondId;
+        FakeDesktopLookupOps ops;
+        ops.count=2;
+        ops.desktops={&first,&second};
+        ops.atResults={S_OK,S_OK};
+        int index=-1;
+        {
+            FakeDesktopLookupOwner output(ops);
+            CHECK(RunFakeDesktopLookup(
+                DesktopCollectionLookupRequest::ByGuid(secondId),
+                ops,output,index));
+            CHECK(output.value==&second && index==1);
+            CHECK(first.releases==1 && second.releases==0);
+        }
+        CHECK(ops.array.releases==1 && second.releases==1);
+    }
+    {
+        FakeDesktopLookupDesktop first;
+        first.id=firstId;
+        FakeDesktopLookupOps ops;
+        ops.count=1;
+        ops.desktops={&first};
+        ops.atResults={S_OK};
+        FakeDesktopLookupOwner output(ops);
+        int index=0;
+        CHECK(!RunFakeDesktopLookup(
+            DesktopCollectionLookupRequest::ByGuid(secondId),
+            ops,output,index));
+        CHECK(output.value==nullptr && index==-1);
+        CHECK(ops.array.releases==1 && first.releases==1);
+    }
+}
+
+static void test_desktop_snapshot_rechecks_count_after_prior_success(){
+    FakeDesktopLookupDesktop desktop;
+    desktop.id=G(L"{231A0000-0000-0000-0000-000000000075}");
+    FakeDesktopLookupOps ops;
+    ops.count=1;
+    ops.desktops={&desktop};
+    ops.atResults={S_OK};
+    std::vector<DesktopCollectionEntry> snapshot;
+    CHECK(RunFakeDesktopSnapshot(ops,snapshot));
+    CHECK(snapshot.size()==1 && snapshot[0].index==0 &&
+          GuidEq(snapshot[0].guid,desktop.id));
+
+    ops.countResult=E_FAIL;
+    CHECK(!RunFakeDesktopSnapshot(ops,snapshot));
+    CHECK(snapshot.size()==1 && GuidEq(snapshot[0].guid,desktop.id));
+    CHECK(ops.getCountCalls==2 && ops.getAtCalls==1);
+    CHECK(ops.array.releases==2 && desktop.releases==1);
+
+    FakeDesktopLookupOps oversized;
+    oversized.count=UINT_MAX;
+    std::vector<DesktopCollectionEntry> sentinel={{7,desktop.id}};
+    CHECK(!RunFakeDesktopSnapshot(oversized,sentinel));
+    CHECK(sentinel.size()==1 && sentinel[0].index==7 &&
+          GuidEq(sentinel[0].guid,desktop.id));
+    CHECK(oversized.getAtCalls==0 && oversized.array.releases==1);
+}
+
+static void test_desktop_snapshot_fails_atomically_on_collection_errors(){
+    const GUID sentinelId=
+        G(L"{231A0000-0000-0000-0000-000000000076}");
+    const auto unchanged=[&](const std::vector<DesktopCollectionEntry>& value){
+        return value.size()==1 && value[0].index==9 &&
+            GuidEq(value[0].guid,sentinelId);
+    };
+    {
+        FakeDesktopLookupOps ops;
+        ops.desktopsResult=E_FAIL;
+        std::vector<DesktopCollectionEntry> output={{9,sentinelId}};
+        CHECK(!RunFakeDesktopSnapshot(ops,output));
+        CHECK(unchanged(output) && ops.array.releases==1);
+    }
+    {
+        FakeDesktopLookupDesktop desktop;
+        desktop.id=sentinelId;
+        FakeDesktopLookupOps ops;
+        ops.count=1;
+        ops.desktops={&desktop};
+        ops.atResults={E_FAIL};
+        ops.returnDesktopOnFailedGetAt=true;
+        std::vector<DesktopCollectionEntry> output={{9,sentinelId}};
+        CHECK(!RunFakeDesktopSnapshot(ops,output));
+        CHECK(unchanged(output));
+        CHECK(ops.array.releases==1 && desktop.releases==1);
+    }
+    {
+        FakeDesktopLookupDesktop first,second;
+        first.id=G(L"{231A0000-0000-0000-0000-000000000077}");
+        second.id=G(L"{231A0000-0000-0000-0000-000000000078}");
+        second.idResult=E_FAIL;
+        FakeDesktopLookupOps ops;
+        ops.count=2;
+        ops.desktops={&first,&second};
+        ops.atResults={S_OK,S_OK};
+        std::vector<DesktopCollectionEntry> output={{9,sentinelId}};
+        CHECK(!RunFakeDesktopSnapshot(ops,output));
+        CHECK(unchanged(output));
+        CHECK(ops.array.releases==1 && first.releases==1 &&
+              second.releases==1);
+    }
 }
 
 static void test_service_initialization_releases_every_failed_partial_state(){
@@ -5471,6 +5843,308 @@ static void test_layout_parse_v2(){
 static std::string V4Line(const char* guid, const char* recordId, const char* lastSeen, const char* missing){
     return std::string("W\tfirefox\t") + recordId + "\t0\t" + guid + "\t" + b64enc("Inbox") +
         "\tmail.example\t1\tmail.example:1\t" + lastSeen + "\t" + missing + "\n";
+}
+
+static LayoutWin Identified(const char* recordId,const char* app,int deskIndex,
+        const std::map<std::string,int>& counts,const char* activeTitle){
+    LayoutWin record;
+    record.recordId=recordId;
+    record.app=app;
+    record.deskIndex=deskIndex;
+    record.desktop=G(L"{231A0000-0000-0000-0000-000000000001}");
+    record.activeTitle=activeTitle;
+    record.activeDomain=counts.empty() ? "" : counts.begin()->first;
+    record.counts=counts;
+    for(const auto& count : counts) record.tabCount+=count.second;
+    record.lastSeenUtc=1900000000;
+    return record;
+}
+
+static void test_layout_rejects_invalid_base64(){
+    std::string text = V4Line(
+        "{231A0000-0000-0000-0000-000000000001}",
+        "{00000000-0000-0000-0000-000000000401}",
+        "1700000000", "0");
+    size_t title = text.find(b64enc("Inbox"));
+    text.replace(title, b64enc("Inbox").size(), "%%%=");
+    std::vector<DeskRec> d;
+    std::vector<LayoutWin> w;
+    std::string error;
+    CHECK(!ParseLayout(text, d, w, 1800000000, &error));
+}
+
+static void test_unknown_desktop_guid_is_not_index_zero(){
+    LayoutWin saved = Identified(
+        "{00000000-0000-0000-0000-000000000402}", "firefox", 0,
+        {{"a.com", 1}}, "A");
+    saved.desktop = G(L"{231A0000-0000-0000-0000-000000009999}");
+    CHECK(ResolveSavedDesktop(saved, {}) == -1);
+}
+
+static void test_auto_restore_destination_uses_preserved_prepare_desktops(){
+    LayoutWin saved=Identified(
+        "{00000000-0000-0000-0000-000000000408}","firefox",0,
+        {{"a.com",1}},"A");
+    saved.desktop=G(L"{231A0000-0000-0000-0000-000000000008}");
+    const std::vector<DeskRec> prepared={
+        {8,saved.desktop,L"remembered"}
+    };
+    CHECK(SavedRestoreDestinationAvailable(
+        saved,saved.desktop,prepared));
+    CHECK(!SavedRestoreDestinationAvailable(
+        saved,saved.desktop,{}));
+    CHECK(!SavedRestoreDestinationAvailable(
+        saved,G(L"{231A0000-0000-0000-0000-000000000009}"),prepared));
+}
+
+static void test_disabled_app_is_not_marked_newly_missing(){
+    const UnixSeconds now = 2000000000;
+    LayoutWin firefox = Identified(
+        "{00000000-0000-0000-0000-000000000403}", "firefox", 0,
+        {{"a.com", 1}}, "A");
+    std::vector<LayoutWin> records = MarkOnlyObservedAppsMissing(
+        {firefox}, {}, {"chrome"}, now);
+    CHECK(records[0].missingSinceUtc == 0);
+}
+
+static void test_missing_bookkeeping_is_copy_transactional_and_prunes_globally(){
+    const UnixSeconds now=2000000000;
+    LayoutWin firefox=Identified(
+        "{00000000-0000-0000-0000-000000000404}","firefox",0,
+        {{"a.com",1}},"A");
+    LayoutWin chrome=Identified(
+        "{00000000-0000-0000-0000-000000000405}","chrome",0,
+        {{"b.com",1}},"B");
+    LayoutWin edge=Identified(
+        "{00000000-0000-0000-0000-000000000406}","msedge",0,
+        {{"c.com",1}},"C");
+    LayoutWin expired=Identified(
+        "{00000000-0000-0000-0000-000000000407}","firefox",0,
+        {{"d.com",1}},"D");
+    firefox.lastSeenUtc=now-100;
+    chrome.lastSeenUtc=now-50;
+    edge.lastSeenUtc=now-25;
+    expired.missingSinceUtc=now-WINDOW_RETENTION_SECONDS;
+    const std::vector<LayoutWin> input={firefox,chrome,edge,expired};
+
+    const std::vector<LayoutWin> output=MarkOnlyObservedAppsMissing(
+        input,{edge.recordId},{"chrome","msedge"},now);
+
+    CHECK(output.size()==3);
+    CHECK(output[0].recordId==firefox.recordId && output[0].missingSinceUtc==0);
+    CHECK(output[1].recordId==chrome.recordId &&
+          output[1].missingSinceUtc==chrome.lastSeenUtc);
+    CHECK(output[2].recordId==edge.recordId && output[2].missingSinceUtc==0);
+    CHECK(input.size()==4 && input[1].missingSinceUtc==0 &&
+          input[3].missingSinceUtc==expired.missingSinceUtc);
+}
+
+static void test_title_only_provisional_cannot_steal_established_restore(){
+    const UnixSeconds now=2000000000;
+    LayoutWin established=Identified(
+        "{00000000-0000-0000-0000-000000000409}","firefox",1,
+        {{"a.com",1}},"Old title");
+    established.desktop=G(L"{231A0000-0000-0000-0000-000000000011}");
+    LayoutWin provisional=Identified(
+        "{00000000-0000-0000-0000-000000000410}","firefox",0,
+        {},"Current title");
+    provisional.desktop=G(L"{231A0000-0000-0000-0000-000000000010}");
+    provisional.provisional=true;
+    LayoutWin live=Identified(
+        "{00000000-0000-0000-0000-000000000411}","firefox",0,
+        {{"a.com",1}},"Current title");
+    live.desktop=provisional.desktop;
+
+    const ReconcilePlan plan=PlanAppReconcile(
+        {established,provisional},{live},"firefox",now);
+
+    CHECK(!plan.deferred);
+    CHECK(plan.matches.size()==1 && plan.matches[0].savedIndex==0 &&
+          plan.matches[0].liveIndex==0);
+    CHECK(plan.restores.size()==1 && plan.restores[0].savedIndex==0 &&
+          GuidEq(plan.restores[0].destination,established.desktop));
+}
+
+static void test_distinct_title_only_provisionals_adopt_rich_live_rows(){
+    const UnixSeconds now=2000000000;
+    LayoutWin alpha=Identified(
+        "{00000000-0000-0000-0000-000000000414}","firefox",0,{},"  Alpha ");
+    LayoutWin beta=Identified(
+        "{00000000-0000-0000-0000-000000000415}","firefox",0,{},"BETA");
+    alpha.provisional=true;
+    beta.provisional=true;
+    LayoutWin liveBeta=Identified(
+        "{00000000-0000-0000-0000-000000000416}","firefox",0,
+        {{"beta.example",1}}," beta ");
+    LayoutWin liveAlpha=Identified(
+        "{00000000-0000-0000-0000-000000000417}","firefox",0,
+        {{"alpha.example",1}},"alpha");
+
+    const ReconcilePlan plan=PlanAppReconcile(
+        {alpha,beta},{liveBeta,liveAlpha},"firefox",now);
+
+    CHECK(!plan.deferred && plan.matches.size()==2);
+    const auto alphaMatch=std::find_if(
+        plan.matches.begin(),plan.matches.end(),
+        [](const LayoutMatch& match){ return match.savedIndex==0; });
+    const auto betaMatch=std::find_if(
+        plan.matches.begin(),plan.matches.end(),
+        [](const LayoutMatch& match){ return match.savedIndex==1; });
+    CHECK(alphaMatch!=plan.matches.end() && alphaMatch->liveIndex==1);
+    CHECK(betaMatch!=plan.matches.end() && betaMatch->liveIndex==0);
+    CHECK(plan.newRecords.empty() && plan.missingSavedIndices.empty());
+}
+
+static void test_disjoint_residual_titles_do_not_block_safe_adoption(){
+    const UnixSeconds now=2000000000;
+    LayoutWin alpha=Identified(
+        "{00000000-0000-0000-0000-000000000430}","firefox",0,{},"Alpha");
+    LayoutWin beta=Identified(
+        "{00000000-0000-0000-0000-000000000431}","firefox",0,{},"Beta");
+    alpha.provisional=true;
+    beta.provisional=true;
+    LayoutWin liveAlpha=Identified(
+        "{00000000-0000-0000-0000-000000000432}","firefox",0,
+        {{"alpha.example",1}},"Alpha");
+    LayoutWin liveGamma=Identified(
+        "{00000000-0000-0000-0000-000000000433}","firefox",0,
+        {{"gamma.example",1}},"Gamma");
+
+    const ReconcilePlan plan=PlanAppReconcile(
+        {alpha,beta},{liveAlpha,liveGamma},"firefox",now);
+
+    CHECK(!plan.deferred);
+    CHECK(plan.matches.size()==1 && plan.matches[0].savedIndex==0 &&
+          plan.matches[0].liveIndex==0);
+    CHECK(plan.missingSavedIndices.size()==1 &&
+          plan.missingSavedIndices[0]==1);
+    CHECK(plan.newRecords.size()==1 && plan.newRecords[0].liveIndex==1);
+}
+
+static void test_duplicate_title_only_provisionals_remain_deferred(){
+    const UnixSeconds now=2000000000;
+    LayoutWin first=Identified(
+        "{00000000-0000-0000-0000-000000000418}","firefox",0,{},"Same");
+    LayoutWin second=Identified(
+        "{00000000-0000-0000-0000-000000000419}","firefox",0,{}," same ");
+    first.provisional=true;
+    second.provisional=true;
+    LayoutWin liveFirst=Identified(
+        "{00000000-0000-0000-0000-000000000420}","firefox",0,
+        {{"first.example",1}},"Same");
+    LayoutWin liveSecond=Identified(
+        "{00000000-0000-0000-0000-000000000421}","firefox",0,
+        {{"second.example",1}},"Same");
+
+    const ReconcilePlan plan=PlanAppReconcile(
+        {first,second},{liveFirst,liveSecond},"firefox",now);
+
+    CHECK(plan.deferred);
+    CHECK(plan.matches.empty() && plan.restores.empty());
+}
+
+static void test_title_only_provisional_cannot_steal_title_only_live(){
+    const UnixSeconds now=2000000000;
+    LayoutWin established=Identified(
+        "{00000000-0000-0000-0000-000000000422}","firefox",1,
+        {{"remembered.example",1}},"Remembered");
+    LayoutWin provisional=Identified(
+        "{00000000-0000-0000-0000-000000000423}","firefox",0,{},"Current");
+    provisional.provisional=true;
+    LayoutWin live=Identified(
+        "{00000000-0000-0000-0000-000000000424}","firefox",0,{},"Current");
+
+    const ReconcilePlan plan=PlanAppReconcile(
+        {established,provisional},{live},"firefox",now);
+
+    CHECK(plan.deferred);
+    CHECK(plan.matches.empty() && plan.restores.empty());
+
+    LayoutWin unrelated=Identified(
+        "{00000000-0000-0000-0000-000000000425}","firefox",0,
+        {{"unrelated.example",1}},"Current");
+    const ReconcilePlan unrelatedPlan=PlanAppReconcile(
+        {established,provisional},{unrelated},"firefox",now);
+    CHECK(!unrelatedPlan.deferred);
+    CHECK(unrelatedPlan.matches.size()==1 &&
+          unrelatedPlan.matches[0].savedIndex==1 &&
+          unrelatedPlan.matches[0].liveIndex==0);
+
+    LayoutWin otherProvisional=Identified(
+        "{00000000-0000-0000-0000-000000000434}","firefox",0,{},"Other");
+    otherProvisional.provisional=true;
+    LayoutWin titleOnlyGamma=Identified(
+        "{00000000-0000-0000-0000-000000000435}","firefox",0,{},"Gamma");
+    LayoutWin titleOnlyDelta=Identified(
+        "{00000000-0000-0000-0000-000000000436}","firefox",0,{},"Delta");
+    const ReconcilePlan disjointTitleOnly=PlanAppReconcile(
+        {established,provisional,otherProvisional},
+        {titleOnlyGamma,titleOnlyDelta},"firefox",now);
+    CHECK(disjointTitleOnly.deferred);
+    CHECK(disjointTitleOnly.matches.empty());
+}
+
+static void test_auto_cli_restore_uses_reconcile_semantics(){
+    const UnixSeconds now=2000000000;
+    LayoutWin provisional=Identified(
+        "{00000000-0000-0000-0000-000000000426}","firefox",0,{}," CLI ");
+    provisional.provisional=true;
+    LayoutWin live=Identified(
+        "{00000000-0000-0000-0000-000000000427}","firefox",0,
+        {{"cli.example",1}},"cli");
+    const CliRestoreMatchPlan adopted=PlanCliCheckpointRestoreMatches(
+        false,{provisional},{live},{"firefox"},now);
+    CHECK(adopted.status==CliRestoreMatchStatus::Ready);
+    CHECK(adopted.matches.size()==1 && adopted.matches[0].savedIndex==0 &&
+          adopted.matches[0].liveIndex==0);
+
+    LayoutWin duplicate=provisional;
+    duplicate.recordId="{00000000-0000-0000-0000-000000000428}";
+    LayoutWin duplicateLive=live;
+    const CliRestoreMatchPlan ambiguous=PlanCliCheckpointRestoreMatches(
+        false,{provisional,duplicate},{live,duplicateLive},{"firefox"},now);
+    CHECK(ambiguous.status==CliRestoreMatchStatus::Deferred);
+    CHECK(ambiguous.matches.empty());
+
+    LayoutWin expired=Identified(
+        "{00000000-0000-0000-0000-000000000429}","firefox",1,
+        {{"expired.example",1}},"Expired");
+    expired.missingSinceUtc=now-WINDOW_RETENTION_SECONDS;
+    LayoutWin expiredLive=expired;
+    expiredLive.recordId.clear();
+    expiredLive.missingSinceUtc=0;
+    const CliRestoreMatchPlan autoExpired=PlanCliCheckpointRestoreMatches(
+        false,{expired},{expiredLive},{"firefox"},now);
+    CHECK(autoExpired.status==CliRestoreMatchStatus::Ready);
+    CHECK(autoExpired.matches.empty());
+    const CliRestoreMatchPlan manualExpired=PlanCliCheckpointRestoreMatches(
+        true,{expired},{expiredLive},{"firefox"},now);
+    CHECK(manualExpired.status==CliRestoreMatchStatus::Ready);
+    CHECK(manualExpired.matches.size()==1);
+}
+
+static void test_final_provisional_binding_yields_to_unresolved_established_record(){
+    const UnixSeconds now=2000000000;
+    LayoutWin established=Identified(
+        "{00000000-0000-0000-0000-000000000412}","firefox",1,
+        {{"a.com",1}},"Remembered");
+    LayoutWin provisional=Identified(
+        "{00000000-0000-0000-0000-000000000413}","firefox",0,
+        {},"Observed");
+    provisional.provisional=true;
+    const std::vector<LayoutWin> records={established,provisional};
+
+    CHECK(!CanBindFinalProvisional(
+        records,{},provisional,false,false,now));
+    CHECK(CanBindFinalProvisional(
+        records,{established.recordId},provisional,false,false,now));
+    CHECK(!CanBindFinalProvisional(
+        records,{established.recordId},provisional,true,false,now));
+    CHECK(!CanBindFinalProvisional(
+        records,{established.recordId},provisional,false,true,now));
+    established.missingSinceUtc=now-WINDOW_RETENTION_SECONDS;
+    CHECK(CanBindFinalProvisional(
+        {established,provisional},{},provisional,false,false,now));
 }
 
 static void test_layout_rejects_invalid_desktop_guid_transactionally(){
@@ -11077,6 +11751,24 @@ static size_t CountSourceText(const std::string& source,
         position+=needle.size();
     }
     return count;
+}
+
+static void test_cli_list_uses_one_atomic_desktop_snapshot(){
+    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    const std::string cli=SourceSection(
+        source,"static int CliRun(const std::wstring& cmd){",
+        "// ================================ GUI: picker");
+    CHECK(!cli.empty());
+    CHECK(CountSourceText(cli,"CurrentDesktops(")==1);
+    CHECK(cli.find("g_vdmi->GetCount(")==std::string::npos);
+    CHECK(cli.find("GetDesktopByIndex(")==std::string::npos);
+    CHECK(cli.find("->GetID(")==std::string::npos);
+    const size_t snapshot=cli.find(
+        "if(!CurrentDesktops(desks,&desktopError))");
+    const size_t output=cli.find("printf(\"Virtual desktops: %u\\n\"");
+    CHECK(snapshot!=std::string::npos && output!=std::string::npos &&
+          snapshot<output);
+    CHECK(cli.find("return 1;",snapshot)<output);
 }
 
 static void test_ui_resources_have_one_owned_cleanup_path(){
@@ -16875,34 +17567,41 @@ static void test_checkpoint_failed_end_is_retryable_at_destroy(){
     CHECK(calls==2 && controller.finalization.finished);
 }
 
-static void test_corrective_tray_exit_finalizes_before_destroy_and_retries_once(){
+static void test_tray_exit_requires_successful_finalize_before_destroy(){
     CheckpointController controller;
     int writes=0,destroys=0;
     auto checkpoint=[&](CheckpointReason){
         ++writes;
         return writes>1;
     };
+    CHECK(!RunTrayExit(
+        [&](){ return controller.dispatch(
+            CheckpointReason::Finalize,true,true,false,checkpoint); },
+        [&](){ ++destroys; return true; },
+        [&](){ controller.finalization.reopen(); }));
+    CHECK(writes==1 && destroys==0 && !controller.finalization.finished);
     CHECK(RunTrayExit(
         [&](){ return controller.dispatch(
             CheckpointReason::Finalize,true,true,false,checkpoint); },
-        [&](){
-            ++destroys;
-            CHECK(controller.dispatch(
-                CheckpointReason::Finalize,true,true,false,checkpoint));
-        }));
+        [&](){ ++destroys; return true; },
+        [&](){ controller.finalization.reopen(); }));
     CHECK(writes==2 && destroys==1 && controller.finalization.finished);
 
     CheckpointController throwing;
     writes=0; destroys=0;
-    CHECK(RunTrayExit(
+    CHECK(!RunTrayExit(
         [&](){
             return throwing.dispatch(CheckpointReason::Finalize,true,true,false,
                 [&](CheckpointReason)->bool{ ++writes; throw std::bad_alloc(); });
-        },[&](){
-            ++destroys;
-            CHECK(throwing.dispatch(CheckpointReason::Finalize,true,true,false,
-                [&](CheckpointReason){ ++writes; return true; }));
-        }));
+        },[&](){ ++destroys; return true; },
+        [&](){ throwing.finalization.reopen(); }));
+    CHECK(writes==1 && destroys==0 && !throwing.finalization.finished);
+    CHECK(RunTrayExit(
+        [&](){ return throwing.dispatch(
+            CheckpointReason::Finalize,true,true,false,
+            [&](CheckpointReason){ ++writes; return true; }); },
+        [&](){ ++destroys; return true; },
+        [&](){ throwing.finalization.reopen(); }));
     CHECK(writes==2 && destroys==1 && throwing.finalization.finished);
 
     CheckpointController alreadySaved;
@@ -16916,8 +17615,25 @@ static void test_corrective_tray_exit_finalizes_before_destroy_and_retries_once(
             CHECK(alreadySaved.dispatch(
                 CheckpointReason::Finalize,true,true,false,
                 [&](CheckpointReason){ ++writes; return true; }));
-        }));
+            return true;
+        },[&](){ alreadySaved.finalization.reopen(); }));
     CHECK(writes==1 && destroys==1);
+
+    CheckpointController destroyRetry;
+    writes=0; destroys=0;
+    auto finalizeDestroyRetry=[&](){
+        return destroyRetry.dispatch(
+            CheckpointReason::Finalize,true,true,false,
+            [&](CheckpointReason){ ++writes; return true; });
+    };
+    CHECK(!RunTrayExit(
+        finalizeDestroyRetry,[&](){ ++destroys; return false; },
+        [&](){ destroyRetry.finalization.reopen(); }));
+    CHECK(writes==1 && destroys==1 && !destroyRetry.finalization.finished);
+    CHECK(RunTrayExit(
+        finalizeDestroyRetry,[&](){ ++destroys; return true; },
+        [&](){ destroyRetry.finalization.reopen(); }));
+    CHECK(writes==2 && destroys==2 && destroyRetry.finalization.finished);
 }
 
 static void test_corrective_successful_session_end_quiesces_late_work(){
@@ -17914,6 +18630,7 @@ int main(){
     test_picker_icon_loading_is_bounded_and_outside_paint();
     test_picker_preloads_only_laid_out_visible_rows();
     test_picker_wm_paint_requires_the_owned_buffer();
+    test_cli_list_uses_one_atomic_desktop_snapshot();
     test_ui_resources_have_one_owned_cleanup_path();
     test_message_pump_failure_uses_shared_teardown();
     test_footer_literal_and_links_are_exact();
@@ -18030,6 +18747,8 @@ int main(){
     test_explicit_save_with_unbound_sibling_rearms_reconcile();
     test_fast_snapshot_versions_are_order_independent_and_quality_aware();
     test_resolve_saved_desktop_uses_guid_only();
+    test_unknown_desktop_guid_is_not_index_zero();
+    test_auto_restore_destination_uses_preserved_prepare_desktops();
     test_rebase_merges_different_ids_and_preserves_external_records();
     test_rebase_same_id_newer_validated_upsert_wins();
     test_durable_candidate_delta_is_satisfied_by_external_unrelated_revision();
@@ -18088,7 +18807,7 @@ int main(){
     test_corrective_stable_monitor_rearms_dirty_flush_after_timer_failure();
     test_checkpoint_controller_heartbeat_and_session_end_chain();
     test_checkpoint_failed_end_is_retryable_at_destroy();
-    test_corrective_tray_exit_finalizes_before_destroy_and_retries_once();
+    test_tray_exit_requires_successful_finalize_before_destroy();
     test_corrective_successful_session_end_quiesces_late_work();
     test_corrective_message_routes_are_no_throw_and_retire_exactly_once();
     test_settings_checkpoint_rejects_enabled_unloaded_and_preserves_state();
@@ -18144,7 +18863,17 @@ int main(){
     test_unbound_manual_reservation_uses_provisional_origin_id();
     test_auto_restore_failure_never_completes_as_success();
     test_identity_guard_recaptures_immediately_before_issue_or_verify();
+    test_fast_window_publication_requires_exact_final_identity();
+    test_fast_window_identity_failure_invalidates_all_enabled_profiles();
     test_desktop_services_require_documented_manager();
+    test_failed_com_out_pointer_is_released();
+    test_desktop_lookup_releases_failed_getdesktops_output();
+    test_desktop_lookup_rejects_failed_or_oversized_count();
+    test_desktop_lookup_releases_failed_getat_output();
+    test_desktop_lookup_rejects_failed_or_zero_getid();
+    test_desktop_lookup_returns_only_valid_owned_matches();
+    test_desktop_snapshot_rechecks_count_after_prior_success();
+    test_desktop_snapshot_fails_atomically_on_collection_errors();
     test_service_initialization_releases_every_failed_partial_state();
     test_reconcile_deadline_retires_dropped_operation_exactly_once();
     test_dirty_flush_preserves_mutation_during_write_and_limits_errors();
@@ -18232,6 +18961,7 @@ int main(){
     test_layout_legacy_migration_never_invents_provisional_marker();
     test_layout_provisional_companions_do_not_consume_record_cap();
     test_layout_parse_v2();
+    test_layout_rejects_invalid_base64();
     test_layout_rejects_invalid_desktop_guid_transactionally();
     test_layout_rejects_progid_as_desktop_guid();
     test_layout_rejects_integer_trailing_junk_transactionally();
@@ -18257,6 +18987,15 @@ int main(){
     test_cached_stale_edge_preserves_match_and_defers_unmatched();
     test_failed_chrome_restore_retains_saved_destination_and_marks_seen();
     test_empty_chrome_reconcile_marks_only_chrome_missing();
+    test_disabled_app_is_not_marked_newly_missing();
+    test_missing_bookkeeping_is_copy_transactional_and_prunes_globally();
+    test_title_only_provisional_cannot_steal_established_restore();
+    test_distinct_title_only_provisionals_adopt_rich_live_rows();
+    test_disjoint_residual_titles_do_not_block_safe_adoption();
+    test_duplicate_title_only_provisionals_remain_deferred();
+    test_title_only_provisional_cannot_steal_title_only_live();
+    test_auto_cli_restore_uses_reconcile_semantics();
+    test_final_provisional_binding_yields_to_unresolved_established_record();
     test_reserved_chrome_record_cannot_be_stolen_by_duplicate();
     test_same_desktop_match_learns_live_index_without_restore();
     test_late_window_after_first_wave_restores_before_save();
