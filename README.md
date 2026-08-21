@@ -128,6 +128,22 @@ vde.exe restore       restore from layout-manual.txt
 vde.exe restore-auto  restore from the last auto-saved layout
 ```
 
+### Picker diagnostics
+
+For an explicitly requested one-shot picker trace, first exit the running tray
+instance, then start:
+
+```text
+build\vde.exe --trace-picker
+```
+
+Reproduce one picker opening and Ctrl+Click, then exit VDE from the tray. The
+bounded JSONL file is stored under
+`%LOCALAPPDATA%\VirtualDesktopsExtention\diagnostics`. Tracing is off during
+ordinary launches and is never added to autostart. It does not record window
+titles, searches, URLs, browser-session data, layout records, or full paths of
+other applications.
+
 ## Data files
 
 Stored under `%LOCALAPPDATA%\VirtualDesktopsExtention\`:

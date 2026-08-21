@@ -12262,6 +12262,429 @@ static size_t CountSourceText(const std::string& source,
     return count;
 }
 
+static std::string NormalizeCppForPickerTraceAudit(
+        const std::string& source,
+        bool preserveIdentifierBoundaries=false){
+    enum class State { Code, LineComment, BlockComment, String, Character };
+    State state=State::Code;
+    std::string normalized;
+    normalized.reserve(source.size());
+    bool separated=false;
+    const auto identifierCharacter=[](char value){
+        return (value>='a' && value<='z') ||
+            (value>='A' && value<='Z') ||
+            (value>='0' && value<='9') || value=='_';
+    };
+    const auto appendCode=[&](char value){
+        if(preserveIdentifierBoundaries && separated &&
+           !normalized.empty() && identifierCharacter(normalized.back()) &&
+           identifierCharacter(value)) normalized.push_back(' ');
+        normalized.push_back(value);
+        separated=false;
+    };
+    for(size_t index=0;index<source.size();++index){
+        const char current=source[index];
+        const char next=index+1<source.size()?source[index+1]:'\0';
+        if(state==State::LineComment){
+            if(current=='\n'){
+                state=State::Code;
+                separated=true;
+            }
+            continue;
+        }
+        if(state==State::BlockComment){
+            if(current=='*' && next=='/'){
+                state=State::Code;
+                separated=true;
+                ++index;
+            }
+            continue;
+        }
+        if(state==State::String){
+            if(current=='\\' && index+1<source.size()){
+                ++index;
+                continue;
+            }
+            if(current=='"'){
+                normalized.push_back('"');
+                separated=false;
+                state=State::Code;
+            }
+            continue;
+        }
+        if(state==State::Character){
+            if(current=='\\' && index+1<source.size()){
+                ++index;
+                continue;
+            }
+            if(current=='\''){
+                normalized.push_back('\'');
+                separated=false;
+                state=State::Code;
+            }
+            continue;
+        }
+        if(current=='/' && next=='/'){
+            state=State::LineComment;
+            separated=true;
+            ++index;
+            continue;
+        }
+        if(current=='/' && next=='*'){
+            state=State::BlockComment;
+            separated=true;
+            ++index;
+            continue;
+        }
+        if(current=='R' && next=='"'){
+            const size_t delimiterBegin=index+2;
+            const size_t open=source.find('(',delimiterBegin);
+            if(open!=std::string::npos && open-delimiterBegin<=16){
+                const std::string delimiter=
+                    source.substr(delimiterBegin,open-delimiterBegin);
+                const std::string close=")"+delimiter+"\"";
+                const size_t closeAt=source.find(close,open+1);
+                if(closeAt!=std::string::npos){
+                    appendCode('R');
+                    appendCode('"');
+                    appendCode('"');
+                    index=closeAt+close.size()-1;
+                    continue;
+                }
+            }
+        }
+        if(current=='"'){
+            appendCode('"');
+            state=State::String;
+            continue;
+        }
+        if(current=='\''){
+            appendCode('\'');
+            state=State::Character;
+            continue;
+        }
+        if(current==' ' || current=='\t' || current=='\r' || current=='\n'){
+            separated=true;
+            continue;
+        }
+        appendCode(current);
+    }
+    return normalized;
+}
+
+static bool PickerTraceContainsIdentifierForTest(
+        const std::string& source,const std::string& identifier){
+    const std::string compact=NormalizeCppForPickerTraceAudit(source,true);
+    size_t position=0;
+    while((position=compact.find(identifier,position))!=std::string::npos){
+        const auto identifierCharacter=[](char value){
+            return (value>='a' && value<='z') ||
+                (value>='A' && value<='Z') ||
+                (value>='0' && value<='9') || value=='_';
+        };
+        const bool left=position==0 ||
+            !identifierCharacter(compact[position-1]);
+        const size_t end=position+identifier.size();
+        const bool right=end==compact.size() ||
+            !identifierCharacter(compact[end]);
+        if(left && right) return true;
+        position=end;
+    }
+    return false;
+}
+
+static std::vector<std::string> PickerTraceEmitArgumentsForTest(
+        const std::string& source){
+    const std::string compact=NormalizeCppForPickerTraceAudit(source);
+    const char* calls[]={
+        ".emit(","->emit(","->emitAttempt(","->emitTerminal(",
+        "->emitStart("
+    };
+    std::vector<std::string> arguments;
+    for(const char* call:calls){
+        const std::string needle=call;
+        size_t position=0;
+        while((position=compact.find(needle,position))!=std::string::npos){
+            const size_t begin=position+needle.size();
+            size_t cursor=begin;
+            unsigned depth=1;
+            for(;cursor<compact.size() && depth!=0;++cursor){
+                if(compact[cursor]=='(') ++depth;
+                else if(compact[cursor]==')') --depth;
+            }
+            if(depth!=0) break;
+            arguments.push_back(compact.substr(begin,cursor-begin-1));
+            position=cursor;
+        }
+    }
+    return arguments;
+}
+
+static std::string PickerTraceStructBodyForTest(
+        const std::string& source,const std::string& name){
+    const std::string compact=NormalizeCppForPickerTraceAudit(source);
+    const std::string marker="struct"+name+"{";
+    const size_t markerAt=compact.find(marker);
+    if(markerAt==std::string::npos) return {};
+    const size_t begin=markerAt+marker.size();
+    unsigned depth=1;
+    size_t cursor=begin;
+    for(;cursor<compact.size() && depth!=0;++cursor){
+        if(compact[cursor]=='{') ++depth;
+        else if(compact[cursor]=='}') --depth;
+    }
+    if(depth!=0) return {};
+    return compact.substr(begin,cursor-begin-1);
+}
+
+static std::multiset<std::string> PickerTraceEmitDeclarationsForTest(
+        const std::string& source){
+    const std::string compact=NormalizeCppForPickerTraceAudit(source);
+    const char* markers[]={"voidemit(","voidemitStart("};
+    std::multiset<std::string> declarations;
+    for(const char* marker:markers){
+        size_t position=0;
+        while((position=compact.find(marker,position))!=std::string::npos){
+            const size_t end=compact.find(';',position);
+            if(end==std::string::npos) break;
+            declarations.insert(compact.substr(position,end-position+1));
+            position=end+1;
+        }
+    }
+    return declarations;
+}
+
+static std::vector<std::string> PickerTraceEventAssignmentsForTest(
+        const std::string& source){
+    const std::string compact=NormalizeCppForPickerTraceAudit(source,true);
+    const char* prefixes[]={
+        "snapshot.terminal.","result.terminal.","result.attempt.",
+        "switchEvent.","traceEvent.","mouseEvent.","event."
+    };
+    std::vector<std::string> assignments;
+    const auto identifierCharacter=[](char value){
+        return (value>='a' && value<='z') ||
+            (value>='A' && value<='Z') ||
+            (value>='0' && value<='9') || value=='_';
+    };
+    for(size_t position=0;position<compact.size();){
+        bool captured=false;
+        for(const char* value:prefixes){
+            const std::string prefix=value;
+            if(position+prefix.size()>compact.size() ||
+               compact.compare(position,prefix.size(),prefix)!=0) continue;
+            if(position>0){
+                const char prior=compact[position-1];
+                if(identifierCharacter(prior)) continue;
+            }
+            size_t cursor=position+prefix.size();
+            if(cursor>=compact.size() ||
+               !((compact[cursor]>='a' && compact[cursor]<='z') ||
+                 (compact[cursor]>='A' && compact[cursor]<='Z') ||
+                  compact[cursor]=='_')) continue;
+            while(cursor<compact.size() &&
+                  identifierCharacter(compact[cursor])) ++cursor;
+            for(;;){
+                if(cursor<compact.size() && compact[cursor]=='.'){
+                    const size_t memberBegin=++cursor;
+                    if(cursor>=compact.size() ||
+                       !((compact[cursor]>='a' && compact[cursor]<='z') ||
+                         (compact[cursor]>='A' && compact[cursor]<='Z') ||
+                          compact[cursor]=='_')){
+                        cursor=memberBegin-1;
+                        break;
+                    }
+                    while(cursor<compact.size() &&
+                          identifierCharacter(compact[cursor])) ++cursor;
+                    continue;
+                }
+                if(cursor<compact.size() && compact[cursor]=='['){
+                    unsigned depth=1;
+                    ++cursor;
+                    while(cursor<compact.size() && depth!=0){
+                        if(compact[cursor]=='[') ++depth;
+                        else if(compact[cursor]==']') --depth;
+                        ++cursor;
+                    }
+                    if(depth!=0) return {};
+                    continue;
+                }
+                break;
+            }
+            size_t assignmentBegin=position;
+            size_t operatorLength=0;
+            size_t terminatorBegin=cursor;
+            if(position>=2 &&
+               (compact.compare(position-2,2,"++")==0 ||
+                compact.compare(position-2,2,"--")==0)){
+                assignmentBegin=position-2;
+                operatorLength=2;
+            } else {
+                const char* operators[]={
+                    "<<=",">>=","+=","-=","*=","/=","%=","&=",
+                    "^=","|=","++","--","="
+                };
+                for(const char* candidate:operators){
+                    const size_t length=
+                        std::char_traits<char>::length(candidate);
+                    if(cursor+length<=compact.size() &&
+                       compact.compare(cursor,length,candidate)==0){
+                        if(length==1 && cursor+1<compact.size() &&
+                           compact[cursor+1]=='=') continue;
+                        operatorLength=length;
+                        terminatorBegin=cursor+length;
+                        break;
+                    }
+                }
+            }
+            if(operatorLength==0) continue;
+            const size_t end=compact.find(';',terminatorBegin);
+            if(end==std::string::npos) return {};
+            std::string assignment=
+                compact.substr(assignmentBegin,end-assignmentBegin+1);
+            assignment.erase(
+                std::remove(assignment.begin(),assignment.end(),' '),
+                assignment.end());
+            assignments.push_back(std::move(assignment));
+            position=end+1;
+            captured=true;
+            break;
+        }
+        if(!captured) ++position;
+    }
+    return assignments;
+}
+
+static std::multiset<std::string> PickerTraceWholeEventWritesForTest(
+        const std::string& source){
+    const std::string compact=NormalizeCppForPickerTraceAudit(source,true);
+    const char* roots[]={
+        "snapshot.terminal","result.terminal","result.attempt",
+        "switchEvent","traceEvent","mouseEvent","event"
+    };
+    const auto identifierCharacter=[](char value){
+        return (value>='a' && value<='z') ||
+            (value>='A' && value<='Z') ||
+            (value>='0' && value<='9') || value=='_';
+    };
+    std::multiset<std::string> writes;
+    for(size_t position=0;position<compact.size();){
+        bool captured=false;
+        for(const char* value:roots){
+            const std::string root=value;
+            if(position+root.size()>compact.size() ||
+               compact.compare(position,root.size(),root)!=0) continue;
+            if(position>0){
+                const char prior=compact[position-1];
+                if(identifierCharacter(prior) || prior=='.' || prior=='>' ||
+                   prior==':') continue;
+            }
+            const size_t cursor=position+root.size();
+            if(cursor<compact.size() &&
+               (identifierCharacter(compact[cursor]) ||
+                compact[cursor]=='.' || compact[cursor]=='[')) continue;
+            size_t writeBegin=position;
+            size_t operatorLength=0;
+            size_t terminatorBegin=cursor;
+            if(position>=2 &&
+               (compact.compare(position-2,2,"++")==0 ||
+                compact.compare(position-2,2,"--")==0)){
+                writeBegin=position-2;
+                operatorLength=2;
+            } else {
+                const char* operators[]={
+                    "<<=",">>=","+=","-=","*=","/=","%=","&=",
+                    "^=","|=","++","--","="
+                };
+                for(const char* candidate:operators){
+                    const size_t length=
+                        std::char_traits<char>::length(candidate);
+                    if(cursor+length<=compact.size() &&
+                       compact.compare(cursor,length,candidate)==0){
+                        if(length==1 && cursor+1<compact.size() &&
+                           compact[cursor+1]=='=') continue;
+                        operatorLength=length;
+                        terminatorBegin=cursor+length;
+                        break;
+                    }
+                }
+            }
+            if(operatorLength==0) continue;
+            const size_t end=compact.find(';',terminatorBegin);
+            if(end==std::string::npos) return {};
+            std::string write=compact.substr(writeBegin,end-writeBegin+1);
+            write.erase(std::remove(write.begin(),write.end(),' '),
+                        write.end());
+            writes.insert(std::move(write));
+            position=end+1;
+            captured=true;
+            break;
+        }
+        if(!captured) ++position;
+    }
+    return writes;
+}
+
+static std::multiset<std::string> PickerTraceWholeEventInitializersForTest(
+        const std::string& source,
+        const std::vector<std::string>& eventTypes){
+    const std::string compact=NormalizeCppForPickerTraceAudit(source,true);
+    std::multiset<std::string> initializers;
+    const auto identifierCharacter=[](char value){
+        return (value>='a' && value<='z') ||
+            (value>='A' && value<='Z') ||
+            (value>='0' && value<='9') || value=='_';
+    };
+    for(const std::string& type:eventTypes){
+        size_t position=0;
+        while((position=compact.find(type,position))!=std::string::npos){
+            if(position>0 && identifierCharacter(compact[position-1])){
+                position+=type.size();
+                continue;
+            }
+            size_t cursor=position+type.size();
+            if(cursor>=compact.size() || compact[cursor]!=' '){
+                position=cursor;
+                continue;
+            }
+            while(cursor<compact.size() && compact[cursor]==' ') ++cursor;
+            if(cursor>=compact.size() ||
+               !((compact[cursor]>='a' && compact[cursor]<='z') ||
+                 (compact[cursor]>='A' && compact[cursor]<='Z') ||
+                  compact[cursor]=='_')){
+                position=cursor;
+                continue;
+            }
+            while(cursor<compact.size() &&
+                  identifierCharacter(compact[cursor])) ++cursor;
+            if(cursor<compact.size() &&
+               (compact[cursor]=='=' || compact[cursor]=='{')){
+                const size_t end=compact.find(';',cursor+1);
+                if(end==std::string::npos) return {};
+                std::string initializer=
+                    compact.substr(position,end-position+1);
+                initializer.erase(
+                    std::remove(initializer.begin(),initializer.end(),' '),
+                    initializer.end());
+                initializers.insert(std::move(initializer));
+                position=end+1;
+            } else position=cursor;
+        }
+    }
+    return initializers;
+}
+
+static std::string PickerTraceAssignmentDigestForTest(
+        const std::vector<std::string>& assignments){
+    std::string joined;
+    for(const std::string& assignment:assignments){
+        joined+=assignment;
+        joined.push_back('\n');
+    }
+    return PickerTraceDigestHex(PickerTraceSha256Bytes(
+        joined.data(),joined.size()));
+}
+
 static void test_cli_list_uses_one_atomic_desktop_snapshot(){
     const std::string source=ReadSourceFile(L"src\\vde.cpp");
     const std::string cli=SourceSection(
@@ -23192,6 +23615,59 @@ struct PickerTraceHasDiagnosticTextForTest<Type,
     PickerTraceVoidForTest<decltype(&Type::diagnosticText)>>
     : std::true_type {};
 
+#define VDE_DEFINE_PICKER_TRACE_PRIVATE_MEMBER_TRAIT(TraitName,MemberName) \
+template<class Type,class=void>                                      \
+struct TraitName : std::false_type {};                               \
+template<class Type>                                                 \
+struct TraitName<Type,PickerTraceVoidForTest<decltype(&Type::MemberName)>> \
+    : std::true_type {}
+
+VDE_DEFINE_PICKER_TRACE_PRIVATE_MEMBER_TRAIT(
+    PickerTraceHasSearchTextForTest,searchText);
+VDE_DEFINE_PICKER_TRACE_PRIVATE_MEMBER_TRAIT(
+    PickerTraceHasCapturedTitleForTest,capturedTitle);
+VDE_DEFINE_PICKER_TRACE_PRIVATE_MEMBER_TRAIT(
+    PickerTraceHasRuntimeKeyForTest,runtimeKey);
+VDE_DEFINE_PICKER_TRACE_PRIVATE_MEMBER_TRAIT(
+    PickerTraceHasPendingRecordIdForTest,pendingRecordId);
+VDE_DEFINE_PICKER_TRACE_PRIVATE_MEMBER_TRAIT(
+    PickerTraceHasSessionStoreForTest,sessionStore);
+VDE_DEFINE_PICKER_TRACE_PRIVATE_MEMBER_TRAIT(
+    PickerTraceHasSessionstoreForTest,sessionstore);
+VDE_DEFINE_PICKER_TRACE_PRIVATE_MEMBER_TRAIT(
+    PickerTraceHasProcessImageForTest,image);
+VDE_DEFINE_PICKER_TRACE_PRIVATE_MEMBER_TRAIT(
+    PickerTraceHasGlobalTargetTitleForTest,g_targetTitle);
+
+#undef VDE_DEFINE_PICKER_TRACE_PRIVATE_MEMBER_TRAIT
+
+template<class Event>
+static void CheckPickerTraceEventPrivacyTypeForTest(){
+    static_assert(!PickerTraceHasTitleForTest<Event>::value,
+        "trace event must not own title text");
+    static_assert(!PickerTraceHasTitleTextForTest<Event>::value,
+        "trace event must not own title text");
+    static_assert(!PickerTraceHasSearchTextForTest<Event>::value,
+        "trace event must not own picker search text");
+    static_assert(!PickerTraceHasCapturedTitleForTest<Event>::value,
+        "trace event must not own a captured title");
+    static_assert(!PickerTraceHasDiagnosticForTest<Event>::value,
+        "trace event must not own diagnostic prose");
+    static_assert(!PickerTraceHasDiagnosticTextForTest<Event>::value,
+        "trace event must not own diagnostic prose");
+    static_assert(!PickerTraceHasRuntimeKeyForTest<Event>::value,
+        "trace event must not own a runtime key");
+    static_assert(!PickerTraceHasPendingRecordIdForTest<Event>::value,
+        "trace event must not own a layout record id");
+    static_assert(!PickerTraceHasSessionStoreForTest<Event>::value &&
+                  !PickerTraceHasSessionstoreForTest<Event>::value,
+        "trace event must not own sessionstore data");
+    static_assert(!PickerTraceHasProcessImageForTest<Event>::value,
+        "trace event must not own a full process image path");
+    static_assert(!PickerTraceHasGlobalTargetTitleForTest<Event>::value,
+        "trace event must not own the picker target title");
+}
+
 static void test_picker_trace_task9_vocabulary_is_exhaustive(){
     struct ReasonCase {
         PickerTraceTerminalizationReason value;
@@ -23620,6 +24096,599 @@ static void test_picker_trace_task9_runtime_wiring_is_causal_and_private(){
         "StorePickerTracePendingTerminalDelivery(")==2);
 }
 
+static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
+    CheckPickerTraceEventPrivacyTypeForTest<PickerTraceStartEvent>();
+    CheckPickerTraceEventPrivacyTypeForTest<PickerTraceCaptureEvent>();
+    CheckPickerTraceEventPrivacyTypeForTest<PickerTraceOpenEvent>();
+    CheckPickerTraceEventPrivacyTypeForTest<PickerTraceEnumBeginEvent>();
+    CheckPickerTraceEventPrivacyTypeForTest<PickerTraceEnumWindowEvent>();
+    CheckPickerTraceEventPrivacyTypeForTest<PickerTraceEnumEndEvent>();
+    CheckPickerTraceEventPrivacyTypeForTest<PickerTraceMouseDownEvent>();
+    CheckPickerTraceEventPrivacyTypeForTest<
+        PickerTraceActivationRequestEvent>();
+    CheckPickerTraceEventPrivacyTypeForTest<
+        PickerTraceActivationResultEvent>();
+    CheckPickerTraceEventPrivacyTypeForTest<PickerTraceMoveBeginEvent>();
+    CheckPickerTraceEventPrivacyTypeForTest<
+        PickerTraceMoveBeginExceptionEvent>();
+    CheckPickerTraceEventPrivacyTypeForTest<PickerTraceEffectEvent>();
+    CheckPickerTraceEventPrivacyTypeForTest<PickerTraceApiResultEvent>();
+    CheckPickerTraceEventPrivacyTypeForTest<
+        PickerTraceTerminalizationAttemptEvent>();
+    CheckPickerTraceEventPrivacyTypeForTest<
+        PickerTraceTransitionTerminalEvent>();
+
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string traceSource=
+        ReadSourceFile(L"src\\picker_trace.cpp");
+    const std::string traceHeader=
+        ReadSourceFile(L"src\\picker_trace.hpp");
+    CHECK(!source.empty() && !traceSource.empty() && !traceHeader.empty());
+
+    struct SchemaCase { const char* name; const char* body; };
+    const SchemaCase schemas[]={
+        {"PickerTraceCaptureEvent",
+         "uintptr_thwnd=0;DWORDpid=0;DWORDtid=0;inttitleLength=0;"
+         "boolwindowValid=false;booltitleRead=false;"
+         "boolidentityComplete=false;WindowIdentityRecapturerecapture="
+         "WindowIdentityRecapture::Indeterminate;booltargetPublished=false;"},
+        {"PickerTraceOpenEvent",
+         "PickerTraceOpenResultresult=PickerTraceOpenResult::ModelUnavailable;"
+         "PickerTraceDesktopSnapshotStatusdesktopSnapshot="
+         "PickerTraceDesktopSnapshotStatus::NotAttempted;"
+         "HRESULTdesktopSnapshotResult=E_NOTIMPL;intdesktopSnapshotIndex=-1;"
+         "uint32_tdesktopSnapshotCount=0;GUIDcurrentDesktop{};"
+         "uint64_tmodelGeneration=0;boolcurrentDesktopAvailable=false;"
+         "booltargetIdentityPresent=false;"},
+        {"PickerTraceEnumBeginEvent",
+         "uint64_tmodelGeneration=0;std::vector<GUID>desktops;"},
+        {"PickerTraceEnumWindowEvent",
+         "uint64_tmodelGeneration=0;uint64_tenumSequence=0;uintptr_thwnd=0;"
+         "uintptr_towner=0;uintptr_trootOwner=0;uintptr_tlastActivePopup=0;"
+         "DWORDpid=0;DWORDtid=0;PickerTraceSafeClassNameclassName;"
+         "PickerTraceSafeImageBasenameimageBasename;"
+         "boolvisibleObserved=false;boolvisible=false;"
+         "boolfirstTitleObserved=false;intfirstTitleLength=0;"
+         "DWORDfirstTitleError=ERROR_SUCCESS;boolexStyleObserved=false;"
+         "uint64_texStyle=0;DWORDexStyleError=ERROR_SUCCESS;"
+         "booltoolWindow=false;boolrootOwnerObserved=false;"
+         "boolrootOwnerSelf=false;boolcloakedObserved=false;DWORDcloaked=0;"
+         "HRESULTcloakedResult=E_NOTIMPL;PickerTraceAltTabReasonaltTabReason="
+         "PickerTraceAltTabReason::FirstTitleUnavailable;"
+         "HRESULTdesktopResult=E_NOTIMPL;GUIDdesktop{};inttileIndex=-1;"
+         "boolsecondTitleObserved=false;intsecondTitleLength=0;"
+         "intsecondTitleCopied=0;DWORDsecondTitleError=ERROR_SUCCESS;"
+         "boolprocessStartCacheHit=false;boolprocessStartAvailable=false;"
+         "DWORDprocessStartError=ERROR_SUCCESS;boolidentityComplete=false;"
+         "WindowIdentityRecapturerecapture="
+         "WindowIdentityRecapture::Indeterminate;"
+         "PickerTraceEnumDecisiondecision="
+         "PickerTraceEnumDecision::GlobalSnapshotFailure;"},
+        {"PickerTraceEnumEndEvent",
+         "uint64_tmodelGeneration=0;uint64_tcandidates=0;"
+         "std::array<uint64_t,static_cast<size_t>("
+         "PickerTraceEnumDecision::Count)>counts{};"
+         "boolenumWindowsReturned=false;DWORDenumWindowsError=ERROR_SUCCESS;"
+         "boolmodelPublished=false;"},
+        {"PickerTraceMouseDownEvent",
+         "uint64_trawWparam=0;intx=0;inty=0;boolctrl=false;"
+         "boolcontrolled=false;boolsearchActive=false;"
+         "PickerPointerTargettarget=PickerPointerTarget::None;"
+         "inttileIndex=-1;"},
+        {"PickerTraceActivationRequestEvent",
+         "uint64_tactivationId=0;PickerTraceActivationSourcesource="
+         "PickerTraceActivationSource::Mouse;boolctrl=false;inttileIndex=-1;"},
+        {"PickerTraceActivationResultEvent",
+         "uint64_tactivationId=0;PickerTraceActivationResultresult="
+         "PickerTraceActivationResult::InvalidTile;"},
+        {"PickerTraceMoveBeginEvent",
+         "uint64_tactivationId=0;uint64_tgeneration=0;inttileIndex=-1;"
+         "PickerTraceMoveBeginReasonreason="
+         "PickerTraceMoveBeginReason::InvalidIndex;GUIDtargetOrigin{};"
+         "GUIDpopupOrigin{};GUIDcurrentOrigin{};GUIDdestination{};"
+         "PickerEffectKindfirstEffect=PickerEffectKind::None;"},
+        {"PickerTraceMoveBeginExceptionEvent",
+         "uint64_tactivationId=0;booltransitionPublished=false;"},
+        {"PickerTraceEffectEvent",
+         "PickerTraceEffectStagestage=PickerTraceEffectStage::Queue;"
+         "uint64_tgeneration=0;uint64_teffectSerial=0;"
+         "PickerEventobservationEvent=PickerEvent::Timer;"
+         "PickerEffectKindeffect=PickerEffectKind::None;"
+         "PickerEffectKindnextEffect=PickerEffectKind::None;"
+         "PickerPhasephaseBefore=PickerPhase::Idle;"
+         "PickerPhasephaseAfter=PickerPhase::Idle;"
+         "PickerIdentityValidityidentity=PickerIdentityValidity::Unknown;"
+         "PickerReadValiditytargetRead=PickerReadValidity::Unknown;"
+         "PickerReadValiditypopupRead=PickerReadValidity::Unknown;"
+         "PickerReadValiditycurrentRead=PickerReadValidity::Unknown;"
+         "PickerEffectExecutionRouteexecutionRoute="
+         "PickerEffectExecutionRoute::Execute;PickerTraceDeliveryRoutedelivery="
+         "PickerTraceDeliveryRoute::None;uint32_tdeliveryAttempt=0;"
+         "boolexecutionRouteAvailable=false;booldeliveryAvailable=false;"
+         "boolapiInvoked=false;boolapiAccepted=false;"},
+        {"PickerTraceApiResultEvent",
+         "PickerTraceApiKindapi=PickerTraceApiKind::GetDesktops;"
+         "PickerTraceDesktopLookupUselookupUse="
+         "PickerTraceDesktopLookupUse::MoveEntryDestination;"
+         "PickerTraceDesktopLookupStagelookupStage="
+         "PickerTraceDesktopLookupStage::ValidateRequest;"
+         "PickerTraceRawResultKindresultKind="
+         "PickerTraceRawResultKind::HResult;uint64_tgeneration=0;"
+         "uint64_teffectSerial=0;uintptr_thwnd=0;DWORDsourceThread=0;"
+         "DWORDdestinationThread=0;intindex=-1;GUIDrequestedDesktop{};"
+         "GUIDactualDesktop{};HRESULThresult=E_NOTIMPL;"
+         "boolboolResult=false;boolinvoked=false;"
+         "boollastErrorAvailable=false;DWORDlastError=ERROR_SUCCESS;"},
+        {"PickerTraceTerminalizationAttemptEvent",
+         "uint64_tgeneration=0;uint64_tattempt=0;"
+         "PickerTraceTerminalizationReasonreason="
+         "PickerTraceTerminalizationReason::RuntimeNotReady;"
+         "PickerTraceDeliveryRouteincomingDelivery="
+         "PickerTraceDeliveryRoute::None;"
+         "PickerTraceDeliveryRouteretryDelivery="
+         "PickerTraceDeliveryRoute::None;"
+         "boolincomingDeliveryAvailable=false;"
+         "boolretryDeliveryAvailable=false;boolterminalAcknowledged=false;"
+         "boolpendingEffectNone=false;boolruntimeKeyPresent=false;"
+         "PickerTerminalGuardReleaseActionfirstReleaseAction="
+         "PickerTerminalGuardReleaseAction::ResolvedAbsent;"
+         "PickerTerminalGuardReleaseActionretryReleaseAction="
+         "PickerTerminalGuardReleaseAction::ResolvedAbsent;"
+         "PickerTraceReservationExceptionStagereleaseExceptionStage="
+         "PickerTraceReservationExceptionStage::None;"
+         "boolreleaseAttempted=false;"
+         "boolfirstReleaseActionAvailable=false;"
+         "boolretryReleaseActionAvailable=false;"
+         "boolreleaseExceptionStageAvailable=false;"
+         "boolreleaseRetried=false;boolreleaseThrew=false;"
+         "boolreservationReleased=false;boolready=false;boolfinalized=false;"},
+        {"PickerTraceTransitionTerminalEvent",
+         "uint64_tgeneration=0;PickerTraceTerminalOutcomeoutcome="
+         "PickerTraceTerminalOutcome::Failed;"
+         "PickerTraceRollbackTriggerrollbackTrigger="
+         "PickerTraceRollbackTrigger::None;"
+         "PickerTraceDiagnosticCodediagnosticCode="
+         "PickerTraceDiagnosticCode::None;intforwardTargetAttempts=0;"
+         "intforwardPopupAttempts=0;intforwardSwitchAttempts=0;"
+         "introllbackTargetAttempts=0;introllbackPopupAttempts=0;"
+         "introllbackSwitchAttempts=0;intfocusAttempts=0;"
+         "PickerReadValiditytargetRead=PickerReadValidity::Unknown;"
+         "PickerReadValiditypopupRead=PickerReadValidity::Unknown;"
+         "PickerReadValiditycurrentRead=PickerReadValidity::Unknown;"
+         "GUIDtargetDesktop{};GUIDpopupDesktop{};GUIDcurrentDesktop{};"},
+        {"PickerTraceStartEvent",
+         "PickerTraceDigestimageDigest;PickerTraceDigestpathDigest;"
+         "PickerTraceSafeImageBasenamemoduleBasename;uint64_tfileSize=0;"
+         "uint64_tlastWrite100ns=0;uint32_tpeTimestamp=0;DWORDpid=0;"
+         "DWORDtid=0;DWORDprocessSessionId=0;DWORDintegrityRid=0;"
+         "DWORDwindowsBuild=0;boolfileMetadataAvailable=false;"
+         "boolpeTimestampAvailable=false;boolprocessSessionAvailable=false;"
+         "boolintegrityAvailable=false;boolelevated=false;"}
+    };
+    static_assert(sizeof(schemas)/sizeof(schemas[0])==15,
+        "every public picker trace event schema must be allowlisted");
+    for(const SchemaCase& schema:schemas)
+        CHECK(PickerTraceStructBodyForTest(traceHeader,schema.name)==
+              schema.body);
+
+    const char* emitTypes[]={
+        "PickerTraceCaptureEvent","PickerTraceOpenEvent",
+        "PickerTraceEnumBeginEvent","PickerTraceEnumWindowEvent",
+        "PickerTraceEnumEndEvent","PickerTraceMouseDownEvent",
+        "PickerTraceActivationRequestEvent",
+        "PickerTraceActivationResultEvent","PickerTraceMoveBeginEvent",
+        "PickerTraceMoveBeginExceptionEvent","PickerTraceEffectEvent",
+        "PickerTraceApiResultEvent",
+        "PickerTraceTerminalizationAttemptEvent",
+        "PickerTraceTransitionTerminalEvent"
+    };
+    static_assert(sizeof(emitTypes)/sizeof(emitTypes[0])==14,
+        "writer and session emit surfaces must stay exact");
+    std::multiset<std::string> expectedEmitDeclarations;
+    std::vector<std::string> eventTypeNames;
+    for(const char* type:emitTypes){
+        eventTypeNames.emplace_back(type);
+        const std::string declaration=
+            std::string("voidemit(const")+type+"&)noexcept;";
+        expectedEmitDeclarations.insert(declaration);
+        expectedEmitDeclarations.insert(declaration);
+    }
+    expectedEmitDeclarations.insert(
+        "voidemitStart(conststructPickerTraceStartEvent&,"
+        "constwchar_t*appVersion)noexcept;");
+    CHECK(PickerTraceEmitDeclarationsForTest(traceHeader)==
+          expectedEmitDeclarations);
+    eventTypeNames.emplace_back("PickerTraceStartEvent");
+    const std::multiset<std::string> expectedVdeEventInitializers={
+        "PickerTraceApiResultEventevent=input;"
+    };
+    const std::multiset<std::string> expectedModuleEventInitializers={
+        "PickerTraceStartEventstartEvent="
+        "PickerTraceCollectStartEvent(provenance);"
+    };
+    CHECK(PickerTraceWholeEventInitializersForTest(
+        source,eventTypeNames)==expectedVdeEventInitializers);
+    CHECK(PickerTraceWholeEventInitializersForTest(
+        traceSource,eventTypeNames)==expectedModuleEventInitializers);
+    const std::vector<std::string> syntheticEventTypes={
+        "PickerTraceApiResultEvent","PickerTraceStartEvent"
+    };
+    const std::multiset<std::string> expectedSyntheticInitializers={
+        "PickerTraceApiResultEventevent=input;",
+        "PickerTraceStartEventstartEvent=make();"
+    };
+    CHECK(PickerTraceWholeEventInitializersForTest(
+        "// PickerTraceApiResultEvent fake=runtimeKey;\n"
+        "const char* text=\"PickerTraceStartEvent fake=diagnostic;\";\n"
+        "PickerTraceApiResultEvent event=input;\n"
+        "const PickerTraceStartEvent startEvent=make();",
+        syntheticEventTypes)==expectedSyntheticInitializers);
+    const std::multiset<std::string> expectedVdeWholeEventWrites={
+        "event=input;"
+    };
+    CHECK(PickerTraceWholeEventWritesForTest(source)==
+          expectedVdeWholeEventWrites);
+    CHECK(PickerTraceWholeEventWritesForTest(traceSource).empty());
+    const std::multiset<std::string> expectedSyntheticWholeEventWrites={
+        "++traceEvent;","event=unsafeEvent;","mouseEvent--;",
+        "result.terminal+=unsafe;"
+    };
+    CHECK(PickerTraceWholeEventWritesForTest(
+        "event=unsafeEvent; result.terminal+=unsafe; ++traceEvent; "
+        "mouseEvent--; observation.event=ignored;")==
+        expectedSyntheticWholeEventWrites);
+
+    const std::vector<std::string> syntheticAssignments=
+        PickerTraceEventAssignmentsForTest(
+            "event.safe = source; // event.bad=runtimeKey;\n"
+            "const char* fake=\"traceEvent.bad=pendingRecordId;\";\n"
+            "traceEvent.value=fn(/* ignored ; */ x);\n"
+            "mouseEvent.ctrl=value==other;\n"
+            "result.terminal.outcome=done;\n"
+            "result.attempt.reason=reason;\n"
+            "switchEvent.hresult=value;\n"
+            "snapshot.terminal.currentRead=validity;\n"
+            "event.pathDigest.status=status;\n"
+            "event.counts[index]=count;\n"
+            "event.counts[index]+=delta;\n"
+            "++event.counts[index];\n"
+            "event.pathDigest.status--;\n"
+            "unrelatedEvent.value=runtimeKey;\n"
+            "event.text=std::string(\"private; text\");");
+    const std::vector<std::string> expectedSyntheticAssignments={
+        "event.safe=source;","traceEvent.value=fn(x);",
+        "mouseEvent.ctrl=value==other;",
+        "result.terminal.outcome=done;",
+        "result.attempt.reason=reason;","switchEvent.hresult=value;",
+        "snapshot.terminal.currentRead=validity;",
+        "event.pathDigest.status=status;","event.counts[index]=count;",
+        "event.counts[index]+=delta;","++event.counts[index];",
+        "event.pathDigest.status--;",
+        "event.text=std::string(\"\");"
+    };
+    CHECK(syntheticAssignments==expectedSyntheticAssignments);
+
+    const std::vector<std::string> vdeEventAssignments=
+        PickerTraceEventAssignmentsForTest(source);
+    const std::vector<std::string> moduleEventAssignments=
+        PickerTraceEventAssignmentsForTest(traceSource);
+    CHECK(vdeEventAssignments.size()==160);
+    CHECK(moduleEventAssignments.size()==74);
+    CHECK(PickerTraceAssignmentDigestForTest(vdeEventAssignments)==
+          "3422a4d9b758b3eadeda2951c5f52a2872e64c00b391e56a2f34744356aa96c4");
+    CHECK(PickerTraceAssignmentDigestForTest(moduleEventAssignments)==
+          "3cf0a4ba0d03558355119c432dd5c642014b7ac987858d2ade5c62a01a4cf493");
+    CHECK(std::find(moduleEventAssignments.begin(),
+                    moduleEventAssignments.end(),
+                    "event.pathDigest.status="
+                    "PickerTraceDigestStatus::NormalizeFailed;")!=
+          moduleEventAssignments.end());
+    const char* forbiddenAssignmentIdentifiers[]={
+        "g_targetTitle","searchText","capturedTitle","diagnostic",
+        "runtimeKey","pendingRecordId","sessionstore","sessionStore",
+        "ProcessSnapshot"
+    };
+    for(const std::string& assignment:vdeEventAssignments)
+        for(const char* forbidden:forbiddenAssignmentIdentifiers)
+            CHECK(!PickerTraceContainsIdentifierForTest(
+                assignment,forbidden));
+    for(const std::string& assignment:moduleEventAssignments)
+        for(const char* forbidden:forbiddenAssignmentIdentifiers)
+            CHECK(!PickerTraceContainsIdentifierForTest(
+                assignment,forbidden));
+    const char* forbiddenFullImages[]={
+        "process.image","process->second.image","snapshot.image"
+    };
+    for(const std::string& assignment:vdeEventAssignments)
+        for(const char* forbidden:forbiddenFullImages)
+            CHECK(assignment.find(forbidden)==std::string::npos);
+    for(const std::string& assignment:moduleEventAssignments)
+        for(const char* forbidden:forbiddenFullImages)
+            CHECK(assignment.find(forbidden)==std::string::npos);
+
+    const std::string capture=SourceSection(
+        source,"static PickerTargetCaptureState CapturePickerTarget(",
+        "static bool GetPrimaryPickerWorkArea(");
+    const std::string captureAdapter=SourceSection(
+        source,"class PickerTraceCaptureEmitScope {",
+        "static PickerTargetCaptureState CapturePickerTarget(");
+    const std::string open=SourceSection(
+        source,"static void ShowPicker(","static void MoveSel(");
+    const std::string openAdapter=SourceSection(
+        source,"class PickerTraceOpenEmitScope {","static void ShowPicker(");
+    const std::string model=SourceSection(
+        source,"static bool BuildModel(",
+        "static bool SetPickerSelectionCurrent(");
+    const std::string enumWindow=SourceSection(
+        source,"static BOOL CALLBACK EnumAll(",
+        "static bool PopulatePickerFilteredRows(");
+    const std::string enumFinish=SourceSection(
+        source,"static BOOL FinishPickerEnumWindow(",
+        "static BOOL CALLBACK EnumAll(");
+    const std::string mouse=SourceSection(
+        source,"case WM_LBUTTONDOWN:","case WM_MOUSEMOVE:");
+    const std::string activation=SourceSection(
+        source,"static void Activate(",
+        "// --------------------------- settings window");
+    const std::string moveBegin=SourceSection(
+        source,"static PickerTraceMoveBeginReason BeginVerifiedPickerMove(",
+        "class PickerTraceCaptureEmitScope");
+    const std::string effects=SourceSection(
+        source,"static PickerObservation ExecutePickerEffect(",
+        "static void PumpPickerTransitionWork() noexcept;");
+    const std::string apiEmit=SourceSection(
+        source,"static void EmitPickerTraceHResult(",
+        "static HRESULT IssuePickerWindowMove(");
+    const std::string foregroundAdapter=SourceSection(
+        source,"static void EmitPickerProductApiTrace(",
+        "static PickerObservation ExecutePickerEffect(");
+    const std::string vdeLookup=SourceSection(
+        source,"static PickerTraceDesktopLookupStage PickerTraceLookupStage(",
+        "static ScopedComPtr<IVirtualDesktop> GetDesktopByIndex(");
+    const std::string terminalObservers=SourceSection(
+        source,"static void EmitPickerRuntimeTerminalizationAttempt(",
+        "static PickerRuntimeTerminalizationResult\n"
+            "FinalizePickerRuntimeTransition()");
+    const std::string terminalReadback=SourceSection(
+        source,"static void ReadPickerRuntimeTerminalTraceSnapshot(",
+        "static void EmitPickerRuntimeTerminalizationAttempt(");
+    const std::string pump=SourceSection(
+        source,"static void PumpPickerTransitionWork() noexcept {",
+        "static void RequestPickerCancellation(");
+    const std::string lookup=SourceSection(
+        traceSource,"void EmitPickerTraceDesktopLookupStage(",
+        "static void EmitPickerTraceApiResult(");
+    const std::string apiExecution=SourceSection(
+        traceSource,"PickerTraceForegroundHandoffResult "
+            "ExecutePickerForegroundHandoffCalls(",
+        "static bool PickerTraceRollbackPhase(");
+    const std::string reducer=SourceSection(
+        traceSource,"PickerEffect AdvancePickerTransitionTraced(",
+        "void StorePickerTracePendingTerminalDelivery(");
+    const std::string terminalPublisher=SourceSection(
+        traceSource,"void PublishPickerTraceTerminalization(",
+        "const char* PickerTraceRecaptureName(");
+    CHECK(!capture.empty() && !captureAdapter.empty() && !open.empty() &&
+          !openAdapter.empty() && !model.empty() &&
+          !enumWindow.empty() && !enumFinish.empty() && !mouse.empty() &&
+          !activation.empty() && !moveBegin.empty() && !effects.empty() &&
+          !apiEmit.empty() && !vdeLookup.empty() &&
+          !terminalObservers.empty() && !terminalReadback.empty() &&
+          !pump.empty() && !lookup.empty() &&
+          !apiExecution.empty() && !reducer.empty() &&
+          !terminalPublisher.empty());
+
+    CHECK(capture.find("PickerTraceCaptureEvent traceEvent;")!=
+          std::string::npos);
+    CHECK(capture.find("PickerTraceCaptureEmitScope traceScope(")!=
+          std::string::npos);
+    CHECK(CountSourceText(captureAdapter,
+        "g_pickerTrace.emit(*event_);")==1);
+    CHECK(open.find("PickerTraceOpenEvent traceEvent;")!=std::string::npos);
+    CHECK(open.find("PickerTraceOpenEmitScope traceScope(")!=
+          std::string::npos);
+    CHECK(CountSourceText(openAdapter,
+        "g_pickerTrace.emit(*event_);")==1);
+    CHECK(model.find("PickerTraceEnumBeginEvent event;")!=
+          std::string::npos);
+    CHECK(model.find("PickerTraceEnumEndEvent event;")!=std::string::npos);
+    CHECK(CountSourceText(model,"g_pickerTrace.emit(event);")==2);
+    CHECK(enumWindow.find("PickerTraceEnumWindowEvent traceEvent;")!=
+          std::string::npos);
+    CHECK(enumWindow.find("FinishPickerEnumWindow(")!=std::string::npos);
+    CHECK(enumFinish.find("PickerTraceEnumWindowEvent& event")!=
+          std::string::npos);
+    CHECK(CountSourceText(enumFinish,"g_pickerTrace.emit(event);")==1);
+    CHECK(mouse.find("PickerTraceMouseDownEvent mouseEvent;")!=
+          std::string::npos);
+    CHECK(CountSourceText(mouse,"g_pickerTrace.emit(mouseEvent);")==2);
+    CHECK(activation.find("PickerTraceActivationRequestEvent event;")!=
+          std::string::npos);
+    CHECK(activation.find("PickerTraceActivationResultEvent event;")!=
+          std::string::npos);
+    CHECK(CountSourceText(activation,"g_pickerTrace.emit(event);")==2);
+    CHECK(moveBegin.find("PickerTraceMoveBeginEvent traceEvent;")!=
+          std::string::npos);
+    CHECK(moveBegin.find("PickerTraceMoveBeginExceptionEvent event;")!=
+          std::string::npos);
+    CHECK(moveBegin.find("g_pickerTrace.emit(traceEvent);")!=
+          std::string::npos);
+    CHECK(moveBegin.find("g_pickerTrace.emit(event);")!=std::string::npos);
+
+    CHECK(lookup.find("PickerTraceApiResultEvent event;")!=
+          std::string::npos);
+    CHECK(lookup.find("context->trace->emit(event);")!=std::string::npos);
+    CHECK(vdeLookup.find("EmitPickerTraceDesktopLookupStage(")!=
+          std::string::npos);
+    CHECK(vdeLookup.find(
+        "LookupDesktopCollectionOwned<IObjectArray,IVirtualDesktop>(")!=
+          std::string::npos);
+    CHECK(apiExecution.find("PickerTraceApiResultEvent event;")!=
+          std::string::npos);
+    CHECK(apiExecution.find("PickerTraceApiResultEvent switchEvent;")!=
+          std::string::npos);
+    CHECK(apiExecution.find("EmitPickerTraceApiResult(observer,event);")!=
+          std::string::npos);
+    CHECK(apiEmit.find("PickerTraceApiResultEvent event;")!=
+          std::string::npos);
+    CHECK(apiEmit.find("g_pickerTrace.emit(event);")!=std::string::npos);
+    CHECK(CountSourceText(foregroundAdapter,
+        "g_pickerTrace.emit(event);")==1);
+    CHECK(foregroundAdapter.find(
+        "observer.emit=EmitPickerProductApiTrace;")!=std::string::npos);
+    CHECK(foregroundAdapter.find(
+        "ops,g_pickerTrace.active()?&observer:nullptr")!=std::string::npos);
+    CHECK(effects.find("IssuePickerWindowMove(")!=std::string::npos);
+    CHECK(effects.find("EmitPickerTraceWindowDesktopFacts(")!=
+          std::string::npos);
+    CHECK(effects.find("EmitPickerTraceCurrentDesktopFacts(")!=
+          std::string::npos);
+    CHECK(reducer.find("PickerTraceEffectStage::Reduce")!=std::string::npos);
+    CHECK(reducer.find("trace->emit(event);")!=std::string::npos);
+    CHECK(CountSourceText(source,
+        "AdvancePickerTransitionTraced(g_picker,")==3);
+    CHECK(terminalObservers.find(
+        "const PickerTraceTerminalizationAttemptEvent& event")!=
+          std::string::npos);
+    CHECK(terminalObservers.find(
+        "const PickerTraceTransitionTerminalEvent& event")!=
+          std::string::npos);
+    CHECK(CountSourceText(terminalObservers,
+        "static_cast<PickerTraceSession*>(opaque)->emit(event);")==2);
+    CHECK(terminalObservers.find(
+        "observer.emitAttempt=EmitPickerRuntimeTerminalizationAttempt;")!=
+          std::string::npos);
+    CHECK(terminalObservers.find(
+        "observer.emitTerminal=EmitPickerRuntimeTerminalEvent;")!=
+          std::string::npos);
+    CHECK(terminalObservers.find(
+        "observer.flushBoundary=FlushPickerRuntimeTerminalBoundary;")!=
+          std::string::npos);
+    const std::string normalizedTerminalReadback=
+        NormalizeCppForPickerTraceAudit(terminalReadback);
+    CHECK(CountSourceText(normalizedTerminalReadback,
+        "snapshot.terminal.")==9);
+    CHECK(normalizedTerminalReadback.find(
+        "ReadPickerWindowDesktop(snapshot.target,"
+        "snapshot.terminal.targetRead,snapshot.terminal.targetDesktop,"
+        "&targetFacts);")!=std::string::npos);
+    CHECK(normalizedTerminalReadback.find(
+        "ReadPickerWindowDesktop(g_main,snapshot.terminal.popupRead,"
+        "snapshot.terminal.popupDesktop,&popupFacts);")!=std::string::npos);
+    CHECK(terminalPublisher.find("observer->emitAttempt(")!=
+          std::string::npos);
+    CHECK(terminalPublisher.find("observer->emitTerminal(")!=
+          std::string::npos);
+    CHECK(CountSourceText(pump,"MapPickerTraceTerminalization(")==2);
+    CHECK(CountSourceText(pump,"PublishPickerTraceTerminalization(")==2);
+    CHECK(CountSourceText(NormalizeCppForPickerTraceAudit(traceSource),
+        "switchEvent.")==4);
+
+    const std::vector<std::string> syntheticEmitValues=
+        PickerTraceEmitArgumentsForTest(
+            "obj.emit /* gap */ ( event ); // obj.emit(secret)\n"
+            "const char* text=\"obj.emit(secret)\";\n"
+            "obj /* block */ . emit ( traceEvent );\n"
+            "obj->emitAttempt(ctx,attempt);\n"
+            "obj.emit(R\"tag(.emit(secret))tag\");");
+    const std::multiset<std::string> syntheticEmitArguments(
+        syntheticEmitValues.begin(),syntheticEmitValues.end());
+    const std::multiset<std::string> expectedSyntheticEmitArguments={
+        "event","traceEvent","ctx,attempt","R\"\""
+    };
+    CHECK(syntheticEmitArguments==expectedSyntheticEmitArguments);
+
+    std::vector<std::string> emitArguments=
+        PickerTraceEmitArgumentsForTest(source);
+    const std::vector<std::string> traceEmitArguments=
+        PickerTraceEmitArgumentsForTest(traceSource);
+    emitArguments.insert(emitArguments.end(),traceEmitArguments.begin(),
+                         traceEmitArguments.end());
+    const std::set<std::string> allowedArguments={
+        "event","traceEvent","*event_","mouseEvent",
+        "observer->context,event",
+        "observer->context,emission.attempt",
+        "observer->context,*terminal","startEvent,appVersion"
+    };
+    CHECK(emitArguments.size()==25);
+    for(const std::string& argument:emitArguments){
+        CHECK(allowedArguments.find(argument)!=allowedArguments.end());
+        const char* forbidden[]={
+            "g_targetTitle","searchText","capturedTitle","diagnostic",
+            "runtimeKey","pendingRecordId","sessionstore","sessionStore",
+            "ProcessSnapshot","process.image","process->second.image",
+            "snapshot.image"
+        };
+        for(const char* value:forbidden)
+            CHECK(argument.find(value)==std::string::npos);
+    }
+
+    const std::string imageBasename=SourceSection(
+        source,"static PickerTraceSafeImageBasename "
+            "ReadPickerTraceImageBasename(",
+        "static void CollectPickerTraceEnumNonDrivingFacts(");
+    const std::string enumSafeFacts=SourceSection(
+        source,"static void CollectPickerTraceEnumNonDrivingFacts(",
+        "static uint64_t NextIconTouch()");
+    const std::string safeFactories=SourceSection(
+        traceSource,"PickerTraceSafeClassName MakePickerTraceSafeClassName(",
+        "PickerTraceAltTabReason DecidePickerTraceAltTabReason(");
+    const std::string provenance=SourceSection(
+        traceSource,"static PickerTraceStartEvent "
+            "PickerTraceCollectStartEvent(",
+        "struct PickerTraceSession::Impl {");
+    CHECK(!imageBasename.empty() && !enumSafeFacts.empty() &&
+          !safeFactories.empty() && !provenance.empty());
+    CHECK(CountSourceText(source,"MakePickerTraceSafeClassName(")==1);
+    CHECK(CountSourceText(source,"MakePickerTraceSafeImageBasename(")==1);
+    CHECK(CountSourceText(traceSource,"MakePickerTraceSafeClassName(")==1);
+    CHECK(CountSourceText(traceSource,"MakePickerTraceSafeImageBasename(")==2);
+    CHECK(CountSourceText(source,"event.className=")==1);
+    CHECK(CountSourceText(source,"event.imageBasename=")==1);
+    CHECK(CountSourceText(traceSource,"event.moduleBasename=")==1);
+    const size_t classBuffer=enumSafeFacts.find("wchar_t className[129]");
+    const size_t classRead=enumSafeFacts.find(
+        "GetClassNameW(\n            hwnd,className",classBuffer);
+    const size_t classSafe=enumSafeFacts.find(
+        "MakePickerTraceSafeClassName(\n"
+        "                className,classLength)",classRead);
+    const size_t foreignImageRead=enumSafeFacts.find(
+        "event.imageBasename=ReadPickerTraceImageBasename(event.pid)",
+        classSafe);
+    CHECK(classBuffer!=std::string::npos);
+    CHECK(classRead!=std::string::npos);
+    CHECK(classSafe!=std::string::npos);
+    CHECK(foreignImageRead!=std::string::npos);
+    CHECK(classBuffer<classRead && classRead<classSafe &&
+          classSafe<foreignImageRead);
+    CHECK(safeFactories.find(
+        "if(value[index]==L'\\\\' || value[index]==L'/' || "
+        "value[index]==L':')")!=std::string::npos);
+    const size_t imageQuery=imageBasename.find(
+        "QueryFullProcessImageNameW(");
+    const size_t imageFinalComponent=imageBasename.find(
+        "while(begin>0 && path[begin-1]",imageQuery);
+    const size_t imageSafe=imageBasename.find(
+        "MakePickerTraceSafeImageBasename(\n"
+        "            path.data()+begin",imageFinalComponent);
+    CHECK(imageQuery!=std::string::npos);
+    CHECK(imageFinalComponent!=std::string::npos);
+    CHECK(imageSafe!=std::string::npos);
+    CHECK(imageQuery<imageFinalComponent && imageFinalComponent<imageSafe);
+    CHECK(imageBasename.find("ProcessSnapshot")==std::string::npos);
+    CHECK(imageBasename.find(".image")==std::string::npos);
+    const size_t modulePath=provenance.find("ops.modulePath(path)");
+    const size_t moduleFinalComponent=provenance.find(
+        "path.find_last_of(L\"\\\\/\")",modulePath);
+    const size_t moduleSafe=provenance.find(
+        "MakePickerTraceSafeImageBasename(\n"
+        "            path.data()+basenameBegin",moduleFinalComponent);
+    CHECK(modulePath!=std::string::npos);
+    CHECK(moduleFinalComponent!=std::string::npos);
+    CHECK(moduleSafe!=std::string::npos);
+    CHECK(modulePath<moduleFinalComponent && moduleFinalComponent<moduleSafe);
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
@@ -23679,6 +24748,7 @@ int main(){
     test_picker_trace_terminalization_serializes_only_available_facts();
     test_picker_trace_task9_vocabulary_is_exhaustive();
     test_picker_trace_task9_runtime_wiring_is_causal_and_private();
+    test_picker_trace_task10_runtime_anchors_and_privacy_are_locked();
     test_picker_uses_self_contained_gdi_buffer();
     test_picker_icon_loading_is_bounded_and_outside_paint();
     test_picker_enum_publishes_display_only_rows_safely();
