@@ -453,3 +453,57 @@ VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceTerminalizationAttemptEvent);
 VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceTransitionTerminalEvent);
 
 #undef VDE_DECLARE_PICKER_TRACE_SERIALIZER
+
+struct PickerTraceLimits {
+    explicit PickerTraceLimits(
+        uint64_t bytes=2ULL*1024ULL*1024ULL,
+        uint32_t events=10000) noexcept
+        :maxBytes(bytes),maxEvents(events){}
+    uint64_t maxBytes;
+    uint32_t maxEvents;
+};
+
+struct PickerTraceSinkOps {
+    std::function<size_t(const void*,size_t)> write;
+    std::function<bool()> flush;
+    std::function<bool()> close;
+    std::function<uint64_t()> monotonicMs;
+};
+
+class PickerTraceWriter {
+public:
+    PickerTraceWriter(PickerTraceSinkOps ops,PickerTraceLimits limits,
+                      const std::array<unsigned char,16>& session) noexcept;
+    ~PickerTraceWriter() noexcept;
+    bool active() const noexcept;
+    void flushBoundary() noexcept;
+    void close() noexcept;
+    void emit(const PickerTraceCaptureEvent&) noexcept;
+    void emit(const PickerTraceOpenEvent&) noexcept;
+    void emit(const PickerTraceEnumBeginEvent&) noexcept;
+    void emit(const PickerTraceEnumWindowEvent&) noexcept;
+    void emit(const PickerTraceEnumEndEvent&) noexcept;
+    void emit(const PickerTraceMouseDownEvent&) noexcept;
+    void emit(const PickerTraceActivationRequestEvent&) noexcept;
+    void emit(const PickerTraceActivationResultEvent&) noexcept;
+    void emit(const PickerTraceMoveBeginEvent&) noexcept;
+    void emit(const PickerTraceMoveBeginExceptionEvent&) noexcept;
+    void emit(const PickerTraceEffectEvent&) noexcept;
+    void emit(const PickerTraceApiResultEvent&) noexcept;
+    void emit(const PickerTraceTerminalizationAttemptEvent&) noexcept;
+    void emit(const PickerTraceTransitionTerminalEvent&) noexcept;
+private:
+    template<class Event> void emitTyped(const Event&) noexcept;
+    void truncate() noexcept;
+    bool writeWhole(const std::string&) noexcept;
+    PickerTraceSinkOps ops_;
+    PickerTraceLimits limits_;
+    PickerTraceEnvelope envelope_;
+    uint64_t startMs_=0;
+    uint64_t lastElapsedMs_=0;
+    uint64_t bytesWritten_=0;
+    uint32_t eventsWritten_=0;
+    bool active_=false;
+    bool truncated_=false;
+    bool closed_=false;
+};

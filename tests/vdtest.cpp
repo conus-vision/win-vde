@@ -19420,6 +19420,187 @@ static void test_picker_trace_every_schema_event_is_strict_jsonl(){
         std::string("{\"a\":\"")+char(0xc0)+char(0x80)+"\"}\n"));
 }
 
+static PickerTraceSinkOps PickerTraceMemorySinkForTest(
+        std::string& bytes,uint64_t now=10){
+    PickerTraceSinkOps ops;
+    ops.write=[&](const void* data,size_t size)->size_t{
+        bytes.append(static_cast<const char*>(data),size);
+        return size;
+    };
+    ops.flush=[](){ return true; };
+    ops.close=[](){ return true; };
+    ops.monotonicMs=[now](){ return now; };
+    return ops;
+}
+
+static void test_picker_trace_writer_sequences_and_clamps_clock(){
+    std::string bytes;
+    std::vector<uint64_t> clock={100,105,103,110};
+    size_t tick=0;
+    PickerTraceSinkOps ops;
+    ops.write=[&](const void* data,size_t size)->size_t{
+        bytes.append(static_cast<const char*>(data),size);
+        return size;
+    };
+    ops.flush=[](){ return true; };
+    ops.close=[](){ return true; };
+    ops.monotonicMs=[&](){ return clock[tick++]; };
+    PickerTraceWriter writer(ops,PickerTraceLimits{4096,8},
+                             std::array<unsigned char,16>{});
+    PickerTraceOpenEvent event;
+    writer.emit(event);
+    writer.emit(event);
+    writer.emit(event);
+    CHECK(bytes.find("\"seq\":1")!=std::string::npos);
+    CHECK(bytes.find("\"seq\":2")!=std::string::npos);
+    CHECK(bytes.find("\"ms\":5")!=std::string::npos);
+    size_t count=0;
+    for(size_t at=0;(at=bytes.find("\"ms\":5",at))!=std::string::npos;
+        at+=8) ++count;
+    CHECK(count==2);
+}
+
+static void test_picker_trace_writer_reserves_one_truncation_event(){
+    std::string bytes;
+    PickerTraceSinkOps ops=PickerTraceMemorySinkForTest(bytes);
+    PickerTraceWriter writer(ops,PickerTraceLimits{4096,3},
+                             std::array<unsigned char,16>{});
+    PickerTraceOpenEvent event;
+    writer.emit(event);
+    writer.emit(event);
+    writer.emit(event);
+    writer.emit(event);
+    const auto count=[&](const std::string& needle){
+        size_t total=0;
+        for(size_t at=0;(at=bytes.find(needle,at))!=std::string::npos;
+            at+=needle.size()) ++total;
+        return total;
+    };
+    CHECK(count("\"event\":\"picker.open\"")==2);
+    CHECK(count("\"event\":\"trace.truncated\"")==1);
+    CHECK(!writer.active());
+}
+
+static void test_picker_trace_writer_failure_is_fail_open(){
+    int writes=0;
+    PickerTraceSinkOps ops;
+    ops.write=[&](const void*,size_t)->size_t{
+        ++writes;
+        return 0;
+    };
+    ops.flush=[](){ return true; };
+    ops.close=[](){ return true; };
+    ops.monotonicMs=[](){ return 10ULL; };
+    PickerTraceWriter writer(ops,PickerTraceLimits{4096,8},
+                             std::array<unsigned char,16>{});
+    PickerTraceOpenEvent event;
+    writer.emit(event);
+    writer.emit(event);
+    CHECK(writes==1);
+    CHECK(!writer.active());
+}
+
+static void test_picker_trace_writer_byte_cap_emits_only_truncation(){
+    std::string bytes;
+    PickerTraceSinkOps ops=PickerTraceMemorySinkForTest(bytes);
+    PickerTraceWriter writer(ops,PickerTraceLimits{256,8},
+                             std::array<unsigned char,16>{});
+    writer.emit(PickerTraceOpenEvent{});
+    CHECK(bytes.find("\"event\":\"picker.open\"")==std::string::npos);
+    CHECK(bytes.find("\"event\":\"trace.truncated\"")!=std::string::npos);
+    CHECK(bytes.size()<=256);
+    CHECK(!writer.active());
+}
+
+static void test_picker_trace_writer_partial_write_disables_once(){
+    int writes=0;
+    PickerTraceSinkOps ops;
+    ops.write=[&](const void*,size_t size)->size_t{
+        ++writes;
+        return size ? size-1 : 0;
+    };
+    ops.flush=[](){ return true; };
+    ops.close=[](){ return true; };
+    ops.monotonicMs=[](){ return 10ULL; };
+    PickerTraceWriter writer(ops,PickerTraceLimits{4096,8},
+                             std::array<unsigned char,16>{});
+    writer.emit(PickerTraceOpenEvent{});
+    writer.emit(PickerTraceOpenEvent{});
+    CHECK(writes==1);
+    CHECK(!writer.active());
+}
+
+static void test_picker_trace_writer_callback_exceptions_do_not_escape(){
+    int writes=0;
+    PickerTraceSinkOps ops;
+    ops.write=[&](const void*,size_t)->size_t{
+        ++writes;
+        throw std::runtime_error("write");
+    };
+    ops.flush=[](){ return true; };
+    ops.close=[](){ return true; };
+    ops.monotonicMs=[](){ return 10ULL; };
+    PickerTraceWriter writer(ops,PickerTraceLimits{4096,8},
+                             std::array<unsigned char,16>{});
+    writer.emit(PickerTraceOpenEvent{});
+    writer.emit(PickerTraceOpenEvent{});
+    CHECK(writes==1);
+    CHECK(!writer.active());
+
+    PickerTraceSinkOps clockOps=ops;
+    clockOps.monotonicMs=[]()->uint64_t{
+        throw std::runtime_error("clock");
+    };
+    PickerTraceWriter clockFailure(clockOps,PickerTraceLimits{},
+                                   std::array<unsigned char,16>{});
+    CHECK(!clockFailure.active());
+}
+
+static void test_picker_trace_writer_flush_failure_disables(){
+    std::string bytes;
+    int flushes=0;
+    PickerTraceSinkOps ops=PickerTraceMemorySinkForTest(bytes);
+    ops.flush=[&](){ ++flushes; return false; };
+    PickerTraceWriter writer(ops,PickerTraceLimits{4096,8},
+                             std::array<unsigned char,16>{});
+    writer.emit(PickerTraceOpenEvent{});
+    const size_t before=bytes.size();
+    writer.flushBoundary();
+    writer.emit(PickerTraceOpenEvent{});
+    CHECK(flushes==1);
+    CHECK(bytes.size()==before);
+    CHECK(!writer.active());
+}
+
+static void test_picker_trace_writer_close_is_once_and_no_throw(){
+    std::string bytes;
+    int closes=0;
+    PickerTraceSinkOps ops=PickerTraceMemorySinkForTest(bytes);
+    ops.close=[&](){ ++closes; return false; };
+    {
+        PickerTraceWriter writer(ops,PickerTraceLimits{4096,8},
+                                 std::array<unsigned char,16>{});
+        writer.close();
+        writer.close();
+        CHECK(!writer.active());
+    }
+    CHECK(closes==1);
+
+    int throwingCloses=0;
+    ops.close=[&]()->bool{
+        ++throwingCloses;
+        throw std::runtime_error("close");
+    };
+    {
+        PickerTraceWriter writer(ops,PickerTraceLimits{4096,8},
+                                 std::array<unsigned char,16>{});
+        writer.close();
+        writer.close();
+        CHECK(!writer.active());
+    }
+    CHECK(throwingCloses==1);
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
@@ -19428,6 +19609,14 @@ int main(){
     test_picker_trace_json_line_has_exact_canonical_shape();
     test_picker_trace_enums_have_stable_names();
     test_picker_trace_every_schema_event_is_strict_jsonl();
+    test_picker_trace_writer_sequences_and_clamps_clock();
+    test_picker_trace_writer_reserves_one_truncation_event();
+    test_picker_trace_writer_failure_is_fail_open();
+    test_picker_trace_writer_byte_cap_emits_only_truncation();
+    test_picker_trace_writer_partial_write_disables_once();
+    test_picker_trace_writer_callback_exceptions_do_not_escape();
+    test_picker_trace_writer_flush_failure_disables();
+    test_picker_trace_writer_close_is_once_and_no_throw();
     test_picker_uses_self_contained_gdi_buffer();
     test_picker_icon_loading_is_bounded_and_outside_paint();
     test_picker_enum_publishes_display_only_rows_safely();

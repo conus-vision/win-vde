@@ -1,6 +1,7 @@
 #include "picker_trace.hpp"
 
 #include <cstdio>
+#include <limits>
 
 static bool PickerTraceIsCliCommand(const std::wstring& command) noexcept {
     return command==L"save" || command==L"restore" ||
@@ -1007,3 +1008,169 @@ bool SerializePickerTraceLine(
             json.guid("current_desktop",event.currentDesktop);
     },output);
 }
+
+static bool SerializePickerTraceTruncatedLine(
+        const PickerTraceEnvelope& envelope,std::string& output) noexcept {
+    return PickerTraceSerialize(envelope,"trace.truncated",
+        [](auto&){ return true; },output);
+}
+
+PickerTraceWriter::PickerTraceWriter(
+        PickerTraceSinkOps ops,PickerTraceLimits limits,
+        const std::array<unsigned char,16>& session) noexcept
+    :ops_(std::move(ops)),limits_(limits) {
+    envelope_.session=session;
+    if(!ops_.write || !ops_.flush || !ops_.close || !ops_.monotonicMs ||
+       limits_.maxBytes==0 || limits_.maxEvents==0) return;
+    try {
+        startMs_=ops_.monotonicMs();
+        active_=true;
+    } catch(...) {
+        active_=false;
+    }
+}
+
+PickerTraceWriter::~PickerTraceWriter() noexcept {
+    close();
+}
+
+bool PickerTraceWriter::active() const noexcept {
+    return active_ && !closed_;
+}
+
+void PickerTraceWriter::flushBoundary() noexcept {
+    if(!active()) return;
+    try {
+        if(!ops_.flush()) active_=false;
+    } catch(...) {
+        active_=false;
+    }
+}
+
+void PickerTraceWriter::close() noexcept {
+    if(closed_) return;
+    closed_=true;
+    active_=false;
+    try {
+        if(ops_.close) (void)ops_.close();
+    } catch(...) {}
+}
+
+bool PickerTraceWriter::writeWhole(const std::string& bytes) noexcept {
+    if(!active() || bytes.empty()) return false;
+    try {
+        const size_t written=ops_.write(bytes.data(),bytes.size());
+        if(written!=bytes.size()){
+            active_=false;
+            return false;
+        }
+        return true;
+    } catch(...) {
+        active_=false;
+        return false;
+    }
+}
+
+void PickerTraceWriter::truncate() noexcept {
+    if(!active() || truncated_) return;
+    truncated_=true;
+    PickerTraceEnvelope candidate=envelope_;
+    std::string line;
+    try {
+        if(candidate.seq==(std::numeric_limits<uint64_t>::max)()){
+            active_=false;
+            return;
+        }
+        const uint64_t now=ops_.monotonicMs();
+        uint64_t elapsed=now>=startMs_ ? now-startMs_ : 0;
+        if(elapsed<lastElapsedMs_) elapsed=lastElapsedMs_;
+        candidate.seq++;
+        candidate.ms=elapsed;
+        if(eventsWritten_>=limits_.maxEvents ||
+           !SerializePickerTraceTruncatedLine(candidate,line) ||
+           line.size()>limits_.maxBytes-bytesWritten_ ||
+           !writeWhole(line)){
+            active_=false;
+            return;
+        }
+        envelope_=candidate;
+        lastElapsedMs_=elapsed;
+        bytesWritten_+=static_cast<uint64_t>(line.size());
+        ++eventsWritten_;
+    } catch(...) {}
+    active_=false;
+}
+
+template<class Event>
+void PickerTraceWriter::emitTyped(const Event& event) noexcept {
+    if(!active()) return;
+    try {
+        PickerTraceEnvelope candidate=envelope_;
+        if(candidate.seq==(std::numeric_limits<uint64_t>::max)()){
+            active_=false;
+            return;
+        }
+        const uint64_t now=ops_.monotonicMs();
+        uint64_t elapsed=now>=startMs_ ? now-startMs_ : 0;
+        if(elapsed<lastElapsedMs_) elapsed=lastElapsedMs_;
+        candidate.seq++;
+        candidate.ms=elapsed;
+
+        std::string line;
+        if(!SerializePickerTraceLine(candidate,event,line)){
+            active_=false;
+            return;
+        }
+        if(eventsWritten_>=limits_.maxEvents-1){
+            truncate();
+            return;
+        }
+
+        PickerTraceEnvelope reserveEnvelope=candidate;
+        if(reserveEnvelope.seq==(std::numeric_limits<uint64_t>::max)()){
+            active_=false;
+            return;
+        }
+        ++reserveEnvelope.seq;
+        reserveEnvelope.ms=(std::numeric_limits<uint64_t>::max)();
+        std::string reserve;
+        if(!SerializePickerTraceTruncatedLine(reserveEnvelope,reserve)){
+            active_=false;
+            return;
+        }
+        const uint64_t remaining=limits_.maxBytes-bytesWritten_;
+        if(line.size()>remaining || reserve.size()>remaining-line.size()){
+            truncate();
+            return;
+        }
+        if(!writeWhole(line)) return;
+        envelope_=candidate;
+        lastElapsedMs_=elapsed;
+        bytesWritten_+=static_cast<uint64_t>(line.size());
+        ++eventsWritten_;
+    } catch(...) {
+        active_=false;
+    }
+}
+
+#define VDE_DEFINE_PICKER_TRACE_EMIT(EventType) \
+    void PickerTraceWriter::emit(const EventType& event) noexcept { \
+        emitTyped(event); \
+    }
+
+VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceCaptureEvent)
+VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceOpenEvent)
+VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceEnumBeginEvent)
+VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceEnumWindowEvent)
+VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceEnumEndEvent)
+VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceMouseDownEvent)
+VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceActivationRequestEvent)
+VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceActivationResultEvent)
+VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceMoveBeginEvent)
+VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceMoveBeginExceptionEvent)
+VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceEffectEvent)
+VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceApiResultEvent)
+VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceTerminalizationAttemptEvent)
+VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceTransitionTerminalEvent)
+
+#undef VDE_DEFINE_PICKER_TRACE_EMIT
