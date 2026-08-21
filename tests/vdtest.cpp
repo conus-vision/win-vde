@@ -11525,8 +11525,21 @@ static std::string ReadRawFile(const std::wstring& path){
     return read.status==FileReadStatus::Ok ? read.bytes : std::string();
 }
 
+static std::string ReadSourceFile(const std::wstring& path){
+    std::string source=ReadRawFile(path);
+    std::string normalized;
+    normalized.reserve(source.size());
+    for(size_t index=0;index<source.size();++index){
+        if(source[index]=='\r'){
+            if(index+1<source.size() && source[index+1]=='\n') continue;
+            normalized.push_back('\n');
+        } else normalized.push_back(source[index]);
+    }
+    return normalized;
+}
+
 static void test_picker_uses_self_contained_gdi_buffer(){
-    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
     CHECK(!source.empty());
     CHECK(source.find("#include \"gdi_buffer.hpp\"")!=std::string::npos);
     CHECK(source.find("static GdiBuffer g_pickerBuffer;")!=std::string::npos);
@@ -11545,7 +11558,7 @@ static std::string SourceSection(const std::string& source,
 }
 
 static void test_picker_icon_loading_is_bounded_and_outside_paint(){
-    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
     CHECK(!source.empty());
     CHECK(source.find("#include \"icon_cache.hpp\"")!=std::string::npos);
     CHECK(source.find("static OwnedIconCache g_windowIconCache(256")!=
@@ -11612,7 +11625,7 @@ static void test_picker_icon_loading_is_bounded_and_outside_paint(){
 }
 
 static void test_picker_preloads_only_laid_out_visible_rows(){
-    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
     CHECK(!source.empty());
     const std::string preload=SourceSection(
         source,"static void PreloadVisiblePickerIcons(",
@@ -11727,7 +11740,7 @@ static void test_picker_preloads_only_laid_out_visible_rows(){
 }
 
 static void test_picker_wm_paint_requires_the_owned_buffer(){
-    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
     const std::string message=SourceSection(
         source,"case WM_PAINT:","case WM_ERASEBKGND:");
     CHECK(!message.empty());
@@ -11754,7 +11767,7 @@ static size_t CountSourceText(const std::string& source,
 }
 
 static void test_cli_list_uses_one_atomic_desktop_snapshot(){
-    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
     const std::string cli=SourceSection(
         source,"static int CliRun(const std::wstring& cmd){",
         "// ================================ GUI: picker");
@@ -11772,7 +11785,7 @@ static void test_cli_list_uses_one_atomic_desktop_snapshot(){
 }
 
 static void test_ui_resources_have_one_owned_cleanup_path(){
-    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
     CHECK(!source.empty());
     CHECK(source.find("static HBRUSH g_searchBrush=nullptr;")!=
           std::string::npos);
@@ -11854,7 +11867,7 @@ static void test_ui_resources_have_one_owned_cleanup_path(){
 }
 
 static void test_message_pump_failure_uses_shared_teardown(){
-    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
     const std::string run=SourceSection(
         source,"static int RunGui(HINSTANCE hInst)","int WINAPI wWinMain(");
     CHECK(!run.empty());
@@ -11874,7 +11887,7 @@ static void test_message_pump_failure_uses_shared_teardown(){
 }
 
 static void test_visible_branding_and_help_retention_are_exact(){
-    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
     const std::string retention=
         "A closed Firefox, Chrome, or Edge window keeps its remembered virtual desktop for 30 days. If it reappears before expiry, VDE restores it before updating the saved layout.";
     CHECK(!source.empty());
@@ -11887,7 +11900,7 @@ static void test_visible_branding_and_help_retention_are_exact(){
 }
 
 static void test_picker_search_retry_uses_a_distinct_timer_channel(){
-    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
     CHECK(!source.empty());
     CHECK(source.find("#define TIMER_PICKER_SEARCH_RETRY 7")!=
           std::string::npos);
@@ -11906,7 +11919,7 @@ static void test_picker_search_retry_uses_a_distinct_timer_channel(){
 }
 
 static void test_picker_close_route_is_used_by_the_window_procedure(){
-    const std::string source=ReadRawFile(L"src\\vde.cpp");
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
     CHECK(!source.empty());
     CHECK(source.find("RoutePickerClose(g_picker)")!=std::string::npos);
     CHECK(source.find(
@@ -11918,8 +11931,8 @@ static void test_picker_close_route_is_used_by_the_window_procedure(){
 }
 
 static void test_picker_persistence_transaction_is_used_by_save(){
-    const std::string source=ReadRawFile(L"src\\vde.cpp");
-    const std::string header=ReadRawFile(L"src\\picker_state.hpp");
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string header=ReadSourceFile(L"src\\picker_state.hpp");
     CHECK(!source.empty());
     CHECK(!header.empty());
     CHECK(source.find("RunPickerPersistenceTransaction(")!=
