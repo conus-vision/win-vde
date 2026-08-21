@@ -102,6 +102,10 @@ inline POINT PickerCenteredOrigin(const RECT& workArea,
     return origin;
 }
 
+inline bool PickerOuterSizeValid(const SIZE& outerSize) noexcept {
+    return outerSize.cx>0 && outerSize.cy>0;
+}
+
 struct PickerFooterLayout {
     RECT footer={0,0,0,0};
     RECT repoLink={0,0,0,0};

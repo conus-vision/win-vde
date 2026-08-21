@@ -117,11 +117,15 @@ the key event.
 Add a primary-work-area helper that resolves the monitor containing virtual
 screen point `(0, 0)` with `MONITOR_DEFAULTTOPRIMARY`, validates
 `GetMonitorInfoW`, and returns `rcWork`. If monitor-info lookup fails, use the
-system primary work area; never fall back to the target window's monitor.
+system primary work area; never fall back to the target window's monitor. This
+lookup completes before model, target, or paint-cache publication.
 
 A pure centering helper computes the popup origin from the chosen work area and
-the adjusted outer window size. `ShowPicker` uses only these helpers and no
-longer consults `g_target` for physical placement.
+the adjusted outer window size, and a pure predicate rejects non-positive outer
+dimensions. `ShowPicker` checks both `AdjustWindowRectEx` and `SetWindowPos` and
+no longer consults `g_target` for physical placement. Any lookup, adjustment,
+size-validation, positioning, or paint-cache preparation failure uses one
+shared abort path that hides the popup and clears picker show-preparation state.
 
 Virtual-desktop routing is unchanged: during a controlled move, the popup may
 still be moved to the destination virtual desktop so that it remains visible
@@ -142,8 +146,10 @@ manual action must not create or mutate an automatic layout record.
   passed to undocumented move APIs.
 - A failed desktop switch is returned to the existing reducer, which verifies,
   retries within its current budget, and rolls back when necessary.
-- A failed primary-monitor query uses the primary system work area rather than a
-  secondary-monitor target fallback.
+- A failed primary-monitor query advances through validated primary-only
+  fallbacks. If all fallbacks fail, or a placement API/size check fails, picker
+  show preparation aborts through the shared cleanup path rather than exposing
+  partial target or paint-cache state.
 
 ## Verification
 
@@ -157,6 +163,8 @@ Automated tests will cover:
   helper, with no direct controlled `SwitchDesktop` call;
 - primary-work-area centering, including taskbar offsets and negative virtual
   screen coordinates;
+- fail-closed primary lookup and checked outer-size/placement boundaries before
+  the popup is shown;
 - source wiring that keeps picker enumeration separate from browser profiles;
 - the existing invariant that Ctrl-moving a non-browser never mutates automatic
   layout state.

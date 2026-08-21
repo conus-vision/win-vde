@@ -185,6 +185,17 @@ static void test_picker_centered_origin_uses_exact_work_area(){
     CHECK(oversized.y==-60);
 }
 
+static void test_picker_outer_size_requires_positive_dimensions(){
+    CHECK(PickerOuterSizeValid(SIZE{1,1}));
+    CHECK(PickerOuterSizeValid(SIZE{720,500}));
+    CHECK(!PickerOuterSizeValid(SIZE{0,1}));
+    CHECK(!PickerOuterSizeValid(SIZE{1,0}));
+    CHECK(!PickerOuterSizeValid(SIZE{0,0}));
+    CHECK(!PickerOuterSizeValid(SIZE{-1,1}));
+    CHECK(!PickerOuterSizeValid(SIZE{1,-1}));
+    CHECK(!PickerOuterSizeValid(SIZE{-1,-1}));
+}
+
 static bool SamePickerFooterLayout(
         const PickerFooterLayout& left,
         const PickerFooterLayout& right) noexcept {
@@ -11832,9 +11843,16 @@ static void test_picker_ctrl_move_uses_shared_foreground_handoff(){
 
 static void test_picker_show_uses_primary_monitor_only(){
     const std::string source=ReadSourceFile(L"src\\vde.cpp");
-    const std::string helper=SourceSection(
+    const std::string preparation=SourceSection(
         source,"static bool GetPrimaryPickerWorkArea(",
         "static void ShowPicker(");
+    const std::string abortSignature=
+        "static void AbortPickerShowPreparation() noexcept {";
+    const size_t abortOffset=preparation.find(abortSignature);
+    const std::string helper=abortOffset==std::string::npos
+        ?preparation:preparation.substr(0,abortOffset);
+    const std::string abort=abortOffset==std::string::npos
+        ?std::string():preparation.substr(abortOffset);
     const std::string show=SourceSection(
         source,"static void ShowPicker(","static void MoveSel(");
     CHECK(!helper.empty());
@@ -11880,6 +11898,8 @@ static void test_picker_show_uses_primary_monitor_only(){
     const size_t metricsAssignment=spiAssignment==std::string::npos
         ?std::string::npos
         :helper.find("workArea=fallback;",spiAssignment+1);
+    const size_t metricsReturn=helper.find(
+        "return true;",metricsAssignment);
 
     CHECK(zeroOrigin!=std::string::npos &&
           monitorFromPoint!=std::string::npos &&
@@ -11906,6 +11926,8 @@ static void test_picker_show_uses_primary_monitor_only(){
     CHECK(metricsWidthValidation!=std::string::npos);
     CHECK(metricsHeightValidation!=std::string::npos);
     CHECK(metricsAssignment!=std::string::npos);
+    CHECK(metricsReturn!=std::string::npos &&
+          metricsAssignment<metricsReturn);
     CHECK(monitorFromPoint<primaryArgument &&
           primaryArgument<monitorInfo && monitorInfo<rcWorkWidth &&
           rcWorkWidth<rcWorkHeight && rcWorkHeight<rcWorkAssignment &&
@@ -11916,22 +11938,65 @@ static void test_picker_show_uses_primary_monitor_only(){
           metricsWidth<metricsHeight &&
           metricsHeight<metricsWidthValidation &&
           metricsWidthValidation<metricsHeightValidation &&
-          metricsHeightValidation<metricsAssignment);
+          metricsHeightValidation<metricsAssignment &&
+          metricsAssignment<metricsReturn);
     CHECK(helper.find("MonitorFromWindow(")==std::string::npos);
     CHECK(helper.find("MonitorFromCursor(")==std::string::npos);
     CHECK(helper.find("GetCursorPos(")==std::string::npos);
     CHECK(helper.find("g_target")==std::string::npos);
 
+    const size_t abortDefinition=source.find(abortSignature);
+    const size_t nextAbortDefinition=abortDefinition==std::string::npos
+        ?std::string::npos
+        :source.find(abortSignature,abortDefinition+1);
+    const size_t abortHide=abort.find("HidePicker();");
+    const size_t abortCache=abort.find("g_pickerPaintCache.clear();");
+    const size_t abortTarget=abort.find("g_target=nullptr;");
+    const size_t abortTitle=abort.find("g_targetTitle.clear();");
+    CHECK(!abort.empty());
+    CHECK(abortDefinition!=std::string::npos &&
+          nextAbortDefinition==std::string::npos);
+    CHECK(abortHide!=std::string::npos);
+    CHECK(abortCache!=std::string::npos);
+    CHECK(abortTarget!=std::string::npos);
+    CHECK(abortTitle!=std::string::npos);
+    CHECK(abortHide<abortCache && abortCache<abortTarget &&
+          abortTarget<abortTitle);
+
+    const size_t buildModel=show.find("BuildModel(");
+    const size_t cachePublication=show.find(
+        "InvalidatePublishedPickerPaintCache()");
+    const size_t targetPublication=show.find(
+        "g_target=reinterpret_cast<HWND>(capture.hwnd)");
+    const size_t workAreaGuard=show.find(
+        "if(!GetPrimaryPickerWorkArea(workArea))");
     const size_t workAreaLookup=show.find(
         "GetPrimaryPickerWorkArea(workArea)");
+    const size_t workAreaAbort=show.find(
+        "AbortPickerShowPreparation();",workAreaGuard);
+    const size_t workAreaReturn=show.find("return;",workAreaAbort);
+    const size_t adjustResult=show.find(
+        "const BOOL windowAdjusted=",workAreaReturn);
     const size_t adjustWindow=show.find(
         "AdjustWindowRectEx(",workAreaLookup);
+    const size_t adjustGuard=show.find(
+        "if(!windowAdjusted)",adjustWindow);
+    const size_t adjustAbort=show.find(
+        "AbortPickerShowPreparation();",adjustGuard);
+    const size_t adjustReturn=show.find("return;",adjustAbort);
     const size_t outerWidth=show.find(
         "windowRect.right-windowRect.left",adjustWindow);
     const size_t outerHeight=show.find(
         "windowRect.bottom-windowRect.top",outerWidth);
+    const size_t outerGuard=show.find(
+        "if(!PickerOuterSizeValid(outer))",outerHeight);
+    const size_t outerAbort=show.find(
+        "AbortPickerShowPreparation();",outerGuard);
+    const size_t outerReturn=show.find("return;",outerAbort);
     const size_t centeredOrigin=show.find(
         "PickerCenteredOrigin(workArea,outer)",outerHeight);
+    const size_t setWindowResult=show.find(
+        "const BOOL windowPositioned=",centeredOrigin);
     const size_t setWindowPosition=show.find(
         "SetWindowPos(",centeredOrigin);
     const size_t setWindowCoordinates=show.find(
@@ -11940,29 +12005,79 @@ static void test_picker_show_uses_primary_monitor_only(){
         "outer.cx,outer.cy,SWP_NOACTIVATE",setWindowPosition);
     const size_t setWindowEnd=show.find(
         ");",setWindowSizeAndFlags);
-    const bool placementBounds=workAreaLookup!=std::string::npos &&
-        setWindowEnd!=std::string::npos && workAreaLookup<setWindowEnd;
+    const size_t setWindowGuard=show.find(
+        "if(!windowPositioned)",setWindowEnd);
+    const size_t setWindowAbort=show.find(
+        "AbortPickerShowPreparation();",setWindowGuard);
+    const size_t setWindowReturn=show.find("return;",setWindowAbort);
+    const size_t childLayout=show.find("RECT cr;",setWindowEnd);
+    const size_t paintFailure=show.find(
+        "if(!PickerShowPreparationComplete(",childLayout);
+    const size_t paintAbort=show.find(
+        "AbortPickerShowPreparation();",paintFailure);
+    const size_t paintReturn=show.find("return;",paintAbort);
+    const size_t showWindow=show.find("ShowWindow(g_main,SW_SHOW)",paintFailure);
+    const bool placementBounds=adjustResult!=std::string::npos &&
+        setWindowEnd!=std::string::npos && adjustResult<setWindowEnd;
     const std::string placement=placementBounds
-        ?show.substr(workAreaLookup,setWindowEnd+2-workAreaLookup)
+        ?show.substr(adjustResult,setWindowEnd+2-adjustResult)
         :std::string();
+    CHECK(buildModel!=std::string::npos);
+    CHECK(cachePublication!=std::string::npos);
+    CHECK(targetPublication!=std::string::npos);
+    CHECK(workAreaGuard!=std::string::npos);
     CHECK(workAreaLookup!=std::string::npos);
+    CHECK(workAreaAbort!=std::string::npos);
+    CHECK(workAreaReturn!=std::string::npos);
+    CHECK(workAreaGuard<workAreaLookup &&
+          workAreaLookup<workAreaAbort && workAreaAbort<workAreaReturn &&
+          workAreaReturn<buildModel && buildModel<cachePublication &&
+          cachePublication<targetPublication);
+    CHECK(adjustResult!=std::string::npos);
     CHECK(adjustWindow!=std::string::npos);
+    CHECK(adjustGuard!=std::string::npos);
+    CHECK(adjustAbort!=std::string::npos);
+    CHECK(adjustReturn!=std::string::npos);
     CHECK(outerWidth!=std::string::npos);
     CHECK(outerHeight!=std::string::npos);
+    CHECK(outerGuard!=std::string::npos);
+    CHECK(outerAbort!=std::string::npos);
+    CHECK(outerReturn!=std::string::npos);
     CHECK(centeredOrigin!=std::string::npos);
+    CHECK(setWindowResult!=std::string::npos);
     CHECK(setWindowPosition!=std::string::npos);
     CHECK(setWindowCoordinates!=std::string::npos);
     CHECK(setWindowSizeAndFlags!=std::string::npos);
     CHECK(setWindowEnd!=std::string::npos);
-    CHECK(workAreaLookup<adjustWindow && adjustWindow<outerWidth &&
-          outerWidth<outerHeight && outerHeight<centeredOrigin &&
-          centeredOrigin<setWindowPosition &&
+    CHECK(setWindowGuard!=std::string::npos);
+    CHECK(setWindowAbort!=std::string::npos);
+    CHECK(setWindowReturn!=std::string::npos);
+    CHECK(childLayout!=std::string::npos);
+    CHECK(paintFailure!=std::string::npos);
+    CHECK(paintAbort!=std::string::npos);
+    CHECK(paintReturn!=std::string::npos);
+    CHECK(showWindow!=std::string::npos);
+    CHECK(targetPublication<adjustResult && adjustResult<adjustWindow &&
+          adjustWindow<adjustGuard && adjustGuard<adjustAbort &&
+          adjustAbort<adjustReturn && adjustReturn<outerWidth &&
+          outerWidth<outerHeight && outerHeight<outerGuard &&
+          outerGuard<outerAbort && outerAbort<outerReturn &&
+          outerReturn<centeredOrigin && centeredOrigin<setWindowResult &&
+          setWindowResult<setWindowPosition &&
           setWindowPosition<setWindowCoordinates &&
           setWindowCoordinates<setWindowSizeAndFlags &&
-          setWindowSizeAndFlags<setWindowEnd);
+          setWindowSizeAndFlags<setWindowEnd &&
+          setWindowEnd<setWindowGuard && setWindowGuard<setWindowAbort &&
+          setWindowAbort<setWindowReturn && setWindowReturn<childLayout &&
+          childLayout<paintFailure && paintFailure<paintAbort &&
+          paintAbort<paintReturn && paintReturn<showWindow);
     CHECK(!placement.empty());
     CHECK(placement.find("MonitorFrom")==std::string::npos);
     CHECK(placement.find("g_target")==std::string::npos);
+    CHECK(show.find("HidePicker();")==std::string::npos);
+    CHECK(show.find("g_pickerPaintCache.clear();")==std::string::npos);
+    CHECK(show.find("g_target=nullptr;")==std::string::npos);
+    CHECK(show.find("g_targetTitle.clear();")==std::string::npos);
     CHECK(show.find("MonitorFrom")==std::string::npos);
     CHECK(show.find("GetMonitorInfo")==std::string::npos);
     CHECK(show.find("GetCursorPos(")==std::string::npos);
@@ -18999,6 +19114,7 @@ int main(){
     test_footer_literal_and_links_are_exact();
     test_footer_minimum_size_is_one_line_and_dpi_scaled();
     test_picker_centered_origin_uses_exact_work_area();
+    test_picker_outer_size_requires_positive_dimensions();
     test_footer_geometry_hit_hover_cursor_and_open_result_seams();
     test_footer_cache_and_activation_are_transactional();
     test_composite_picker_cache_cannot_omit_footer_state();

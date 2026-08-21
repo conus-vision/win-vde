@@ -7554,8 +7554,20 @@ static bool GetPrimaryPickerWorkArea(RECT& workArea) noexcept {
     return true;
 }
 
+static void AbortPickerShowPreparation() noexcept {
+    HidePicker();
+    g_pickerPaintCache.clear();
+    g_target=nullptr;
+    g_targetTitle.clear();
+}
+
 static void ShowPicker(PickerTargetCaptureState capture){
     if(g_degraded || g_picker.controlledTransition()) return;   // desktop COM unavailable; startup dialog + tray tip already explain
+    RECT workArea={0,0,0,0};
+    if(!GetPrimaryPickerWorkArea(workArea)){
+        AbortPickerShowPreparation();
+        return;
+    }
     const bool modelReady=BuildModel(capture.identity,true);
     if(!modelReady){
         RefreshPickerPaintCache();
@@ -7567,18 +7579,29 @@ static void ShowPicker(PickerTargetCaptureState capture){
     InvalidatePickerTabSearchCache(
         g_pickerTabSearchCache,g_picker.modelGeneration);
     SIZE sz=DesiredClientSize();
-    RECT workArea={0,0,0,0};
-    if(!GetPrimaryPickerWorkArea(workArea)) return;
     RECT windowRect={0,0,sz.cx,sz.cy};
-    AdjustWindowRectEx(
+    const BOOL windowAdjusted=AdjustWindowRectEx(
         &windowRect,WS_POPUP,FALSE,WS_EX_TOOLWINDOW|WS_EX_TOPMOST);
+    if(!windowAdjusted){
+        AbortPickerShowPreparation();
+        return;
+    }
     const SIZE outer={
         windowRect.right-windowRect.left,
         windowRect.bottom-windowRect.top
     };
+    if(!PickerOuterSizeValid(outer)){
+        AbortPickerShowPreparation();
+        return;
+    }
     const POINT origin=PickerCenteredOrigin(workArea,outer);
-    SetWindowPos(g_main,HWND_TOPMOST,origin.x,origin.y,
-                 outer.cx,outer.cy,SWP_NOACTIVATE);
+    const BOOL windowPositioned=SetWindowPos(
+        g_main,HWND_TOPMOST,origin.x,origin.y,
+        outer.cx,outer.cy,SWP_NOACTIVATE);
+    if(!windowPositioned){
+        AbortPickerShowPreparation();
+        return;
+    }
     RECT cr; GetClientRect(g_main,&cr); LayoutTiles(cr.right);
     EnsurePickerChildren();
     if(g_search){ SetWindowTextW(g_search,L""); RECT sb=SearchBoxRect(cr.right);
@@ -7587,10 +7610,7 @@ static void ShowPicker(PickerTargetCaptureState capture){
     MarkPickerIconPreloadDirty(g_picker.selectedIndex);
     const bool paintCacheReady=RefreshPickerPaintCache(true);
     if(!PickerShowPreparationComplete(modelReady,paintCacheReady)){
-        HidePicker();
-        g_pickerPaintCache.clear();
-        g_target=nullptr;
-        g_targetTitle.clear();
+        AbortPickerShowPreparation();
         return;
     }
     ShowWindow(g_main,SW_SHOW); SetForegroundWindow(g_main);

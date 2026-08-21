@@ -653,6 +653,8 @@ git commit -m "fix(picker): restore reliable ctrl move"
 - Test: `tests/vdtest.cpp:123-170`
 - Test: `tests/vdtest.cpp:11734-11740`
 - Test registration: `tests/vdtest.cpp:18640-18650`
+- Modify: `docs/superpowers/specs/2026-08-21-picker-window-routing-fixes-design.md`
+- Modify: this Task 3 plan section
 
 - [ ] **Step 1: Write the failing centering test**
 
@@ -675,9 +677,17 @@ static void test_picker_centered_origin_uses_exact_work_area(){
     CHECK(oversized.x==-80);
     CHECK(oversized.y==-60);
 }
+
+static void test_picker_outer_size_requires_positive_dimensions(){
+    CHECK(PickerOuterSizeValid(SIZE{720,500}));
+    CHECK(!PickerOuterSizeValid(SIZE{0,500}));
+    CHECK(!PickerOuterSizeValid(SIZE{720,0}));
+    CHECK(!PickerOuterSizeValid(SIZE{-1,500}));
+    CHECK(!PickerOuterSizeValid(SIZE{720,-1}));
+}
 ```
 
-Register it after the existing picker size/DPI tests.
+Register both tests after the existing picker size/DPI tests.
 
 - [ ] **Step 2: Run the suite and verify RED**
 
@@ -687,7 +697,8 @@ Run:
 cmd.exe /d /c .\build-test.bat
 ```
 
-Expected: compilation fails because `PickerCenteredOrigin` does not exist.
+Expected: compilation fails because `PickerCenteredOrigin` and
+`PickerOuterSizeValid` do not exist.
 
 - [ ] **Step 3: Add the pure centering helper**
 
@@ -706,6 +717,10 @@ inline POINT PickerCenteredOrigin(const RECT& workArea,
     origin.y=PickerSaturatingInt(static_cast<long long>(workArea.top)+
         (height-outerSize.cy)/2);
     return origin;
+}
+
+inline bool PickerOuterSizeValid(const SIZE& outerSize) noexcept {
+    return outerSize.cx>0 && outerSize.cy>0;
 }
 ```
 
@@ -726,20 +741,24 @@ Add near the existing `ShowPicker` source assertions:
 ```cpp
 static void test_picker_show_uses_primary_monitor_only(){
     const std::string source=ReadSourceFile(L"src\\vde.cpp");
-    const std::string helper=SourceSection(
+    const std::string preparation=SourceSection(
         source,"static bool GetPrimaryPickerWorkArea(",
         "static void ShowPicker(");
     const std::string show=SourceSection(
         source,"static void ShowPicker(","static void MoveSel(");
-    CHECK(!helper.empty());
-    CHECK(helper.find("MonitorFromPoint(")!=std::string::npos);
-    CHECK(helper.find("MONITOR_DEFAULTTOPRIMARY")!=std::string::npos);
-    CHECK(helper.find("GetMonitorInfoW(")!=std::string::npos);
-    CHECK(helper.find("SPI_GETWORKAREA")!=std::string::npos);
-    CHECK(show.find("GetPrimaryPickerWorkArea(")!=std::string::npos);
+    CHECK(preparation.find("MonitorFromPoint(")!=std::string::npos);
+    CHECK(preparation.find("MONITOR_DEFAULTTOPRIMARY")!=std::string::npos);
+    CHECK(preparation.find("GetMonitorInfoW(")!=std::string::npos);
+    CHECK(preparation.find("SPI_GETWORKAREA")!=std::string::npos);
+    CHECK(preparation.find("AbortPickerShowPreparation")!=std::string::npos);
+    CHECK(show.find("GetPrimaryPickerWorkArea(")<show.find("BuildModel("));
+    CHECK(show.find("const BOOL windowAdjusted=AdjustWindowRectEx(")!=
+          std::string::npos);
+    CHECK(show.find("PickerOuterSizeValid(outer)")!=std::string::npos);
     CHECK(show.find("PickerCenteredOrigin(")!=std::string::npos);
+    CHECK(show.find("const BOOL windowPositioned=SetWindowPos(")!=
+          std::string::npos);
     CHECK(show.find("MonitorFromWindow(")==std::string::npos);
-    CHECK(show.find("g_target?g_target:g_main")==std::string::npos);
 }
 ```
 
@@ -753,8 +772,9 @@ Run:
 cmd.exe /d /c .\build-test.bat
 ```
 
-Expected: the new test fails because `ShowPicker` still uses
-`MonitorFromWindow(g_target ? g_target : g_main, ...)`.
+Expected: the new test fails while `ShowPicker` still uses target-monitor
+routing or leaves work-area, adjustment, size, positioning, and cleanup failure
+paths unchecked.
 
 - [ ] **Step 7: Add primary work-area lookup and route ShowPicker through it**
 
@@ -766,10 +786,11 @@ static bool GetPrimaryPickerWorkArea(RECT& workArea) noexcept {
     HMONITOR monitor=MonitorFromPoint(
         origin,MONITOR_DEFAULTTOPRIMARY);
     MONITORINFO info={sizeof(info)};
-    if(monitor && GetMonitorInfoW(monitor,&info)){
+    if(monitor && GetMonitorInfoW(monitor,&info) &&
+       info.rcWork.right>info.rcWork.left &&
+       info.rcWork.bottom>info.rcWork.top){
         workArea=info.rcWork;
-        return workArea.right>workArea.left &&
-               workArea.bottom>workArea.top;
+        return true;
     }
     RECT fallback={0,0,0,0};
     if(SystemParametersInfoW(
@@ -779,32 +800,61 @@ static bool GetPrimaryPickerWorkArea(RECT& workArea) noexcept {
         workArea=fallback;
         return true;
     }
-    fallback.right=GetSystemMetrics(SM_CXSCREEN);
-    fallback.bottom=GetSystemMetrics(SM_CYSCREEN);
-    if(fallback.right<=0 || fallback.bottom<=0) return false;
+    fallback={0,0,GetSystemMetrics(SM_CXSCREEN),
+                   GetSystemMetrics(SM_CYSCREEN)};
+    if(fallback.right<=fallback.left ||
+       fallback.bottom<=fallback.top) return false;
     workArea=fallback;
     return true;
 }
+
+static void AbortPickerShowPreparation() noexcept {
+    HidePicker();
+    g_pickerPaintCache.clear();
+    g_target=nullptr;
+    g_targetTitle.clear();
+}
 ```
 
-Replace the monitor-selection and centering block in `ShowPicker` with:
+Resolve the work area at the start of `ShowPicker`, before `BuildModel` and any
+target/cache publication. Route every placement failure through the shared
+abort helper:
 
 ```cpp
 RECT workArea={0,0,0,0};
-if(!GetPrimaryPickerWorkArea(workArea)) return;
+if(!GetPrimaryPickerWorkArea(workArea)){
+    AbortPickerShowPreparation();
+    return;
+}
+
+// BuildModel and the existing target/cache publication follow here.
 RECT windowRect={0,0,sz.cx,sz.cy};
-AdjustWindowRectEx(
+const BOOL windowAdjusted=AdjustWindowRectEx(
     &windowRect,WS_POPUP,FALSE,WS_EX_TOOLWINDOW|WS_EX_TOPMOST);
+if(!windowAdjusted){
+    AbortPickerShowPreparation();
+    return;
+}
 const SIZE outer={
     windowRect.right-windowRect.left,
     windowRect.bottom-windowRect.top
 };
+if(!PickerOuterSizeValid(outer)){
+    AbortPickerShowPreparation();
+    return;
+}
 const POINT origin=PickerCenteredOrigin(workArea,outer);
-SetWindowPos(g_main,HWND_TOPMOST,origin.x,origin.y,
-             outer.cx,outer.cy,SWP_NOACTIVATE);
+const BOOL windowPositioned=SetWindowPos(
+    g_main,HWND_TOPMOST,origin.x,origin.y,
+    outer.cx,outer.cy,SWP_NOACTIVATE);
+if(!windowPositioned){
+    AbortPickerShowPreparation();
+    return;
+}
 ```
 
-Do not use the target window or cursor for physical-monitor selection.
+The existing failed `PickerShowPreparationComplete` branch uses the same abort
+helper. Do not use the target window or cursor for physical-monitor selection.
 
 - [ ] **Step 8: Run tests and production build**
 
@@ -815,13 +865,13 @@ cmd.exe /d /c .\build-test.bat
 cmd.exe /d /c .\build.bat
 ```
 
-Expected: all tests pass; production compilation ends with
-`Built build\vde.exe`.
+Expected: all tests pass, including fail-closed lookup and checked placement
+source wiring; production compilation ends with `Built build\vde.exe`.
 
 - [ ] **Step 9: Commit Task 3**
 
 ```powershell
-git add -- src/picker_state.hpp src/vde.cpp tests/vdtest.cpp
+git add -- src/picker_state.hpp src/vde.cpp tests/vdtest.cpp docs/superpowers/specs/2026-08-21-picker-window-routing-fixes-design.md docs/superpowers/plans/2026-08-21-picker-window-routing-fixes.md
 git commit -m "fix(picker): pin popup to primary monitor"
 ```
 
