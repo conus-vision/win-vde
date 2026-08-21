@@ -19823,6 +19823,251 @@ static void test_picker_trace_storage_failures_disable_only_trace(){
     CHECK(!OpenPickerTraceStorage(fileCreateFailure,7,opened));
 }
 
+static void test_picker_trace_sha256_and_path_normalization(){
+    const PickerTraceDigest digest=PickerTraceSha256Bytes("abc",3);
+    CHECK(digest.available);
+    CHECK(PickerTraceDigestHex(digest)==
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    std::string first,second;
+    CHECK(NormalizePickerTraceModulePath(
+        L"C:/Apps/VDE.EXE",first));
+    CHECK(NormalizePickerTraceModulePath(
+        L"\\\\?\\c:\\apps\\vde.exe",second));
+    CHECK(first==second);
+}
+
+static PickerTraceProvenanceOps PickerTraceFileOpsForTest(
+        const std::vector<unsigned char>& file,size_t& offset,
+        bool& failRead){
+    PickerTraceProvenanceOps ops;
+    ops.openRead=[&](const std::wstring&){
+        offset=0;
+        return reinterpret_cast<HANDLE>(static_cast<uintptr_t>(0x55));
+    };
+    ops.readFile=[&](HANDLE,void* output,DWORD requested,DWORD& read){
+        if(failRead){
+            SetLastError(ERROR_READ_FAULT);
+            read=0;
+            return FALSE;
+        }
+        const size_t available=offset<file.size() ? file.size()-offset : 0;
+        const size_t count=(std::min)(available,static_cast<size_t>(requested));
+        unsigned char* destination=static_cast<unsigned char*>(output);
+        std::copy(file.begin()+offset,file.begin()+offset+count,destination);
+        offset+=count;
+        read=static_cast<DWORD>(count);
+        return TRUE;
+    };
+    ops.seekFile=[&](HANDLE,LONGLONG distance,DWORD origin){
+        if(origin!=FILE_BEGIN || distance<0 ||
+           static_cast<uint64_t>(distance)>file.size()) return FALSE;
+        offset=static_cast<size_t>(distance);
+        return TRUE;
+    };
+    ops.fileMetadata=[&](HANDLE,uint64_t& size,uint64_t& lastWrite){
+        size=file.size();
+        lastWrite=123;
+        return true;
+    };
+    ops.closeHandle=[](HANDLE){ return TRUE; };
+    return ops;
+}
+
+template<class Value>
+static void PickerTraceWriteStructForTest(
+        std::vector<unsigned char>& bytes,size_t offset,const Value& value){
+    const unsigned char* begin=
+        reinterpret_cast<const unsigned char*>(&value);
+    if(bytes.size()<offset+sizeof(Value)) bytes.resize(offset+sizeof(Value));
+    std::copy(begin,begin+sizeof(Value),bytes.begin()+offset);
+}
+
+static std::vector<unsigned char> PickerTracePeImageForTest(
+        LONG peOffset,DWORD timestamp,bool completeHeader=true){
+    IMAGE_DOS_HEADER dos{};
+    dos.e_magic=IMAGE_DOS_SIGNATURE;
+    dos.e_lfanew=peOffset;
+    std::vector<unsigned char> bytes(sizeof(dos));
+    PickerTraceWriteStructForTest(bytes,0,dos);
+    if(peOffset<0) return bytes;
+    const DWORD signature=IMAGE_NT_SIGNATURE;
+    PickerTraceWriteStructForTest(bytes,static_cast<size_t>(peOffset),signature);
+    if(completeHeader){
+        IMAGE_FILE_HEADER header{};
+        header.TimeDateStamp=timestamp;
+        PickerTraceWriteStructForTest(
+            bytes,static_cast<size_t>(peOffset)+sizeof(signature),header);
+    }
+    return bytes;
+}
+
+static void test_picker_trace_file_hash_streams_and_reports_read_failure(){
+    std::vector<unsigned char> file={'a','b','c'};
+    size_t offset=0;
+    bool failRead=false;
+    PickerTraceProvenanceOps ops=PickerTraceFileOpsForTest(
+        file,offset,failRead);
+    PickerTraceDigest digest=PickerTraceSha256File(L"C:\\vde.exe",ops);
+    CHECK(digest.available);
+    CHECK(PickerTraceDigestHex(digest)==
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    failRead=true;
+    digest=PickerTraceSha256File(L"C:\\vde.exe",ops);
+    CHECK(!digest.available);
+    CHECK(digest.status==PickerTraceDigestStatus::ReadFailed);
+    CHECK(digest.win32Error==ERROR_READ_FAULT);
+}
+
+static void test_picker_trace_pe_timestamp_validates_every_boundary(){
+    uint32_t timestamp=0;
+    DWORD error=ERROR_SUCCESS;
+    size_t offset=0;
+    bool failRead=false;
+
+    std::vector<unsigned char> truncated(sizeof(IMAGE_DOS_HEADER)-1,0);
+    PickerTraceProvenanceOps ops=PickerTraceFileOpsForTest(
+        truncated,offset,failRead);
+    CHECK(!ReadPickerTracePeTimestamp(L"C:\\vde.exe",ops,timestamp,error));
+
+    std::vector<unsigned char> invalidOffset=PickerTracePeImageForTest(-1,0);
+    ops=PickerTraceFileOpsForTest(invalidOffset,offset,failRead);
+    CHECK(!ReadPickerTracePeTimestamp(L"C:\\vde.exe",ops,timestamp,error));
+
+    std::vector<unsigned char> truncatedPe=
+        PickerTracePeImageForTest(0x80,0,false);
+    ops=PickerTraceFileOpsForTest(truncatedPe,offset,failRead);
+    CHECK(!ReadPickerTracePeTimestamp(L"C:\\vde.exe",ops,timestamp,error));
+
+    std::vector<unsigned char> valid=
+        PickerTracePeImageForTest(0x80,0x12345678,true);
+    ops=PickerTraceFileOpsForTest(valid,offset,failRead);
+    CHECK(ReadPickerTracePeTimestamp(L"C:\\vde.exe",ops,timestamp,error));
+    CHECK(timestamp==0x12345678);
+}
+
+static void test_picker_trace_disabled_session_is_strict_zero_work(){
+    int callbacks=0;
+    PickerTraceRuntimeOps runtime;
+    runtime.storage.localAppData=[&](std::wstring&){ ++callbacks; return false; };
+    runtime.storage.getAttributes=[&](const std::wstring&){
+        ++callbacks; return INVALID_FILE_ATTRIBUTES;
+    };
+    runtime.storage.createDirectory=[&](const std::wstring&){
+        ++callbacks; return FALSE;
+    };
+    runtime.storage.listDirectory=[&](const std::wstring&,
+                                      std::vector<PickerTraceDirectoryEntry>&){
+        ++callbacks; return false;
+    };
+    runtime.storage.deleteFile=[&](const std::wstring&){
+        ++callbacks; return FALSE;
+    };
+    runtime.storage.createNew=[&](const std::wstring&,DWORD){
+        ++callbacks; return INVALID_HANDLE_VALUE;
+    };
+    runtime.storage.writeFile=[&](HANDLE,const void*,DWORD,DWORD&){
+        ++callbacks; return FALSE;
+    };
+    runtime.storage.flushFile=[&](HANDLE){ ++callbacks; return FALSE; };
+    runtime.storage.closeHandle=[&](HANDLE){ ++callbacks; return FALSE; };
+    runtime.storage.utcFileTime100ns=[&](){ ++callbacks; return 0ULL; };
+    runtime.storage.monotonicMs=[&](){ ++callbacks; return 0ULL; };
+    runtime.provenance.modulePath=[&](std::wstring&){ ++callbacks; return false; };
+    runtime.provenance.openRead=[&](const std::wstring&){
+        ++callbacks; return INVALID_HANDLE_VALUE;
+    };
+    runtime.provenance.readFile=[&](HANDLE,void*,DWORD,DWORD&){
+        ++callbacks; return FALSE;
+    };
+    runtime.provenance.seekFile=[&](HANDLE,LONGLONG,DWORD){
+        ++callbacks; return FALSE;
+    };
+    runtime.provenance.fileMetadata=[&](HANDLE,uint64_t&,uint64_t&){
+        ++callbacks; return false;
+    };
+    runtime.provenance.closeHandle=[&](HANDLE){ ++callbacks; return FALSE; };
+    runtime.provenance.randomBytes=[&](void*,size_t){
+        ++callbacks; return false;
+    };
+    runtime.provenance.processSessionId=[&](DWORD&){
+        ++callbacks; return false;
+    };
+    runtime.provenance.processIntegrity=[&](DWORD&,bool&){
+        ++callbacks; return false;
+    };
+    runtime.provenance.processId=[&](){ ++callbacks; return 1UL; };
+    runtime.provenance.threadId=[&](){ ++callbacks; return 1UL; };
+    runtime.provenance.windowsBuild=[&](){ ++callbacks; return 1UL; };
+    {
+        PickerTraceSession session(runtime);
+        CHECK(!session.start(false,L"1.1.0"));
+        CHECK(!session.active());
+        CHECK(!session.requested());
+    }
+    CHECK(callbacks==0);
+}
+
+static void test_picker_trace_start_event_is_first_and_path_private(){
+    const uint64_t day=24ULL*60ULL*60ULL*10000000ULL;
+    const uint64_t now=200000ULL*day;
+    std::vector<std::wstring> deleted;
+    std::wstring listed,created;
+    DWORD disposition=0;
+    int directoryCreates=0;
+    PickerTraceRuntimeOps runtime;
+    runtime.storage=PickerTraceStorageOpsForTest(
+        now,{},deleted,listed,created,disposition,directoryCreates);
+    std::string bytes;
+    int storageCloses=0;
+    runtime.storage.writeFile=[&](HANDLE,const void* data,DWORD size,DWORD& written){
+        bytes.append(static_cast<const char*>(data),size);
+        written=size;
+        return TRUE;
+    };
+    runtime.storage.closeHandle=[&](HANDLE){ ++storageCloses; return TRUE; };
+
+    std::vector<unsigned char> image=
+        PickerTracePeImageForTest(0x80,0x87654321,true);
+    size_t offset=0;
+    bool failRead=false;
+    runtime.provenance=PickerTraceFileOpsForTest(image,offset,failRead);
+    runtime.provenance.modulePath=[](std::wstring& output){
+        output=L"C:\\Users\\private\\build\\vde.exe";
+        return true;
+    };
+    runtime.provenance.randomBytes=[](void* output,size_t size){
+        std::fill_n(static_cast<unsigned char*>(output),size,0x22);
+        return true;
+    };
+    runtime.provenance.processSessionId=[](DWORD& output){
+        output=3; return true;
+    };
+    runtime.provenance.processIntegrity=[](DWORD& rid,bool& elevated){
+        rid=SECURITY_MANDATORY_MEDIUM_RID;
+        elevated=false;
+        return true;
+    };
+    runtime.provenance.processId=[](){ return 42UL; };
+    runtime.provenance.threadId=[](){ return 7UL; };
+    runtime.provenance.windowsBuild=[](){ return 26100UL; };
+
+    PickerTraceSession session(runtime,PickerTraceLimits{8192,32});
+    CHECK(session.start(true,L"1.1.0"));
+    CHECK(session.active());
+    CHECK(session.requested());
+    CHECK(bytes.find("\"event\":\"trace.start\"")!=std::string::npos);
+    CHECK(bytes.find("\"image_digest\":")!=std::string::npos);
+    CHECK(bytes.find("\"path_digest\":")!=std::string::npos);
+    CHECK(bytes.find("vde.exe")!=std::string::npos);
+    CHECK(bytes.find("Users")==std::string::npos);
+    CHECK(bytes.find("private")==std::string::npos);
+    CHECK(bytes.find("C:\\\\")==std::string::npos);
+    CHECK(session.pathForLocalInspection()==created);
+    session.close();
+    session.close();
+    CHECK(storageCloses==1);
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
@@ -19845,6 +20090,11 @@ int main(){
     test_picker_trace_storage_reuses_valid_directory_and_is_nonrecursive();
     test_picker_trace_storage_rejects_unsafe_diagnostics_paths();
     test_picker_trace_storage_failures_disable_only_trace();
+    test_picker_trace_sha256_and_path_normalization();
+    test_picker_trace_file_hash_streams_and_reports_read_failure();
+    test_picker_trace_pe_timestamp_validates_every_boundary();
+    test_picker_trace_disabled_session_is_strict_zero_work();
+    test_picker_trace_start_event_is_first_and_path_private();
     test_picker_uses_self_contained_gdi_buffer();
     test_picker_icon_loading_is_bounded_and_outside_paint();
     test_picker_enum_publishes_display_only_rows_safely();

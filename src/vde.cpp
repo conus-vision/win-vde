@@ -114,6 +114,7 @@ static const wchar_t* APP_VERSION = L"1.1.0";
 static HWND g_main=nullptr;
 static void Balloon(const std::wstring& text);
 static PickerState g_picker;
+static PickerTraceSession g_pickerTrace;
 static PickerTabSearchCacheState g_pickerTabSearchCache;
 static bool g_suppressPickerCtrlSpaceChar=false;
 
@@ -8623,7 +8624,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int){
     const std::wstring cmd=launch.command;
     const bool cli=launch.cli;
     const bool tracePicker=launch.tracePicker;
-    (void)tracePicker;
 
     if(FAILED(CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED))) return 1;
     UniqueWinHandle trayMutex;
@@ -8672,6 +8672,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int){
                 });
         } else {
             g_inst=hInst;
+            (void)g_pickerTrace.start(tracePicker,APP_VERSION);
             InitMetrics();
             bool good=InitializeServicesWithRollback(
                 []{ return InitServices(); },
@@ -8686,6 +8687,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int){
                 ShowCompatIssue(last!=0 && last!=GetWindowsBuild());
                 dispatchResult=RunGui(hInst);
             }
+            g_pickerTrace.close();
         }
         ReleaseServices();
         return dispatchResult;
@@ -8697,10 +8699,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int){
     catch(...) {
         ShutdownUi();
         ReleaseServices();
+        g_pickerTrace.close();
         CoUninitialize();
         return 1;
     }
     ShutdownUi();
+    g_pickerTrace.close();
     CoUninitialize();
     return rc;
 }

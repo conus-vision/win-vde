@@ -492,6 +492,8 @@ public:
     void emit(const PickerTraceApiResultEvent&) noexcept;
     void emit(const PickerTraceTerminalizationAttemptEvent&) noexcept;
     void emit(const PickerTraceTransitionTerminalEvent&) noexcept;
+    void emitStart(const struct PickerTraceStartEvent&,
+                   const wchar_t* appVersion) noexcept;
 private:
     template<class Event> void emitTyped(const Event&) noexcept;
     void truncate() noexcept;
@@ -548,3 +550,107 @@ struct PickerTraceOpenedFile {
 PickerTraceStorageOps DefaultPickerTraceStorageOps() noexcept;
 bool OpenPickerTraceStorage(const PickerTraceStorageOps& ops,DWORD processId,
                             PickerTraceOpenedFile& output) noexcept;
+
+enum class PickerTraceDigestStatus : uint8_t {
+    Available, PathUnavailable, NormalizeFailed, OpenFailed,
+    MetadataFailed, ReadFailed, CryptoFailed
+};
+
+struct PickerTraceDigest {
+    PickerTraceDigestStatus status=PickerTraceDigestStatus::PathUnavailable;
+    std::array<unsigned char,32> bytes{};
+    DWORD win32Error=ERROR_SUCCESS;
+    LONG cryptoStatus=0;
+    bool available=false;
+};
+
+struct PickerTraceProvenanceOps {
+    std::function<bool(std::wstring&)> modulePath;
+    std::function<HANDLE(const std::wstring&)> openRead;
+    std::function<BOOL(HANDLE,void*,DWORD,DWORD&)> readFile;
+    std::function<BOOL(HANDLE,LONGLONG,DWORD)> seekFile;
+    std::function<bool(HANDLE,uint64_t&,uint64_t&)> fileMetadata;
+    std::function<BOOL(HANDLE)> closeHandle;
+    std::function<bool(void*,size_t)> randomBytes;
+    std::function<bool(DWORD&)> processSessionId;
+    std::function<bool(DWORD&,bool&)> processIntegrity;
+    std::function<DWORD()> processId;
+    std::function<DWORD()> threadId;
+    std::function<DWORD()> windowsBuild;
+};
+
+struct PickerTraceRuntimeOps {
+    PickerTraceStorageOps storage;
+    PickerTraceProvenanceOps provenance;
+};
+
+PickerTraceProvenanceOps DefaultPickerTraceProvenanceOps() noexcept;
+PickerTraceRuntimeOps DefaultPickerTraceRuntimeOps() noexcept;
+
+PickerTraceDigest PickerTraceSha256Bytes(
+    const void* bytes,size_t size) noexcept;
+PickerTraceDigest PickerTraceSha256File(
+    const std::wstring& path,const PickerTraceProvenanceOps& ops) noexcept;
+std::string PickerTraceDigestHex(const PickerTraceDigest&) noexcept;
+bool NormalizePickerTraceModulePath(
+    const std::wstring& input,std::string& normalizedUtf8) noexcept;
+bool ReadPickerTracePeTimestamp(
+    const std::wstring& path,const PickerTraceProvenanceOps& ops,
+    uint32_t& timestamp,DWORD& win32Error) noexcept;
+
+struct PickerTraceStartEvent {
+    PickerTraceDigest imageDigest;
+    PickerTraceDigest pathDigest;
+    PickerTraceSafeImageBasename moduleBasename;
+    uint64_t fileSize=0;
+    uint64_t lastWrite100ns=0;
+    uint32_t peTimestamp=0;
+    DWORD pid=0;
+    DWORD tid=0;
+    DWORD processSessionId=0;
+    DWORD integrityRid=0;
+    DWORD windowsBuild=0;
+    bool fileMetadataAvailable=false;
+    bool peTimestampAvailable=false;
+    bool processSessionAvailable=false;
+    bool integrityAvailable=false;
+    bool elevated=false;
+};
+
+const char* PickerTraceDigestStatusName(PickerTraceDigestStatus) noexcept;
+bool SerializePickerTraceLine(
+    const PickerTraceEnvelope&,const PickerTraceStartEvent&,
+    const wchar_t* appVersion,std::string& output) noexcept;
+
+class PickerTraceSession {
+public:
+    PickerTraceSession() noexcept;
+    explicit PickerTraceSession(PickerTraceRuntimeOps ops,
+                                PickerTraceLimits limits=
+                                    PickerTraceLimits()) noexcept;
+    ~PickerTraceSession() noexcept;
+    bool start(bool requested,const wchar_t* appVersion) noexcept;
+    bool active() const noexcept;
+    bool requested() const noexcept;
+    uint64_t nextCorrelationId() noexcept;
+    void flushBoundary() noexcept;
+    void close() noexcept;
+    void emit(const PickerTraceCaptureEvent&) noexcept;
+    void emit(const PickerTraceOpenEvent&) noexcept;
+    void emit(const PickerTraceEnumBeginEvent&) noexcept;
+    void emit(const PickerTraceEnumWindowEvent&) noexcept;
+    void emit(const PickerTraceEnumEndEvent&) noexcept;
+    void emit(const PickerTraceMouseDownEvent&) noexcept;
+    void emit(const PickerTraceActivationRequestEvent&) noexcept;
+    void emit(const PickerTraceActivationResultEvent&) noexcept;
+    void emit(const PickerTraceMoveBeginEvent&) noexcept;
+    void emit(const PickerTraceMoveBeginExceptionEvent&) noexcept;
+    void emit(const PickerTraceEffectEvent&) noexcept;
+    void emit(const PickerTraceApiResultEvent&) noexcept;
+    void emit(const PickerTraceTerminalizationAttemptEvent&) noexcept;
+    void emit(const PickerTraceTransitionTerminalEvent&) noexcept;
+    std::wstring pathForLocalInspection() const;
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};

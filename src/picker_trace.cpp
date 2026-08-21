@@ -1,7 +1,12 @@
 #include "picker_trace.hpp"
 
+#include <bcrypt.h>
 #include <cstdio>
 #include <limits>
+#include <new>
+
+#pragma comment(lib,"bcrypt.lib")
+#pragma comment(lib,"advapi32.lib")
 
 static bool PickerTraceIsCliCommand(const std::wstring& command) noexcept {
     return command==L"save" || command==L"restore" ||
@@ -1517,4 +1522,782 @@ PickerTraceStorageOps DefaultPickerTraceStorageOps() noexcept {
         return PickerTraceStorageOps{};
     }
     return ops;
+}
+
+class PickerTraceSha256Accumulator {
+public:
+    PickerTraceSha256Accumulator() noexcept {
+        status_=BCryptOpenAlgorithmProvider(
+            &algorithm_,BCRYPT_SHA256_ALGORITHM,nullptr,0);
+        if(!BCRYPT_SUCCESS(status_)) return;
+        ULONG objectBytes=0;
+        ULONG copied=0;
+        status_=BCryptGetProperty(
+            algorithm_,BCRYPT_OBJECT_LENGTH,
+            reinterpret_cast<PUCHAR>(&objectBytes),sizeof(objectBytes),
+            &copied,0);
+        if(!BCRYPT_SUCCESS(status_) || copied!=sizeof(objectBytes) ||
+           objectBytes==0) return;
+        try { object_.resize(objectBytes); }
+        catch(...) {
+            status_=static_cast<NTSTATUS>(0xc0000017L);
+            return;
+        }
+        status_=BCryptCreateHash(
+            algorithm_,&hash_,object_.data(),objectBytes,
+            nullptr,0,0);
+    }
+
+    ~PickerTraceSha256Accumulator() noexcept {
+        if(hash_) BCryptDestroyHash(hash_);
+        if(algorithm_) BCryptCloseAlgorithmProvider(algorithm_,0);
+    }
+
+    bool ready() const noexcept {
+        return algorithm_ && hash_ && BCRYPT_SUCCESS(status_);
+    }
+
+    bool update(const void* bytes,size_t size) noexcept {
+        if(!ready() || (!bytes && size)) return false;
+        const unsigned char* at=static_cast<const unsigned char*>(bytes);
+        while(size){
+            const ULONG chunk=size>(std::numeric_limits<ULONG>::max)()
+                ? (std::numeric_limits<ULONG>::max)()
+                : static_cast<ULONG>(size);
+            status_=BCryptHashData(hash_,const_cast<PUCHAR>(at),chunk,0);
+            if(!BCRYPT_SUCCESS(status_)) return false;
+            at+=chunk;
+            size-=chunk;
+        }
+        return true;
+    }
+
+    bool finish(std::array<unsigned char,32>& output) noexcept {
+        if(!ready()) return false;
+        status_=BCryptFinishHash(
+            hash_,output.data(),static_cast<ULONG>(output.size()),0);
+        return BCRYPT_SUCCESS(status_);
+    }
+
+    LONG status() const noexcept { return static_cast<LONG>(status_); }
+
+private:
+    BCRYPT_ALG_HANDLE algorithm_=nullptr;
+    BCRYPT_HASH_HANDLE hash_=nullptr;
+    std::vector<unsigned char> object_;
+    NTSTATUS status_=static_cast<NTSTATUS>(0xc0000001L);
+};
+
+const char* PickerTraceDigestStatusName(
+        PickerTraceDigestStatus value) noexcept {
+    switch(value){
+    case PickerTraceDigestStatus::Available: return "available";
+    case PickerTraceDigestStatus::PathUnavailable: return "path_unavailable";
+    case PickerTraceDigestStatus::NormalizeFailed: return "normalize_failed";
+    case PickerTraceDigestStatus::OpenFailed: return "open_failed";
+    case PickerTraceDigestStatus::MetadataFailed: return "metadata_failed";
+    case PickerTraceDigestStatus::ReadFailed: return "read_failed";
+    case PickerTraceDigestStatus::CryptoFailed: return "crypto_failed";
+    }
+    return "unknown";
+}
+
+PickerTraceDigest PickerTraceSha256Bytes(
+        const void* bytes,size_t size) noexcept {
+    PickerTraceDigest result;
+    result.status=PickerTraceDigestStatus::CryptoFailed;
+    if(!bytes && size){
+        result.win32Error=ERROR_INVALID_PARAMETER;
+        return result;
+    }
+    try {
+        PickerTraceSha256Accumulator hash;
+        if(!hash.ready() || !hash.update(bytes,size) ||
+           !hash.finish(result.bytes)){
+            result.cryptoStatus=hash.status();
+            return result;
+        }
+        result.status=PickerTraceDigestStatus::Available;
+        result.cryptoStatus=0;
+        result.available=true;
+        return result;
+    } catch(...) {
+        return result;
+    }
+}
+
+static void PickerTraceCloseProvenanceHandle(
+        const PickerTraceProvenanceOps& ops,HANDLE handle) noexcept {
+    if(!handle || handle==INVALID_HANDLE_VALUE || !ops.closeHandle) return;
+    try { (void)ops.closeHandle(handle); }
+    catch(...) {}
+}
+
+PickerTraceDigest PickerTraceSha256File(
+        const std::wstring& path,const PickerTraceProvenanceOps& ops) noexcept {
+    PickerTraceDigest result;
+    result.status=PickerTraceDigestStatus::OpenFailed;
+    if(path.empty() || !ops.openRead || !ops.readFile || !ops.closeHandle){
+        result.win32Error=ERROR_INVALID_PARAMETER;
+        return result;
+    }
+    HANDLE handle=INVALID_HANDLE_VALUE;
+    try {
+        SetLastError(ERROR_SUCCESS);
+        handle=ops.openRead(path);
+        if(!handle || handle==INVALID_HANDLE_VALUE){
+            result.win32Error=GetLastError();
+            if(result.win32Error==ERROR_SUCCESS)
+                result.win32Error=ERROR_OPEN_FAILED;
+            return result;
+        }
+        PickerTraceSha256Accumulator hash;
+        if(!hash.ready()){
+            result.status=PickerTraceDigestStatus::CryptoFailed;
+            result.cryptoStatus=hash.status();
+            PickerTraceCloseProvenanceHandle(ops,handle);
+            return result;
+        }
+        std::array<unsigned char,64*1024> buffer{};
+        for(;;){
+            DWORD read=0;
+            SetLastError(ERROR_SUCCESS);
+            if(!ops.readFile(handle,buffer.data(),
+                             static_cast<DWORD>(buffer.size()),read)){
+                result.status=PickerTraceDigestStatus::ReadFailed;
+                result.win32Error=GetLastError();
+                if(result.win32Error==ERROR_SUCCESS)
+                    result.win32Error=ERROR_READ_FAULT;
+                PickerTraceCloseProvenanceHandle(ops,handle);
+                return result;
+            }
+            if(read>buffer.size()){
+                result.status=PickerTraceDigestStatus::ReadFailed;
+                result.win32Error=ERROR_INVALID_DATA;
+                PickerTraceCloseProvenanceHandle(ops,handle);
+                return result;
+            }
+            if(read==0) break;
+            if(!hash.update(buffer.data(),read)){
+                result.status=PickerTraceDigestStatus::CryptoFailed;
+                result.cryptoStatus=hash.status();
+                PickerTraceCloseProvenanceHandle(ops,handle);
+                return result;
+            }
+        }
+        if(!hash.finish(result.bytes)){
+            result.status=PickerTraceDigestStatus::CryptoFailed;
+            result.cryptoStatus=hash.status();
+            PickerTraceCloseProvenanceHandle(ops,handle);
+            return result;
+        }
+        PickerTraceCloseProvenanceHandle(ops,handle);
+        result.status=PickerTraceDigestStatus::Available;
+        result.available=true;
+        return result;
+    } catch(...) {
+        PickerTraceCloseProvenanceHandle(ops,handle);
+        if(result.status==PickerTraceDigestStatus::OpenFailed)
+            result.win32Error=ERROR_UNHANDLED_EXCEPTION;
+        else
+            result.status=PickerTraceDigestStatus::ReadFailed;
+        return result;
+    }
+}
+
+std::string PickerTraceDigestHex(const PickerTraceDigest& digest) noexcept {
+    if(!digest.available) return std::string();
+    try {
+        static const char digits[]="0123456789abcdef";
+        std::string result(digest.bytes.size()*2,'0');
+        for(size_t index=0;index<digest.bytes.size();++index){
+            result[index*2]=digits[(digest.bytes[index]>>4)&0x0f];
+            result[index*2+1]=digits[digest.bytes[index]&0x0f];
+        }
+        return result;
+    } catch(...) {
+        return std::string();
+    }
+}
+
+static bool PickerTraceWidePrefixEqualInsensitive(
+        const std::wstring& value,const wchar_t* prefix) noexcept {
+    if(!prefix) return false;
+    const size_t count=wcslen(prefix);
+    if(value.size()<count) return false;
+    for(size_t index=0;index<count;++index){
+        wchar_t left=value[index];
+        wchar_t right=prefix[index];
+        if(left>=L'A' && left<=L'Z') left+=L'a'-L'A';
+        if(right>=L'A' && right<=L'Z') right+=L'a'-L'A';
+        if(left!=right) return false;
+    }
+    return true;
+}
+
+bool NormalizePickerTraceModulePath(
+        const std::wstring& input,std::string& normalizedUtf8) noexcept {
+    normalizedUtf8.clear();
+    try {
+        if(input.empty() || input.find(L'\0')!=std::wstring::npos ||
+           input.size()>static_cast<size_t>((std::numeric_limits<int>::max)()))
+            return false;
+        std::wstring normalized=input;
+        if(PickerTraceWidePrefixEqualInsensitive(normalized,L"\\\\?\\UNC\\"))
+            normalized=L"\\\\"+normalized.substr(8);
+        else if(PickerTraceWidePrefixEqualInsensitive(normalized,L"\\\\?\\"))
+            normalized.erase(0,4);
+        std::replace(normalized.begin(),normalized.end(),L'/',L'\\');
+        if(!PickerTraceIsAbsoluteDirectoryPath(normalized)) return false;
+        const int count=static_cast<int>(normalized.size());
+        const int required=LCMapStringEx(
+            LOCALE_NAME_INVARIANT,LCMAP_LOWERCASE,
+            normalized.data(),count,nullptr,0,nullptr,nullptr,0);
+        if(required!=count) return false;
+        std::wstring lower(static_cast<size_t>(required),L'\0');
+        if(LCMapStringEx(LOCALE_NAME_INVARIANT,LCMAP_LOWERCASE,
+                         normalized.data(),count,&lower[0],required,
+                         nullptr,nullptr,0)!=required) return false;
+        return PickerTraceWideToUtf8(
+            lower.data(),static_cast<int>(lower.size()),normalizedUtf8);
+    } catch(...) {
+        normalizedUtf8.clear();
+        return false;
+    }
+}
+
+static bool PickerTraceReadExact(
+        const PickerTraceProvenanceOps& ops,HANDLE handle,
+        void* output,DWORD size,DWORD& error) noexcept {
+    error=ERROR_SUCCESS;
+    unsigned char* destination=static_cast<unsigned char*>(output);
+    DWORD total=0;
+    try {
+        while(total<size){
+            DWORD read=0;
+            SetLastError(ERROR_SUCCESS);
+            if(!ops.readFile(handle,destination+total,size-total,read)){
+                error=GetLastError();
+                if(error==ERROR_SUCCESS) error=ERROR_READ_FAULT;
+                return false;
+            }
+            if(read==0 || read>size-total){
+                error=read==0 ? ERROR_HANDLE_EOF : ERROR_INVALID_DATA;
+                return false;
+            }
+            total+=read;
+        }
+        return true;
+    } catch(...) {
+        error=ERROR_UNHANDLED_EXCEPTION;
+        return false;
+    }
+}
+
+bool ReadPickerTracePeTimestamp(
+        const std::wstring& path,const PickerTraceProvenanceOps& ops,
+        uint32_t& timestamp,DWORD& win32Error) noexcept {
+    timestamp=0;
+    win32Error=ERROR_SUCCESS;
+    if(path.empty() || !ops.openRead || !ops.readFile ||
+       !ops.seekFile || !ops.closeHandle){
+        win32Error=ERROR_INVALID_PARAMETER;
+        return false;
+    }
+    HANDLE handle=INVALID_HANDLE_VALUE;
+    try {
+        SetLastError(ERROR_SUCCESS);
+        handle=ops.openRead(path);
+        if(!handle || handle==INVALID_HANDLE_VALUE){
+            win32Error=GetLastError();
+            if(win32Error==ERROR_SUCCESS) win32Error=ERROR_OPEN_FAILED;
+            return false;
+        }
+        IMAGE_DOS_HEADER dos{};
+        if(!PickerTraceReadExact(ops,handle,&dos,sizeof(dos),win32Error) ||
+           dos.e_magic!=IMAGE_DOS_SIGNATURE ||
+           dos.e_lfanew<static_cast<LONG>(sizeof(dos)) ||
+           dos.e_lfanew>64L*1024L*1024L){
+            if(win32Error==ERROR_SUCCESS) win32Error=ERROR_BAD_EXE_FORMAT;
+            PickerTraceCloseProvenanceHandle(ops,handle);
+            return false;
+        }
+        SetLastError(ERROR_SUCCESS);
+        if(!ops.seekFile(handle,dos.e_lfanew,FILE_BEGIN)){
+            win32Error=GetLastError();
+            if(win32Error==ERROR_SUCCESS) win32Error=ERROR_SEEK;
+            PickerTraceCloseProvenanceHandle(ops,handle);
+            return false;
+        }
+        DWORD signature=0;
+        IMAGE_FILE_HEADER header{};
+        if(!PickerTraceReadExact(
+                ops,handle,&signature,sizeof(signature),win32Error) ||
+           signature!=IMAGE_NT_SIGNATURE ||
+           !PickerTraceReadExact(
+                ops,handle,&header,sizeof(header),win32Error)){
+            if(win32Error==ERROR_SUCCESS) win32Error=ERROR_BAD_EXE_FORMAT;
+            PickerTraceCloseProvenanceHandle(ops,handle);
+            return false;
+        }
+        PickerTraceCloseProvenanceHandle(ops,handle);
+        timestamp=header.TimeDateStamp;
+        return true;
+    } catch(...) {
+        PickerTraceCloseProvenanceHandle(ops,handle);
+        win32Error=ERROR_UNHANDLED_EXCEPTION;
+        return false;
+    }
+}
+
+bool SerializePickerTraceLine(
+        const PickerTraceEnvelope& envelope,const PickerTraceStartEvent& event,
+        const wchar_t* appVersion,std::string& output) noexcept {
+    return PickerTraceSerialize(envelope,"trace.start",[&](auto& json){
+        std::string version;
+        std::string basename;
+        const wchar_t* safeVersion=appVersion ? appVersion : L"";
+        const size_t versionLength=wcslen(safeVersion);
+        if(versionLength>static_cast<size_t>((std::numeric_limits<int>::max)()) ||
+           !PickerTraceWideToUtf8(safeVersion,
+                                  static_cast<int>(versionLength),version))
+            return false;
+        if(event.moduleBasename.available() &&
+           !PickerTraceWideToUtf8(event.moduleBasename.data(),
+                                  event.moduleBasename.length(),basename))
+            return false;
+        bool ok=json.string("app_version",version) &&
+            json.string("image_digest_status",
+                        PickerTraceDigestStatusName(event.imageDigest.status)) &&
+            json.boolean("image_digest_available",event.imageDigest.available);
+        if(ok && event.imageDigest.available)
+            ok=json.string("image_digest",PickerTraceDigestHex(event.imageDigest));
+        ok=ok && json.hex32("image_digest_win32_error",event.imageDigest.win32Error) &&
+            json.hex32("image_digest_crypto_status",
+                       static_cast<uint32_t>(event.imageDigest.cryptoStatus)) &&
+            json.string("path_digest_status",
+                        PickerTraceDigestStatusName(event.pathDigest.status)) &&
+            json.boolean("path_digest_available",event.pathDigest.available);
+        if(ok && event.pathDigest.available)
+            ok=json.string("path_digest",PickerTraceDigestHex(event.pathDigest));
+        ok=ok && json.hex32("path_digest_win32_error",event.pathDigest.win32Error) &&
+            json.hex32("path_digest_crypto_status",
+                       static_cast<uint32_t>(event.pathDigest.cryptoStatus)) &&
+            json.boolean("module_basename_available",
+                         event.moduleBasename.available());
+        if(ok && event.moduleBasename.available())
+            ok=json.string("module_basename",basename);
+        return ok &&
+            json.unsignedNumber("file_size",event.fileSize) &&
+            json.unsignedNumber("last_write_100ns",event.lastWrite100ns) &&
+            json.hex32("pe_timestamp",event.peTimestamp) &&
+            json.unsignedNumber("pid",event.pid) &&
+            json.unsignedNumber("tid",event.tid) &&
+            json.unsignedNumber("process_session_id",event.processSessionId) &&
+            json.unsignedNumber("integrity_rid",event.integrityRid) &&
+            json.unsignedNumber("windows_build",event.windowsBuild) &&
+            json.boolean("file_metadata_available",event.fileMetadataAvailable) &&
+            json.boolean("pe_timestamp_available",event.peTimestampAvailable) &&
+            json.boolean("process_session_available",event.processSessionAvailable) &&
+            json.boolean("integrity_available",event.integrityAvailable) &&
+            json.boolean("elevated",event.elevated);
+    },output);
+}
+
+void PickerTraceWriter::emitStart(
+        const PickerTraceStartEvent& event,
+        const wchar_t* appVersion) noexcept {
+    if(!active()) return;
+    try {
+        PickerTraceEnvelope candidate=envelope_;
+        if(candidate.seq==(std::numeric_limits<uint64_t>::max)()){
+            active_=false;
+            return;
+        }
+        const uint64_t now=ops_.monotonicMs();
+        uint64_t elapsed=now>=startMs_ ? now-startMs_ : 0;
+        if(elapsed<lastElapsedMs_) elapsed=lastElapsedMs_;
+        candidate.seq++;
+        candidate.ms=elapsed;
+        std::string line;
+        if(!SerializePickerTraceLine(candidate,event,appVersion,line)){
+            active_=false;
+            return;
+        }
+        if(eventsWritten_>=limits_.maxEvents-1){
+            truncate();
+            return;
+        }
+        PickerTraceEnvelope reserveEnvelope=candidate;
+        if(reserveEnvelope.seq==(std::numeric_limits<uint64_t>::max)()){
+            active_=false;
+            return;
+        }
+        ++reserveEnvelope.seq;
+        reserveEnvelope.ms=(std::numeric_limits<uint64_t>::max)();
+        std::string reserve;
+        if(!SerializePickerTraceTruncatedLine(reserveEnvelope,reserve)){
+            active_=false;
+            return;
+        }
+        const uint64_t remaining=limits_.maxBytes-bytesWritten_;
+        if(line.size()>remaining || reserve.size()>remaining-line.size()){
+            truncate();
+            return;
+        }
+        if(!writeWhole(line)) return;
+        envelope_=candidate;
+        lastElapsedMs_=elapsed;
+        bytesWritten_+=static_cast<uint64_t>(line.size());
+        ++eventsWritten_;
+    } catch(...) {
+        active_=false;
+    }
+}
+
+PickerTraceProvenanceOps DefaultPickerTraceProvenanceOps() noexcept {
+    PickerTraceProvenanceOps ops;
+    try {
+        ops.modulePath=[](std::wstring& output) noexcept {
+            output.clear();
+            try {
+                std::vector<wchar_t> buffer(1024,L'\0');
+                while(buffer.size()<=32768){
+                    SetLastError(ERROR_SUCCESS);
+                    const DWORD written=GetModuleFileNameW(
+                        nullptr,buffer.data(),static_cast<DWORD>(buffer.size()));
+                    if(written==0) return false;
+                    if(written<buffer.size()-1 ||
+                       (written<buffer.size() &&
+                        GetLastError()!=ERROR_INSUFFICIENT_BUFFER)){
+                        output.assign(buffer.data(),written);
+                        return true;
+                    }
+                    buffer.resize((std::min)(buffer.size()*2,
+                                             static_cast<size_t>(32769)),L'\0');
+                }
+                return false;
+            } catch(...) { output.clear(); return false; }
+        };
+        ops.openRead=[](const std::wstring& path) noexcept {
+            return CreateFileW(path.c_str(),GENERIC_READ,
+                FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+        };
+        ops.readFile=[](HANDLE handle,void* output,DWORD size,
+                        DWORD& read) noexcept {
+            read=0;
+            return ReadFile(handle,output,size,&read,nullptr);
+        };
+        ops.seekFile=[](HANDLE handle,LONGLONG distance,DWORD origin) noexcept {
+            LARGE_INTEGER move{};
+            move.QuadPart=distance;
+            return SetFilePointerEx(handle,move,nullptr,origin);
+        };
+        ops.fileMetadata=[](HANDLE handle,uint64_t& size,
+                            uint64_t& lastWrite) noexcept {
+            LARGE_INTEGER fileSize{};
+            FILETIME write{};
+            if(!GetFileSizeEx(handle,&fileSize) || fileSize.QuadPart<0 ||
+               !GetFileTime(handle,nullptr,nullptr,&write)) return false;
+            size=static_cast<uint64_t>(fileSize.QuadPart);
+            lastWrite=PickerTraceFileTimeValue(write);
+            return true;
+        };
+        ops.closeHandle=[](HANDLE handle) noexcept { return CloseHandle(handle); };
+        ops.randomBytes=[](void* output,size_t size) noexcept {
+            if(!output || size>static_cast<size_t>((std::numeric_limits<ULONG>::max)()))
+                return false;
+            return BCRYPT_SUCCESS(BCryptGenRandom(
+                nullptr,static_cast<PUCHAR>(output),static_cast<ULONG>(size),
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG));
+        };
+        ops.processSessionId=[](DWORD& output) noexcept {
+            return ProcessIdToSessionId(GetCurrentProcessId(),&output)!=FALSE;
+        };
+        ops.processIntegrity=[](DWORD& rid,bool& elevated) noexcept {
+            rid=0;
+            elevated=false;
+            HANDLE token=nullptr;
+            if(!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token))
+                return false;
+            try {
+                DWORD required=0;
+                GetTokenInformation(token,TokenIntegrityLevel,nullptr,0,&required);
+                if(required==0){ CloseHandle(token); return false; }
+                std::vector<unsigned char> buffer(required);
+                if(!GetTokenInformation(token,TokenIntegrityLevel,
+                        buffer.data(),required,&required)){
+                    CloseHandle(token);
+                    return false;
+                }
+                const TOKEN_MANDATORY_LABEL* label=
+                    reinterpret_cast<const TOKEN_MANDATORY_LABEL*>(buffer.data());
+                if(!label->Label.Sid || !IsValidSid(label->Label.Sid)){
+                    CloseHandle(token);
+                    return false;
+                }
+                const UCHAR count=*GetSidSubAuthorityCount(label->Label.Sid);
+                if(count==0){ CloseHandle(token); return false; }
+                rid=*GetSidSubAuthority(label->Label.Sid,count-1);
+                TOKEN_ELEVATION elevation{};
+                DWORD copied=0;
+                if(!GetTokenInformation(token,TokenElevation,&elevation,
+                                        sizeof(elevation),&copied)){
+                    CloseHandle(token);
+                    return false;
+                }
+                elevated=elevation.TokenIsElevated!=0;
+                CloseHandle(token);
+                return true;
+            } catch(...) {
+                CloseHandle(token);
+                rid=0;
+                elevated=false;
+                return false;
+            }
+        };
+        ops.processId=[]() noexcept { return GetCurrentProcessId(); };
+        ops.threadId=[]() noexcept { return GetCurrentThreadId(); };
+        ops.windowsBuild=[]() noexcept {
+            using RtlGetVersionFunction=LONG (WINAPI*)(OSVERSIONINFOW*);
+            HMODULE module=GetModuleHandleW(L"ntdll.dll");
+            if(!module) return 0UL;
+            const auto function=reinterpret_cast<RtlGetVersionFunction>(
+                GetProcAddress(module,"RtlGetVersion"));
+            if(!function) return 0UL;
+            OSVERSIONINFOW version{};
+            version.dwOSVersionInfoSize=sizeof(version);
+            return function(&version)==0 ? version.dwBuildNumber : 0UL;
+        };
+    } catch(...) {
+        return PickerTraceProvenanceOps{};
+    }
+    return ops;
+}
+
+PickerTraceRuntimeOps DefaultPickerTraceRuntimeOps() noexcept {
+    PickerTraceRuntimeOps result;
+    try {
+        result.storage=DefaultPickerTraceStorageOps();
+        result.provenance=DefaultPickerTraceProvenanceOps();
+    } catch(...) {
+        return PickerTraceRuntimeOps{};
+    }
+    return result;
+}
+
+static PickerTraceStartEvent PickerTraceCollectStartEvent(
+        const PickerTraceProvenanceOps& ops) noexcept {
+    PickerTraceStartEvent event;
+    try { if(ops.processId) event.pid=ops.processId(); } catch(...) {}
+    try { if(ops.threadId) event.tid=ops.threadId(); } catch(...) {}
+    try {
+        if(ops.windowsBuild) event.windowsBuild=ops.windowsBuild();
+    } catch(...) {}
+    try {
+        if(ops.processSessionId)
+            event.processSessionAvailable=
+                ops.processSessionId(event.processSessionId);
+    } catch(...) {
+        event.processSessionAvailable=false;
+    }
+    try {
+        if(ops.processIntegrity)
+            event.integrityAvailable=
+                ops.processIntegrity(event.integrityRid,event.elevated);
+    } catch(...) {
+        event.integrityAvailable=false;
+    }
+
+    std::wstring path;
+    try {
+        if(!ops.modulePath || !ops.modulePath(path) || path.empty()) return event;
+    } catch(...) {
+        return event;
+    }
+    const size_t slash=path.find_last_of(L"\\/");
+    const size_t basenameBegin=slash==std::wstring::npos ? 0 : slash+1;
+    const size_t basenameLength=path.size()-basenameBegin;
+    if(basenameLength<=260)
+        event.moduleBasename=MakePickerTraceSafeImageBasename(
+            path.data()+basenameBegin,static_cast<int>(basenameLength));
+
+    std::string normalized;
+    if(NormalizePickerTraceModulePath(path,normalized))
+        event.pathDigest=PickerTraceSha256Bytes(
+            normalized.data(),normalized.size());
+    else
+        event.pathDigest.status=PickerTraceDigestStatus::NormalizeFailed;
+    event.imageDigest=PickerTraceSha256File(path,ops);
+
+    if(ops.openRead && ops.fileMetadata && ops.closeHandle){
+        HANDLE handle=INVALID_HANDLE_VALUE;
+        try {
+            handle=ops.openRead(path);
+            if(handle && handle!=INVALID_HANDLE_VALUE){
+                event.fileMetadataAvailable=ops.fileMetadata(
+                    handle,event.fileSize,event.lastWrite100ns);
+                PickerTraceCloseProvenanceHandle(ops,handle);
+            }
+        } catch(...) {
+            PickerTraceCloseProvenanceHandle(ops,handle);
+            event.fileMetadataAvailable=false;
+        }
+    }
+    DWORD peError=ERROR_SUCCESS;
+    event.peTimestampAvailable=ReadPickerTracePeTimestamp(
+        path,ops,event.peTimestamp,peError);
+    return event;
+}
+
+struct PickerTraceSession::Impl {
+    Impl(PickerTraceRuntimeOps runtimeOps,PickerTraceLimits traceLimits)
+        :ops(std::move(runtimeOps)),limits(traceLimits){}
+    PickerTraceRuntimeOps ops;
+    PickerTraceLimits limits;
+    std::unique_ptr<PickerTraceWriter> writer;
+    std::wstring path;
+    uint64_t correlation=0;
+    bool requested=false;
+    bool attempted=false;
+};
+
+PickerTraceSession::PickerTraceSession() noexcept=default;
+
+PickerTraceSession::PickerTraceSession(
+        PickerTraceRuntimeOps ops,PickerTraceLimits limits) noexcept {
+    try {
+        impl_.reset(new(std::nothrow) Impl(std::move(ops),limits));
+    } catch(...) {
+        impl_.reset();
+    }
+}
+
+PickerTraceSession::~PickerTraceSession() noexcept {
+    close();
+}
+
+bool PickerTraceSession::start(
+        bool requestedValue,const wchar_t* appVersion) noexcept {
+    if(!requestedValue) return false;
+    if(!impl_){
+        try {
+            impl_.reset(new(std::nothrow) Impl(
+                DefaultPickerTraceRuntimeOps(),PickerTraceLimits()));
+        } catch(...) {
+            impl_.reset();
+        }
+    }
+    if(!impl_) return false;
+    if(impl_->attempted) return active();
+    impl_->requested=true;
+    impl_->attempted=true;
+    PickerTraceOpenedFile opened;
+    bool openedOwned=false;
+    try {
+        const PickerTraceProvenanceOps& provenance=impl_->ops.provenance;
+        const PickerTraceStorageOps& storage=impl_->ops.storage;
+        if(!provenance.processId || !provenance.randomBytes ||
+           !storage.writeFile || !storage.flushFile ||
+           !storage.closeHandle || !storage.monotonicMs) return false;
+        const DWORD pid=provenance.processId();
+        if(pid==0 || !OpenPickerTraceStorage(storage,pid,opened)) return false;
+        openedOwned=true;
+
+        std::array<unsigned char,16> session{};
+        if(!provenance.randomBytes(session.data(),session.size())){
+            try { (void)storage.closeHandle(opened.handle); } catch(...) {}
+            return false;
+        }
+
+        PickerTraceSinkOps sink;
+        const HANDLE handle=opened.handle;
+        sink.write=[write=storage.writeFile,handle](
+                const void* bytes,size_t size)->size_t {
+            if(size>(std::numeric_limits<DWORD>::max)()) return 0;
+            DWORD written=0;
+            if(!write(handle,bytes,static_cast<DWORD>(size),written)) return 0;
+            return written;
+        };
+        sink.flush=[flush=storage.flushFile,handle](){
+            return flush(handle)!=FALSE;
+        };
+        sink.close=[closeHandle=storage.closeHandle,handle](){
+            return closeHandle(handle)!=FALSE;
+        };
+        sink.monotonicMs=storage.monotonicMs;
+
+        std::unique_ptr<PickerTraceWriter> writer(
+            new(std::nothrow) PickerTraceWriter(
+                std::move(sink),impl_->limits,session));
+        if(!writer){
+            try { (void)storage.closeHandle(opened.handle); } catch(...) {}
+            return false;
+        }
+        openedOwned=false;
+        if(!writer->active()) return false;
+        const PickerTraceStartEvent startEvent=
+            PickerTraceCollectStartEvent(provenance);
+        writer->emitStart(startEvent,appVersion);
+        if(!writer->active()) return false;
+        impl_->path=opened.path;
+        impl_->writer=std::move(writer);
+        return true;
+    } catch(...) {
+        if(openedOwned && opened.handle && opened.handle!=INVALID_HANDLE_VALUE){
+            try { (void)impl_->ops.storage.closeHandle(opened.handle); }
+            catch(...) {}
+        }
+        return false;
+    }
+}
+
+bool PickerTraceSession::active() const noexcept {
+    return impl_ && impl_->writer && impl_->writer->active();
+}
+
+bool PickerTraceSession::requested() const noexcept {
+    return impl_ && impl_->requested;
+}
+
+uint64_t PickerTraceSession::nextCorrelationId() noexcept {
+    if(!active() || impl_->correlation==
+       (std::numeric_limits<uint64_t>::max)()) return 0;
+    return ++impl_->correlation;
+}
+
+void PickerTraceSession::flushBoundary() noexcept {
+    if(impl_ && impl_->writer) impl_->writer->flushBoundary();
+}
+
+void PickerTraceSession::close() noexcept {
+    if(impl_ && impl_->writer) impl_->writer->close();
+}
+
+#define VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(EventType) \
+    void PickerTraceSession::emit(const EventType& event) noexcept { \
+        if(impl_ && impl_->writer) impl_->writer->emit(event); \
+    }
+
+VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceCaptureEvent)
+VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceOpenEvent)
+VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceEnumBeginEvent)
+VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceEnumWindowEvent)
+VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceEnumEndEvent)
+VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceMouseDownEvent)
+VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceActivationRequestEvent)
+VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceActivationResultEvent)
+VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceMoveBeginEvent)
+VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceMoveBeginExceptionEvent)
+VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceEffectEvent)
+VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceApiResultEvent)
+VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceTerminalizationAttemptEvent)
+VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceTransitionTerminalEvent)
+
+#undef VDE_DEFINE_PICKER_TRACE_SESSION_EMIT
+
+std::wstring PickerTraceSession::pathForLocalInspection() const {
+    try { return impl_ ? impl_->path : std::wstring(); }
+    catch(...) { return std::wstring(); }
 }
