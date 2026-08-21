@@ -577,6 +577,282 @@ const char* PickerTraceReadValidityName(PickerReadValidity value) noexcept {
     return "unknown";
 }
 
+static PickerTraceApiKind PickerTraceLookupApiKind(
+        PickerTraceDesktopLookupStage stage) noexcept {
+    switch(stage){
+    case PickerTraceDesktopLookupStage::GetCount:
+        return PickerTraceApiKind::GetCount;
+    case PickerTraceDesktopLookupStage::GetAt:
+        return PickerTraceApiKind::GetAt;
+    case PickerTraceDesktopLookupStage::GetId:
+        return PickerTraceApiKind::GetId;
+    default:
+        return PickerTraceApiKind::GetDesktops;
+    }
+}
+
+void EmitPickerTraceDesktopLookupStage(
+        const PickerTraceDesktopLookupContext* context,
+        PickerTraceDesktopLookupStage stage,int index,HRESULT result,
+        const GUID& actual,bool matched) noexcept {
+    if(!context || !context->trace || !context->trace->active()) return;
+    PickerTraceApiResultEvent event;
+    event.api=PickerTraceLookupApiKind(stage);
+    event.lookupUse=context->use;
+    event.lookupStage=stage;
+    event.resultKind=PickerTraceRawResultKind::HResult;
+    event.generation=context->generation;
+    event.effectSerial=context->effectSerial;
+    event.index=index;
+    event.requestedDesktop=context->requested;
+    event.actualDesktop=actual;
+    event.hresult=result;
+    event.boolResult=matched;
+    event.invoked=stage==PickerTraceDesktopLookupStage::GetDesktops ||
+        stage==PickerTraceDesktopLookupStage::GetCount ||
+        stage==PickerTraceDesktopLookupStage::GetAt ||
+        stage==PickerTraceDesktopLookupStage::GetId;
+    context->trace->emit(event);
+}
+
+static void EmitPickerTraceApiResult(
+        const PickerTraceApiEventObserver* observer,
+        const PickerTraceApiResultEvent& event) noexcept {
+    if(!observer || !observer->emit) return;
+    try { observer->emit(observer->context,event); }
+    catch(...) {}
+}
+
+PickerTraceForegroundHandoffResult ExecutePickerForegroundHandoffCalls(
+        const PickerForegroundHandoffPlan& plan,HWND progman,
+        DWORD desktopThread,DWORD foregroundThread,DWORD currentThread,
+        const PickerTraceForegroundHandoffOps& ops,
+        const PickerTraceApiEventObserver* observer) noexcept {
+    PickerTraceForegroundHandoffResult result;
+    const auto emitBool=[&](PickerTraceApiKind api,BOOL value,
+                            DWORD source,DWORD destination,
+                            HWND hwnd=nullptr,
+                            PickerTraceRawResultKind kind=
+                                PickerTraceRawResultKind::NoExtendedError)
+                            noexcept {
+        PickerTraceApiResultEvent event;
+        event.api=api;
+        event.resultKind=kind;
+        event.hwnd=reinterpret_cast<uintptr_t>(hwnd);
+        event.sourceThread=source;
+        event.destinationThread=destination;
+        event.boolResult=value!=FALSE;
+        event.invoked=true;
+        event.lastErrorAvailable=false;
+        EmitPickerTraceApiResult(observer,event);
+    };
+    const auto callAttach=[&](DWORD source,BOOL attach) noexcept {
+        try {
+            return ops.attachThreadInput
+                ? ops.attachThreadInput(
+                    ops.context,source,currentThread,attach)
+                : FALSE;
+        } catch(...) { return FALSE; }
+    };
+    if(plan.attachDesktop){
+        result.desktopAttachAttempted=true;
+        const BOOL attached=callAttach(desktopThread,TRUE);
+        result.desktopAttached=attached!=FALSE;
+        emitBool(PickerTraceApiKind::AttachDesktopInput,attached,
+                 desktopThread,currentThread);
+    }
+    if(plan.attachForeground){
+        result.foregroundAttachAttempted=true;
+        const BOOL attached=callAttach(foregroundThread,TRUE);
+        result.foregroundAttached=attached!=FALSE;
+        emitBool(PickerTraceApiKind::AttachForegroundInput,attached,
+                 foregroundThread,currentThread);
+    }
+    if(plan.focusShell){
+        try {
+            result.focusResult=ops.setForegroundWindow
+                ? ops.setForegroundWindow(ops.context,progman) : FALSE;
+        } catch(...) { result.focusResult=FALSE; }
+        emitBool(PickerTraceApiKind::SetForegroundWindow,
+                 result.focusResult,0,0,progman);
+    }
+    if(result.foregroundAttached){
+        result.foregroundDetachResult=
+            callAttach(foregroundThread,FALSE);
+        emitBool(PickerTraceApiKind::DetachForegroundInput,
+                 result.foregroundDetachResult,
+                 foregroundThread,currentThread);
+    }
+    if(result.desktopAttached){
+        result.desktopDetachResult=callAttach(desktopThread,FALSE);
+        emitBool(PickerTraceApiKind::DetachDesktopInput,
+                 result.desktopDetachResult,desktopThread,currentThread);
+    }
+    result.invoked=true;
+    try {
+        result.switchResult=ops.switchDesktop
+            ? ops.switchDesktop(ops.context) : E_POINTER;
+    } catch(...) { result.switchResult=E_FAIL; }
+    PickerTraceApiResultEvent switchEvent;
+    switchEvent.api=PickerTraceApiKind::SwitchDesktop;
+    switchEvent.resultKind=PickerTraceRawResultKind::HResult;
+    switchEvent.hresult=result.switchResult;
+    switchEvent.invoked=true;
+    EmitPickerTraceApiResult(observer,switchEvent);
+
+    if(progman){
+        try {
+            result.previousVisibility=ops.showWindow
+                ? ops.showWindow(ops.context,progman,SW_MINIMIZE) : FALSE;
+        } catch(...) { result.previousVisibility=FALSE; }
+        emitBool(PickerTraceApiKind::ShowWindowProgmanCleanup,
+                 result.previousVisibility,0,0,progman,
+                 PickerTraceRawResultKind::PreviousVisibility);
+    }
+    return result;
+}
+
+static bool PickerTraceRollbackPhase(PickerPhase phase) noexcept {
+    switch(phase){
+    case PickerPhase::RollbackTargetIssue:
+    case PickerPhase::RollbackTargetVerify:
+    case PickerPhase::RollbackPopupIssue:
+    case PickerPhase::RollbackPopupVerify:
+    case PickerPhase::RollbackSwitchIssue:
+    case PickerPhase::OriginVerify:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void ObservePickerTraceTerminalMetadata(
+        PickerTraceTerminalMetadata& metadata,
+        PickerPhase before,PickerPhase after,
+        const PickerObservation& observation,
+        bool queueConflict,bool caughtException) noexcept {
+    if(metadata.rollbackTrigger!=PickerTraceRollbackTrigger::None ||
+       metadata.diagnosticCode!=PickerTraceDiagnosticCode::None) return;
+    if(metadata.generation==0 || before==PickerPhase::Idle) return;
+    if(caughtException){
+        metadata.rollbackTrigger=PickerTraceRollbackTrigger::Exception;
+        metadata.diagnosticCode=PickerTraceDiagnosticCode::Exception;
+        return;
+    }
+    if(queueConflict){
+        metadata.rollbackTrigger=PickerTraceRollbackTrigger::QueueConflict;
+        metadata.diagnosticCode=PickerTraceDiagnosticCode::QueueConflict;
+        return;
+    }
+    if(observation.generation!=metadata.generation) return;
+    if(observation.event==PickerEvent::CancelRequested){
+        metadata.rollbackTrigger=PickerTraceRollbackTrigger::Cancellation;
+        metadata.diagnosticCode=PickerTraceDiagnosticCode::Cancelled;
+        return;
+    }
+    if(PickerTraceRollbackPhase(before) ||
+       (!PickerTraceRollbackPhase(after) &&
+        after!=PickerPhase::RefreshModel)) return;
+    if(observation.identity==PickerIdentityValidity::Lost){
+        metadata.rollbackTrigger=PickerTraceRollbackTrigger::IdentityLost;
+        metadata.diagnosticCode=PickerTraceDiagnosticCode::IdentityLost;
+        return;
+    }
+    if(observation.identity==PickerIdentityValidity::Indeterminate){
+        metadata.rollbackTrigger=
+            PickerTraceRollbackTrigger::IdentityIndeterminate;
+        metadata.diagnosticCode=
+            PickerTraceDiagnosticCode::IdentityIndeterminate;
+        return;
+    }
+    if(observation.targetRead==PickerReadValidity::Unavailable ||
+       observation.popupRead==PickerReadValidity::Unavailable ||
+       observation.currentRead==PickerReadValidity::Unavailable){
+        metadata.rollbackTrigger=PickerTraceRollbackTrigger::ReadUnavailable;
+        metadata.diagnosticCode=PickerTraceDiagnosticCode::ReadUnavailable;
+        return;
+    }
+    switch(before){
+    case PickerPhase::TargetIssue:
+        metadata.rollbackTrigger=PickerTraceRollbackTrigger::TargetMove;
+        metadata.diagnosticCode=PickerTraceDiagnosticCode::ApiRejected;
+        break;
+    case PickerPhase::TargetVerify:
+    case PickerPhase::IdentityVerifyBeforePopup:
+        metadata.rollbackTrigger=PickerTraceRollbackTrigger::TargetVerify;
+        metadata.diagnosticCode=
+            PickerTraceDiagnosticCode::VerificationMismatch;
+        break;
+    case PickerPhase::PopupIssue:
+        metadata.rollbackTrigger=PickerTraceRollbackTrigger::PopupMove;
+        metadata.diagnosticCode=PickerTraceDiagnosticCode::ApiRejected;
+        break;
+    case PickerPhase::PopupVerify:
+        metadata.rollbackTrigger=PickerTraceRollbackTrigger::PopupVerify;
+        metadata.diagnosticCode=
+            PickerTraceDiagnosticCode::VerificationMismatch;
+        break;
+    case PickerPhase::IdentityVerifyBeforeSwitch:
+        metadata.rollbackTrigger=
+            PickerTraceRollbackTrigger::RetryBudgetExhausted;
+        metadata.diagnosticCode=
+            PickerTraceDiagnosticCode::RetryBudgetExhausted;
+        break;
+    case PickerPhase::SwitchIssue:
+        metadata.rollbackTrigger=PickerTraceRollbackTrigger::DesktopSwitch;
+        metadata.diagnosticCode=PickerTraceDiagnosticCode::ApiRejected;
+        break;
+    case PickerPhase::DestinationVerify:
+        metadata.rollbackTrigger=
+            observation.effectKind==PickerEffectKind::ReadPopup
+                ? PickerTraceRollbackTrigger::PopupVerify
+                : PickerTraceRollbackTrigger::DesktopSwitch;
+        metadata.diagnosticCode=
+            PickerTraceDiagnosticCode::VerificationMismatch;
+        break;
+    default:
+        break;
+    }
+}
+
+PickerEffect AdvancePickerTransitionTraced(
+        PickerState& state,const PickerObservation& observation,
+        PickerTraceSession* trace,
+        PickerTraceTerminalMetadata* metadata) noexcept {
+    const PickerPhase phaseBefore=state.transition.phase;
+    const uint64_t generationBefore=state.transition.generation;
+    const PickerEffect result=AdvancePickerTransition(state,observation);
+    if(metadata && observation.event==PickerEvent::Begin &&
+       result.kind!=PickerEffectKind::None){
+        *metadata=PickerTraceTerminalMetadata{};
+        metadata->generation=state.transition.generation;
+    }
+    if(metadata){
+        ObservePickerTraceTerminalMetadata(
+            *metadata,phaseBefore,state.transition.phase,
+            observation,false,false);
+    }
+    if(trace && trace->active()){
+        PickerTraceEffectEvent event;
+        event.stage=PickerTraceEffectStage::Reduce;
+        event.generation=generationBefore;
+        event.effectSerial=observation.effectSerial;
+        event.observationEvent=observation.event;
+        event.effect=observation.effectKind;
+        event.nextEffect=result.kind;
+        event.phaseBefore=phaseBefore;
+        event.phaseAfter=state.transition.phase;
+        event.identity=observation.identity;
+        event.targetRead=observation.targetRead;
+        event.popupRead=observation.popupRead;
+        event.currentRead=observation.currentRead;
+        event.apiInvoked=observation.apiInvoked;
+        event.apiAccepted=observation.apiAccepted;
+        trace->emit(event);
+    }
+    return result;
+}
+
 const char* PickerTraceRecaptureName(WindowIdentityRecapture value) noexcept {
     switch(value){
     VDE_TRACE_NAME_CASE(WindowIdentityRecapture,Match,"match");
@@ -1046,7 +1322,8 @@ bool SerializePickerTraceLine(const PickerTraceEnvelope& envelope,
                               const PickerTraceApiResultEvent& event,
                               std::string& output) noexcept {
     return PickerTraceSerialize(envelope,"api.result",[&](auto& json){
-        return json.string("api",PickerTraceApiKindName(event.api)) &&
+        const bool common=
+            json.string("api",PickerTraceApiKindName(event.api)) &&
             json.string("lookup_use",PickerTraceDesktopLookupUseName(event.lookupUse)) &&
             json.string("lookup_stage",PickerTraceDesktopLookupStageName(event.lookupStage)) &&
             json.string("result_kind",PickerTraceRawResultKindName(event.resultKind)) &&
@@ -1063,6 +1340,9 @@ bool SerializePickerTraceLine(const PickerTraceEnvelope& envelope,
             json.boolean("invoked",event.invoked) &&
             json.boolean("last_error_available",event.lastErrorAvailable) &&
             json.hex32("last_error",event.lastError);
+        if(!common) return false;
+        return event.resultKind!=PickerTraceRawResultKind::PreviousVisibility ||
+            json.boolean("previously_visible",event.boolResult);
     },output);
 }
 

@@ -458,6 +458,58 @@ struct DesktopCollectionComOps {
     }
 };
 
+static PickerTraceDesktopLookupStage PickerTraceLookupStage(
+        DesktopCollectionLookupObservationStage stage) noexcept {
+    switch(stage){
+    case DesktopCollectionLookupObservationStage::ValidateRequest:
+        return PickerTraceDesktopLookupStage::ValidateRequest;
+    case DesktopCollectionLookupObservationStage::GetDesktops:
+        return PickerTraceDesktopLookupStage::GetDesktops;
+    case DesktopCollectionLookupObservationStage::GetCount:
+        return PickerTraceDesktopLookupStage::GetCount;
+    case DesktopCollectionLookupObservationStage::GetAt:
+        return PickerTraceDesktopLookupStage::GetAt;
+    case DesktopCollectionLookupObservationStage::GetId:
+        return PickerTraceDesktopLookupStage::GetId;
+    case DesktopCollectionLookupObservationStage::Match:
+        return PickerTraceDesktopLookupStage::Match;
+    case DesktopCollectionLookupObservationStage::NotFound:
+        return PickerTraceDesktopLookupStage::NotFound;
+    case DesktopCollectionLookupObservationStage::Exception:
+        return PickerTraceDesktopLookupStage::Exception;
+    }
+    return PickerTraceDesktopLookupStage::Exception;
+}
+
+template<class DesktopOwner>
+static bool LookupPickerDesktopByGuid(
+        const GUID& target,DesktopCollectionComOps& ops,
+        DesktopOwner& desktop,int& matchedIndex,
+        const PickerTraceDesktopLookupContext* context) noexcept {
+    if(!context || !context->trace || !context->trace->active())
+        return LookupDesktopCollectionOwned<IObjectArray,IVirtualDesktop>(
+            DesktopCollectionLookupRequest::ByGuid(target),
+            ops,desktop,matchedIndex);
+    std::function<void(const DesktopCollectionLookupObservation&)>
+        observer;
+    try {
+        observer=[context](
+                const DesktopCollectionLookupObservation& observation){
+            EmitPickerTraceDesktopLookupStage(
+                context,PickerTraceLookupStage(observation.stage),
+                observation.index,observation.result,
+                observation.actual,observation.matched);
+        };
+    } catch(...) {
+        return LookupDesktopCollectionOwned<IObjectArray,IVirtualDesktop>(
+            DesktopCollectionLookupRequest::ByGuid(target),
+            ops,desktop,matchedIndex);
+    }
+    return LookupDesktopCollectionOwned<IObjectArray,IVirtualDesktop>(
+        DesktopCollectionLookupRequest::ByGuid(target),
+        ops,desktop,matchedIndex,&observer);
+}
+
 static ScopedComPtr<IVirtualDesktop> GetDesktopByIndex(UINT index){
     DesktopCollectionComOps ops;
     ScopedComPtr<IVirtualDesktop> desktop;
@@ -468,23 +520,25 @@ static ScopedComPtr<IVirtualDesktop> GetDesktopByIndex(UINT index){
     return desktop;
 }
 
-static ScopedComPtr<IVirtualDesktop> GetDesktopByGuid(const GUID& target){
+static ScopedComPtr<IVirtualDesktop> GetDesktopByGuid(
+        const GUID& target,
+        const PickerTraceDesktopLookupContext* traceContext=nullptr){
     DesktopCollectionComOps ops;
     ScopedComPtr<IVirtualDesktop> desktop;
     int matchedIndex=-1;
-    LookupDesktopCollectionOwned<IObjectArray,IVirtualDesktop>(
-        DesktopCollectionLookupRequest::ByGuid(target),
-        ops,desktop,matchedIndex);
+    LookupPickerDesktopByGuid(
+        target,ops,desktop,matchedIndex,traceContext);
     return desktop;
 }
 
-static int GetDesktopIndexByGuid(const GUID& target){
+static int GetDesktopIndexByGuid(
+        const GUID& target,
+        const PickerTraceDesktopLookupContext* traceContext=nullptr){
     DesktopCollectionComOps ops;
     ScopedComPtr<IVirtualDesktop> desktop;
     int matchedIndex=-1;
-    if(!LookupDesktopCollectionOwned<IObjectArray,IVirtualDesktop>(
-            DesktopCollectionLookupRequest::ByGuid(target),
-            ops,desktop,matchedIndex)) return -1;
+    if(!LookupPickerDesktopByGuid(
+            target,ops,desktop,matchedIndex,traceContext)) return -1;
     return matchedIndex;
 }
 
@@ -5193,6 +5247,10 @@ static bool g_pickerTerminalizationPending=false;
 static bool g_pickerPumpActive=false;
 static bool g_pickerShutdownDrain=false;
 static bool g_pickerDurableKickPending=false;
+static PickerTraceTerminalMetadata g_pickerTraceTerminalMetadata;
+static uint64_t g_pickerTraceDeliveryGeneration=0;
+static uint64_t g_pickerTraceDeliverySerial=0;
+static uint32_t g_pickerTraceDeliveryAttempt=0;
 static HWND g_target=nullptr; static std::wstring g_targetTitle;
 static HWND g_settings=nullptr;
 static HINSTANCE g_inst=nullptr;
@@ -5250,6 +5308,10 @@ static bool QuiesceRuntime(HWND messageWindow) noexcept {
         g_pickerTerminalizationPending=false;
         g_pickerShutdownDrain=false;
         g_pickerDurableKickPending=false;
+        g_pickerTraceTerminalMetadata=PickerTraceTerminalMetadata{};
+        g_pickerTraceDeliveryGeneration=0;
+        g_pickerTraceDeliverySerial=0;
+        g_pickerTraceDeliveryAttempt=0;
         StopWorkers(messageWindow);
     });
 }
@@ -5444,16 +5506,36 @@ static bool ClearWindowIconCache() noexcept {
     return g_windowIconCache.clear();
 }
 
-static GUID CurrentDesktopGuid() noexcept {
+struct PickerTraceCurrentDesktopFacts {
+    bool currentInvoked=false;
+    HRESULT currentResult=E_NOINTERFACE;
+    bool idInvoked=false;
+    HRESULT idResult=E_NOTIMPL;
+    GUID actual{};
+    PickerReadValidity validity=PickerReadValidity::Unavailable;
+};
+
+static GUID CurrentDesktopGuid(
+        PickerTraceCurrentDesktopFacts* facts=nullptr) noexcept {
+    if(facts) *facts=PickerTraceCurrentDesktopFacts{};
     GUID guid={0};
     if(!g_vdmi) return guid;
     IVirtualDesktop* raw=nullptr;
+    if(facts) facts->currentInvoked=true;
     const HRESULT currentResult=g_vdmi->GetCurrentDesktop(&raw);
+    if(facts) facts->currentResult=currentResult;
     ScopedComPtr<IVirtualDesktop> desktop(raw);
     if(FAILED(currentResult) || !desktop) return guid;
     GUID candidate={0};
-    if(FAILED(desktop->GetID(&candidate)) || GuidIsZero(candidate))
+    if(facts) facts->idInvoked=true;
+    const HRESULT idResult=desktop->GetID(&candidate);
+    if(facts){
+        facts->idResult=idResult;
+        facts->actual=candidate;
+    }
+    if(FAILED(idResult) || GuidIsZero(candidate))
         return guid;
+    if(facts) facts->validity=PickerReadValidity::Valid;
     return candidate;
 }
 
@@ -5866,9 +5948,15 @@ static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi,
             }
             enumAttempted=true;
             SetLastError(ERROR_SUCCESS);
-            enumWindowsResult=EnumWindows(
-                EnumAll,reinterpret_cast<LPARAM>(&enumContext));
-            enumWindowsError=GetLastError();
+            const PickerTraceBoolCallResult enumResult=
+                CallPickerTraceBoolWithImmediateError(
+                    [&]() noexcept {
+                        return EnumWindows(
+                            EnumAll,
+                            reinterpret_cast<LPARAM>(&enumContext));
+                    },[]() noexcept { return GetLastError(); });
+            enumWindowsResult=enumResult.value;
+            enumWindowsError=enumResult.immediateError;
             if(!enumWindowsResult || enumContext.failed) return false;
             if(!PopulatePickerFilteredRows(tiles,state.searchText))
                 return false;
@@ -6800,53 +6888,177 @@ static PickerIdentityValidity PickerIdentityObservation(
     return PickerIdentityValidity::Indeterminate;
 }
 
+static void EmitPickerTraceHResult(
+        PickerTraceApiKind api,uint64_t generation,uint64_t effectSerial,
+        HRESULT result,bool invoked,HWND hwnd=nullptr,
+        const GUID& requested=GUID{},
+        const GUID& actual=GUID{}) noexcept {
+    PickerTraceApiResultEvent event;
+    event.api=api;
+    event.resultKind=PickerTraceRawResultKind::HResult;
+    event.generation=generation;
+    event.effectSerial=effectSerial;
+    event.hwnd=reinterpret_cast<uintptr_t>(hwnd);
+    event.requestedDesktop=requested;
+    event.actualDesktop=actual;
+    event.hresult=result;
+    event.invoked=invoked;
+    g_pickerTrace.emit(event);
+}
+
 static HRESULT IssuePickerWindowMove(
         const WindowIdentityKey& expected,const GUID& destinationGuid,
-        bool& invoked,WindowIdentityRecapture& identity) noexcept {
+        bool& invoked,WindowIdentityRecapture& identity,
+        PickerTraceDesktopLookupUse lookupUse,
+        uint64_t generation,uint64_t effectSerial) noexcept {
     invoked=false;
     identity=WindowIdentityRecapture::Indeterminate;
     if(GuidIsZero(destinationGuid) || !g_vdmi) return E_INVALIDARG;
+    HWND hwnd=nullptr;
+    PickerTraceApiKind selectedApi=
+        PickerTraceApiKind::MoveViewToDesktop;
+    bool selectedApiKnown=false;
     try {
+        PickerTraceDesktopLookupContext lookupContext;
+        lookupContext.trace=&g_pickerTrace;
+        lookupContext.use=lookupUse;
+        lookupContext.generation=generation;
+        lookupContext.effectSerial=effectSerial;
+        lookupContext.requested=destinationGuid;
         ScopedComPtr<IVirtualDesktop> destination=
-            GetDesktopByGuid(destinationGuid);
+            GetDesktopByGuid(destinationGuid,&lookupContext);
         if(!destination) return E_INVALIDARG;
-        const HWND hwnd=reinterpret_cast<HWND>(expected.hwnd);
+        hwnd=reinterpret_cast<HWND>(expected.hwnd);
         if(expected.pid==GetCurrentProcessId()){
-            if(!g_vdmDoc) return E_NOINTERFACE;
+            selectedApi=PickerTraceApiKind::MoveWindowToDesktop;
+            selectedApiKnown=true;
+            if(!g_vdmDoc){
+                EmitPickerTraceHResult(
+                    selectedApi,generation,effectSerial,
+                    E_NOINTERFACE,false,hwnd,destinationGuid);
+                return E_NOINTERFACE;
+            }
             identity=RecaptureGenericWindowIdentity(expected);
-            if(identity!=WindowIdentityRecapture::Match)
-                return identity==WindowIdentityRecapture::Lost
-                    ? E_ABORT : E_PENDING;
+            if(identity!=WindowIdentityRecapture::Match){
+                const HRESULT result=
+                    identity==WindowIdentityRecapture::Lost
+                        ? E_ABORT : E_PENDING;
+                EmitPickerTraceHResult(
+                    selectedApi,generation,effectSerial,
+                    result,false,hwnd,destinationGuid);
+                return result;
+            }
             invoked=true;
-            return g_vdmDoc->MoveWindowToDesktop(hwnd,destinationGuid);
+            const HRESULT result=
+                g_vdmDoc->MoveWindowToDesktop(hwnd,destinationGuid);
+            EmitPickerTraceHResult(
+                PickerTraceApiKind::MoveWindowToDesktop,
+                generation,effectSerial,result,true,hwnd,
+                destinationGuid);
+            return result;
         }
-        if(!g_avc) return E_NOINTERFACE;
+        selectedApi=PickerTraceApiKind::MoveViewToDesktop;
+        selectedApiKnown=true;
+        if(!g_avc){
+            EmitPickerTraceHResult(
+                PickerTraceApiKind::GetViewForHwnd,
+                generation,effectSerial,E_NOINTERFACE,false,hwnd);
+            EmitPickerTraceHResult(
+                selectedApi,generation,effectSerial,
+                E_NOINTERFACE,false,hwnd,destinationGuid);
+            return E_NOINTERFACE;
+        }
         IApplicationView* rawView=nullptr;
         const HRESULT viewResult=g_avc->GetViewForHwnd(hwnd,&rawView);
+        EmitPickerTraceHResult(
+            PickerTraceApiKind::GetViewForHwnd,
+            generation,effectSerial,viewResult,true,hwnd);
         ScopedComPtr<IApplicationView> view(rawView);
-        if(FAILED(viewResult) || !view) return FAILED(viewResult)
-            ? viewResult : E_FAIL;
+        if(FAILED(viewResult) || !view){
+            const HRESULT result=FAILED(viewResult)
+                ? viewResult : E_FAIL;
+            EmitPickerTraceHResult(
+                selectedApi,generation,effectSerial,
+                result,false,hwnd,destinationGuid);
+            return result;
+        }
         identity=RecaptureGenericWindowIdentity(expected);
-        if(identity!=WindowIdentityRecapture::Match)
-            return identity==WindowIdentityRecapture::Lost
-                ? E_ABORT : E_PENDING;
+        if(identity!=WindowIdentityRecapture::Match){
+            const HRESULT result=
+                identity==WindowIdentityRecapture::Lost
+                    ? E_ABORT : E_PENDING;
+            EmitPickerTraceHResult(
+                selectedApi,generation,effectSerial,
+                result,false,hwnd,destinationGuid);
+            return result;
+        }
         invoked=true;
-        return g_vdmi->MoveViewToDesktop(view.get(),destination.get());
-    } catch(...) { return E_FAIL; }
+        const HRESULT result=
+            g_vdmi->MoveViewToDesktop(view.get(),destination.get());
+        EmitPickerTraceHResult(
+            PickerTraceApiKind::MoveViewToDesktop,
+            generation,effectSerial,result,true,hwnd,
+            destinationGuid);
+        return result;
+    } catch(...) {
+        if(selectedApiKnown)
+            EmitPickerTraceHResult(
+                selectedApi,generation,effectSerial,
+                E_FAIL,invoked,hwnd,destinationGuid);
+        return E_FAIL;
+    }
 }
 
+struct PickerTraceWindowDesktopFacts {
+    bool invoked=false;
+    HRESULT result=E_NOINTERFACE;
+    GUID actual{};
+    PickerReadValidity validity=PickerReadValidity::Unavailable;
+};
+
 static void ReadPickerWindowDesktop(
-        HWND hwnd,PickerReadValidity& validity,GUID& desktop) noexcept {
+        HWND hwnd,PickerReadValidity& validity,GUID& desktop,
+        PickerTraceWindowDesktopFacts* facts=nullptr) noexcept {
+    if(facts) *facts=PickerTraceWindowDesktopFacts{};
     validity=PickerReadValidity::Unavailable;
     desktop=GUID{};
     if(!hwnd || !g_vdmDoc) return;
     GUID observed={0};
     HRESULT result=E_FAIL;
+    if(facts) facts->invoked=true;
     try { result=g_vdmDoc->GetWindowDesktopId(hwnd,&observed); }
     catch(...) { result=E_FAIL; }
+    if(facts){
+        facts->result=result;
+        facts->actual=observed;
+    }
     if(SUCCEEDED(result) && !GuidIsZero(observed)){
         desktop=observed;
         validity=PickerReadValidity::Valid;
+        if(facts) facts->validity=PickerReadValidity::Valid;
+    }
+}
+
+static void EmitPickerTraceWindowDesktopFacts(
+        PickerTraceApiKind api,HWND hwnd,uint64_t generation,
+        uint64_t effectSerial,
+        const PickerTraceWindowDesktopFacts& facts) noexcept {
+    EmitPickerTraceHResult(
+        api,generation,effectSerial,facts.result,
+        facts.invoked,hwnd,GUID{},facts.actual);
+}
+
+static void EmitPickerTraceCurrentDesktopFacts(
+        uint64_t generation,uint64_t effectSerial,
+        const PickerTraceCurrentDesktopFacts& facts) noexcept {
+    EmitPickerTraceHResult(
+        PickerTraceApiKind::GetCurrentDesktop,
+        generation,effectSerial,facts.currentResult,
+        facts.currentInvoked,nullptr,GUID{},facts.actual);
+    if(facts.idInvoked){
+        EmitPickerTraceHResult(
+            PickerTraceApiKind::GetId,generation,effectSerial,
+            facts.idResult,true,nullptr,GUID{},facts.actual);
     }
 }
 
@@ -6884,12 +7096,78 @@ static bool RefreshPickerModelPreservingUi() noexcept {
     } catch(...) { return false; }
 }
 
+struct PickerForegroundHandoffProductContext {
+    IVirtualDesktop* desktop=nullptr;
+};
+
+static BOOL PickerProductAttachThreadInput(
+        void*,DWORD source,DWORD destination,BOOL attach) noexcept {
+    return AttachThreadInput(source,destination,attach);
+}
+
+static BOOL PickerProductSetForegroundWindow(
+        void*,HWND hwnd) noexcept {
+    return SetForegroundWindow(hwnd);
+}
+
+static HRESULT PickerProductSwitchDesktop(void* opaque) {
+    auto* context=
+        static_cast<PickerForegroundHandoffProductContext*>(opaque);
+    return g_vdmi && context && context->desktop
+        ? g_vdmi->SwitchDesktop(context->desktop) : E_NOINTERFACE;
+}
+
+static BOOL PickerProductShowWindow(
+        void*,HWND hwnd,int command) noexcept {
+    return ShowWindow(hwnd,command);
+}
+
+struct PickerProductApiTraceContext {
+    uint64_t generation=0;
+    uint64_t effectSerial=0;
+    HWND progman=nullptr;
+    HWND foreground=nullptr;
+    GUID requested{};
+};
+
+static void EmitPickerProductApiTrace(
+        void* opaque,const PickerTraceApiResultEvent& input) noexcept {
+    PickerTraceApiResultEvent event=input;
+    const auto* context=static_cast<PickerProductApiTraceContext*>(opaque);
+    if(context){
+        event.generation=context->generation;
+        event.effectSerial=context->effectSerial;
+        event.requestedDesktop=context->requested;
+        switch(event.api){
+        case PickerTraceApiKind::AttachForegroundInput:
+        case PickerTraceApiKind::DetachForegroundInput:
+            event.hwnd=reinterpret_cast<uintptr_t>(context->foreground);
+            break;
+        case PickerTraceApiKind::AttachDesktopInput:
+        case PickerTraceApiKind::DetachDesktopInput:
+            event.hwnd=reinterpret_cast<uintptr_t>(context->progman);
+            break;
+        default:
+            break;
+        }
+    }
+    g_pickerTrace.emit(event);
+}
+
 static HRESULT SwitchDesktopWithForegroundHandoff(
-        const GUID& destinationGuid,bool& invoked) noexcept {
+        const GUID& destinationGuid,bool& invoked,
+        uint64_t generation=0,uint64_t effectSerial=0) noexcept {
     invoked=false;
     if(GuidIsZero(destinationGuid) || !g_vdmi) return E_INVALIDARG;
+    PickerTraceDesktopLookupContext lookupContext;
+    lookupContext.trace=&g_pickerTrace;
+    lookupContext.use=
+        PickerTraceDesktopLookupUse::SwitchHandoffDestination;
+    lookupContext.generation=generation;
+    lookupContext.effectSerial=effectSerial;
+    lookupContext.requested=destinationGuid;
     ScopedComPtr<IVirtualDesktop> desktop;
-    try { desktop=GetDesktopByGuid(destinationGuid); }
+    try { desktop=GetDesktopByGuid(destinationGuid,&lookupContext); }
     catch(...) { return E_FAIL; }
     if(!desktop) return E_INVALIDARG;
 
@@ -6897,36 +7175,41 @@ static HRESULT SwitchDesktopWithForegroundHandoff(
     DWORD ignored=0;
     const DWORD desktopThread=prog
         ?GetWindowThreadProcessId(prog,&ignored):0;
+    const HWND foreground=GetForegroundWindow();
     const DWORD foregroundThread=
-        GetWindowThreadProcessId(GetForegroundWindow(),&ignored);
+        GetWindowThreadProcessId(foreground,&ignored);
     const DWORD currentThread=GetCurrentThreadId();
     const PickerForegroundHandoffPlan plan=PlanPickerForegroundHandoff(
         prog!=nullptr,desktopThread,foregroundThread,currentThread);
-    bool desktopAttached=false;
-    bool foregroundAttached=false;
-    if(plan.attachDesktop)
-        desktopAttached=AttachThreadInput(
-            desktopThread,currentThread,TRUE)!=FALSE;
-    if(plan.attachForeground)
-        foregroundAttached=AttachThreadInput(
-            foregroundThread,currentThread,TRUE)!=FALSE;
-    if(plan.focusShell) SetForegroundWindow(prog);
-    if(foregroundAttached)
-        AttachThreadInput(foregroundThread,currentThread,FALSE);
-    if(desktopAttached)
-        AttachThreadInput(desktopThread,currentThread,FALSE);
-
-    HRESULT result=E_FAIL;
-    invoked=true;
-    try { result=g_vdmi->SwitchDesktop(desktop.get()); }
-    catch(...) { result=E_FAIL; }
-
-    if(prog) ShowWindow(prog,SW_MINIMIZE);
-    return result;
+    PickerForegroundHandoffProductContext productContext;
+    productContext.desktop=desktop.get();
+    PickerTraceForegroundHandoffOps ops;
+    ops.context=&productContext;
+    ops.attachThreadInput=PickerProductAttachThreadInput;
+    ops.setForegroundWindow=PickerProductSetForegroundWindow;
+    ops.switchDesktop=PickerProductSwitchDesktop;
+    ops.showWindow=PickerProductShowWindow;
+    PickerProductApiTraceContext traceContext;
+    traceContext.generation=generation;
+    traceContext.effectSerial=effectSerial;
+    traceContext.progman=prog;
+    traceContext.foreground=foreground;
+    traceContext.requested=destinationGuid;
+    PickerTraceApiEventObserver observer;
+    observer.context=&traceContext;
+    observer.emit=EmitPickerProductApiTrace;
+    const PickerTraceForegroundHandoffResult result=
+        ExecutePickerForegroundHandoffCalls(
+            plan,prog,desktopThread,foregroundThread,currentThread,
+            ops,g_pickerTrace.active()?&observer:nullptr);
+    invoked=result.invoked;
+    return result.switchResult;
 }
 
 static PickerObservation ExecutePickerEffect(
-        const PickerEffect& effect) noexcept {
+        const PickerEffect& effect,
+        bool* caughtException=nullptr) noexcept {
+    if(caughtException) *caughtException=false;
     PickerObservation observation;
     observation.generation=effect.generation;
     observation.effectKind=effect.kind;
@@ -6941,7 +7224,9 @@ static PickerObservation ExecutePickerEffect(
             bool invoked=false;
             const HRESULT result=IssuePickerWindowMove(
                 g_picker.transition.target,effect.desktop,
-                invoked,identity);
+                invoked,identity,
+                PickerTraceDesktopLookupUse::MoveTargetDestination,
+                effect.generation,effect.effectSerial);
             observation.identity=PickerIdentityObservation(identity);
             observation.apiInvoked=invoked;
             observation.apiAccepted=SUCCEEDED(result);
@@ -6952,13 +7237,18 @@ static PickerObservation ExecutePickerEffect(
             const WindowIdentityRecapture identity=
                 RecaptureGenericWindowIdentity(g_picker.transition.target);
             observation.identity=PickerIdentityObservation(identity);
+            PickerTraceWindowDesktopFacts facts;
             if(identity==WindowIdentityRecapture::Match)
                 ReadPickerWindowDesktop(
                     reinterpret_cast<HWND>(g_picker.transition.target.hwnd),
                     observation.targetRead,
-                    observation.actualTargetDesktop);
+                    observation.actualTargetDesktop,&facts);
             else
                 observation.targetRead=PickerReadValidity::Unavailable;
+            EmitPickerTraceWindowDesktopFacts(
+                PickerTraceApiKind::GetWindowDesktopIdTarget,
+                reinterpret_cast<HWND>(g_picker.transition.target.hwnd),
+                effect.generation,effect.effectSerial,facts);
             break;
         }
         case PickerEffectKind::ValidateTarget:
@@ -6972,22 +7262,36 @@ static PickerObservation ExecutePickerEffect(
             bool invoked=false;
             WindowIdentityKey popup=CapturePickerWindowIdentity(g_main);
             const HRESULT result=IssuePickerWindowMove(
-                popup,effect.desktop,invoked,identity);
+                popup,effect.desktop,invoked,identity,
+                PickerTraceDesktopLookupUse::MovePopupDestination,
+                effect.generation,effect.effectSerial);
             observation.apiInvoked=invoked;
             observation.apiAccepted=SUCCEEDED(result);
             break;
         }
-        case PickerEffectKind::ReadPopup:
+        case PickerEffectKind::ReadPopup: {
             observation.event=PickerEvent::ReadbackCompleted;
+            PickerTraceWindowDesktopFacts facts;
             ReadPickerWindowDesktop(
                 g_main,observation.popupRead,
-                observation.actualPopupDesktop);
+                observation.actualPopupDesktop,&facts);
+            EmitPickerTraceWindowDesktopFacts(
+                PickerTraceApiKind::GetWindowDesktopIdPopup,g_main,
+                effect.generation,effect.effectSerial,facts);
             break;
+        }
         case PickerEffectKind::SwitchDesktop: {
             observation.event=PickerEvent::ApiCompleted;
             HRESULT result=E_INVALIDARG;
+            PickerTraceDesktopLookupContext lookupContext;
+            lookupContext.trace=&g_pickerTrace;
+            lookupContext.use=
+                PickerTraceDesktopLookupUse::SwitchPrecheckDestination;
+            lookupContext.generation=effect.generation;
+            lookupContext.effectSerial=effect.effectSerial;
+            lookupContext.requested=effect.desktop;
             ScopedComPtr<IVirtualDesktop> desktop=
-                GetDesktopByGuid(effect.desktop);
+                GetDesktopByGuid(effect.desktop,&lookupContext);
             const bool rollback=
                 g_picker.transition.phase==
                     PickerPhase::RollbackSwitchIssue;
@@ -7003,7 +7307,8 @@ static PickerObservation ExecutePickerEffect(
                (rollback && desktop && g_vdmi)){
                 bool invoked=false;
                 result=SwitchDesktopWithForegroundHandoff(
-                    effect.desktop,invoked);
+                    effect.desktop,invoked,
+                    effect.generation,effect.effectSerial);
                 observation.apiInvoked=invoked;
             }
             observation.apiAccepted=SUCCEEDED(result);
@@ -7011,7 +7316,10 @@ static PickerObservation ExecutePickerEffect(
         }
         case PickerEffectKind::ReadCurrent: {
             observation.event=PickerEvent::ReadbackCompleted;
-            const GUID current=CurrentDesktopGuid();
+            PickerTraceCurrentDesktopFacts facts;
+            const GUID current=CurrentDesktopGuid(&facts);
+            EmitPickerTraceCurrentDesktopFacts(
+                effect.generation,effect.effectSerial,facts);
             if(!GuidIsZero(current)){
                 observation.currentRead=PickerReadValidity::Valid;
                 observation.actualCurrentDesktop=current;
@@ -7076,11 +7384,101 @@ static PickerObservation ExecutePickerEffect(
         }
     } catch(...) {
         observation.apiAccepted=false;
+        if(caughtException) *caughtException=true;
     }
     return observation;
 }
 
 static void PumpPickerTransitionWork() noexcept;
+
+static uint32_t NextPickerTraceDeliveryAttempt(
+        const PickerEffect& effect) noexcept {
+    if(effect.generation!=g_pickerTraceDeliveryGeneration ||
+       effect.effectSerial!=g_pickerTraceDeliverySerial){
+        g_pickerTraceDeliveryGeneration=effect.generation;
+        g_pickerTraceDeliverySerial=effect.effectSerial;
+        g_pickerTraceDeliveryAttempt=0;
+    }
+    if(g_pickerTraceDeliveryAttempt!=
+       (std::numeric_limits<uint32_t>::max)())
+        ++g_pickerTraceDeliveryAttempt;
+    return g_pickerTraceDeliveryAttempt;
+}
+
+static void EmitPickerTraceEffectQueue(
+        const PickerEffect& effect,
+        const PickerTraceScheduleResult& schedule) noexcept {
+    if(!g_pickerTrace.active()) return;
+    PickerTraceEffectEvent event;
+    event.stage=PickerTraceEffectStage::Queue;
+    event.generation=effect.generation;
+    event.effectSerial=effect.effectSerial;
+    event.effect=effect.kind;
+    event.delivery=schedule.route;
+    event.deliveryAvailable=schedule.routeAvailable;
+    event.deliveryAttempt=NextPickerTraceDeliveryAttempt(effect);
+    g_pickerTrace.emit(event);
+}
+
+static void EmitPickerTraceEffectExecute(
+        const PickerEffect& effect,
+        PickerEffectExecutionRoute route) noexcept {
+    if(!g_pickerTrace.active()) return;
+    PickerTraceEffectEvent event;
+    event.stage=PickerTraceEffectStage::Execute;
+    event.generation=effect.generation;
+    event.effectSerial=effect.effectSerial;
+    event.effect=effect.kind;
+    event.executionRoute=route;
+    event.executionRouteAvailable=true;
+    g_pickerTrace.emit(event);
+}
+
+static void EmitPickerTraceEffectObservation(
+        const PickerEffect& effect,
+        const PickerObservation& observation) noexcept {
+    if(!g_pickerTrace.active()) return;
+    PickerTraceEffectEvent event;
+    event.stage=PickerTraceEffectStage::Observation;
+    event.generation=effect.generation;
+    event.effectSerial=effect.effectSerial;
+    event.observationEvent=observation.event;
+    event.effect=effect.kind;
+    event.identity=observation.identity;
+    event.targetRead=observation.targetRead;
+    event.popupRead=observation.popupRead;
+    event.currentRead=observation.currentRead;
+    event.apiInvoked=observation.apiInvoked;
+    event.apiAccepted=observation.apiAccepted;
+    g_pickerTrace.emit(event);
+}
+
+static PickerTraceScheduleResult PickerTraceObservationDelivery(
+        PickerKickRoute route) noexcept {
+    PickerTraceScheduleResult result;
+    result.routeAvailable=true;
+    switch(route){
+    case PickerKickRoute::Posted:
+        result.deferred=true;
+        result.route=PickerTraceDeliveryRoute::Posted;
+        break;
+    case PickerKickRoute::TimerArmed:
+        result.deferred=true;
+        result.route=PickerTraceDeliveryRoute::TimerArmed;
+        break;
+    case PickerKickRoute::InlineFallback:
+        result.route=PickerTraceDeliveryRoute::InlineFallback;
+        break;
+    case PickerKickRoute::Teardown:
+        result.route=PickerTraceDeliveryRoute::ShutdownDrain;
+        break;
+    case PickerKickRoute::PendingPreserved:
+        result.deferred=true;
+        result.route=PickerTraceDeliveryRoute::DurableExternalKick;
+        break;
+    }
+    return result;
+}
 
 static void StagePickerScheduledEffect(
         const PickerEffect& effect) noexcept {
@@ -7092,40 +7490,43 @@ static void StagePickerScheduledEffect(
         : 0;
 }
 
-static bool DeferPickerTransitionWork(bool delayed) noexcept {
-    if(!g_main) return false;
-    if(g_pickerShutdownDrain) return false;
-    if(delayed){
-        const uint64_t remaining=PickerSettlingDelayRemainingMs(
+static PickerTraceScheduleResult DeferPickerTransitionWork(
+        bool delayed) noexcept {
+    uint64_t remaining=0;
+    if(g_main && !g_pickerShutdownDrain && delayed)
+        remaining=PickerSettlingDelayRemainingMs(
             MonotonicNowMs(),g_pickerEffectNotBeforeMs);
-        if(remaining!=0){
-            const UINT wait=static_cast<UINT>((std::min)(
-                remaining,static_cast<uint64_t>(UINT_MAX)));
-            if(SetTimer(g_main,TIMER_PICKER_TRANSITION,
-                        wait?wait:1,nullptr)){
-                g_pickerDurableKickPending=false;
-                return true;
-            }
-            g_pickerDurableKickPending=true;
-            return true;
-        }
-    }
-    if(PostMessageW(g_main,WM_PICKER_TRANSITION,0,0)){
+    const PickerTraceScheduleResult result=SchedulePickerTransitionWork(
+        g_main!=nullptr,g_pickerShutdownDrain,remaining,
+        [](UINT wait) noexcept {
+            return SetTimer(
+                g_main,TIMER_PICKER_TRANSITION,wait,nullptr)!=0;
+        },[]() noexcept {
+            return PostMessageW(
+                g_main,WM_PICKER_TRANSITION,0,0)!=FALSE;
+        });
+    switch(result.route){
+    case PickerTraceDeliveryRoute::Posted:
+    case PickerTraceDeliveryRoute::TimerArmed:
+    case PickerTraceDeliveryRoute::DelayedTimer:
         g_pickerDurableKickPending=false;
-        return true;
+        break;
+    case PickerTraceDeliveryRoute::DurableExternalKick:
+        g_pickerDurableKickPending=true;
+        break;
+    default:
+        break;
     }
-    if(SetTimer(g_main,TIMER_PICKER_TRANSITION,1,nullptr)){
-        g_pickerDurableKickPending=false;
-        return true;
-    }
-    return false;
+    return result;
 }
 
 static void QueuePickerEffect(const PickerEffect& effect) noexcept {
     if(effect.kind==PickerEffectKind::None){
         if(g_picker.transition.terminalAcknowledged){
             g_pickerTerminalizationPending=true;
-            if(!DeferPickerTransitionWork(false) && !g_pickerPumpActive)
+            const PickerTraceScheduleResult schedule=
+                DeferPickerTransitionWork(false);
+            if(!schedule.deferred && !g_pickerPumpActive)
                 PumpPickerTransitionWork();
         }
         return;
@@ -7135,11 +7536,20 @@ static void QueuePickerEffect(const PickerEffect& effect) noexcept {
         g_picker.transition.suppressFocus=true;
         g_picker.transition.terminalAcknowledged=true;
         g_pickerTerminalizationPending=true;
+        ObservePickerTraceTerminalMetadata(
+            g_pickerTraceTerminalMetadata,
+            g_picker.transition.phase,g_picker.transition.phase,
+            PickerObservation{},true,false);
         return;
     }
     StagePickerScheduledEffect(effect);
     const bool delayed=PickerEffectRequiresSettlingDelay(effect.kind);
-    if(!DeferPickerTransitionWork(delayed) && !g_pickerPumpActive)
+    const PickerTraceScheduleResult schedule=
+        DeferPickerTransitionWork(delayed);
+    const PickerTraceQueueCallerDecision decision=
+        DecidePickerTraceExternalQueue(schedule,g_pickerPumpActive);
+    EmitPickerTraceEffectQueue(effect,decision.delivery);
+    if(decision.runInlinePump)
         PumpPickerTransitionWork();
 }
 
@@ -7203,12 +7613,17 @@ static void PumpPickerTransitionWork() noexcept {
             if(!ConsumePickerObservationKick(
                     g_pickerObservationKick,observation)) break;
             const PickerEffect next=
-                AdvancePickerTransition(g_picker,observation);
+                AdvancePickerTransitionTraced(g_picker,
+                    observation,&g_pickerTrace,
+                    &g_pickerTraceTerminalMetadata);
             if(next.kind!=PickerEffectKind::None){
                 StagePickerScheduledEffect(next);
                 const bool delayed=
                     PickerEffectRequiresSettlingDelay(next.kind);
-                if(DeferPickerTransitionWork(delayed)){
+                const PickerTraceScheduleResult schedule=
+                    DeferPickerTransitionWork(delayed);
+                EmitPickerTraceEffectQueue(next,schedule);
+                if(schedule.deferred){
                     effectDeferredUntilDue=delayed;
                     break;
                 }
@@ -7216,7 +7631,9 @@ static void PumpPickerTransitionWork() noexcept {
             }
             if(g_picker.transition.terminalAcknowledged){
                 g_pickerTerminalizationPending=true;
-                if(DeferPickerTransitionWork(false)) break;
+                const PickerTraceScheduleResult schedule=
+                    DeferPickerTransitionWork(false);
+                if(schedule.deferred) break;
             }
             continue;
         }
@@ -7226,12 +7643,18 @@ static void PumpPickerTransitionWork() noexcept {
                    g_pickerScheduledEffect.kind) &&
                PickerSettlingDelayRemainingMs(
                    MonotonicNowMs(),g_pickerEffectNotBeforeMs)!=0){
-                effectDeferredUntilDue=DeferPickerTransitionWork(true);
+                const PickerTraceScheduleResult schedule=
+                    DeferPickerTransitionWork(true);
+                EmitPickerTraceEffectQueue(
+                    g_pickerScheduledEffect,schedule);
+                effectDeferredUntilDue=schedule.deferred;
                 break;
             }
             const PickerEffectExecutionRoute executionRoute=
                 RoutePickerEffectExecution(
                     g_pickerScheduledEffect.kind,g_pickerShutdownDrain);
+            EmitPickerTraceEffectExecute(
+                g_pickerScheduledEffect,executionRoute);
             if(executionRoute==
                     PickerEffectExecutionRoute::DeferUntilDue){
                 effectDeferredUntilDue=true;
@@ -7242,6 +7665,7 @@ static void PumpPickerTransitionWork() noexcept {
             g_pickerEffectScheduled=false;
             g_pickerEffectNotBeforeMs=0;
             PickerObservation observation;
+            bool caughtException=false;
             if(executionRoute==
                     PickerEffectExecutionRoute::AcknowledgeWithoutUi){
                 observation.generation=effect.generation;
@@ -7250,8 +7674,16 @@ static void PumpPickerTransitionWork() noexcept {
                 observation.event=PickerEvent::EffectCompleted;
                 observation.apiAccepted=true;
             } else {
-                observation=ExecutePickerEffect(effect);
+                observation=ExecutePickerEffect(
+                    effect,&caughtException);
             }
+            if(caughtException)
+                ObservePickerTraceTerminalMetadata(
+                    g_pickerTraceTerminalMetadata,
+                    g_picker.transition.phase,
+                    g_picker.transition.phase,
+                    observation,false,true);
+            EmitPickerTraceEffectObservation(effect,observation);
             const bool posted=!g_pickerShutdownDrain && PostMessageW(
                 g_main,WM_PICKER_TRANSITION,0,0)!=FALSE;
             const bool timer=posted || g_pickerShutdownDrain ? false :
@@ -7259,6 +7691,8 @@ static void PumpPickerTransitionWork() noexcept {
             const PickerKickRoute route=StagePickerObservationKick(
                 g_pickerObservationKick,observation,
                 posted,timer,g_main!=nullptr);
+            EmitPickerTraceEffectQueue(
+                effect,PickerTraceObservationDelivery(route));
             if(route==PickerKickRoute::Posted ||
                route==PickerKickRoute::TimerArmed) break;
             continue;
@@ -7287,8 +7721,16 @@ static void PumpPickerTransitionWork() noexcept {
                     g_pickerShutdownDrain,terminalRetryDeferred)==
                     PickerTerminalNoProgressRoute::DurableExternalKick)
                 g_pickerDurableKickPending=true;
-        } else if(!DeferPickerTransitionWork(false)){
-            g_pickerDurableKickPending=true;
+        } else {
+            const PickerTraceScheduleResult schedule=
+                DeferPickerTransitionWork(false);
+            const PickerTraceQueueCallerDecision decision=
+                DecidePickerTracePumpRearm(schedule);
+            if(decision.claimDurableKickAtCaller)
+                g_pickerDurableKickPending=true;
+            if(g_pickerEffectScheduled)
+                EmitPickerTraceEffectQueue(
+                    g_pickerScheduledEffect,decision.delivery);
         }
     }
 }
@@ -7304,7 +7746,9 @@ static void RequestPickerCancellation() noexcept {
     cancel.event=PickerEvent::CancelRequested;
     cancel.generation=g_picker.transition.generation;
     cancel.unissuedEffectCancelled=unissued;
-    QueuePickerEffect(AdvancePickerTransition(g_picker,cancel));
+    QueuePickerEffect(AdvancePickerTransitionTraced(g_picker,
+        cancel,&g_pickerTrace,
+        &g_pickerTraceTerminalMetadata));
 }
 
 static bool DrainPickerForShutdown() noexcept {
@@ -7318,16 +7762,24 @@ static bool DrainPickerForShutdown() noexcept {
        g_pickerObservationKick.pending || g_pickerTerminalizationPending)){
         const bool delayed=g_pickerEffectScheduled &&
             PickerEffectRequiresSettlingDelay(g_pickerScheduledEffect.kind);
-        const bool deferred=DeferPickerTransitionWork(delayed);
+        PickerTraceScheduleResult schedule=
+            DeferPickerTransitionWork(delayed);
         g_pickerDurableKickPending=
             PickerDurableKickRequiredAfterDefer(
-                deferred,g_pickerDurableKickPending);
+                schedule.deferred,g_pickerDurableKickPending);
+        if(g_pickerDurableKickPending)
+            schedule=MarkPickerTraceDurableKick(schedule);
+        if(g_pickerEffectScheduled)
+            EmitPickerTraceEffectQueue(
+                g_pickerScheduledEffect,schedule);
     }
     return drained;
 }
 
-static bool CaptureFastWindowForMove(HWND hwnd,FastWin& output,bool& tracked,
-                                     bool& titleComplete){
+static bool CaptureFastWindowForMove(
+        HWND hwnd,FastWin& output,bool& tracked,bool& titleComplete,
+        PickerTraceWindowDesktopFacts* desktopFacts=nullptr){
+    if(desktopFacts) *desktopFacts=PickerTraceWindowDesktopFacts{};
     tracked=false;
     titleComplete=true;
     if(!IsWindow(hwnd)) return false;
@@ -7359,7 +7811,14 @@ static bool CaptureFastWindowForMove(HWND hwnd,FastWin& output,bool& tracked,
         }
     }
     if(g_vdmDoc){
+        if(desktopFacts) desktopFacts->invoked=true;
         HRESULT read=g_vdmDoc->GetWindowDesktopId(hwnd,&captured.desktop);
+        if(desktopFacts){
+            desktopFacts->result=read;
+            desktopFacts->actual=captured.desktop;
+            if(SUCCEEDED(read) && !GuidIsZero(captured.desktop))
+                desktopFacts->validity=PickerReadValidity::Valid;
+        }
         if(FAILED(read)) captured.desktop=GUID{};
     }
     output=std::move(captured);
@@ -7547,16 +8006,28 @@ static PickerTraceMoveBeginReason BeginVerifiedPickerMove(
         if(!IsWindow(g_target))
             return finish(PickerTraceMoveBeginReason::TargetWindowInvalid);
         const GUID destination=g_tiles[index].guid;
-        const GUID currentOrigin=CurrentDesktopGuid();
+        PickerTraceCurrentDesktopFacts currentFacts;
+        const GUID currentOrigin=CurrentDesktopGuid(&currentFacts);
+        EmitPickerTraceCurrentDesktopFacts(0,0,currentFacts);
         PickerReadValidity popupValidity=PickerReadValidity::Unavailable;
         GUID popupOrigin={0};
-        ReadPickerWindowDesktop(g_main,popupValidity,popupOrigin);
+        PickerTraceWindowDesktopFacts popupFacts;
+        ReadPickerWindowDesktop(
+            g_main,popupValidity,popupOrigin,&popupFacts);
+        EmitPickerTraceWindowDesktopFacts(
+            PickerTraceApiKind::GetWindowDesktopIdPopup,
+            g_main,0,0,popupFacts);
         traceEvent.destination=destination;
         traceEvent.currentOrigin=currentOrigin;
         traceEvent.popupOrigin=popupOrigin;
         if(GuidIsZero(destination))
             return finish(PickerTraceMoveBeginReason::DestinationZero);
-        if(GetDesktopIndexByGuid(destination)<0)
+        PickerTraceDesktopLookupContext lookupContext;
+        lookupContext.trace=&g_pickerTrace;
+        lookupContext.use=
+            PickerTraceDesktopLookupUse::MoveEntryDestination;
+        lookupContext.requested=destination;
+        if(GetDesktopIndexByGuid(destination,&lookupContext)<0)
             return finish(
                 PickerTraceMoveBeginReason::DestinationLookupFailed);
         if(GuidIsZero(currentOrigin))
@@ -7569,9 +8040,14 @@ static PickerTraceMoveBeginReason BeginVerifiedPickerMove(
 
         FastWin fast;
         bool tracked=false,titleComplete=true;
+        PickerTraceWindowDesktopFacts targetDesktopFacts;
         if(!CaptureFastWindowForMove(
-                g_target,fast,tracked,titleComplete))
+                g_target,fast,tracked,titleComplete,
+                &targetDesktopFacts))
             return finish(PickerTraceMoveBeginReason::FastCaptureFailed);
+        EmitPickerTraceWindowDesktopFacts(
+            PickerTraceApiKind::GetWindowDesktopIdCapture,
+            g_target,0,0,targetDesktopFacts);
         traceEvent.targetOrigin=fast.desktop;
         if(GuidIsZero(fast.desktop))
             return finish(
@@ -7883,6 +8359,9 @@ static PickerTraceMoveBeginReason BeginVerifiedPickerMove(
         });
         if(!staged) return finish(stagingFailure);
         transitionPublishedForTrace=true;
+        g_pickerTraceTerminalMetadata=PickerTraceTerminalMetadata{};
+        g_pickerTraceTerminalMetadata.generation=
+            g_picker.transition.generation;
 
         SetPickerCurrentDesktop(g_picker,currentOrigin);
         if(!g_picker.transition.pendingRecordId.empty()){
@@ -7895,7 +8374,9 @@ static PickerTraceMoveBeginReason BeginVerifiedPickerMove(
         begin.event=PickerEvent::Begin;
         begin.generation=g_picker.transition.generation;
         const PickerEffect effect=
-            AdvancePickerTransition(g_picker,begin);
+            AdvancePickerTransitionTraced(g_picker,
+                begin,&g_pickerTrace,
+                &g_pickerTraceTerminalMetadata);
         if(effect.kind==PickerEffectKind::None){
             MoveResult terminal;
             terminal.completed=true;

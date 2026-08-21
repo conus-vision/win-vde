@@ -1614,33 +1614,88 @@ inline bool SnapshotDesktopCollectionOwned(
         ops,snapshotOut,nullptr);
 }
 
+enum class DesktopCollectionLookupObservationStage {
+    ValidateRequest,GetDesktops,GetCount,GetAt,GetId,
+    Match,NotFound,Exception
+};
+
+struct DesktopCollectionLookupObservation {
+    DesktopCollectionLookupObservationStage stage=
+        DesktopCollectionLookupObservationStage::ValidateRequest;
+    int index=-1;
+    HRESULT result=E_NOTIMPL;
+    GUID actual{};
+    bool matched=false;
+};
+
+inline void ObserveDesktopCollectionLookup(
+        const std::function<void(
+            const DesktopCollectionLookupObservation&)>* observer,
+        const DesktopCollectionLookupObservation& observation) noexcept {
+    if(!observer) return;
+    try { (*observer)(observation); }
+    catch(...) {}
+}
+
 template<class Array,class Desktop,class Ops,class DesktopOwner>
 inline bool LookupDesktopCollectionOwned(
         const DesktopCollectionLookupRequest& request,Ops& ops,
-        DesktopOwner& desktopOut,int& indexOut) noexcept {
+        DesktopOwner& desktopOut,int& indexOut,
+        const std::function<void(
+            const DesktopCollectionLookupObservation&)>* observer) noexcept {
     static_assert(noexcept(desktopOut.reset()),
                   "desktop output owner reset must be noexcept");
     static_assert(noexcept(desktopOut.reset(static_cast<Desktop*>(nullptr))),
                   "desktop output owner adoption must be noexcept");
     desktopOut.reset();
     indexOut=-1;
+    DesktopCollectionLookupObservation observation;
+    observation.index=request.kind==DesktopCollectionLookupKind::Index
+        ? static_cast<int>(request.index) : -1;
+    observation.result=
+        request.kind==DesktopCollectionLookupKind::Guid &&
+        GuidIsZero(request.guid)
+            ? E_INVALIDARG : S_OK;
+    ObserveDesktopCollectionLookup(observer,observation);
     if(request.kind==DesktopCollectionLookupKind::Guid &&
        GuidIsZero(request.guid)) return false;
 
     try {
         Array* array=nullptr;
         DesktopCollectionArrayOutputOwner<Array,Ops> arrayOwner(array,ops);
+        observation=DesktopCollectionLookupObservation{};
+        observation.stage=DesktopCollectionLookupObservationStage::GetDesktops;
         const HRESULT desktopsResult=ops.getDesktops(&array);
+        observation.result=desktopsResult;
+        ObserveDesktopCollectionLookup(observer,observation);
         if(FAILED(desktopsResult) || !array) return false;
 
         UINT count=0;
+        observation=DesktopCollectionLookupObservation{};
+        observation.stage=DesktopCollectionLookupObservationStage::GetCount;
         const HRESULT countResult=ops.getCount(array,&count);
+        observation.result=countResult;
+        ObserveDesktopCollectionLookup(observer,observation);
         if(FAILED(countResult) || count==0 ||
            count>MAX_VIRTUAL_DESKTOPS) return false;
         if(request.kind==DesktopCollectionLookupKind::Index &&
-           request.index>=count) return false;
+           request.index>=count){
+            observation.stage=
+                DesktopCollectionLookupObservationStage::NotFound;
+            observation.index=static_cast<int>(request.index);
+            observation.result=S_FALSE;
+            ObserveDesktopCollectionLookup(observer,observation);
+            return false;
+        }
         if(request.kind!=DesktopCollectionLookupKind::Index &&
-           request.kind!=DesktopCollectionLookupKind::Guid) return false;
+           request.kind!=DesktopCollectionLookupKind::Guid){
+            observation.stage=
+                DesktopCollectionLookupObservationStage::ValidateRequest;
+            observation.index=-1;
+            observation.result=E_INVALIDARG;
+            ObserveDesktopCollectionLookup(observer,observation);
+            return false;
+        }
 
         const UINT begin=request.kind==DesktopCollectionLookupKind::Index
             ? request.index : 0U;
@@ -1650,10 +1705,21 @@ inline bool LookupDesktopCollectionOwned(
             Desktop* desktop=nullptr;
             DesktopCollectionItemOutputOwner<Desktop,Ops> desktopOwner(
                 desktop,ops);
+            observation=DesktopCollectionLookupObservation{};
+            observation.stage=DesktopCollectionLookupObservationStage::GetAt;
+            observation.index=static_cast<int>(i);
             const HRESULT atResult=ops.getAt(array,i,&desktop);
+            observation.result=atResult;
+            ObserveDesktopCollectionLookup(observer,observation);
             if(FAILED(atResult) || !desktop) return false;
             GUID id={0};
+            observation=DesktopCollectionLookupObservation{};
+            observation.stage=DesktopCollectionLookupObservationStage::GetId;
+            observation.index=static_cast<int>(i);
             const HRESULT idResult=ops.getId(desktop,&id);
+            observation.result=idResult;
+            observation.actual=id;
+            ObserveDesktopCollectionLookup(observer,observation);
             if(FAILED(idResult) || GuidIsZero(id)) return false;
             const bool matches=
                 request.kind==DesktopCollectionLookupKind::Index ||
@@ -1662,12 +1728,32 @@ inline bool LookupDesktopCollectionOwned(
             desktopOut.reset(desktop);
             desktopOwner.release();
             indexOut=static_cast<int>(i);
+            observation.stage=DesktopCollectionLookupObservationStage::Match;
+            observation.result=S_OK;
+            observation.matched=true;
+            ObserveDesktopCollectionLookup(observer,observation);
             return true;
         }
+        observation.stage=DesktopCollectionLookupObservationStage::NotFound;
+        observation.result=S_FALSE;
+        observation.matched=false;
+        ObserveDesktopCollectionLookup(observer,observation);
         return false;
     } catch(...) {
+        observation.stage=DesktopCollectionLookupObservationStage::Exception;
+        observation.result=E_FAIL;
+        observation.matched=false;
+        ObserveDesktopCollectionLookup(observer,observation);
         return false;
     }
+}
+
+template<class Array,class Desktop,class Ops,class DesktopOwner>
+inline bool LookupDesktopCollectionOwned(
+        const DesktopCollectionLookupRequest& request,Ops& ops,
+        DesktopOwner& desktopOut,int& indexOut) noexcept {
+    return LookupDesktopCollectionOwned<Array,Desktop>(
+        request,ops,desktopOut,indexOut,nullptr);
 }
 
 template<class Initialize,class Sanity,class Release>

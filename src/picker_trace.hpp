@@ -432,6 +432,176 @@ struct PickerTraceApiResultEvent {
     DWORD lastError=ERROR_SUCCESS;
 };
 
+class PickerTraceSession;
+
+struct PickerTraceDesktopLookupContext {
+    PickerTraceSession* trace=nullptr;
+    PickerTraceDesktopLookupUse use=
+        PickerTraceDesktopLookupUse::MoveEntryDestination;
+    uint64_t generation=0;
+    uint64_t effectSerial=0;
+    GUID requested{};
+};
+
+void EmitPickerTraceDesktopLookupStage(
+    const PickerTraceDesktopLookupContext* context,
+    PickerTraceDesktopLookupStage stage,int index,HRESULT result,
+    const GUID& actual,bool matched) noexcept;
+
+struct PickerTraceBoolCallResult {
+    BOOL value=FALSE;
+    DWORD immediateError=ERROR_SUCCESS;
+};
+
+template<class Call,class ReadError>
+PickerTraceBoolCallResult CallPickerTraceBoolWithImmediateError(
+        Call call,ReadError readError) noexcept {
+    PickerTraceBoolCallResult result;
+    try {
+        result.value=call();
+        result.immediateError=readError();
+    } catch(...) {
+        result.value=FALSE;
+        result.immediateError=ERROR_GEN_FAILURE;
+    }
+    return result;
+}
+
+struct PickerTraceForegroundHandoffOps {
+    void* context=nullptr;
+    BOOL (*attachThreadInput)(void*,DWORD,DWORD,BOOL)=nullptr;
+    BOOL (*setForegroundWindow)(void*,HWND)=nullptr;
+    HRESULT (*switchDesktop)(void*)=nullptr;
+    BOOL (*showWindow)(void*,HWND,int)=nullptr;
+};
+
+struct PickerTraceApiEventObserver {
+    void* context=nullptr;
+    void (*emit)(void*,const PickerTraceApiResultEvent&) noexcept=nullptr;
+};
+
+struct PickerTraceForegroundHandoffResult {
+    HRESULT switchResult=E_FAIL;
+    bool invoked=false;
+    bool desktopAttachAttempted=false;
+    bool desktopAttached=false;
+    bool foregroundAttachAttempted=false;
+    bool foregroundAttached=false;
+    BOOL focusResult=FALSE;
+    BOOL foregroundDetachResult=FALSE;
+    BOOL desktopDetachResult=FALSE;
+    BOOL previousVisibility=FALSE;
+};
+
+PickerTraceForegroundHandoffResult ExecutePickerForegroundHandoffCalls(
+    const PickerForegroundHandoffPlan&,HWND progman,
+    DWORD desktopThread,DWORD foregroundThread,DWORD currentThread,
+    const PickerTraceForegroundHandoffOps&,
+    const PickerTraceApiEventObserver* observer) noexcept;
+
+struct PickerTraceScheduleResult {
+    bool deferred=false;
+    bool routeAvailable=false;
+    PickerTraceDeliveryRoute route=PickerTraceDeliveryRoute::None;
+};
+
+inline PickerTraceScheduleResult MarkPickerTraceDurableKick(
+        PickerTraceScheduleResult result) noexcept {
+    result.routeAvailable=true;
+    result.route=PickerTraceDeliveryRoute::DurableExternalKick;
+    return result;
+}
+
+struct PickerTraceQueueCallerDecision {
+    PickerTraceScheduleResult delivery;
+    bool runInlinePump=false;
+    bool claimDurableKickAtCaller=false;
+};
+
+inline PickerTraceQueueCallerDecision DecidePickerTraceExternalQueue(
+        const PickerTraceScheduleResult& schedule,
+        bool pumpActive) noexcept {
+    PickerTraceQueueCallerDecision result;
+    result.delivery=schedule;
+    result.runInlinePump=!schedule.deferred && !pumpActive;
+    return result;
+}
+
+inline PickerTraceQueueCallerDecision DecidePickerTracePumpRearm(
+        const PickerTraceScheduleResult& schedule) noexcept {
+    PickerTraceQueueCallerDecision result;
+    result.delivery=schedule;
+    if(!schedule.deferred){
+        result.claimDurableKickAtCaller=true;
+        result.delivery=MarkPickerTraceDurableKick(result.delivery);
+    }
+    return result;
+}
+
+template<class ArmTimer,class Post>
+PickerTraceScheduleResult SchedulePickerTransitionWork(
+        bool mainAvailable,bool shutdownDrain,uint64_t remainingMs,
+        ArmTimer armTimer,Post post) noexcept {
+    PickerTraceScheduleResult result;
+    result.routeAvailable=true;
+    if(!mainAvailable){
+        result.route=PickerTraceDeliveryRoute::InlineFallback;
+        return result;
+    }
+    if(shutdownDrain){
+        result.route=PickerTraceDeliveryRoute::ShutdownDrain;
+        return result;
+    }
+    try {
+        if(remainingMs!=0){
+            const UINT wait=static_cast<UINT>((std::min)(
+                remainingMs,static_cast<uint64_t>(UINT_MAX)));
+            if(armTimer(wait?wait:1)){
+                result.deferred=true;
+                result.route=PickerTraceDeliveryRoute::DelayedTimer;
+                return result;
+            }
+            result.deferred=true;
+            result.route=PickerTraceDeliveryRoute::DurableExternalKick;
+            return result;
+        }
+        if(post()){
+            result.deferred=true;
+            result.route=PickerTraceDeliveryRoute::Posted;
+            return result;
+        }
+        if(armTimer(1)){
+            result.deferred=true;
+            result.route=PickerTraceDeliveryRoute::TimerArmed;
+            return result;
+        }
+    } catch(...) {
+        result.deferred=false;
+        result.route=PickerTraceDeliveryRoute::InlineFallback;
+        return result;
+    }
+    result.route=PickerTraceDeliveryRoute::InlineFallback;
+    return result;
+}
+
+struct PickerTraceTerminalMetadata {
+    uint64_t generation=0;
+    PickerTraceRollbackTrigger rollbackTrigger=
+        PickerTraceRollbackTrigger::None;
+    PickerTraceDiagnosticCode diagnosticCode=
+        PickerTraceDiagnosticCode::None;
+};
+
+void ObservePickerTraceTerminalMetadata(
+    PickerTraceTerminalMetadata&,PickerPhase before,PickerPhase after,
+    const PickerObservation&,bool queueConflict,bool caughtException)
+    noexcept;
+
+PickerEffect AdvancePickerTransitionTraced(
+    PickerState& state,const PickerObservation& observation,
+    PickerTraceSession* trace,PickerTraceTerminalMetadata* metadata)
+    noexcept;
+
 struct PickerTraceTerminalizationAttemptEvent {
     uint64_t generation=0;
     uint64_t attempt=0;

@@ -5480,16 +5480,25 @@ struct FakeDesktopLookupOps {
     std::vector<FakeDesktopLookupDesktop*> desktops;
     std::vector<HRESULT> atResults;
     bool returnDesktopOnFailedGetAt=false;
+    bool throwGetDesktops=false;
+    bool throwGetCount=false;
+    int throwGetAtIndex=-1;
+    int throwGetIdIndex=-1;
     int getCountCalls=0;
     int getAtCalls=0;
     int getIdCalls=0;
+    std::string transcript;
 
     HRESULT getDesktops(FakeDesktopLookupArray** output){
+        transcript.push_back('d');
+        if(throwGetDesktops) throw std::runtime_error("getDesktops");
         if(returnArray) *output=&array;
         return desktopsResult;
     }
 
     HRESULT getCount(FakeDesktopLookupArray*,UINT* output){
+        transcript.push_back('c');
+        if(throwGetCount) throw std::runtime_error("getCount");
         ++getCountCalls;
         *output=count;
         return countResult;
@@ -5497,6 +5506,9 @@ struct FakeDesktopLookupOps {
 
     HRESULT getAt(FakeDesktopLookupArray*,UINT index,
                   FakeDesktopLookupDesktop** output){
+        transcript.push_back('a');
+        if(static_cast<int>(index)==throwGetAtIndex)
+            throw std::runtime_error("getAt");
         ++getAtCalls;
         const HRESULT result=index<atResults.size()
             ? atResults[index] : E_FAIL;
@@ -5508,16 +5520,21 @@ struct FakeDesktopLookupOps {
     }
 
     HRESULT getId(FakeDesktopLookupDesktop* desktop,GUID* output){
+        transcript.push_back('i');
+        const int index=!desktops.empty() && desktop==desktops[0]?0:1;
+        if(index==throwGetIdIndex) throw std::runtime_error("getId");
         ++getIdCalls;
         *output=desktop->id;
         return desktop->idResult;
     }
 
     void releaseArray(FakeDesktopLookupArray* value){
+        transcript.push_back('A');
         ++value->releases;
     }
 
     void releaseDesktop(FakeDesktopLookupDesktop* value){
+        transcript.push_back('D');
         ++value->releases;
     }
 };
@@ -11796,38 +11813,32 @@ static void test_picker_ctrl_move_uses_shared_foreground_handoff(){
 
     CHECK(!helper.empty());
     CHECK(helper.find("PlanPickerForegroundHandoff(")!=std::string::npos);
-    CHECK(helper.find("SetForegroundWindow(prog)")!=std::string::npos);
-    CHECK(helper.find("g_vdmi->SwitchDesktop(desktop.get())")!=
+    CHECK(helper.find("ExecutePickerForegroundHandoffCalls(")!=
           std::string::npos);
-    const size_t desktopAttach=helper.find(
-        "desktopAttached=AttachThreadInput(");
-    const size_t desktopAttachTrue=helper.find(
-        "desktopThread,currentThread,TRUE",desktopAttach);
-    const size_t foregroundAttach=helper.find(
-        "foregroundAttached=AttachThreadInput(");
-    const size_t foregroundAttachTrue=helper.find(
-        "foregroundThread,currentThread,TRUE",foregroundAttach);
-    const size_t focusShell=helper.find("SetForegroundWindow(prog)");
-    const size_t foregroundDetach=helper.find(
-        "foregroundThread,currentThread,FALSE)");
-    const size_t desktopDetach=helper.find(
-        "desktopThread,currentThread,FALSE)");
-    const size_t invoked=helper.find("invoked=true;");
-    const size_t switchCall=helper.find(
-        "g_vdmi->SwitchDesktop(desktop.get())");
-    CHECK(desktopAttach!=std::string::npos &&
-          desktopAttachTrue!=std::string::npos &&
-          foregroundAttach!=std::string::npos &&
-          foregroundAttachTrue!=std::string::npos &&
-          focusShell!=std::string::npos &&
-          foregroundDetach!=std::string::npos &&
-          desktopDetach!=std::string::npos && invoked!=std::string::npos &&
-          switchCall!=std::string::npos);
-    CHECK(desktopAttach<desktopAttachTrue && desktopAttachTrue<focusShell &&
-          foregroundAttach<foregroundAttachTrue &&
-          foregroundAttachTrue<focusShell && focusShell<foregroundDetach &&
-          foregroundDetach<desktopDetach && desktopDetach<invoked &&
-          invoked<switchCall);
+    CHECK(helper.find("ops.attachThreadInput=")!=std::string::npos);
+    CHECK(helper.find("ops.setForegroundWindow=")!=std::string::npos);
+    CHECK(helper.find("ops.switchDesktop=")!=std::string::npos);
+    CHECK(helper.find("ops.showWindow=")!=std::string::npos);
+    CHECK(helper.find("const HWND foreground=GetForegroundWindow();")!=
+          std::string::npos);
+    CHECK(helper.find("AttachThreadInput(")==std::string::npos);
+    CHECK(helper.find("SetForegroundWindow(prog)")==std::string::npos);
+    CHECK(helper.find("g_vdmi->SwitchDesktop(desktop.get())")==
+          std::string::npos);
+    CHECK(source.find("return AttachThreadInput(source,destination,attach);")!=
+          std::string::npos);
+    CHECK(source.find("return SetForegroundWindow(hwnd);")!=
+          std::string::npos);
+    CHECK(source.find("g_vdmi->SwitchDesktop(context->desktop)")!=
+          std::string::npos);
+    CHECK(source.find(
+        "static HRESULT PickerProductSwitchDesktop(void* opaque) noexcept")==
+          std::string::npos);
+    CHECK(source.find(
+        "static HRESULT PickerProductSwitchDesktop(void* opaque) {")!=
+          std::string::npos);
+    CHECK(source.find("return ShowWindow(hwnd,command);")!=
+          std::string::npos);
     CHECK(effects.find("SwitchDesktopWithForegroundHandoff(")!=
           std::string::npos);
     CHECK(effects.find("g_vdmi->SwitchDesktop(")==std::string::npos);
@@ -21003,6 +21014,1464 @@ static void test_picker_trace_activation_runtime_wiring_is_causal(){
     CHECK(mouse.find("GetKeyState(VK_CONTROL)")==std::string::npos);
 }
 
+template<class Event>
+static bool SerializedTraceContains(
+        const Event& event,const std::string& needle){
+    PickerTraceEnvelope envelope;
+    envelope.session.fill(0x33);
+    envelope.seq=1;
+    std::string line;
+    return SerializePickerTraceLine(envelope,event,line) &&
+        line.find(needle)!=std::string::npos;
+}
+
+template<class Run>
+static std::string RunWithActivePickerTraceSessionForTest(Run run){
+    const uint64_t now=200000ULL*24ULL*60ULL*60ULL*10000000ULL;
+    std::vector<std::wstring> deleted;
+    std::wstring listed,created;
+    DWORD disposition=0;
+    int directoryCreates=0;
+    PickerTraceRuntimeOps runtime;
+    runtime.storage=PickerTraceStorageOpsForTest(
+        now,{},deleted,listed,created,disposition,directoryCreates);
+    std::string bytes;
+    runtime.storage.writeFile=[&](HANDLE,const void* data,DWORD size,
+                                  DWORD& written){
+        bytes.append(static_cast<const char*>(data),size);
+        written=size;
+        return TRUE;
+    };
+    std::vector<unsigned char> image=
+        PickerTracePeImageForTest(0x80,0x12345678,true);
+    size_t offset=0;
+    bool failRead=false;
+    runtime.provenance=PickerTraceFileOpsForTest(image,offset,failRead);
+    runtime.provenance.modulePath=[](std::wstring& output){
+        output=L"C:\\Apps\\vde.exe";
+        return true;
+    };
+    runtime.provenance.randomBytes=[](void* output,size_t size){
+        std::fill_n(static_cast<unsigned char*>(output),size,0x44);
+        return true;
+    };
+    runtime.provenance.processSessionId=[](DWORD& output){
+        output=2;
+        return true;
+    };
+    runtime.provenance.processIntegrity=[](DWORD& rid,bool& elevated){
+        rid=SECURITY_MANDATORY_MEDIUM_RID;
+        elevated=false;
+        return true;
+    };
+    runtime.provenance.processId=[](){ return 42UL; };
+    runtime.provenance.threadId=[](){ return 7UL; };
+    runtime.provenance.windowsBuild=[](){ return 26100UL; };
+    PickerTraceSession session(runtime,PickerTraceLimits{65536,128});
+    CHECK(session.start(true,L"1.1.0"));
+    run(session);
+    session.close();
+    return bytes;
+}
+
+static void test_picker_trace_raw_api_contracts_are_exact(){
+    PickerTraceEnvelope envelope;
+    envelope.session.fill(0x11);
+    envelope.seq=7;
+    envelope.ms=25;
+    PickerTraceApiResultEvent failed;
+    failed.api=PickerTraceApiKind::MoveViewToDesktop;
+    failed.lookupUse=PickerTraceDesktopLookupUse::MoveTargetDestination;
+    failed.lookupStage=PickerTraceDesktopLookupStage::GetAt;
+    failed.resultKind=PickerTraceRawResultKind::HResult;
+    failed.generation=12;
+    failed.effectSerial=34;
+    failed.hwnd=0x123;
+    failed.sourceThread=5;
+    failed.destinationThread=6;
+    failed.index=7;
+    failed.requestedDesktop=
+        G(L"{231A0000-0000-0000-0000-000000008111}");
+    failed.actualDesktop=
+        G(L"{231A0000-0000-0000-0000-000000008112}");
+    failed.hresult=(HRESULT)0x80070005L;
+    failed.invoked=true;
+    failed.lastErrorAvailable=true;
+    failed.lastError=ERROR_ACCESS_DENIED;
+    std::string failedLine;
+    CHECK(SerializePickerTraceLine(envelope,failed,failedLine));
+    CHECK(failedLine==
+        "{\"schema\":1,\"session\":\"11111111111111111111111111111111\","
+        "\"seq\":7,\"ms\":25,\"event\":\"api.result\","
+        "\"api\":\"move_view_to_desktop\","
+        "\"lookup_use\":\"move_target_destination\","
+        "\"lookup_stage\":\"get_at\",\"result_kind\":\"hresult\","
+        "\"generation\":12,\"effect_serial\":34,"
+        "\"hwnd\":\"0x0000000000000123\",\"source_thread\":5,"
+        "\"destination_thread\":6,\"index\":7,"
+        "\"requested_desktop\":\"231a0000-0000-0000-0000-000000008111\","
+        "\"actual_desktop\":\"231a0000-0000-0000-0000-000000008112\","
+        "\"hresult\":\"0x80070005\",\"bool_result\":false,"
+        "\"invoked\":true,\"last_error_available\":true,"
+        "\"last_error\":\"0x00000005\"}\n");
+    CHECK(failedLine.find("previously_visible")==std::string::npos);
+    PickerTraceApiResultEvent foreground;
+    foreground.api=PickerTraceApiKind::SetForegroundWindow;
+    foreground.resultKind=PickerTraceRawResultKind::NoExtendedError;
+    foreground.boolResult=false;
+    foreground.lastErrorAvailable=false;
+    PickerTraceApiResultEvent cleanup;
+    cleanup.api=PickerTraceApiKind::ShowWindowProgmanCleanup;
+    cleanup.resultKind=PickerTraceRawResultKind::PreviousVisibility;
+    cleanup.boolResult=true;
+    std::string cleanupLine;
+    CHECK(SerializePickerTraceLine(PickerTraceEnvelope{},cleanup,cleanupLine));
+    CHECK(cleanupLine==
+        "{\"schema\":1,\"session\":\"00000000000000000000000000000000\","
+        "\"seq\":0,\"ms\":0,\"event\":\"api.result\","
+        "\"api\":\"show_window_progman_cleanup\","
+        "\"lookup_use\":\"move_entry_destination\","
+        "\"lookup_stage\":\"validate_request\","
+        "\"result_kind\":\"previous_visibility\","
+        "\"generation\":0,\"effect_serial\":0,"
+        "\"hwnd\":\"0x0000000000000000\",\"source_thread\":0,"
+        "\"destination_thread\":0,\"index\":-1,"
+        "\"requested_desktop\":\"00000000-0000-0000-0000-000000000000\","
+        "\"actual_desktop\":\"00000000-0000-0000-0000-000000000000\","
+        "\"hresult\":\"0x80004001\",\"bool_result\":true,"
+        "\"invoked\":false,\"last_error_available\":false,"
+        "\"last_error\":\"0x00000000\",\"previously_visible\":true}\n");
+    CHECK(SerializedTraceContains(failed,"0x80070005"));
+    CHECK(SerializedTraceContains(foreground,
+        "\"last_error_available\":false"));
+    CHECK(SerializedTraceContains(cleanup,
+        "\"previously_visible\":true"));
+}
+
+static void test_picker_trace_task8_enums_have_complete_stable_names(){
+    struct ApiCase { PickerTraceApiKind value; const char* name; };
+    const ApiCase apis[]={
+        {PickerTraceApiKind::GetViewForHwnd,"get_view_for_hwnd"},
+        {PickerTraceApiKind::MoveViewToDesktop,"move_view_to_desktop"},
+        {PickerTraceApiKind::MoveWindowToDesktop,"move_window_to_desktop"},
+        {PickerTraceApiKind::GetWindowDesktopIdTarget,"get_window_desktop_id_target"},
+        {PickerTraceApiKind::GetWindowDesktopIdPopup,"get_window_desktop_id_popup"},
+        {PickerTraceApiKind::GetWindowDesktopIdCapture,"get_window_desktop_id_capture"},
+        {PickerTraceApiKind::GetDesktops,"get_desktops"},
+        {PickerTraceApiKind::GetCount,"get_count"},
+        {PickerTraceApiKind::GetAt,"get_at"},
+        {PickerTraceApiKind::GetId,"get_id"},
+        {PickerTraceApiKind::GetCurrentDesktop,"get_current_desktop"},
+        {PickerTraceApiKind::AttachDesktopInput,"attach_desktop_input"},
+        {PickerTraceApiKind::AttachForegroundInput,"attach_foreground_input"},
+        {PickerTraceApiKind::SetForegroundWindow,"set_foreground_window"},
+        {PickerTraceApiKind::DetachForegroundInput,"detach_foreground_input"},
+        {PickerTraceApiKind::DetachDesktopInput,"detach_desktop_input"},
+        {PickerTraceApiKind::SwitchDesktop,"switch_desktop"},
+        {PickerTraceApiKind::ShowWindowProgmanCleanup,"show_window_progman_cleanup"}
+    };
+    static_assert(sizeof(apis)/sizeof(apis[0])==
+        static_cast<size_t>(PickerTraceApiKind::ShowWindowProgmanCleanup)+1,
+        "API trace vocabulary must be exhaustive");
+    for(size_t i=0;i<sizeof(apis)/sizeof(apis[0]);++i){
+        CHECK(static_cast<size_t>(apis[i].value)==i);
+        CHECK(std::string(PickerTraceApiKindName(apis[i].value))==
+              apis[i].name);
+        PickerTraceApiResultEvent event;
+        event.api=apis[i].value;
+        CHECK(SerializedTraceContains(event,
+            std::string("\"api\":\"")+apis[i].name+"\""));
+    }
+
+    struct StageCase {
+        PickerTraceDesktopLookupStage value;
+        const char* name;
+    };
+    const StageCase stages[]={
+        {PickerTraceDesktopLookupStage::ValidateRequest,"validate_request"},
+        {PickerTraceDesktopLookupStage::GetDesktops,"get_desktops"},
+        {PickerTraceDesktopLookupStage::GetCount,"get_count"},
+        {PickerTraceDesktopLookupStage::GetAt,"get_at"},
+        {PickerTraceDesktopLookupStage::GetId,"get_id"},
+        {PickerTraceDesktopLookupStage::Match,"match"},
+        {PickerTraceDesktopLookupStage::NotFound,"not_found"},
+        {PickerTraceDesktopLookupStage::Exception,"exception"}
+    };
+    static_assert(sizeof(stages)/sizeof(stages[0])==
+        static_cast<size_t>(PickerTraceDesktopLookupStage::Exception)+1,
+        "lookup-stage vocabulary must be exhaustive");
+    for(size_t i=0;i<sizeof(stages)/sizeof(stages[0]);++i){
+        CHECK(static_cast<size_t>(stages[i].value)==i);
+        CHECK(std::string(PickerTraceDesktopLookupStageName(
+            stages[i].value))==stages[i].name);
+        PickerTraceApiResultEvent event;
+        event.lookupStage=stages[i].value;
+        CHECK(SerializedTraceContains(event,
+            std::string("\"lookup_stage\":\"")+stages[i].name+"\""));
+    }
+
+    struct UseCase { PickerTraceDesktopLookupUse value; const char* name; };
+    const UseCase uses[]={
+        {PickerTraceDesktopLookupUse::MoveEntryDestination,"move_entry_destination"},
+        {PickerTraceDesktopLookupUse::MoveTargetDestination,"move_target_destination"},
+        {PickerTraceDesktopLookupUse::MovePopupDestination,"move_popup_destination"},
+        {PickerTraceDesktopLookupUse::SwitchPrecheckDestination,"switch_precheck_destination"},
+        {PickerTraceDesktopLookupUse::SwitchHandoffDestination,"switch_handoff_destination"}
+    };
+    static_assert(sizeof(uses)/sizeof(uses[0])==
+        static_cast<size_t>(PickerTraceDesktopLookupUse::SwitchHandoffDestination)+1,
+        "lookup-use vocabulary must be exhaustive");
+    for(size_t i=0;i<sizeof(uses)/sizeof(uses[0]);++i){
+        CHECK(static_cast<size_t>(uses[i].value)==i);
+        CHECK(std::string(PickerTraceDesktopLookupUseName(uses[i].value))==
+              uses[i].name);
+        PickerTraceApiResultEvent event;
+        event.lookupUse=uses[i].value;
+        CHECK(SerializedTraceContains(event,
+            std::string("\"lookup_use\":\"")+uses[i].name+"\""));
+    }
+
+    struct RawCase { PickerTraceRawResultKind value; const char* name; };
+    const RawCase rawKinds[]={
+        {PickerTraceRawResultKind::HResult,"hresult"},
+        {PickerTraceRawResultKind::Win32Bool,"win32_bool"},
+        {PickerTraceRawResultKind::PreviousVisibility,"previous_visibility"},
+        {PickerTraceRawResultKind::NoExtendedError,"no_extended_error"}
+    };
+    static_assert(sizeof(rawKinds)/sizeof(rawKinds[0])==
+        static_cast<size_t>(PickerTraceRawResultKind::NoExtendedError)+1,
+        "raw-result vocabulary must be exhaustive");
+    for(size_t i=0;i<sizeof(rawKinds)/sizeof(rawKinds[0]);++i){
+        CHECK(static_cast<size_t>(rawKinds[i].value)==i);
+        CHECK(std::string(PickerTraceRawResultKindName(rawKinds[i].value))==
+              rawKinds[i].name);
+        PickerTraceApiResultEvent event;
+        event.resultKind=rawKinds[i].value;
+        CHECK(SerializedTraceContains(event,
+            std::string("\"result_kind\":\"")+rawKinds[i].name+"\""));
+    }
+
+    struct RouteCase { PickerTraceDeliveryRoute value; const char* name; };
+    const RouteCase routes[]={
+        {PickerTraceDeliveryRoute::None,"none"},
+        {PickerTraceDeliveryRoute::Posted,"posted"},
+        {PickerTraceDeliveryRoute::TimerArmed,"timer_armed"},
+        {PickerTraceDeliveryRoute::InlineFallback,"inline_fallback"},
+        {PickerTraceDeliveryRoute::DelayedTimer,"delayed_timer"},
+        {PickerTraceDeliveryRoute::DurableExternalKick,"durable_external_kick"},
+        {PickerTraceDeliveryRoute::ShutdownDrain,"shutdown_drain"}
+    };
+    static_assert(sizeof(routes)/sizeof(routes[0])==
+        static_cast<size_t>(PickerTraceDeliveryRoute::ShutdownDrain)+1,
+        "delivery vocabulary must be exhaustive");
+    for(size_t i=0;i<sizeof(routes)/sizeof(routes[0]);++i){
+        CHECK(static_cast<size_t>(routes[i].value)==i);
+        CHECK(std::string(PickerTraceDeliveryRouteName(routes[i].value))==
+              routes[i].name);
+        PickerTraceEffectEvent event;
+        event.delivery=routes[i].value;
+        CHECK(SerializedTraceContains(event,
+            std::string("\"delivery\":\"")+routes[i].name+"\""));
+    }
+
+    struct TriggerCase {
+        PickerTraceRollbackTrigger value;
+        const char* name;
+    };
+    const TriggerCase triggers[]={
+        {PickerTraceRollbackTrigger::None,"none"},
+        {PickerTraceRollbackTrigger::Cancellation,"cancellation"},
+        {PickerTraceRollbackTrigger::TargetMove,"target_move"},
+        {PickerTraceRollbackTrigger::TargetVerify,"target_verify"},
+        {PickerTraceRollbackTrigger::PopupMove,"popup_move"},
+        {PickerTraceRollbackTrigger::PopupVerify,"popup_verify"},
+        {PickerTraceRollbackTrigger::DesktopSwitch,"desktop_switch"},
+        {PickerTraceRollbackTrigger::IdentityLost,"identity_lost"},
+        {PickerTraceRollbackTrigger::IdentityIndeterminate,"identity_indeterminate"},
+        {PickerTraceRollbackTrigger::ReadUnavailable,"read_unavailable"},
+        {PickerTraceRollbackTrigger::RetryBudgetExhausted,"retry_budget_exhausted"},
+        {PickerTraceRollbackTrigger::QueueConflict,"queue_conflict"},
+        {PickerTraceRollbackTrigger::Exception,"exception"}
+    };
+    static_assert(sizeof(triggers)/sizeof(triggers[0])==
+        static_cast<size_t>(PickerTraceRollbackTrigger::Exception)+1,
+        "rollback vocabulary must be exhaustive");
+    for(size_t i=0;i<sizeof(triggers)/sizeof(triggers[0]);++i){
+        CHECK(static_cast<size_t>(triggers[i].value)==i);
+        CHECK(std::string(PickerTraceRollbackTriggerName(
+            triggers[i].value))==triggers[i].name);
+        PickerTraceTransitionTerminalEvent event;
+        event.rollbackTrigger=triggers[i].value;
+        CHECK(SerializedTraceContains(event,
+            std::string("\"rollback_trigger\":\"")+
+                triggers[i].name+"\""));
+    }
+
+    struct DiagnosticCase {
+        PickerTraceDiagnosticCode value;
+        const char* name;
+    };
+    const DiagnosticCase diagnostics[]={
+        {PickerTraceDiagnosticCode::None,"none"},
+        {PickerTraceDiagnosticCode::ApiRejected,"api_rejected"},
+        {PickerTraceDiagnosticCode::VerificationMismatch,"verification_mismatch"},
+        {PickerTraceDiagnosticCode::IdentityLost,"identity_lost"},
+        {PickerTraceDiagnosticCode::IdentityIndeterminate,"identity_indeterminate"},
+        {PickerTraceDiagnosticCode::ReadUnavailable,"read_unavailable"},
+        {PickerTraceDiagnosticCode::RetryBudgetExhausted,"retry_budget_exhausted"},
+        {PickerTraceDiagnosticCode::QueueConflict,"queue_conflict"},
+        {PickerTraceDiagnosticCode::Exception,"exception"},
+        {PickerTraceDiagnosticCode::Cancelled,"cancelled"}
+    };
+    static_assert(sizeof(diagnostics)/sizeof(diagnostics[0])==
+        static_cast<size_t>(PickerTraceDiagnosticCode::Cancelled)+1,
+        "diagnostic vocabulary must be exhaustive");
+    for(size_t i=0;i<sizeof(diagnostics)/sizeof(diagnostics[0]);++i){
+        CHECK(static_cast<size_t>(diagnostics[i].value)==i);
+        CHECK(std::string(PickerTraceDiagnosticCodeName(
+            diagnostics[i].value))==diagnostics[i].name);
+        PickerTraceTransitionTerminalEvent event;
+        event.diagnosticCode=diagnostics[i].value;
+        CHECK(SerializedTraceContains(event,
+            std::string("\"diagnostic_code\":\"")+
+                diagnostics[i].name+"\""));
+    }
+}
+
+static void test_picker_trace_bool_wrapper_reads_error_immediately(){
+    std::string order;
+    const PickerTraceBoolCallResult result=
+        CallPickerTraceBoolWithImmediateError(
+            [&](){ order.push_back('c'); return FALSE; },
+            [&](){ order.push_back('e'); return DWORD{123}; });
+    CHECK(order=="ce");
+    CHECK(result.value==FALSE && result.immediateError==123);
+    int reads=0;
+    const PickerTraceBoolCallResult threw=
+        CallPickerTraceBoolWithImmediateError(
+            []()->BOOL { throw std::runtime_error("call"); },
+            [&](){ ++reads; return DWORD{7}; });
+    CHECK(threw.value==FALSE && threw.immediateError==ERROR_GEN_FAILURE);
+    CHECK(reads==0);
+}
+
+enum class PickerTraceLookupCaseForTest {
+    GetDesktopsFailure,GetCountFailure,GetAtFailure,GetAtSecondFailure,
+    GetIdFailure,GetIdSecondFailure,NotFound,Match,ZeroGuid,
+    IndexOutOfRange,InvalidKind,Exception
+};
+
+struct PickerTraceLookupRunForTest {
+    bool result=false;
+    bool owned=false;
+    int index=-1;
+    int arrayReleases=0;
+    int firstReleases=0;
+    int secondReleases=0;
+    int getCountCalls=0;
+    int getAtCalls=0;
+    int getIdCalls=0;
+    std::string transcript;
+    std::vector<DesktopCollectionLookupObservation> observations;
+};
+
+static PickerTraceLookupRunForTest RunPickerTraceLookupCaseForTest(
+        PickerTraceLookupCaseForTest selected,bool observed,
+        bool throwingObserver=false){
+    FakeDesktopLookupDesktop first,second;
+    first.id=G(L"{231A0000-0000-0000-0000-000000008001}");
+    second.id=G(L"{231A0000-0000-0000-0000-000000008002}");
+    FakeDesktopLookupOps ops;
+    ops.count=2;
+    ops.desktops={&first,&second};
+    ops.atResults={S_OK,S_OK};
+    DesktopCollectionLookupRequest request=
+        DesktopCollectionLookupRequest::ByGuid(second.id);
+    switch(selected){
+    case PickerTraceLookupCaseForTest::GetDesktopsFailure:
+        ops.desktopsResult=E_ACCESSDENIED;
+        break;
+    case PickerTraceLookupCaseForTest::GetCountFailure:
+        ops.countResult=E_UNEXPECTED;
+        break;
+    case PickerTraceLookupCaseForTest::GetAtFailure:
+        ops.atResults[0]=E_ABORT;
+        ops.returnDesktopOnFailedGetAt=true;
+        request=DesktopCollectionLookupRequest::ByGuid(first.id);
+        break;
+    case PickerTraceLookupCaseForTest::GetAtSecondFailure:
+        ops.atResults[1]=E_HANDLE;
+        ops.returnDesktopOnFailedGetAt=true;
+        break;
+    case PickerTraceLookupCaseForTest::GetIdFailure:
+        first.idResult=E_NOINTERFACE;
+        request=DesktopCollectionLookupRequest::ByGuid(first.id);
+        break;
+    case PickerTraceLookupCaseForTest::GetIdSecondFailure:
+        second.idResult=E_POINTER;
+        break;
+    case PickerTraceLookupCaseForTest::NotFound:
+        request=DesktopCollectionLookupRequest::ByGuid(
+            G(L"{231A0000-0000-0000-0000-000000008099}"));
+        break;
+    case PickerTraceLookupCaseForTest::Match:
+        break;
+    case PickerTraceLookupCaseForTest::ZeroGuid:
+        request=DesktopCollectionLookupRequest::ByGuid(GUID{});
+        break;
+    case PickerTraceLookupCaseForTest::IndexOutOfRange:
+        request=DesktopCollectionLookupRequest::ByIndex(9);
+        break;
+    case PickerTraceLookupCaseForTest::InvalidKind:
+        request.kind=static_cast<DesktopCollectionLookupKind>(99);
+        break;
+    case PickerTraceLookupCaseForTest::Exception:
+        ops.throwGetCount=true;
+        break;
+    }
+    PickerTraceLookupRunForTest run;
+    {
+        FakeDesktopLookupOwner output(ops);
+        int index=77;
+        if(observed){
+            std::function<void(const DesktopCollectionLookupObservation&)>
+                observer;
+            if(throwingObserver){
+                observer=[](const DesktopCollectionLookupObservation&){
+                    throw std::runtime_error("observer");
+                };
+            } else {
+                observer=[&](const DesktopCollectionLookupObservation& value){
+                    run.observations.push_back(value);
+                };
+            }
+            run.result=LookupDesktopCollectionOwned<
+                FakeDesktopLookupArray,FakeDesktopLookupDesktop>(
+                    request,
+                    ops,output,index,&observer);
+        } else {
+            run.result=LookupDesktopCollectionOwned<
+                FakeDesktopLookupArray,FakeDesktopLookupDesktop>(
+                    request,
+                    ops,output,index);
+        }
+        run.owned=output.value!=nullptr;
+        run.index=index;
+    }
+    run.arrayReleases=ops.array.releases;
+    run.firstReleases=first.releases;
+    run.secondReleases=second.releases;
+    run.getCountCalls=ops.getCountCalls;
+    run.getAtCalls=ops.getAtCalls;
+    run.getIdCalls=ops.getIdCalls;
+    run.transcript=ops.transcript;
+    return run;
+}
+
+static void test_picker_trace_lookup_observer_is_exact_and_equivalent(){
+    const auto checkStages=[](
+            const PickerTraceLookupRunForTest& run,
+            std::initializer_list<DesktopCollectionLookupObservationStage>
+                expected){
+        CHECK(run.observations.size()==expected.size());
+        size_t index=0;
+        for(const auto stage:expected){
+            if(index<run.observations.size())
+                CHECK(run.observations[index].stage==stage);
+            ++index;
+        }
+    };
+    const PickerTraceLookupCaseForTest cases[]={
+        PickerTraceLookupCaseForTest::GetDesktopsFailure,
+        PickerTraceLookupCaseForTest::GetCountFailure,
+        PickerTraceLookupCaseForTest::GetAtFailure,
+        PickerTraceLookupCaseForTest::GetAtSecondFailure,
+        PickerTraceLookupCaseForTest::GetIdFailure,
+        PickerTraceLookupCaseForTest::GetIdSecondFailure,
+        PickerTraceLookupCaseForTest::NotFound,
+        PickerTraceLookupCaseForTest::Match,
+        PickerTraceLookupCaseForTest::ZeroGuid,
+        PickerTraceLookupCaseForTest::IndexOutOfRange,
+        PickerTraceLookupCaseForTest::InvalidKind,
+        PickerTraceLookupCaseForTest::Exception
+    };
+    for(const auto selected:cases){
+        const PickerTraceLookupRunForTest plain=
+            RunPickerTraceLookupCaseForTest(selected,false);
+        const PickerTraceLookupRunForTest traced=
+            RunPickerTraceLookupCaseForTest(selected,true);
+        CHECK(plain.result==traced.result);
+        CHECK(plain.owned==traced.owned && plain.index==traced.index);
+        CHECK(plain.arrayReleases==traced.arrayReleases);
+        CHECK(plain.firstReleases==traced.firstReleases);
+        CHECK(plain.secondReleases==traced.secondReleases);
+        CHECK(plain.getCountCalls==traced.getCountCalls);
+        CHECK(plain.getAtCalls==traced.getAtCalls);
+        CHECK(plain.getIdCalls==traced.getIdCalls);
+        CHECK(plain.transcript==traced.transcript);
+        CHECK(!traced.observations.empty());
+        CHECK(traced.observations.front().stage==
+              DesktopCollectionLookupObservationStage::ValidateRequest);
+    }
+    const auto desktops=RunPickerTraceLookupCaseForTest(
+        PickerTraceLookupCaseForTest::GetDesktopsFailure,true);
+    checkStages(desktops,{
+        DesktopCollectionLookupObservationStage::ValidateRequest,
+        DesktopCollectionLookupObservationStage::GetDesktops});
+    CHECK(desktops.observations.back().stage==
+          DesktopCollectionLookupObservationStage::GetDesktops);
+    CHECK(desktops.observations.back().result==E_ACCESSDENIED);
+    const auto count=RunPickerTraceLookupCaseForTest(
+        PickerTraceLookupCaseForTest::GetCountFailure,true);
+    checkStages(count,{
+        DesktopCollectionLookupObservationStage::ValidateRequest,
+        DesktopCollectionLookupObservationStage::GetDesktops,
+        DesktopCollectionLookupObservationStage::GetCount});
+    CHECK(count.observations.back().stage==
+          DesktopCollectionLookupObservationStage::GetCount);
+    CHECK(count.observations.back().result==E_UNEXPECTED);
+    const auto at=RunPickerTraceLookupCaseForTest(
+        PickerTraceLookupCaseForTest::GetAtFailure,true);
+    checkStages(at,{
+        DesktopCollectionLookupObservationStage::ValidateRequest,
+        DesktopCollectionLookupObservationStage::GetDesktops,
+        DesktopCollectionLookupObservationStage::GetCount,
+        DesktopCollectionLookupObservationStage::GetAt});
+    CHECK(at.observations.back().stage==
+          DesktopCollectionLookupObservationStage::GetAt);
+    CHECK(at.observations.back().index==0);
+    CHECK(at.observations.back().result==E_ABORT);
+    const auto atSecond=RunPickerTraceLookupCaseForTest(
+        PickerTraceLookupCaseForTest::GetAtSecondFailure,true);
+    checkStages(atSecond,{
+        DesktopCollectionLookupObservationStage::ValidateRequest,
+        DesktopCollectionLookupObservationStage::GetDesktops,
+        DesktopCollectionLookupObservationStage::GetCount,
+        DesktopCollectionLookupObservationStage::GetAt,
+        DesktopCollectionLookupObservationStage::GetId,
+        DesktopCollectionLookupObservationStage::GetAt});
+    CHECK(atSecond.observations.back().stage==
+          DesktopCollectionLookupObservationStage::GetAt);
+    CHECK(atSecond.observations.back().index==1);
+    CHECK(atSecond.observations.back().result==E_HANDLE);
+    const auto id=RunPickerTraceLookupCaseForTest(
+        PickerTraceLookupCaseForTest::GetIdFailure,true);
+    checkStages(id,{
+        DesktopCollectionLookupObservationStage::ValidateRequest,
+        DesktopCollectionLookupObservationStage::GetDesktops,
+        DesktopCollectionLookupObservationStage::GetCount,
+        DesktopCollectionLookupObservationStage::GetAt,
+        DesktopCollectionLookupObservationStage::GetId});
+    CHECK(id.observations.back().stage==
+          DesktopCollectionLookupObservationStage::GetId);
+    CHECK(id.observations.back().result==E_NOINTERFACE);
+    CHECK(id.observations.back().index==0);
+    CHECK(GuidEq(id.observations.back().actual,
+        G(L"{231A0000-0000-0000-0000-000000008001}")));
+    const auto idSecond=RunPickerTraceLookupCaseForTest(
+        PickerTraceLookupCaseForTest::GetIdSecondFailure,true);
+    checkStages(idSecond,{
+        DesktopCollectionLookupObservationStage::ValidateRequest,
+        DesktopCollectionLookupObservationStage::GetDesktops,
+        DesktopCollectionLookupObservationStage::GetCount,
+        DesktopCollectionLookupObservationStage::GetAt,
+        DesktopCollectionLookupObservationStage::GetId,
+        DesktopCollectionLookupObservationStage::GetAt,
+        DesktopCollectionLookupObservationStage::GetId});
+    CHECK(idSecond.observations.back().stage==
+          DesktopCollectionLookupObservationStage::GetId);
+    CHECK(idSecond.observations.back().index==1);
+    CHECK(idSecond.observations.back().result==E_POINTER);
+    CHECK(GuidEq(idSecond.observations.back().actual,
+        G(L"{231A0000-0000-0000-0000-000000008002}")));
+    const auto missing=RunPickerTraceLookupCaseForTest(
+        PickerTraceLookupCaseForTest::NotFound,true);
+    checkStages(missing,{
+        DesktopCollectionLookupObservationStage::ValidateRequest,
+        DesktopCollectionLookupObservationStage::GetDesktops,
+        DesktopCollectionLookupObservationStage::GetCount,
+        DesktopCollectionLookupObservationStage::GetAt,
+        DesktopCollectionLookupObservationStage::GetId,
+        DesktopCollectionLookupObservationStage::GetAt,
+        DesktopCollectionLookupObservationStage::GetId,
+        DesktopCollectionLookupObservationStage::NotFound});
+    CHECK(missing.observations[3].index==0 &&
+          missing.observations[3].result==S_OK);
+    CHECK(missing.observations[4].index==0 &&
+          missing.observations[4].result==S_OK);
+    CHECK(missing.observations[5].index==1 &&
+          missing.observations[5].result==S_OK);
+    CHECK(missing.observations[6].index==1 &&
+          missing.observations[6].result==S_OK);
+    CHECK(missing.observations.back().stage==
+          DesktopCollectionLookupObservationStage::NotFound);
+    CHECK(missing.observations.back().index==1);
+    const auto match=RunPickerTraceLookupCaseForTest(
+        PickerTraceLookupCaseForTest::Match,true);
+    checkStages(match,{
+        DesktopCollectionLookupObservationStage::ValidateRequest,
+        DesktopCollectionLookupObservationStage::GetDesktops,
+        DesktopCollectionLookupObservationStage::GetCount,
+        DesktopCollectionLookupObservationStage::GetAt,
+        DesktopCollectionLookupObservationStage::GetId,
+        DesktopCollectionLookupObservationStage::GetAt,
+        DesktopCollectionLookupObservationStage::GetId,
+        DesktopCollectionLookupObservationStage::Match});
+    CHECK(match.observations.back().stage==
+          DesktopCollectionLookupObservationStage::Match);
+    CHECK(match.observations.back().matched);
+    CHECK(match.observations.back().index==1);
+    CHECK(GuidEq(match.observations.back().actual,
+        G(L"{231A0000-0000-0000-0000-000000008002}")));
+    const auto zero=RunPickerTraceLookupCaseForTest(
+        PickerTraceLookupCaseForTest::ZeroGuid,true);
+    CHECK(zero.transcript.empty());
+    CHECK(zero.observations.size()==1);
+    CHECK(zero.observations.back().result==E_INVALIDARG);
+    const auto outOfRange=RunPickerTraceLookupCaseForTest(
+        PickerTraceLookupCaseForTest::IndexOutOfRange,true);
+    CHECK(outOfRange.transcript=="dcA");
+    CHECK(outOfRange.observations.back().stage==
+          DesktopCollectionLookupObservationStage::NotFound);
+    CHECK(outOfRange.observations.back().index==9);
+    const auto invalidKind=RunPickerTraceLookupCaseForTest(
+        PickerTraceLookupCaseForTest::InvalidKind,true);
+    CHECK(invalidKind.transcript=="dcA");
+    CHECK(invalidKind.observations.back().stage==
+          DesktopCollectionLookupObservationStage::ValidateRequest);
+    CHECK(invalidKind.observations.back().result==E_INVALIDARG);
+    const auto exception=RunPickerTraceLookupCaseForTest(
+        PickerTraceLookupCaseForTest::Exception,true);
+    CHECK(exception.observations.back().stage==
+          DesktopCollectionLookupObservationStage::Exception);
+    CHECK(exception.observations.back().result==E_FAIL);
+    const auto throwing=RunPickerTraceLookupCaseForTest(
+        PickerTraceLookupCaseForTest::Match,true,true);
+    CHECK(throwing.result && throwing.owned && throwing.index==1);
+    CHECK(throwing.transcript==match.transcript);
+}
+
+struct PickerTraceForegroundContextForTest {
+    std::string calls;
+    BOOL desktopAttach=TRUE;
+    BOOL foregroundAttach=TRUE;
+    BOOL focus=TRUE;
+    BOOL foregroundDetach=TRUE;
+    BOOL desktopDetach=TRUE;
+    HRESULT switched=S_OK;
+    bool throwSwitch=false;
+    BOOL previousVisibility=TRUE;
+    std::array<PickerTraceApiResultEvent,16> events{};
+    size_t eventCount=0;
+};
+
+static BOOL PickerTraceForegroundAttachForTest(
+        void* opaque,DWORD source,DWORD,BOOL attach){
+    auto& value=*static_cast<PickerTraceForegroundContextForTest*>(opaque);
+    const bool desktop=source==10;
+    value.calls.push_back(desktop
+        ? (attach?'d':'D') : (attach?'f':'F'));
+    if(attach) return desktop?value.desktopAttach:value.foregroundAttach;
+    return desktop?value.desktopDetach:value.foregroundDetach;
+}
+
+static BOOL PickerTraceForegroundFocusForTest(void* opaque,HWND){
+    auto& value=*static_cast<PickerTraceForegroundContextForTest*>(opaque);
+    value.calls.push_back('x');
+    return value.focus;
+}
+
+static HRESULT PickerTraceForegroundSwitchForTest(void* opaque){
+    auto& value=*static_cast<PickerTraceForegroundContextForTest*>(opaque);
+    value.calls.push_back('s');
+    if(value.throwSwitch) throw std::runtime_error("switch");
+    return value.switched;
+}
+
+static BOOL PickerTraceForegroundCleanupForTest(void* opaque,HWND,int){
+    auto& value=*static_cast<PickerTraceForegroundContextForTest*>(opaque);
+    value.calls.push_back('c');
+    return value.previousVisibility;
+}
+
+static void PickerTraceForegroundObserveForTest(
+        void* opaque,const PickerTraceApiResultEvent& event) noexcept {
+    auto& value=*static_cast<PickerTraceForegroundContextForTest*>(opaque);
+    if(value.eventCount<value.events.size())
+        value.events[value.eventCount++]=event;
+}
+
+struct PickerTraceForegroundRunForTest {
+    PickerTraceForegroundHandoffResult result;
+    std::string calls;
+    std::array<PickerTraceApiResultEvent,16> events{};
+    size_t eventCount=0;
+};
+
+static PickerTraceForegroundRunForTest RunPickerTraceForegroundForTest(
+        const PickerForegroundHandoffPlan& plan,bool observed,
+        BOOL desktopAttach=TRUE,HRESULT switched=S_OK,
+        bool throwSwitch=false,BOOL foregroundAttach=TRUE,
+        BOOL focus=TRUE,BOOL foregroundDetach=TRUE,
+        BOOL desktopDetach=TRUE,BOOL previousVisibility=TRUE){
+    PickerTraceForegroundContextForTest context;
+    context.desktopAttach=desktopAttach;
+    context.switched=switched;
+    context.throwSwitch=throwSwitch;
+    context.foregroundAttach=foregroundAttach;
+    context.focus=focus;
+    context.foregroundDetach=foregroundDetach;
+    context.desktopDetach=desktopDetach;
+    context.previousVisibility=previousVisibility;
+    PickerTraceForegroundHandoffOps ops;
+    ops.context=&context;
+    ops.attachThreadInput=PickerTraceForegroundAttachForTest;
+    ops.setForegroundWindow=PickerTraceForegroundFocusForTest;
+    ops.switchDesktop=PickerTraceForegroundSwitchForTest;
+    ops.showWindow=PickerTraceForegroundCleanupForTest;
+    PickerTraceApiEventObserver observer;
+    observer.context=&context;
+    observer.emit=PickerTraceForegroundObserveForTest;
+    PickerTraceForegroundRunForTest run;
+    run.result=ExecutePickerForegroundHandoffCalls(
+        plan,reinterpret_cast<HWND>(0x99),10,30,20,ops,
+        observed?&observer:nullptr);
+    run.calls=context.calls;
+    run.events=context.events;
+    run.eventCount=context.eventCount;
+    return run;
+}
+
+static void test_picker_trace_foreground_handoff_is_ordered_and_equivalent(){
+    const PickerForegroundHandoffPlan both=
+        PlanPickerForegroundHandoff(true,10,30,20);
+    const auto plain=RunPickerTraceForegroundForTest(both,false);
+    const auto traced=RunPickerTraceForegroundForTest(both,true);
+    CHECK(plain.calls=="dfxFDsc");
+    CHECK(plain.calls==traced.calls);
+    CHECK(plain.result.switchResult==traced.result.switchResult);
+    CHECK(plain.result.invoked==traced.result.invoked);
+    CHECK(plain.result.desktopAttachAttempted==
+          traced.result.desktopAttachAttempted);
+    CHECK(plain.result.desktopAttached==traced.result.desktopAttached);
+    CHECK(plain.result.foregroundAttachAttempted==
+          traced.result.foregroundAttachAttempted);
+    CHECK(plain.result.foregroundAttached==traced.result.foregroundAttached);
+    CHECK(plain.result.focusResult==traced.result.focusResult);
+    CHECK(plain.result.foregroundDetachResult==
+          traced.result.foregroundDetachResult);
+    CHECK(plain.result.desktopDetachResult==
+          traced.result.desktopDetachResult);
+    CHECK(plain.result.previousVisibility==
+          traced.result.previousVisibility);
+    CHECK(traced.eventCount==7);
+    const PickerTraceApiKind expected[]={
+        PickerTraceApiKind::AttachDesktopInput,
+        PickerTraceApiKind::AttachForegroundInput,
+        PickerTraceApiKind::SetForegroundWindow,
+        PickerTraceApiKind::DetachForegroundInput,
+        PickerTraceApiKind::DetachDesktopInput,
+        PickerTraceApiKind::SwitchDesktop,
+        PickerTraceApiKind::ShowWindowProgmanCleanup
+    };
+    for(size_t i=0;i<traced.eventCount;++i){
+        CHECK(traced.events[i].api==expected[i]);
+        CHECK(!traced.events[i].lastErrorAvailable);
+        CHECK(traced.events[i].invoked);
+    }
+    CHECK(traced.events[0].sourceThread==10);
+    CHECK(traced.events[0].destinationThread==20);
+    CHECK(traced.events[0].boolResult);
+    CHECK(traced.events[1].sourceThread==30);
+    CHECK(traced.events[1].destinationThread==20);
+    CHECK(traced.events[2].hwnd==0x99);
+    CHECK(traced.events[2].boolResult);
+    CHECK(traced.events[3].sourceThread==30);
+    CHECK(traced.events[3].destinationThread==20);
+    CHECK(traced.events[3].boolResult);
+    CHECK(traced.events[4].sourceThread==10);
+    CHECK(traced.events[4].destinationThread==20);
+    CHECK(traced.events[4].boolResult);
+    CHECK(traced.events[5].resultKind==
+          PickerTraceRawResultKind::HResult);
+    CHECK(traced.events[5].hresult==S_OK);
+    CHECK(traced.events[6].resultKind==
+          PickerTraceRawResultKind::PreviousVisibility);
+    CHECK(traced.events[6].hwnd==0x99);
+    CHECK(traced.events[6].boolResult);
+
+    const auto attachFailed=
+        RunPickerTraceForegroundForTest(both,true,FALSE);
+    CHECK(attachFailed.calls=="dfxFsc");
+    CHECK(attachFailed.result.desktopAttachAttempted);
+    CHECK(!attachFailed.result.desktopAttached);
+    CHECK(!attachFailed.result.desktopDetachResult);
+    const PickerForegroundHandoffPlan foregroundOnly=
+        PlanPickerForegroundHandoff(true,20,30,20);
+    const auto single=RunPickerTraceForegroundForTest(foregroundOnly,true);
+    CHECK(single.calls=="fxFsc");
+    CHECK(!single.result.desktopAttachAttempted);
+    CHECK(single.result.foregroundAttachAttempted);
+
+    const auto switchFailed=RunPickerTraceForegroundForTest(
+        both,true,TRUE,E_ACCESSDENIED);
+    CHECK(switchFailed.result.invoked);
+    CHECK(switchFailed.result.switchResult==E_ACCESSDENIED);
+    CHECK(switchFailed.events[5].hresult==E_ACCESSDENIED);
+    CHECK(switchFailed.calls=="dfxFDsc");
+    const auto switchThrew=RunPickerTraceForegroundForTest(
+        both,true,TRUE,S_OK,true);
+    CHECK(switchThrew.result.invoked);
+    CHECK(switchThrew.result.switchResult==E_FAIL);
+    CHECK(switchThrew.events[5].hresult==E_FAIL);
+    CHECK(switchThrew.calls=="dfxFDsc");
+    const auto rawFalse=RunPickerTraceForegroundForTest(
+        both,true,TRUE,S_OK,false,TRUE,FALSE,FALSE,FALSE,FALSE);
+    CHECK(rawFalse.eventCount==7);
+    CHECK(rawFalse.calls=="dfxFDsc");
+    CHECK(rawFalse.events[0].boolResult);
+    CHECK(rawFalse.events[1].boolResult);
+    CHECK(!rawFalse.events[2].boolResult);
+    CHECK(!rawFalse.events[3].boolResult);
+    CHECK(!rawFalse.events[4].boolResult);
+    CHECK(!rawFalse.events[6].boolResult);
+}
+
+struct PickerTraceScheduleRunForTest {
+    PickerTraceScheduleResult result;
+    std::string calls;
+};
+
+static PickerTraceScheduleRunForTest RunPickerTraceScheduleForTest(
+        bool mainAvailable,bool shutdown,uint64_t remaining,
+        bool delayedTimer,bool postResult,bool fallbackTimer){
+    PickerTraceScheduleRunForTest run;
+    int timerCall=0;
+    run.result=SchedulePickerTransitionWork(
+        mainAvailable,shutdown,remaining,
+        [&](UINT wait){
+            run.calls.push_back(wait==1?'t':'T');
+            return timerCall++==0
+                ? (remaining?delayedTimer:fallbackTimer)
+                : fallbackTimer;
+        },[&](){ run.calls.push_back('p'); return postResult; });
+    return run;
+}
+
+static void test_picker_trace_scheduler_reports_one_exact_route(){
+    struct Case {
+        bool mainAvailable,shutdown;
+        uint64_t remaining;
+        bool delayedTimer,postResult,fallbackTimer;
+        bool deferred;
+        PickerTraceDeliveryRoute route;
+        const char* calls;
+    };
+    const Case cases[]={
+        {false,false,0,false,false,false,false,
+            PickerTraceDeliveryRoute::InlineFallback,""},
+        {true,true,0,false,false,false,false,
+            PickerTraceDeliveryRoute::ShutdownDrain,""},
+        {true,false,50,true,false,false,true,
+            PickerTraceDeliveryRoute::DelayedTimer,"T"},
+        {true,false,50,false,false,false,true,
+            PickerTraceDeliveryRoute::DurableExternalKick,"T"},
+        {true,false,0,false,true,false,true,
+            PickerTraceDeliveryRoute::Posted,"p"},
+        {true,false,0,false,false,true,true,
+            PickerTraceDeliveryRoute::TimerArmed,"pt"},
+        {true,false,0,false,false,false,false,
+            PickerTraceDeliveryRoute::InlineFallback,"pt"}
+    };
+    for(const Case& value:cases){
+        const auto run=RunPickerTraceScheduleForTest(
+            value.mainAvailable,value.shutdown,value.remaining,
+            value.delayedTimer,value.postResult,value.fallbackTimer);
+        CHECK(run.result.deferred==value.deferred);
+        CHECK(run.result.routeAvailable);
+        CHECK(run.result.route==value.route);
+        CHECK(run.calls==value.calls);
+    }
+    UINT clamped=0;
+    const auto clampedResult=SchedulePickerTransitionWork(
+        true,false,static_cast<uint64_t>(UINT_MAX)+100,
+        [&](UINT wait){ clamped=wait; return true; },
+        [](){ return false; });
+    CHECK(clamped==UINT_MAX);
+    CHECK(clampedResult.deferred);
+    CHECK(clampedResult.route==PickerTraceDeliveryRoute::DelayedTimer);
+    PickerTraceScheduleResult result;
+    result.deferred=false;
+    result=MarkPickerTraceDurableKick(result);
+    CHECK(!result.deferred && result.routeAvailable);
+    CHECK(result.route==PickerTraceDeliveryRoute::DurableExternalKick);
+
+    struct ExternalCase {
+        PickerTraceDeliveryRoute route;
+        bool deferred;
+        bool pumpActive;
+        bool runInline;
+    };
+    const ExternalCase externalCases[]={
+        {PickerTraceDeliveryRoute::Posted,true,false,false},
+        {PickerTraceDeliveryRoute::DurableExternalKick,true,false,false},
+        {PickerTraceDeliveryRoute::InlineFallback,false,false,true},
+        {PickerTraceDeliveryRoute::InlineFallback,false,true,false},
+        {PickerTraceDeliveryRoute::ShutdownDrain,false,false,true}
+    };
+    for(const auto& value:externalCases){
+        PickerTraceScheduleResult schedule;
+        schedule.deferred=value.deferred;
+        schedule.route=value.route;
+        schedule.routeAvailable=true;
+        const auto decision=DecidePickerTraceExternalQueue(
+            schedule,value.pumpActive);
+        CHECK(decision.delivery.deferred==schedule.deferred);
+        CHECK(decision.delivery.routeAvailable);
+        CHECK(decision.delivery.route==value.route);
+        CHECK(decision.runInlinePump==value.runInline);
+        CHECK(!decision.claimDurableKickAtCaller);
+    }
+
+    const PickerTraceDeliveryRoute pumpRoutes[]={
+        PickerTraceDeliveryRoute::Posted,
+        PickerTraceDeliveryRoute::DurableExternalKick,
+        PickerTraceDeliveryRoute::InlineFallback,
+        PickerTraceDeliveryRoute::ShutdownDrain
+    };
+    for(const auto route:pumpRoutes){
+        PickerTraceScheduleResult schedule;
+        schedule.deferred=route==PickerTraceDeliveryRoute::Posted ||
+            route==PickerTraceDeliveryRoute::DurableExternalKick;
+        schedule.route=route;
+        schedule.routeAvailable=true;
+        const auto decision=DecidePickerTracePumpRearm(schedule);
+        CHECK(decision.delivery.deferred==schedule.deferred);
+        CHECK(decision.delivery.routeAvailable);
+        CHECK(decision.claimDurableKickAtCaller==!schedule.deferred);
+        CHECK(!decision.runInlinePump);
+        CHECK(decision.delivery.route==(schedule.deferred
+            ? route : PickerTraceDeliveryRoute::DurableExternalKick));
+    }
+}
+
+static void CheckPickerTraceReducerStateForTest(
+        const PickerState& left,const PickerState& right){
+    const PickerTransition& a=left.transition;
+    const PickerTransition& b=right.transition;
+    CHECK(a.phase==b.phase && a.generation==b.generation);
+    CHECK(a.reservationToken.owner==b.reservationToken.owner);
+    CHECK(a.reservationToken.operationId==b.reservationToken.operationId);
+    CHECK(a.reservationToken.jobId==b.reservationToken.jobId);
+    CHECK(a.target.hwnd==b.target.hwnd && a.target.pid==b.target.pid);
+    CHECK(a.target.processStart==b.target.processStart);
+    CHECK(a.runtimeKey==b.runtimeKey && a.app==b.app);
+    CHECK(a.pendingRecordId==b.pendingRecordId);
+    CHECK(a.capturedTitle==b.capturedTitle);
+    CHECK(GuidEq(a.targetOrigin,b.targetOrigin));
+    CHECK(GuidEq(a.popupOrigin,b.popupOrigin));
+    CHECK(GuidEq(a.currentOrigin,b.currentOrigin));
+    CHECK(GuidEq(a.destination,b.destination));
+    CHECK(a.effectSerial==b.effectSerial && a.pendingEffect==b.pendingEffect);
+    CHECK(a.forwardTargetAttempts==b.forwardTargetAttempts);
+    CHECK(a.forwardPopupAttempts==b.forwardPopupAttempts);
+    CHECK(a.forwardSwitchAttempts==b.forwardSwitchAttempts);
+    CHECK(a.rollbackTargetAttempts==b.rollbackTargetAttempts);
+    CHECK(a.rollbackPopupAttempts==b.rollbackPopupAttempts);
+    CHECK(a.rollbackSwitchAttempts==b.rollbackSwitchAttempts);
+    CHECK(a.focusAttempts==b.focusAttempts);
+    CHECK(a.targetMayHaveMoved==b.targetMayHaveMoved);
+    CHECK(a.popupMayHaveMoved==b.popupMayHaveMoved);
+    CHECK(a.switchMayHaveChanged==b.switchMayHaveChanged);
+    CHECK(a.rollbackVerificationRequired==b.rollbackVerificationRequired);
+    CHECK(a.targetUnresolvedBeforeIssue==b.targetUnresolvedBeforeIssue);
+    CHECK(a.popupUnresolvedBeforeIssue==b.popupUnresolvedBeforeIssue);
+    CHECK(a.switchUnresolvedBeforeIssue==b.switchUnresolvedBeforeIssue);
+    CHECK(a.postSwitchPopupRepair==b.postSwitchPopupRepair);
+    CHECK(a.cancelRequested==b.cancelRequested);
+    CHECK(a.dismissed==b.dismissed && a.failed==b.failed);
+    CHECK(a.hidePending==b.hidePending && a.hideCompleted==b.hideCompleted);
+    CHECK(a.failureReported==b.failureReported);
+    CHECK(a.focusFailureTerminal==b.focusFailureTerminal);
+    CHECK(a.targetIdentityUnusable==b.targetIdentityUnusable);
+    CHECK(a.commitCutoffReached==b.commitCutoffReached);
+    CHECK(a.suppressFocus==b.suppressFocus);
+    CHECK(a.terminalAcknowledged==b.terminalAcknowledged);
+    CHECK(a.capturedTitleComplete==b.capturedTitleComplete);
+    CHECK(a.resumeAfterHide==b.resumeAfterHide);
+    CHECK(a.identityGeneration==b.identityGeneration);
+    CHECK(a.lifecycleSaveGeneration==b.lifecycleSaveGeneration);
+    CHECK(a.lifecycleLayoutSignature==b.lifecycleLayoutSignature);
+    CHECK(a.lifecycleSessionSignature==b.lifecycleSessionSignature);
+    CHECK(a.observedTargetValidity==b.observedTargetValidity);
+    CHECK(a.observedPopupValidity==b.observedPopupValidity);
+    CHECK(a.observedCurrentValidity==b.observedCurrentValidity);
+    CHECK(GuidEq(a.observedTargetDesktop,b.observedTargetDesktop));
+    CHECK(GuidEq(a.observedPopupDesktop,b.observedPopupDesktop));
+    CHECK(GuidEq(a.observedCurrentDesktop,b.observedCurrentDesktop));
+    CHECK(a.diagnostic==b.diagnostic);
+    CHECK(GuidEq(left.currentDesktop,right.currentDesktop));
+    CHECK(GuidEq(left.selectedDesktop,right.selectedDesktop));
+    CHECK(left.selectedIndex==right.selectedIndex);
+    CHECK(left.activeWindow.hwnd==right.activeWindow.hwnd);
+    CHECK(left.activeWindow.pid==right.activeWindow.pid);
+    CHECK(left.activeWindow.processStart==right.activeWindow.processStart);
+    CHECK(left.searchEditText==right.searchEditText);
+    CHECK(left.searchText==right.searchText);
+    CHECK(left.searchActive==right.searchActive);
+    CHECK(left.scrollByDesktop==right.scrollByDesktop);
+    CHECK(left.modelGeneration==right.modelGeneration);
+    CHECK(left.paintGeneration==right.paintGeneration);
+}
+
+static void CheckPickerTraceReducerEquivalentForTest(
+        const PickerState& initial,const PickerObservation& observation){
+    PickerState plain=initial,traced=initial;
+    const PickerEffect expected=AdvancePickerTransition(plain,observation);
+    PickerTraceTerminalMetadata metadata;
+    const PickerEffect actual=AdvancePickerTransitionTraced(
+        traced,observation,nullptr,&metadata);
+    CHECK(expected.kind==actual.kind);
+    CHECK(expected.generation==actual.generation);
+    CHECK(expected.effectSerial==actual.effectSerial);
+    CHECK(GuidEq(expected.desktop,actual.desktop));
+    CheckPickerTraceReducerStateForTest(plain,traced);
+}
+
+static void test_picker_trace_reducer_is_behavior_equivalent(){
+    PickerState beginState=PickerTransitionFixture(8801);
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=8801;
+    CheckPickerTraceReducerEquivalentForTest(beginState,begin);
+
+    PickerState success=beginState;
+    PickerEffect move=AdvancePickerTransition(success,begin);
+    PickerObservation issued=PickerObservationFor(
+        move,PickerEvent::ApiCompleted);
+    issued.apiInvoked=true;
+    issued.apiAccepted=true;
+    issued.identity=PickerIdentityValidity::Match;
+    CheckPickerTraceReducerEquivalentForTest(success,issued);
+
+    PickerState retry=success;
+    PickerEffect read=AdvancePickerTransition(retry,issued);
+    retry.transition.forwardTargetAttempts=2;
+    PickerObservation mismatch=PickerObservationFor(
+        read,PickerEvent::ReadbackCompleted);
+    mismatch.identity=PickerIdentityValidity::Match;
+    mismatch.targetRead=PickerReadValidity::Valid;
+    mismatch.actualTargetDesktop=retry.transition.targetOrigin;
+    CheckPickerTraceReducerEquivalentForTest(retry,mismatch);
+
+    PickerState rollback=retry;
+    rollback.transition.forwardTargetAttempts=4;
+    CheckPickerTraceReducerEquivalentForTest(rollback,mismatch);
+
+    PickerState cancelled=success;
+    PickerObservation cancel;
+    cancel.event=PickerEvent::CancelRequested;
+    cancel.generation=cancelled.transition.generation;
+    CheckPickerTraceReducerEquivalentForTest(cancelled,cancel);
+
+    PickerState terminal=PickerTransitionFixture(8802);
+    terminal.transition.phase=PickerPhase::FocusRestore;
+    terminal.transition.pendingEffect=PickerEffectKind::ShowAndFocus;
+    terminal.transition.effectSerial=9;
+    PickerEffect focus;
+    focus.kind=PickerEffectKind::ShowAndFocus;
+    focus.generation=8802;
+    focus.effectSerial=9;
+    PickerObservation focused=PickerObservationFor(
+        focus,PickerEvent::EffectCompleted);
+    focused.popupIsForeground=true;
+    focused.apiAccepted=true;
+    CheckPickerTraceReducerEquivalentForTest(terminal,focused);
+}
+
+static void test_picker_trace_active_reducer_emits_once_and_resets_metadata(){
+    PickerState expected=PickerTransitionFixture(8810);
+    PickerState actual=expected;
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=8810;
+    PickerTraceTerminalMetadata metadata;
+    metadata.generation=7;
+    metadata.rollbackTrigger=PickerTraceRollbackTrigger::QueueConflict;
+    metadata.diagnosticCode=PickerTraceDiagnosticCode::QueueConflict;
+    size_t reduceCalls=0;
+    const std::string bytes=RunWithActivePickerTraceSessionForTest(
+        [&](PickerTraceSession& session){
+            const auto step=[&](PickerState& plain,PickerState& traced,
+                                const PickerObservation& observation){
+                const PickerEffect expectedEffect=
+                    AdvancePickerTransition(plain,observation);
+                const PickerEffect actualEffect=
+                    AdvancePickerTransitionTraced(
+                        traced,observation,&session,&metadata);
+                CHECK(expectedEffect.kind==actualEffect.kind);
+                CHECK(expectedEffect.generation==actualEffect.generation);
+                CHECK(expectedEffect.effectSerial==actualEffect.effectSerial);
+                CHECK(GuidEq(expectedEffect.desktop,actualEffect.desktop));
+                CheckPickerTraceReducerStateForTest(plain,traced);
+                ++reduceCalls;
+                return actualEffect;
+            };
+            const PickerEffect move=step(expected,actual,begin);
+            CHECK(metadata.generation==8810);
+            CHECK(metadata.rollbackTrigger==PickerTraceRollbackTrigger::None);
+            CHECK(metadata.diagnosticCode==PickerTraceDiagnosticCode::None);
+
+            PickerObservation issued=PickerObservationFor(
+                move,PickerEvent::ApiCompleted);
+            issued.apiInvoked=true;
+            issued.apiAccepted=true;
+            issued.identity=PickerIdentityValidity::Match;
+            const PickerEffect read=step(expected,actual,issued);
+
+            const PickerState retryBaseExpected=expected;
+            const PickerState retryBaseActual=actual;
+            PickerObservation mismatch=PickerObservationFor(
+                read,PickerEvent::ReadbackCompleted);
+            mismatch.identity=PickerIdentityValidity::Match;
+            mismatch.targetRead=PickerReadValidity::Valid;
+            mismatch.actualTargetDesktop=expected.transition.targetOrigin;
+            expected.transition.forwardTargetAttempts=2;
+            actual.transition.forwardTargetAttempts=2;
+            (void)step(expected,actual,mismatch);
+
+            PickerState rollbackExpected=retryBaseExpected;
+            PickerState rollbackActual=retryBaseActual;
+            rollbackExpected.transition.forwardTargetAttempts=4;
+            rollbackActual.transition.forwardTargetAttempts=4;
+            (void)step(rollbackExpected,rollbackActual,mismatch);
+
+            PickerState cancelExpected=retryBaseExpected;
+            PickerState cancelActual=retryBaseActual;
+            PickerObservation cancel;
+            cancel.event=PickerEvent::CancelRequested;
+            cancel.generation=8810;
+            (void)step(cancelExpected,cancelActual,cancel);
+
+            PickerState terminalExpected=PickerTransitionFixture(8810);
+            terminalExpected.transition.phase=PickerPhase::FocusRestore;
+            terminalExpected.transition.pendingEffect=
+                PickerEffectKind::ShowAndFocus;
+            terminalExpected.transition.effectSerial=9;
+            PickerState terminalActual=terminalExpected;
+            PickerEffect focus;
+            focus.kind=PickerEffectKind::ShowAndFocus;
+            focus.generation=8810;
+            focus.effectSerial=9;
+            PickerObservation focused=PickerObservationFor(
+                focus,PickerEvent::EffectCompleted);
+            focused.popupIsForeground=true;
+            focused.apiAccepted=true;
+            (void)step(terminalExpected,terminalActual,focused);
+        });
+    CHECK(reduceCalls==6);
+    CHECK(CountSourceText(bytes,"\"event\":\"effect.reduce\"")==
+          reduceCalls);
+    CHECK(bytes.find("\"observation_event\":\"begin\"")!=
+          std::string::npos);
+    CHECK(bytes.find("\"next_effect\":\"move_target\"")!=
+          std::string::npos);
+    CHECK(bytes.find("\"phase_before\":\"idle\"")!=
+          std::string::npos);
+    CHECK(bytes.find("\"phase_after\":\"target_issue\"")!=
+          std::string::npos);
+}
+
+static void test_picker_trace_lookup_context_serializes_exact_mapping(){
+    const GUID requested=
+        G(L"{231A0000-0000-0000-0000-000000008111}");
+    const GUID actual=
+        G(L"{231A0000-0000-0000-0000-000000008112}");
+    const std::string bytes=RunWithActivePickerTraceSessionForTest(
+        [&](PickerTraceSession& session){
+            PickerTraceDesktopLookupContext context;
+            context.trace=&session;
+            context.use=
+                PickerTraceDesktopLookupUse::MovePopupDestination;
+            context.generation=55;
+            context.effectSerial=66;
+            context.requested=requested;
+            EmitPickerTraceDesktopLookupStage(
+                &context,PickerTraceDesktopLookupStage::GetAt,3,
+                E_ACCESSDENIED,actual,false);
+            EmitPickerTraceDesktopLookupStage(
+                &context,PickerTraceDesktopLookupStage::Match,3,
+                S_OK,actual,true);
+        });
+    const size_t raw=bytes.find("\"lookup_stage\":\"get_at\"");
+    const size_t match=bytes.find("\"lookup_stage\":\"match\"");
+    CHECK(raw!=std::string::npos && match!=std::string::npos && raw<match);
+    CHECK(bytes.find("\"api\":\"get_at\"")!=std::string::npos);
+    CHECK(bytes.find("\"lookup_use\":\"move_popup_destination\"")!=
+          std::string::npos);
+    CHECK(bytes.find("\"generation\":55")!=std::string::npos);
+    CHECK(bytes.find("\"effect_serial\":66")!=std::string::npos);
+    CHECK(bytes.find("\"index\":3")!=std::string::npos);
+    CHECK(bytes.find("\"hresult\":\"0x80070005\"")!=
+          std::string::npos);
+    CHECK(bytes.find("\"bool_result\":true")!=std::string::npos);
+    CHECK(bytes.find("231a0000-0000-0000-0000-000000008111")!=
+          std::string::npos);
+    CHECK(bytes.find("231a0000-0000-0000-0000-000000008112")!=
+          std::string::npos);
+}
+
+static void test_picker_trace_terminal_classifiers_are_fixed(){
+    struct Case {
+        PickerPhase before;
+        PickerObservation observation;
+        bool queueConflict;
+        bool caughtException;
+        PickerTraceRollbackTrigger trigger;
+        PickerTraceDiagnosticCode diagnostic;
+    };
+    PickerObservation cancel;
+    cancel.event=PickerEvent::CancelRequested;
+    PickerObservation targetMove;
+    targetMove.event=PickerEvent::ApiCompleted;
+    targetMove.effectKind=PickerEffectKind::MoveTarget;
+    targetMove.identity=PickerIdentityValidity::Match;
+    PickerObservation mismatch;
+    mismatch.event=PickerEvent::ReadbackCompleted;
+    mismatch.effectKind=PickerEffectKind::ReadTarget;
+    mismatch.identity=PickerIdentityValidity::Match;
+    mismatch.targetRead=PickerReadValidity::Valid;
+    PickerObservation popupMove=targetMove;
+    popupMove.effectKind=PickerEffectKind::MovePopup;
+    PickerObservation popupMissing=mismatch;
+    popupMissing.effectKind=PickerEffectKind::ReadPopup;
+    popupMissing.popupRead=PickerReadValidity::Unavailable;
+    PickerObservation popupMismatch=popupMissing;
+    popupMismatch.popupRead=PickerReadValidity::Valid;
+    PickerObservation desktopMove=targetMove;
+    desktopMove.effectKind=PickerEffectKind::SwitchDesktop;
+    PickerObservation lost=targetMove;
+    lost.identity=PickerIdentityValidity::Lost;
+    PickerObservation indeterminate=targetMove;
+    indeterminate.identity=PickerIdentityValidity::Indeterminate;
+    PickerObservation budget;
+    budget.event=PickerEvent::EffectCompleted;
+    budget.effectKind=PickerEffectKind::ValidateTarget;
+    budget.identity=PickerIdentityValidity::Match;
+    cancel.generation=91;
+    targetMove.generation=91;
+    mismatch.generation=91;
+    popupMove.generation=91;
+    popupMissing.generation=91;
+    popupMismatch.generation=91;
+    desktopMove.generation=91;
+    lost.generation=91;
+    indeterminate.generation=91;
+    budget.generation=91;
+    const Case cases[]={
+        {PickerPhase::TargetIssue,cancel,false,false,
+            PickerTraceRollbackTrigger::Cancellation,
+            PickerTraceDiagnosticCode::Cancelled},
+        {PickerPhase::TargetIssue,targetMove,false,false,
+            PickerTraceRollbackTrigger::TargetMove,
+            PickerTraceDiagnosticCode::ApiRejected},
+        {PickerPhase::TargetVerify,mismatch,false,false,
+            PickerTraceRollbackTrigger::TargetVerify,
+            PickerTraceDiagnosticCode::VerificationMismatch},
+        {PickerPhase::PopupIssue,popupMove,false,false,
+            PickerTraceRollbackTrigger::PopupMove,
+            PickerTraceDiagnosticCode::ApiRejected},
+        {PickerPhase::PopupVerify,popupMissing,false,false,
+            PickerTraceRollbackTrigger::ReadUnavailable,
+            PickerTraceDiagnosticCode::ReadUnavailable},
+        {PickerPhase::PopupVerify,popupMismatch,false,false,
+            PickerTraceRollbackTrigger::PopupVerify,
+            PickerTraceDiagnosticCode::VerificationMismatch},
+        {PickerPhase::SwitchIssue,desktopMove,false,false,
+            PickerTraceRollbackTrigger::DesktopSwitch,
+            PickerTraceDiagnosticCode::ApiRejected},
+        {PickerPhase::TargetIssue,lost,false,false,
+            PickerTraceRollbackTrigger::IdentityLost,
+            PickerTraceDiagnosticCode::IdentityLost},
+        {PickerPhase::TargetIssue,indeterminate,false,false,
+            PickerTraceRollbackTrigger::IdentityIndeterminate,
+            PickerTraceDiagnosticCode::IdentityIndeterminate},
+        {PickerPhase::IdentityVerifyBeforeSwitch,budget,false,false,
+            PickerTraceRollbackTrigger::RetryBudgetExhausted,
+            PickerTraceDiagnosticCode::RetryBudgetExhausted},
+        {PickerPhase::TargetIssue,targetMove,true,false,
+            PickerTraceRollbackTrigger::QueueConflict,
+            PickerTraceDiagnosticCode::QueueConflict},
+        {PickerPhase::TargetIssue,targetMove,false,true,
+            PickerTraceRollbackTrigger::Exception,
+            PickerTraceDiagnosticCode::Exception}
+    };
+    for(const Case& value:cases){
+        PickerTraceTerminalMetadata metadata;
+        metadata.generation=91;
+        ObservePickerTraceTerminalMetadata(
+            metadata,value.before,PickerPhase::RollbackTargetIssue,
+            value.observation,value.queueConflict,value.caughtException);
+        CHECK(metadata.rollbackTrigger==value.trigger);
+        CHECK(metadata.diagnosticCode==value.diagnostic);
+        PickerObservation later=lost;
+        ObservePickerTraceTerminalMetadata(
+            metadata,PickerPhase::PopupIssue,
+            PickerPhase::RollbackPopupIssue,later,false,false);
+        CHECK(metadata.rollbackTrigger==value.trigger);
+        CHECK(metadata.diagnosticCode==value.diagnostic);
+    }
+}
+
+static void test_picker_trace_terminal_classifiers_follow_real_reductions(){
+    PickerState base=PickerTransitionFixture(8891);
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=8891;
+    const PickerEffect move=AdvancePickerTransition(base,begin);
+
+    PickerState rejected=base;
+    PickerObservation failed=PickerObservationFor(
+        move,PickerEvent::ApiCompleted);
+    failed.identity=PickerIdentityValidity::Match;
+    failed.apiInvoked=false;
+    PickerTraceTerminalMetadata rejectedMetadata;
+    rejectedMetadata.generation=8891;
+    const PickerEffect refresh=AdvancePickerTransitionTraced(
+        rejected,failed,nullptr,&rejectedMetadata);
+    CHECK(refresh.kind==PickerEffectKind::Refresh);
+    CHECK(rejected.transition.phase==PickerPhase::RefreshModel);
+    CHECK(rejectedMetadata.rollbackTrigger==
+          PickerTraceRollbackTrigger::TargetMove);
+    CHECK(rejectedMetadata.diagnosticCode==
+          PickerTraceDiagnosticCode::ApiRejected);
+
+    PickerState cancelled=base;
+    PickerObservation cancel;
+    cancel.event=PickerEvent::CancelRequested;
+    cancel.generation=8891;
+    PickerTraceTerminalMetadata cancelMetadata;
+    cancelMetadata.generation=8891;
+    const PickerEffect hide=AdvancePickerTransitionTraced(
+        cancelled,cancel,nullptr,&cancelMetadata);
+    CHECK(hide.kind==PickerEffectKind::Hide);
+    CHECK(cancelled.transition.phase==PickerPhase::TargetIssue);
+    CHECK(cancelMetadata.rollbackTrigger==
+          PickerTraceRollbackTrigger::Cancellation);
+    CHECK(cancelMetadata.diagnosticCode==
+          PickerTraceDiagnosticCode::Cancelled);
+
+    PickerState budget=PickerTransitionFixture(8892);
+    budget.transition.phase=PickerPhase::IdentityVerifyBeforeSwitch;
+    budget.transition.pendingEffect=PickerEffectKind::ValidateTarget;
+    budget.transition.effectSerial=17;
+    budget.transition.forwardSwitchAttempts=4;
+    PickerObservation validated;
+    validated.event=PickerEvent::EffectCompleted;
+    validated.generation=8892;
+    validated.effectKind=PickerEffectKind::ValidateTarget;
+    validated.effectSerial=17;
+    validated.identity=PickerIdentityValidity::Match;
+    PickerTraceTerminalMetadata budgetMetadata;
+    budgetMetadata.generation=8892;
+    CHECK(AdvancePickerTransitionTraced(
+        budget,validated,nullptr,&budgetMetadata).kind==
+        PickerEffectKind::Refresh);
+    CHECK(budgetMetadata.rollbackTrigger==
+          PickerTraceRollbackTrigger::RetryBudgetExhausted);
+    CHECK(budgetMetadata.diagnosticCode==
+          PickerTraceDiagnosticCode::RetryBudgetExhausted);
+
+    PickerTraceTerminalMetadata stale;
+    stale.generation=8891;
+    cancel.generation=8890;
+    ObservePickerTraceTerminalMetadata(
+        stale,PickerPhase::TargetIssue,PickerPhase::TargetIssue,
+        cancel,false,false);
+    CHECK(stale.rollbackTrigger==PickerTraceRollbackTrigger::None);
+    CHECK(stale.diagnosticCode==PickerTraceDiagnosticCode::None);
+}
+
+static void test_picker_trace_task8_runtime_wiring_is_explicit(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string begin=SourceSection(
+        source,"static PickerTraceMoveBeginReason BeginVerifiedPickerMove(",
+        "class PickerTraceCaptureEmitScope");
+    const std::string effects=SourceSection(
+        source,"static PickerObservation ExecutePickerEffect(",
+        "static void PumpPickerTransitionWork() noexcept;");
+    const std::string handoff=SourceSection(
+        source,"static HRESULT SwitchDesktopWithForegroundHandoff(",
+        "static PickerObservation ExecutePickerEffect(");
+    const std::string queue=SourceSection(
+        source,"static void QueuePickerEffect(",
+        "static bool FinalizePickerRuntimeTransition(");
+    const std::string pump=SourceSection(
+        source,"static void PumpPickerTransitionWork() noexcept {",
+        "static void RequestPickerCancellation(");
+    const std::string move=SourceSection(
+        source,"static HRESULT IssuePickerWindowMove(",
+        "struct PickerTraceWindowDesktopFacts");
+    CHECK(begin.find("PickerTraceDesktopLookupUse::MoveEntryDestination")!=
+          std::string::npos);
+    CHECK(effects.find("PickerTraceDesktopLookupUse::MoveTargetDestination")!=
+          std::string::npos);
+    CHECK(effects.find("PickerTraceDesktopLookupUse::MovePopupDestination")!=
+          std::string::npos);
+    CHECK(effects.find("PickerTraceDesktopLookupUse::SwitchPrecheckDestination")!=
+          std::string::npos);
+    CHECK(handoff.find("PickerTraceDesktopLookupUse::SwitchHandoffDestination")!=
+          std::string::npos);
+    CHECK(CountSourceText(source,
+        "AdvancePickerTransitionTraced(g_picker,")==3);
+    CHECK(source.find("AdvancePickerTransition(g_picker,")==
+          std::string::npos);
+    CHECK(source.find("static PickerTraceScheduleResult "
+        "DeferPickerTransitionWork(")!=std::string::npos);
+    const size_t queueSchedule=queue.find("DeferPickerTransitionWork(delayed)");
+    const size_t queueDecision=queue.find(
+        "DecidePickerTraceExternalQueue(schedule,g_pickerPumpActive)",
+        queueSchedule);
+    const size_t queueEmit=queue.find(
+        "EmitPickerTraceEffectQueue(effect,decision.delivery)",
+        queueDecision);
+    const size_t inlinePump=queue.find(
+        "PumpPickerTransitionWork()",queueEmit);
+    CHECK(queueSchedule!=std::string::npos &&
+          queueDecision!=std::string::npos && queueEmit!=std::string::npos &&
+          inlinePump!=std::string::npos);
+    CHECK(queueSchedule<queueDecision && queueDecision<queueEmit &&
+          queueEmit<inlinePump);
+    CHECK(queue.find("decision.runInlinePump")!=std::string::npos);
+    CHECK(pump.find("EmitPickerTraceEffectQueue(next,schedule)")!=
+          std::string::npos);
+    CHECK(pump.find("DecidePickerTracePumpRearm(schedule)")!=
+          std::string::npos);
+    CHECK(pump.find("decision.claimDurableKickAtCaller")!=
+          std::string::npos);
+    CHECK(pump.find("g_pickerScheduledEffect,decision.delivery")!=
+          std::string::npos);
+    CHECK(pump.find("EmitPickerTraceEffectExecute(")!=std::string::npos);
+    CHECK(pump.find("EmitPickerTraceEffectObservation(")!=
+          std::string::npos);
+    CHECK(move.find("PickerTraceApiKind::GetViewForHwnd")!=
+          std::string::npos);
+    CHECK(move.find("PickerTraceApiKind::MoveViewToDesktop")!=
+          std::string::npos);
+    CHECK(move.find("PickerTraceApiKind::MoveWindowToDesktop")!=
+          std::string::npos);
+    CHECK(move.find("destinationGuid")!=std::string::npos);
+
+    const std::string traceSource=
+        ReadSourceFile(L"src\\picker_trace.cpp");
+    const std::string executor=SourceSection(
+        traceSource,"PickerTraceForegroundHandoffResult "
+            "ExecutePickerForegroundHandoffCalls(",
+        "static bool PickerTraceRollbackPhase(");
+    CHECK(!executor.empty());
+    CHECK(executor.find("GetLastError(")==std::string::npos);
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
@@ -21044,6 +22513,18 @@ int main(){
     test_picker_trace_move_begin_exception_distinguishes_publication();
     test_picker_trace_activation_is_trace_behavior_equivalent();
     test_picker_trace_activation_runtime_wiring_is_causal();
+    test_picker_trace_raw_api_contracts_are_exact();
+    test_picker_trace_task8_enums_have_complete_stable_names();
+    test_picker_trace_bool_wrapper_reads_error_immediately();
+    test_picker_trace_lookup_observer_is_exact_and_equivalent();
+    test_picker_trace_foreground_handoff_is_ordered_and_equivalent();
+    test_picker_trace_scheduler_reports_one_exact_route();
+    test_picker_trace_reducer_is_behavior_equivalent();
+    test_picker_trace_active_reducer_emits_once_and_resets_metadata();
+    test_picker_trace_lookup_context_serializes_exact_mapping();
+    test_picker_trace_terminal_classifiers_are_fixed();
+    test_picker_trace_terminal_classifiers_follow_real_reductions();
+    test_picker_trace_task8_runtime_wiring_is_explicit();
     test_picker_uses_self_contained_gdi_buffer();
     test_picker_icon_loading_is_bounded_and_outside_paint();
     test_picker_enum_publishes_display_only_rows_safely();
