@@ -19148,9 +19148,286 @@ static void test_picker_trace_launch_preserves_cli_routing(){
     CHECK(ParseVdeLaunchOptions(2,status).command==L"status");
 }
 
+class PickerTraceStrictJsonParserForTest {
+public:
+    explicit PickerTraceStrictJsonParserForTest(const std::string& input)
+        :input_(input){}
+
+    bool parseLine(){
+        if(!validUtf8()) return false;
+        skipWhitespace();
+        if(!value()) return false;
+        if(at_>=input_.size() || input_[at_]!='\n') return false;
+        return ++at_==input_.size();
+    }
+
+private:
+    bool validUtf8() const {
+        const unsigned char* bytes=
+            reinterpret_cast<const unsigned char*>(input_.data());
+        size_t at=0;
+        while(at<input_.size()){
+            const unsigned char first=bytes[at++];
+            if(first<0x80) continue;
+            size_t continuation=0;
+            uint32_t code=0;
+            uint32_t minimum=0;
+            if((first&0xe0)==0xc0){
+                continuation=1; code=first&0x1f; minimum=0x80;
+            } else if((first&0xf0)==0xe0){
+                continuation=2; code=first&0x0f; minimum=0x800;
+            } else if((first&0xf8)==0xf0){
+                continuation=3; code=first&0x07; minimum=0x10000;
+            } else return false;
+            if(at+continuation>input_.size()) return false;
+            for(size_t i=0;i<continuation;++i){
+                const unsigned char next=bytes[at++];
+                if((next&0xc0)!=0x80) return false;
+                code=(code<<6)|(next&0x3f);
+            }
+            if(code<minimum || code>0x10ffff ||
+               (code>=0xd800 && code<=0xdfff)) return false;
+        }
+        return true;
+    }
+
+    void skipWhitespace(){
+        while(at_<input_.size() &&
+              (input_[at_]==' ' || input_[at_]=='\t' ||
+               input_[at_]=='\r')) ++at_;
+    }
+
+    bool value(){
+        skipWhitespace();
+        if(at_>=input_.size()) return false;
+        switch(input_[at_]){
+        case '{': return object();
+        case '[': return array();
+        case '"': { std::string ignored; return string(ignored); }
+        case 't': return literal("true");
+        case 'f': return literal("false");
+        case 'n': return literal("null");
+        default: return number();
+        }
+    }
+
+    bool object(){
+        if(input_[at_++]!='{') return false;
+        skipWhitespace();
+        if(at_<input_.size() && input_[at_]=='}'){ ++at_; return true; }
+        std::set<std::string> keys;
+        for(;;){
+            std::string key;
+            if(!string(key) || !keys.insert(key).second) return false;
+            skipWhitespace();
+            if(at_>=input_.size() || input_[at_++]!=':') return false;
+            if(!value()) return false;
+            skipWhitespace();
+            if(at_>=input_.size()) return false;
+            if(input_[at_]=='}'){ ++at_; return true; }
+            if(input_[at_++]!=',') return false;
+            skipWhitespace();
+        }
+    }
+
+    bool array(){
+        if(input_[at_++]!='[') return false;
+        skipWhitespace();
+        if(at_<input_.size() && input_[at_]==']'){ ++at_; return true; }
+        for(;;){
+            if(!value()) return false;
+            skipWhitespace();
+            if(at_>=input_.size()) return false;
+            if(input_[at_]==']'){ ++at_; return true; }
+            if(input_[at_++]!=',') return false;
+        }
+    }
+
+    static bool hex(char value){
+        return (value>='0' && value<='9') ||
+               (value>='a' && value<='f') ||
+               (value>='A' && value<='F');
+    }
+
+    bool string(std::string& decoded){
+        skipWhitespace();
+        if(at_>=input_.size() || input_[at_++]!='"') return false;
+        decoded.clear();
+        while(at_<input_.size()){
+            const unsigned char value=
+                static_cast<unsigned char>(input_[at_++]);
+            if(value=='"') return true;
+            if(value<0x20) return false;
+            if(value!='\\'){
+                decoded.push_back(static_cast<char>(value));
+                continue;
+            }
+            if(at_>=input_.size()) return false;
+            const char escaped=input_[at_++];
+            if(escaped=='"' || escaped=='\\' || escaped=='/' ||
+               escaped=='b' || escaped=='f' || escaped=='n' ||
+               escaped=='r' || escaped=='t'){
+                decoded.push_back(escaped);
+                continue;
+            }
+            if(escaped!='u' || at_+4>input_.size()) return false;
+            for(int i=0;i<4;++i)
+                if(!hex(input_[at_++])) return false;
+            decoded.push_back('u');
+        }
+        return false;
+    }
+
+    bool literal(const char* expected){
+        const size_t size=strlen(expected);
+        if(input_.compare(at_,size,expected)!=0) return false;
+        at_+=size;
+        return true;
+    }
+
+    bool number(){
+        const size_t begin=at_;
+        if(at_<input_.size() && input_[at_]=='-') ++at_;
+        if(at_>=input_.size()) return false;
+        if(input_[at_]=='0') ++at_;
+        else {
+            if(input_[at_]<'1' || input_[at_]>'9') return false;
+            while(at_<input_.size() && input_[at_]>='0' &&
+                  input_[at_]<='9') ++at_;
+        }
+        if(at_<input_.size() && input_[at_]=='.'){
+            ++at_;
+            const size_t digits=at_;
+            while(at_<input_.size() && input_[at_]>='0' &&
+                  input_[at_]<='9') ++at_;
+            if(at_==digits) return false;
+        }
+        if(at_<input_.size() &&
+           (input_[at_]=='e' || input_[at_]=='E')){
+            ++at_;
+            if(at_<input_.size() &&
+               (input_[at_]=='+' || input_[at_]=='-')) ++at_;
+            const size_t digits=at_;
+            while(at_<input_.size() && input_[at_]>='0' &&
+                  input_[at_]<='9') ++at_;
+            if(at_==digits) return false;
+        }
+        return at_>begin;
+    }
+
+    const std::string& input_;
+    size_t at_=0;
+};
+
+static bool PickerTraceStrictJsonLineForTest(const std::string& input){
+    PickerTraceStrictJsonParserForTest parser(input);
+    return parser.parseLine();
+}
+
+static void test_picker_trace_safe_foreign_names_are_bounded(){
+    const PickerTraceSafeClassName cls=
+        MakePickerTraceSafeClassName(L"Class\"\nName",11);
+    const PickerTraceSafeImageBasename image=
+        MakePickerTraceSafeImageBasename(L"demo.exe",8);
+    const PickerTraceSafeImageBasename path=
+        MakePickerTraceSafeImageBasename(L"C:\\Apps\\demo.exe",16);
+    CHECK(cls.available());
+    CHECK(cls.length()<=128);
+    CHECK(image.available());
+    CHECK(!path.available());
+}
+
+static void test_picker_trace_json_line_escapes_only_allowlisted_text(){
+    PickerTraceEnvelope envelope;
+    envelope.session.fill(0x11);
+    envelope.seq=7;
+    envelope.ms=25;
+    PickerTraceEnumWindowEvent event;
+    event.enumSequence=3;
+    event.className=MakePickerTraceSafeClassName(L"A\"B\n",4);
+    event.imageBasename=MakePickerTraceSafeImageBasename(L"tool.exe",8);
+    event.decision=PickerTraceEnumDecision::Verified;
+    std::string line;
+    CHECK(SerializePickerTraceLine(envelope,event,line));
+    CHECK(line.find("\"seq\":7")!=std::string::npos);
+    CHECK(line.find("A\\\"B\\u000a")!=std::string::npos);
+    CHECK(line.find("tool.exe")!=std::string::npos);
+    CHECK(line.find("title_text")==std::string::npos);
+    CHECK(line.find("search_text")==std::string::npos);
+    CHECK(line.find("diagnostic_text")==std::string::npos);
+    CHECK(!line.empty() && line.back()=='\n');
+}
+
+static void test_picker_trace_json_line_has_exact_canonical_shape(){
+    PickerTraceEnvelope envelope;
+    envelope.session.fill(0x11);
+    envelope.seq=7;
+    envelope.ms=25;
+    PickerTraceActivationResultEvent event;
+    event.activationId=9;
+    event.result=PickerTraceActivationResult::AlreadyControlled;
+    std::string line;
+    CHECK(SerializePickerTraceLine(envelope,event,line));
+    CHECK(line==
+        "{\"schema\":1,\"session\":\"11111111111111111111111111111111\","
+        "\"seq\":7,\"ms\":25,\"event\":\"activation.result\","
+        "\"activation_id\":9,\"result\":\"already_controlled\"}\n");
+}
+
+static void test_picker_trace_enums_have_stable_names(){
+    CHECK(std::string(PickerTraceEnumDecisionName(
+        PickerTraceEnumDecision::SkipRootOwnerMismatch))==
+        "skip_root_owner_mismatch");
+    CHECK(std::string(PickerTraceMoveBeginReasonName(
+        PickerTraceMoveBeginReason::PopupDesktopUnavailable))==
+        "popup_desktop_unavailable");
+    CHECK(std::string(PickerTraceApiKindName(
+        PickerTraceApiKind::SetForegroundWindow))==
+        "set_foreground_window");
+}
+
+static void test_picker_trace_every_schema_event_is_strict_jsonl(){
+    PickerTraceEnvelope envelope;
+    envelope.session.fill(0x5a);
+    envelope.seq=1;
+    envelope.ms=2;
+    const auto check=[&](const auto& event){
+        std::string line;
+        CHECK(SerializePickerTraceLine(envelope,event,line));
+        CHECK(PickerTraceStrictJsonLineForTest(line));
+    };
+    check(PickerTraceCaptureEvent{});
+    check(PickerTraceOpenEvent{});
+    check(PickerTraceEnumBeginEvent{});
+    check(PickerTraceEnumWindowEvent{});
+    check(PickerTraceEnumEndEvent{});
+    check(PickerTraceMouseDownEvent{});
+    check(PickerTraceActivationRequestEvent{});
+    check(PickerTraceActivationResultEvent{});
+    check(PickerTraceMoveBeginEvent{});
+    check(PickerTraceMoveBeginExceptionEvent{});
+    check(PickerTraceEffectEvent{});
+    check(PickerTraceApiResultEvent{});
+    check(PickerTraceTerminalizationAttemptEvent{});
+    check(PickerTraceTransitionTerminalEvent{});
+
+    CHECK(!PickerTraceStrictJsonLineForTest("{\"a\":1\n"));
+    CHECK(!PickerTraceStrictJsonLineForTest("{\"a\":1 \"b\":2}\n"));
+    CHECK(!PickerTraceStrictJsonLineForTest("{\"a\":\"\\q\"}\n"));
+    CHECK(!PickerTraceStrictJsonLineForTest("{\"a\":1,\"a\":2}\n"));
+    CHECK(!PickerTraceStrictJsonLineForTest("{\"a\":1}\nextra"));
+    CHECK(!PickerTraceStrictJsonLineForTest(
+        std::string("{\"a\":\"")+char(0xc0)+char(0x80)+"\"}\n"));
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
+    test_picker_trace_safe_foreign_names_are_bounded();
+    test_picker_trace_json_line_escapes_only_allowlisted_text();
+    test_picker_trace_json_line_has_exact_canonical_shape();
+    test_picker_trace_enums_have_stable_names();
+    test_picker_trace_every_schema_event_is_strict_jsonl();
     test_picker_uses_self_contained_gdi_buffer();
     test_picker_icon_loading_is_bounded_and_outside_paint();
     test_picker_enum_publishes_display_only_rows_safely();
