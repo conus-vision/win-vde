@@ -11841,6 +11841,10 @@ static void test_picker_show_uses_primary_monitor_only(){
 
     const size_t zeroOrigin=helper.find("POINT origin={0,0};");
     const size_t monitorFromPoint=helper.find("MonitorFromPoint(");
+    const size_t monitorFromAny=helper.find("MonitorFrom");
+    const size_t nextMonitorFrom=monitorFromAny==std::string::npos
+        ?std::string::npos
+        :helper.find("MonitorFrom",monitorFromAny+1);
     const size_t primaryArgument=helper.find(
         "origin,MONITOR_DEFAULTTOPRIMARY",monitorFromPoint);
     const size_t monitorInfo=helper.find(
@@ -11851,6 +11855,8 @@ static void test_picker_show_uses_primary_monitor_only(){
         "info.rcWork.bottom>info.rcWork.top",rcWorkWidth);
     const size_t rcWorkAssignment=helper.find(
         "workArea=info.rcWork;",rcWorkHeight);
+    const size_t rcWorkReturn=helper.find(
+        "return true;",rcWorkAssignment);
     const size_t systemWorkArea=helper.find(
         "SystemParametersInfoW(",rcWorkAssignment);
     const size_t spiWorkArea=helper.find(
@@ -11861,6 +11867,8 @@ static void test_picker_show_uses_primary_monitor_only(){
         "fallback.bottom>fallback.top",spiWidth);
     const size_t spiAssignment=helper.find(
         "workArea=fallback;",spiHeight);
+    const size_t spiReturn=helper.find(
+        "return true;",spiAssignment);
     const size_t metricsWidth=helper.find(
         "GetSystemMetrics(SM_CXSCREEN)",spiAssignment);
     const size_t metricsHeight=helper.find(
@@ -11877,16 +11885,22 @@ static void test_picker_show_uses_primary_monitor_only(){
           monitorFromPoint!=std::string::npos &&
           zeroOrigin<monitorFromPoint);
     CHECK(monitorFromPoint!=std::string::npos);
+    CHECK(monitorFromAny==monitorFromPoint);
+    CHECK(nextMonitorFrom==std::string::npos);
     CHECK(primaryArgument!=std::string::npos);
     CHECK(monitorInfo!=std::string::npos);
     CHECK(rcWorkWidth!=std::string::npos);
     CHECK(rcWorkHeight!=std::string::npos);
     CHECK(rcWorkAssignment!=std::string::npos);
+    CHECK(rcWorkReturn!=std::string::npos &&
+          rcWorkAssignment<rcWorkReturn && rcWorkReturn<systemWorkArea);
     CHECK(systemWorkArea!=std::string::npos);
     CHECK(spiWorkArea!=std::string::npos);
     CHECK(spiWidth!=std::string::npos);
     CHECK(spiHeight!=std::string::npos);
     CHECK(spiAssignment!=std::string::npos);
+    CHECK(spiReturn!=std::string::npos &&
+          spiAssignment<spiReturn && spiReturn<metricsWidth);
     CHECK(metricsWidth!=std::string::npos);
     CHECK(metricsHeight!=std::string::npos);
     CHECK(metricsWidthValidation!=std::string::npos);
@@ -11895,10 +11909,11 @@ static void test_picker_show_uses_primary_monitor_only(){
     CHECK(monitorFromPoint<primaryArgument &&
           primaryArgument<monitorInfo && monitorInfo<rcWorkWidth &&
           rcWorkWidth<rcWorkHeight && rcWorkHeight<rcWorkAssignment &&
-          rcWorkAssignment<systemWorkArea &&
+          rcWorkAssignment<rcWorkReturn && rcWorkReturn<systemWorkArea &&
           systemWorkArea<spiWorkArea && spiWorkArea<spiWidth &&
           spiWidth<spiHeight && spiHeight<spiAssignment &&
-          spiAssignment<metricsWidth && metricsWidth<metricsHeight &&
+          spiAssignment<spiReturn && spiReturn<metricsWidth &&
+          metricsWidth<metricsHeight &&
           metricsHeight<metricsWidthValidation &&
           metricsWidthValidation<metricsHeightValidation &&
           metricsHeightValidation<metricsAssignment);
@@ -11909,25 +11924,51 @@ static void test_picker_show_uses_primary_monitor_only(){
 
     const size_t workAreaLookup=show.find(
         "GetPrimaryPickerWorkArea(workArea)");
+    const size_t adjustWindow=show.find(
+        "AdjustWindowRectEx(",workAreaLookup);
+    const size_t outerWidth=show.find(
+        "windowRect.right-windowRect.left",adjustWindow);
+    const size_t outerHeight=show.find(
+        "windowRect.bottom-windowRect.top",outerWidth);
     const size_t centeredOrigin=show.find(
-        "PickerCenteredOrigin(workArea,outer)",workAreaLookup);
+        "PickerCenteredOrigin(workArea,outer)",outerHeight);
     const size_t setWindowPosition=show.find(
         "SetWindowPos(",centeredOrigin);
+    const size_t setWindowCoordinates=show.find(
+        "g_main,HWND_TOPMOST,origin.x,origin.y",setWindowPosition);
+    const size_t setWindowSizeAndFlags=show.find(
+        "outer.cx,outer.cy,SWP_NOACTIVATE",setWindowPosition);
+    const size_t setWindowEnd=show.find(
+        ");",setWindowSizeAndFlags);
+    const bool placementBounds=workAreaLookup!=std::string::npos &&
+        setWindowEnd!=std::string::npos && workAreaLookup<setWindowEnd;
+    const std::string placement=placementBounds
+        ?show.substr(workAreaLookup,setWindowEnd+2-workAreaLookup)
+        :std::string();
     CHECK(workAreaLookup!=std::string::npos);
+    CHECK(adjustWindow!=std::string::npos);
+    CHECK(outerWidth!=std::string::npos);
+    CHECK(outerHeight!=std::string::npos);
     CHECK(centeredOrigin!=std::string::npos);
     CHECK(setWindowPosition!=std::string::npos);
-    CHECK(workAreaLookup<centeredOrigin &&
-          centeredOrigin<setWindowPosition);
-    CHECK(show.find("MonitorFromWindow(")==std::string::npos);
-    CHECK(show.find("MonitorFromPoint(")==std::string::npos);
-    CHECK(show.find("MonitorFromCursor(")==std::string::npos);
+    CHECK(setWindowCoordinates!=std::string::npos);
+    CHECK(setWindowSizeAndFlags!=std::string::npos);
+    CHECK(setWindowEnd!=std::string::npos);
+    CHECK(workAreaLookup<adjustWindow && adjustWindow<outerWidth &&
+          outerWidth<outerHeight && outerHeight<centeredOrigin &&
+          centeredOrigin<setWindowPosition &&
+          setWindowPosition<setWindowCoordinates &&
+          setWindowCoordinates<setWindowSizeAndFlags &&
+          setWindowSizeAndFlags<setWindowEnd);
+    CHECK(!placement.empty());
+    CHECK(placement.find("MonitorFrom")==std::string::npos);
+    CHECK(placement.find("g_target")==std::string::npos);
+    CHECK(show.find("MonitorFrom")==std::string::npos);
     CHECK(show.find("GetMonitorInfo")==std::string::npos);
     CHECK(show.find("GetCursorPos(")==std::string::npos);
     CHECK(show.find("SPI_GETWORKAREA")==std::string::npos);
     CHECK(show.find("SM_CXSCREEN")==std::string::npos);
     CHECK(show.find("SM_CYSCREEN")==std::string::npos);
-    CHECK(show.find("g_target?g_target:g_main")==std::string::npos);
-    CHECK(show.find("g_target ? g_target : g_main")==std::string::npos);
 }
 
 static void test_picker_preloads_only_laid_out_visible_rows(){
