@@ -762,22 +762,59 @@ enum class PickerHoverResetReason {
 
 struct PickerHoverEventState {
     PickerFooterLink footerLink=PickerFooterLink::None;
+    int hoveredRowIndex=-1;
+    uint64_t hoveredRowGeneration=0;
     bool rowTooltipActive=false;
     PickerHoverResetReason lastResetReason=PickerHoverResetReason::None;
     uint64_t resetCount=0;
 };
 
+struct PickerRowHoverUpdate {
+    int previousRowIndex=-1;
+    int currentRowIndex=-1;
+    bool changed=false;
+};
+
+inline PickerRowHoverUpdate UpdatePickerRowHoverEvent(
+        PickerHoverEventState& state,int rowIndex,
+        uint64_t generation) noexcept {
+    if(rowIndex<0){
+        rowIndex=-1;
+        generation=0;
+    }
+    PickerRowHoverUpdate update;
+    update.previousRowIndex=state.hoveredRowIndex;
+    update.currentRowIndex=rowIndex;
+    update.changed=state.hoveredRowIndex!=rowIndex ||
+        state.hoveredRowGeneration!=generation;
+    if(update.changed){
+        state.hoveredRowIndex=rowIndex;
+        state.hoveredRowGeneration=generation;
+    }
+    return update;
+}
+
+inline bool PickerRowHoverMatches(
+        const PickerHoverEventState& state,int rowIndex,
+        uint64_t generation) noexcept {
+    return rowIndex>=0 && state.hoveredRowIndex==rowIndex &&
+        state.hoveredRowGeneration==generation;
+}
+
 inline bool UpdatePickerFooterHoverEvent(
         PickerHoverEventState& state,PickerFooterLink next) noexcept {
     const bool changed=UpdatePickerFooterHover(state.footerLink,next);
-    if(PickerFooterSuppressesRowHover(next))
+    if(PickerFooterSuppressesRowHover(next)){
         state.rowTooltipActive=false;
+        UpdatePickerRowHoverEvent(state,-1,0);
+    }
     return changed;
 }
 
 struct PickerFooterMouseMoveEffects {
     bool invalidateFooter=false;
     bool resetRowTooltip=false;
+    bool invalidateRowHover=false;
 };
 
 inline PickerFooterMouseMoveEffects RoutePickerFooterMouseMove(
@@ -785,12 +822,15 @@ inline PickerFooterMouseMoveEffects RoutePickerFooterMouseMove(
         bool activeRowTooltip) noexcept {
     const bool hadRowTooltip=
         activeRowTooltip || state.rowTooltipActive;
+    const int previousRowIndex=state.hoveredRowIndex;
     PickerFooterMouseMoveEffects effects;
     effects.invalidateFooter=
         UpdatePickerFooterHoverEvent(state,next);
     effects.resetRowTooltip=
         PickerFooterSuppressesRowHover(next) &&
         (effects.invalidateFooter || hadRowTooltip);
+    effects.invalidateRowHover=
+        previousRowIndex!=state.hoveredRowIndex;
     return effects;
 }
 
@@ -798,6 +838,7 @@ inline void ResetPickerHoverEventState(
         PickerHoverEventState& state,
         PickerHoverResetReason reason) noexcept {
     ResetPickerFooterHover(state.footerLink);
+    UpdatePickerRowHoverEvent(state,-1,0);
     state.rowTooltipActive=false;
     state.lastResetReason=reason;
     if(state.resetCount==(std::numeric_limits<uint64_t>::max)())

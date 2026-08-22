@@ -952,6 +952,33 @@ static void test_footer_hover_event_state_covers_every_reset_path(){
     }
 }
 
+static void test_picker_row_hover_tracks_full_row_and_resets(){
+    PickerHoverEventState state;
+    PickerRowHoverUpdate update=UpdatePickerRowHoverEvent(state,3,41);
+    CHECK(update.changed && update.previousRowIndex==-1 &&
+          update.currentRowIndex==3);
+    CHECK(PickerRowHoverMatches(state,3,41));
+
+    update=UpdatePickerRowHoverEvent(state,3,41);
+    CHECK(!update.changed);
+
+    update=UpdatePickerRowHoverEvent(state,7,41);
+    CHECK(update.changed && update.previousRowIndex==3 &&
+          update.currentRowIndex==7);
+    CHECK(!PickerRowHoverMatches(state,3,41));
+    CHECK(PickerRowHoverMatches(state,7,41));
+
+    PickerFooterMouseMoveEffects footer=RoutePickerFooterMouseMove(
+        state,PickerFooterLink::Repository,false);
+    CHECK(footer.invalidateRowHover);
+    CHECK(state.hoveredRowIndex==-1 && state.hoveredRowGeneration==0);
+
+    UpdatePickerRowHoverEvent(state,5,42);
+    ResetPickerHoverEventState(
+        state,PickerHoverResetReason::MouseLeave);
+    CHECK(state.hoveredRowIndex==-1 && state.hoveredRowGeneration==0);
+}
+
 static void test_footer_mousemove_resets_tooltip_only_once_per_transition(){
     PickerHoverEventState state;
     int invalidations=0,tooltipResets=0;
@@ -14397,9 +14424,9 @@ static void test_picker_enum_publishes_display_only_rows_safely(){
         source,"static void Paint(","static void TipDeactivate(");
     CHECK(!paint.empty());
     const size_t activeGuard=paint.find(
-        "PickerRowUsesStableIdentity(\n"
+        "const bool active=PickerRowUsesStableIdentity(\n"
         "                    snapshot.action.admission) &&\n"
-        "               IsActiveWindow(g_picker,snapshot.action.identity)");
+        "                IsActiveWindow(g_picker,snapshot.action.identity)");
     const size_t activeFill=paint.find("FillRoundRect",activeGuard);
     CHECK(activeGuard!=std::string::npos && activeFill!=std::string::npos &&
           activeGuard<activeFill);
@@ -28259,6 +28286,76 @@ static void test_picker_drag_runtime_wiring_and_conflict_gates_are_explicit(){
         lifetime,"EndPickerVisualSessionRuntime();")==2);
 }
 
+static void test_picker_row_hover_runtime_uses_full_hit_geometry(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    CHECK(!source.empty());
+    const std::string mouse=SourceSection(
+        source,"case WM_MOUSEMOVE:","case WM_LBUTTONUP:");
+    const std::string leave=SourceSection(
+        source,"case WM_MOUSELEAVE:","case WM_MOUSEWHEEL:");
+    const std::string paint=SourceSection(
+        source,"static void Paint(","static void TipDeactivate()");
+    CHECK(!mouse.empty() && !leave.empty() && !paint.empty());
+
+    const size_t selection=mouse.find("SetPickerSelectionCurrent(");
+    const size_t refresh=mouse.find("RefreshPickerPaintCache()",selection);
+    const size_t rowHit=mouse.find("HitPickerRow(pt)",refresh);
+    const size_t rowUpdate=mouse.find(
+        "UpdatePickerRowHoverEvent(",rowHit);
+    const size_t tooltipText=mouse.find("snapshot.textRect",rowUpdate);
+    CHECK(selection!=std::string::npos && refresh!=std::string::npos &&
+          rowHit!=std::string::npos && rowUpdate!=std::string::npos &&
+          tooltipText!=std::string::npos);
+    CHECK(selection<refresh && refresh<rowHit && rowHit<rowUpdate &&
+          rowUpdate<tooltipText);
+
+    const size_t hoverBlockStart=mouse.find(
+        "const PickerRowHoverUpdate rowHover=",rowHit);
+    const size_t hoverBlockEnd=mouse.find(
+        "const bool tooltipHit=",hoverBlockStart);
+    const std::string hoverBlock=
+        hoverBlockStart!=std::string::npos &&
+        hoverBlockEnd!=std::string::npos
+        ?mouse.substr(hoverBlockStart,hoverBlockEnd-hoverBlockStart)
+        :std::string();
+    CHECK(!hoverBlock.empty());
+    CHECK(hoverBlock.find("InvalidateRect(")!=std::string::npos);
+    CHECK(hoverBlock.find("BuildModel(")==std::string::npos);
+    CHECK(hoverBlock.find("RefreshPickerPaintCache(")==std::string::npos);
+
+    const size_t dragStarted=mouse.find(
+        "gestureAction==PickerGestureAction::DragStarted");
+    const size_t dragHoverReset=mouse.find(
+        "ResetPickerHoverState(",dragStarted);
+    const size_t idleMouse=mouse.find("const bool cacheReady=",dragStarted);
+    CHECK(dragStarted!=std::string::npos &&
+          dragHoverReset!=std::string::npos &&
+          idleMouse!=std::string::npos &&
+          dragStarted<dragHoverReset && dragHoverReset<idleMouse);
+
+    const size_t hoverMatch=paint.find("PickerRowHoverMatches(");
+    const size_t hoverBlend=paint.find(
+        "BlendColor(fill,CLR_HEAD,24)",hoverMatch);
+    const size_t hoverRect=paint.find("snapshot.hitRect",hoverBlend);
+    const size_t activeFill=paint.find(
+        "FillRoundRect(hdc,activeRect",hoverRect);
+    CHECK(hoverMatch!=std::string::npos &&
+          hoverBlend!=std::string::npos &&
+          hoverRect!=std::string::npos &&
+          activeFill!=std::string::npos);
+    CHECK(hoverMatch<hoverBlend && hoverBlend<hoverRect &&
+          hoverRect<activeFill);
+
+    const size_t leaveChanged=leave.find("hoverChanged");
+    const size_t leaveReset=leave.find(
+        "ResetPickerHoverState(",leaveChanged);
+    const size_t leavePaint=leave.find("InvalidateRect(",leaveReset);
+    CHECK(leaveChanged!=std::string::npos &&
+          leaveReset!=std::string::npos &&
+          leavePaint!=std::string::npos &&
+          leaveChanged<leaveReset && leaveReset<leavePaint);
+}
+
 static void test_picker_exact_activation_runtime_has_no_fallback_target(){
     const std::string source=ReadSourceFile(L"src\\vde.cpp");
     const std::string traceSource=
@@ -28615,6 +28712,7 @@ int main(){
     test_picker_trace_task9_runtime_wiring_is_causal_and_private();
     test_picker_trace_task10_runtime_anchors_and_privacy_are_locked();
     test_picker_drag_runtime_wiring_and_conflict_gates_are_explicit();
+    test_picker_row_hover_runtime_uses_full_hit_geometry();
     test_picker_exact_activation_runtime_has_no_fallback_target();
     test_picker_visual_session_runtime_end_paths_are_explicit();
     test_picker_visual_session_preservation_paths_are_explicit();
@@ -28652,6 +28750,7 @@ int main(){
     test_picker_interaction_busy_and_drop_highlight_are_state_free();
     test_picker_exact_activation_plan_and_route_are_fail_closed();
     test_footer_hover_event_state_covers_every_reset_path();
+    test_picker_row_hover_tracks_full_row_and_resets();
     test_footer_mousemove_resets_tooltip_only_once_per_transition();
     test_visible_branding_and_help_retention_are_exact();
     test_picker_search_retry_uses_a_distinct_timer_channel();

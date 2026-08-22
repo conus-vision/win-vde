@@ -7508,13 +7508,27 @@ static void Paint(HDC hdcReal,HDC hdc,RECT client){
         const int filteredCount=PickerTileFilteredCount(t);
         bool hasScroll=filteredCount>visRows;
         if(paintCacheReady)
-        for(const RowRec& row : g_pickerPaintCache.hoverRows){
+        for(size_t rowIndex=0;
+                rowIndex<g_pickerPaintCache.hoverRows.size();
+                ++rowIndex){
+            const RowRec& row=g_pickerPaintCache.hoverRows[rowIndex];
             const PickerRowHitSnapshot& snapshot=row.snapshot;
             if(snapshot.action.tileIndex!=static_cast<int>(tileIndex))
                 continue;
-            if(PickerRowUsesStableIdentity(
+            const bool active=PickerRowUsesStableIdentity(
                     snapshot.action.admission) &&
-               IsActiveWindow(g_picker,snapshot.action.identity)){
+                IsActiveWindow(g_picker,snapshot.action.identity);
+            const bool hovered=PickerRowHoverMatches(
+                g_pickerHoverState,static_cast<int>(rowIndex),
+                g_pickerPaintCache.generation);
+            if(hovered && !active){
+                const COLORREF hoverRow=
+                    BlendColor(fill,CLR_HEAD,24);
+                FillRoundRect(
+                    hdc,snapshot.hitRect,S(5),
+                    hoverRow,hoverRow,S(1));
+            }
+            if(active){
                 RECT activeRect=row.snapshot.hitRect;
                 FillRoundRect(hdc,activeRect,S(5),activeRow,activeRow,S(1));
                 RECT activeBar={activeRect.left+S(2),activeRect.top+S(3),
@@ -10760,10 +10774,13 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                 ResetPickerPointerGesture(hwnd,true,false);
                 InvalidateRect(hwnd,nullptr,FALSE);
             } else {
-                if(gestureAction==PickerGestureAction::DragStarted)
+                if(gestureAction==PickerGestureAction::DragStarted){
+                    ResetPickerHoverState(
+                        PickerHoverResetReason::ExplicitInvalidation);
                     EmitPickerGestureTrace(
                         gestureFacts,priorPhase,g_pickerGesture.phase,
                         gestureAction,true,candidateDropTile);
+                }
                 if(priorPhase!=g_pickerGesture.phase ||
                     priorDropTileIndex!=
                         g_pickerGesture.dropTileIndex)
@@ -10778,7 +10795,9 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         const PickerFooterMouseMoveEffects footerEffects=
             RoutePickerFooterMouseMove(
                 g_pickerHoverState,footerHover,g_lastHoverRow!=-1);
-        if(footerEffects.invalidateFooter){
+        if(footerEffects.invalidateRowHover){
+            InvalidateRect(hwnd,nullptr,FALSE);
+        } else if(footerEffects.invalidateFooter){
             if(cacheReady)
                 InvalidateRect(hwnd,
                     &g_pickerPaintCache.footer.layout.footer,FALSE);
@@ -10794,12 +10813,33 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             TrackMouseEvent(&tme);
             return 0;
         }
-        int hovRow=-1; if(cacheReady) for(size_t i=0;i<g_pickerPaintCache.hoverRows.size();++i) if(PtInRect(&g_pickerPaintCache.hoverRows[i].snapshot.textRect,pt)){ hovRow=(int)i; break; }
-        if(hovRow>=0 && g_pickerPaintCache.hoverRows[hovRow].snapshot.truncated && g_tip){    // R9: full name on hover when truncated
+        for(size_t index=0;index<g_tiles.size();++index){
+            if(!PtInRect(&g_tiles[index].rc,pt)) continue;
+            if(g_picker.selectedIndex!=static_cast<int>(index)){
+                SetPickerSelectionCurrent(static_cast<int>(index));
+                RefreshPickerPaintCache();
+                InvalidateRect(hwnd,nullptr,FALSE);
+            }
+            break;
+        }
+        const bool rowCacheReady=PickerPaintCacheMatches(
+            g_picker,g_pickerPaintCache.generation);
+        const int hovRow=rowCacheReady?HitPickerRow(pt):-1;
+        const PickerRowHoverUpdate rowHover=
+            UpdatePickerRowHoverEvent(
+                g_pickerHoverState,hovRow,
+                rowCacheReady?g_pickerPaintCache.generation:0);
+        if(rowHover.changed)
+            InvalidateRect(hwnd,nullptr,FALSE);
+        const bool tooltipHit=hovRow>=0 &&
+            PtInRect(
+                &g_pickerPaintCache.hoverRows[hovRow].snapshot.textRect,pt);
+        if(tooltipHit &&
+           g_pickerPaintCache.hoverRows[hovRow].snapshot.truncated &&
+           g_tip){    // R9: full name on hover when truncated
             TrackPickerHoverTooltip(hwnd,g_pickerPaintCache.hoverRows[hovRow],
                 hovRow,g_pickerPaintCache.generation,pt);
         } else if(g_lastHoverRow!=-1){ ResetPickerHoverTooltip(); }
-        for(size_t i=0;i<g_tiles.size();++i) if(PtInRect(&g_tiles[i].rc,pt)){ if(g_picker.selectedIndex!=(int)i){SetPickerSelectionCurrent((int)i); RefreshPickerPaintCache(); InvalidateRect(hwnd,nullptr,FALSE);} break; }
         TRACKMOUSEEVENT tme={sizeof(tme)}; tme.dwFlags=TME_LEAVE; tme.hwndTrack=hwnd; TrackMouseEvent(&tme);
         return 0; }
     case WM_LBUTTONUP:{
@@ -10874,13 +10914,12 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         ResetPickerPointerGesture(hwnd,true);
         return 0;
     case WM_MOUSELEAVE:{
-        const bool footerChanged=
-            g_pickerHoverState.footerLink!=PickerFooterLink::None;
+        const bool hoverChanged=
+            g_pickerHoverState.footerLink!=PickerFooterLink::None ||
+            g_pickerHoverState.hoveredRowIndex>=0;
         ResetPickerHoverState(PickerHoverResetReason::MouseLeave);
-        if(footerChanged && PickerPaintCacheMatches(
-                g_picker,g_pickerPaintCache.generation))
-            InvalidateRect(hwnd,
-                &g_pickerPaintCache.footer.layout.footer,FALSE);
+        if(hoverChanged)
+            InvalidateRect(hwnd,nullptr,FALSE);
         return 0;
     }
     case WM_MOUSEWHEEL:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; ScreenToClient(hwnd,&pt); int delta=GET_WHEEL_DELTA_WPARAM(wp);   // R8: scroll a tile's window list
