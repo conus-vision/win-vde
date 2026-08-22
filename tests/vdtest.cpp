@@ -28260,20 +28260,20 @@ static void test_picker_drag_runtime_wiring_and_conflict_gates_are_explicit(){
     const size_t rowHit=down.find("HitPickerRow(pt)");
     const size_t tileHit=down.find("HitPickerTile(pt)");
     const size_t arm=down.find("ArmPickerRowGesture(");
+    const size_t capturePreview=down.find("CapturePickerDragPreview(");
     const size_t setCapture=down.find("SetCapture(hwnd)");
     const size_t getCapture=down.find("GetCapture()==hwnd");
     CHECK(rowHit!=std::string::npos && tileHit!=std::string::npos &&
           rowHit<tileHit);
-    CHECK(arm!=std::string::npos && setCapture!=std::string::npos &&
-          getCapture!=std::string::npos && arm<setCapture &&
+    CHECK(arm!=std::string::npos && capturePreview!=std::string::npos &&
+          setCapture!=std::string::npos && getCapture!=std::string::npos &&
+          arm<capturePreview && capturePreview<setCapture &&
           setCapture<getCapture);
     CHECK(down.find("ResolvePickerPointerActivation(")!=std::string::npos);
     CHECK(down.find("DispatchPickerPointerActivation(")!=std::string::npos);
     CHECK(down.find("mouseEvent.rowIndex=activation.rowIndex;")!=
           std::string::npos);
     CHECK(down.find("EmitPickerGestureTrace(")!=std::string::npos);
-    CHECK(down.find("fullTitle")==std::string::npos);
-    CHECK(down.find("runtimeKey")==std::string::npos);
 
     const std::string move=SourceSection(
         source,"case WM_MOUSEMOVE:","case WM_LBUTTONUP:");
@@ -28381,6 +28381,113 @@ static void test_picker_drag_runtime_wiring_and_conflict_gates_are_explicit(){
         lifetime,"ResetPickerPointerGesture(hwnd,true)")==2);
     CHECK(CountSourceText(
         lifetime,"EndPickerVisualSessionRuntime();")==2);
+}
+
+static void test_picker_drag_preview_snapshot_is_presentation_only(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string state=ReadSourceFile(L"src\\picker_state.hpp");
+    CHECK(!source.empty() && !state.empty());
+
+    const std::string previewState=SourceSection(
+        source,"struct PickerDragPreviewState {",
+        "struct RuntimeRecordBinding {");
+    CHECK(!previewState.empty());
+    CHECK(previewState.find("std::wstring fullTitle;")!=
+          std::string::npos);
+    CHECK(previewState.find("std::string runtimeKey;")!=
+          std::string::npos);
+    CHECK(previewState.find("WindowIdentityKey identity;")!=
+          std::string::npos);
+    CHECK(previewState.find("SIZE size={0,0};")!=std::string::npos);
+    CHECK(previewState.find("POINT grabOffset={0,0};")!=
+          std::string::npos);
+    CHECK(previewState.find("POINT pointer={0,0};")!=
+          std::string::npos);
+    CHECK(previewState.find("uint64_t modelGeneration=0;")!=
+          std::string::npos);
+    CHECK(previewState.find("uint64_t rowLayoutEpoch=0;")!=
+          std::string::npos);
+    CHECK(previewState.find(
+        "static PickerDragPreviewState g_pickerDragPreview;")!=
+          std::string::npos);
+
+    const std::string gestureState=SourceSection(
+        state,"struct PickerPointerGesture {",
+        "struct PickerGestureResolution {");
+    CHECK(!gestureState.empty());
+    CHECK(gestureState.find("fullTitle")==std::string::npos);
+    CHECK(gestureState.find("runtimeKey")==std::string::npos);
+    CHECK(gestureState.find("grabOffset")==std::string::npos);
+
+    const std::string capture=SourceSection(
+        source,"static bool CapturePickerDragPreview(",
+        "static int HitPickerTile(");
+    CHECK(!capture.empty());
+    CHECK(capture.find("PickerDragPreviewState staged;")!=
+          std::string::npos);
+    CHECK(capture.find("staged.fullTitle=snapshot.fullTitle;")!=
+          std::string::npos);
+    CHECK(capture.find("staged.runtimeKey=snapshot.runtimeKey;")!=
+          std::string::npos);
+    CHECK(capture.find("staged.identity=snapshot.action.identity;")!=
+          std::string::npos);
+    CHECK(capture.find(
+        "static_cast<long long>(snapshot.hitRect.right)-")!=
+          std::string::npos);
+    CHECK(capture.find(
+        "static_cast<long long>(snapshot.hitRect.bottom)-")!=
+          std::string::npos);
+    CHECK(capture.find("static_cast<long long>(pointer.x)-")!=
+          std::string::npos);
+    CHECK(capture.find("static_cast<long long>(pointer.y)-")!=
+          std::string::npos);
+    CHECK(capture.find(
+        "staged.modelGeneration=snapshot.action.modelGeneration;")!=
+          std::string::npos);
+    CHECK(capture.find(
+        "staged.rowLayoutEpoch=snapshot.action.rowLayoutEpoch;")!=
+          std::string::npos);
+    CHECK(capture.find("g_pickerDragPreview.swap(staged);")!=
+          std::string::npos);
+    CHECK(capture.find("catch(...)")!=std::string::npos);
+    CHECK(capture.find("ClearPickerDragPreview();")!=
+          std::string::npos);
+
+    const std::string down=SourceSection(
+        source,"case WM_LBUTTONDOWN:","case WM_MOUSEMOVE:");
+    const size_t snapshot=down.find(
+        "const PickerRowHitSnapshot& hitSnapshot=");
+    const size_t arm=down.find("ArmPickerRowGesture(",snapshot);
+    const size_t preview=down.find(
+        "(void)CapturePickerDragPreview(hitSnapshot,pt);",arm);
+    const size_t captureMouse=down.find("SetCapture(hwnd)",preview);
+    CHECK(snapshot!=std::string::npos && arm!=std::string::npos &&
+          preview!=std::string::npos && captureMouse!=std::string::npos);
+    CHECK(snapshot<arm && arm<preview && preview<captureMouse);
+
+    const std::string reset=SourceSection(
+        source,"static bool ResetPickerPointerGesture(",
+        "static std::wstring LowerW(");
+    const size_t clear=reset.find("ClearPickerDragPreview();");
+    const size_t cancel=reset.find(
+        "CancelPickerRowGesture(g_pickerGesture)");
+    CHECK(clear!=std::string::npos && cancel!=std::string::npos &&
+          clear<cancel);
+
+    const std::string endSession=SourceSection(
+        source,"static void EndPickerVisualSessionRuntime() noexcept {",
+        "static void HidePicker(");
+    const size_t directClear=endSession.find("ClearPickerDragPreview();");
+    const size_t directCancel=endSession.find(
+        "CancelPickerRowGesture(g_pickerGesture)");
+    CHECK(directClear!=std::string::npos &&
+          directCancel!=std::string::npos && directClear<directCancel);
+
+    const std::string dispatch=SourceSection(
+        source,"static PickerActionDispatchResult BeginPickerAction(",
+        "class PickerTraceCaptureEmitScope");
+    CHECK(dispatch.find("g_pickerDragPreview")==std::string::npos);
+    CHECK(dispatch.find("CapturePickerDragPreview")==std::string::npos);
 }
 
 static void test_picker_row_hover_runtime_uses_full_hit_geometry(){
@@ -28809,6 +28916,7 @@ int main(){
     test_picker_trace_task9_runtime_wiring_is_causal_and_private();
     test_picker_trace_task10_runtime_anchors_and_privacy_are_locked();
     test_picker_drag_runtime_wiring_and_conflict_gates_are_explicit();
+    test_picker_drag_preview_snapshot_is_presentation_only();
     test_picker_row_hover_runtime_uses_full_hit_geometry();
     test_picker_exact_activation_runtime_has_no_fallback_target();
     test_picker_visual_session_runtime_end_paths_are_explicit();

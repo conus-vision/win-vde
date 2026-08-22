@@ -116,6 +116,30 @@ static HWND g_main=nullptr;
 static void Balloon(const std::wstring& text);
 static PickerState g_picker;
 static PickerPointerGesture g_pickerGesture;
+struct PickerDragPreviewState {
+    bool captured=false;
+    std::wstring fullTitle;
+    std::string runtimeKey;
+    WindowIdentityKey identity;
+    SIZE size={0,0};
+    POINT grabOffset={0,0};
+    POINT pointer={0,0};
+    uint64_t modelGeneration=0;
+    uint64_t rowLayoutEpoch=0;
+
+    void swap(PickerDragPreviewState& other) noexcept {
+        std::swap(captured,other.captured);
+        fullTitle.swap(other.fullTitle);
+        runtimeKey.swap(other.runtimeKey);
+        std::swap(identity,other.identity);
+        std::swap(size,other.size);
+        std::swap(grabOffset,other.grabOffset);
+        std::swap(pointer,other.pointer);
+        std::swap(modelGeneration,other.modelGeneration);
+        std::swap(rowLayoutEpoch,other.rowLayoutEpoch);
+    }
+};
+static PickerDragPreviewState g_pickerDragPreview;
 static PickerTraceSession g_pickerTrace;
 static PickerTabSearchCacheState g_pickerTabSearchCache;
 static bool g_suppressPickerCtrlSpaceChar=false;
@@ -5762,6 +5786,59 @@ using PickerPaintCache=PickerPaintCacheState<RowRec>;
 static PickerPaintCache g_pickerPaintCache;
 static PickerHoverEventState g_pickerHoverState;
 
+static void ClearPickerDragPreview() noexcept {
+    PickerDragPreviewState empty;
+    g_pickerDragPreview.swap(empty);
+}
+
+static bool CapturePickerDragPreview(
+        const PickerRowHitSnapshot& snapshot,POINT pointer) noexcept {
+    try {
+        PickerDragPreviewState staged;
+        const long long width=
+            static_cast<long long>(snapshot.hitRect.right)-
+            snapshot.hitRect.left;
+        const long long height=
+            static_cast<long long>(snapshot.hitRect.bottom)-
+            snapshot.hitRect.top;
+        const long long grabX=
+            static_cast<long long>(pointer.x)-snapshot.hitRect.left;
+        const long long grabY=
+            static_cast<long long>(pointer.y)-snapshot.hitRect.top;
+        if(width<=0 || height<=0 ||
+           width>(std::numeric_limits<LONG>::max)() ||
+           height>(std::numeric_limits<LONG>::max)() ||
+           grabX<(std::numeric_limits<LONG>::min)() ||
+           grabX>(std::numeric_limits<LONG>::max)() ||
+           grabY<(std::numeric_limits<LONG>::min)() ||
+           grabY>(std::numeric_limits<LONG>::max)()){
+            ClearPickerDragPreview();
+            return false;
+        }
+        staged.size={
+            static_cast<LONG>(width),static_cast<LONG>(height)};
+        staged.grabOffset={
+            static_cast<LONG>(grabX),static_cast<LONG>(grabY)};
+        if(!PickerDragPreviewGeometryValid(
+                staged.size,staged.grabOffset)){
+            ClearPickerDragPreview();
+            return false;
+        }
+        staged.fullTitle=snapshot.fullTitle;
+        staged.runtimeKey=snapshot.runtimeKey;
+        staged.identity=snapshot.action.identity;
+        staged.pointer=pointer;
+        staged.modelGeneration=snapshot.action.modelGeneration;
+        staged.rowLayoutEpoch=snapshot.action.rowLayoutEpoch;
+        staged.captured=true;
+        g_pickerDragPreview.swap(staged);
+        return true;
+    } catch(...) {
+        ClearPickerDragPreview();
+        return false;
+    }
+}
+
 static int HitPickerTile(POINT point) noexcept {
     for(size_t index=0;index<g_tiles.size();++index)
         if(PtInRect(&g_tiles[index].rc,point))
@@ -5822,6 +5899,7 @@ static bool ResetPickerPointerGesture(
     const bool changed=
         g_pickerGesture.phase!=PickerPointerPhase::Idle;
     const PickerPointerGesture facts=g_pickerGesture;
+    ClearPickerDragPreview();
     CancelPickerRowGesture(g_pickerGesture);
     if(changed && emitCancellation)
         EmitPickerGestureTrace(
@@ -7628,6 +7706,7 @@ static void TrackPickerHoverTooltip(HWND hwnd,const RowRec& row,
 static void EndPickerVisualSessionRuntime() noexcept {
     const bool releaseCapture=
         g_main && GetCapture()==g_main;
+    ClearPickerDragPreview();
     CancelPickerRowGesture(g_pickerGesture);
     if(releaseCapture)
         ReleaseCapture();
@@ -10720,9 +10799,11 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                 if(hitIndex<0 ||
                    hitIndex>=static_cast<int>(
                        g_pickerPaintCache.hoverRows.size())) return;
-                const PickerRowActionSnapshot row=
+                const PickerRowHitSnapshot& hitSnapshot=
                     g_pickerPaintCache.hoverRows[
-                        hitIndex].snapshot.action;
+                        hitIndex].snapshot;
+                const PickerRowActionSnapshot row=
+                    hitSnapshot.action;
                 if(row.tileIndex!=rowTileIndex ||
                    !ArmPickerRowGesture(
                        g_pickerGesture,row,pt,ctrl,
@@ -10732,6 +10813,7 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                     g_pickerGesture,PickerPointerPhase::Idle,
                     PickerPointerPhase::Armed,
                     PickerGestureAction::None,false,-1);
+                (void)CapturePickerDragPreview(hitSnapshot,pt);
                 SetCapture(hwnd);
                 const bool captureOwned=GetCapture()==hwnd;
                 if(!captureOwned)
