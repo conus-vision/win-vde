@@ -5618,6 +5618,7 @@ static WindowIdentityKey CapturePickerWindowIdentity(
 struct PickerEnumContext {
     std::vector<Tile>* tiles=nullptr;
     std::set<std::string>* liveKeys=nullptr;
+    GUID currentDesktop{};
     std::map<DWORD,uint64_t> processStarts;
     uint64_t modelGeneration=0;
     uint64_t enumSequence=0;
@@ -5720,7 +5721,34 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
                 traceEvent.tileIndex=candidate.index;
                 break;
             }
-        if(!tile)
+        Tile* currentTile=nullptr;
+        if(!tile && !GuidIsZero(context.currentDesktop))
+            for(Tile& candidate : *context.tiles)
+                if(GuidEq(candidate.guid,context.currentDesktop)){
+                    currentTile=&candidate;
+                    break;
+                }
+        BOOL onCurrentDesktop=FALSE;
+        HRESULT currentMembershipResult=E_NOTIMPL;
+        if(!tile && currentTile){
+            try {
+                currentMembershipResult=g_vdmDoc->
+                    IsWindowOnCurrentVirtualDesktop(hwnd,&onCurrentDesktop);
+            } catch(...) {
+                currentMembershipResult=E_FAIL;
+            }
+        }
+        const PickerDesktopTileRoute desktopRoute=
+            DecidePickerDesktopTileRoute(
+                tile!=nullptr,currentTile!=nullptr,
+                currentMembershipResult,onCurrentDesktop!=FALSE);
+        const bool currentDesktopFallback=
+            desktopRoute==PickerDesktopTileRoute::CurrentDesktopFallback;
+        if(currentDesktopFallback){
+            tile=currentTile;
+            traceEvent.tileIndex=tile->index;
+        }
+        if(desktopRoute==PickerDesktopTileRoute::Skip)
             return finish(
                 PickerTraceEnumDecision::SkipDesktopTileMissing,
                 HandlePickerRowReadResult(
@@ -5779,13 +5807,23 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
         }
         traceEvent.identityComplete=identityComplete;
         traceEvent.recapture=recapture;
-        const PickerRowAdmission admission=DecidePickerRowAdmission(
+        const PickerRowAdmission baseAdmission=DecidePickerRowAdmission(
             true,true,true,identityComplete,recapture);
-        const PickerTraceEnumDecision decision=DecidePickerTraceEnumDecision(
+        const PickerTraceEnumDecision baseDecision=
+            DecidePickerTraceEnumDecision(
             altTab.reason,true,traceEvent.desktopResult,true,
             traceEvent.tileIndex,length,copied,
             traceEvent.tid!=0 && pid!=0,
             traceEvent.processStartAvailable,recapture);
+        const PickerFinalRowRoute<PickerTraceEnumDecision> finalRoute=
+            FinalizePickerRowRoute(
+                baseAdmission,desktopRoute,baseDecision,
+                PickerTraceEnumDecision::
+                    DisplayOnlyCurrentDesktopFallback,
+                PickerTraceEnumDecision::
+                    VerifiedCurrentDesktopFallback);
+        const PickerRowAdmission admission=finalRoute.admission;
+        const PickerTraceEnumDecision decision=finalRoute.decision;
         if(admission==PickerRowAdmission::Skip)
             return finish(decision,TRUE);
 
@@ -5797,14 +5835,8 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
         if(!item.titleLC.empty()) CharLowerW(&item.titleLC[0]);
         item.search=item.titleLC;
         if(PickerRowUsesStableIdentity(admission)){
-            FastWin fast;
-            fast.hwnd=hwnd;
-            fast.pid=pid;
-            fast.processStart=identity.processStart;
-            fast.desktop=desktop;
-            fast.title=title;
-            item.identity=IdentityOf(fast);
-            item.runtimeKey=RuntimeKey(fast);
+            item.identity=identity;
+            item.runtimeKey=RuntimeKey(identity);
             if(!context.liveKeys){
                 const BOOL productResult=HandlePickerRowReadResult(
                     context,PickerRowReadResult::GlobalSnapshotFailure);
@@ -5970,6 +6002,7 @@ static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi,
 
             enumContext.tiles=&tiles;
             enumContext.liveKeys=&liveKeys;
+            enumContext.currentDesktop=observedCurrent;
             enumContext.modelGeneration=attemptedGeneration;
             enumContext.traceActive=g_pickerTrace.active();
             if(enumContext.traceActive){
@@ -7291,6 +7324,8 @@ static PickerObservation ExecutePickerEffect(
             break;
         case PickerEffectKind::MovePopup: {
             observation.event=PickerEvent::ApiCompleted;
+            if(g_picker.transition.popupRoute!=PickerPopupRoute::Managed)
+                break;
             WindowIdentityRecapture identity=
                 WindowIdentityRecapture::Indeterminate;
             bool invoked=false;
@@ -7305,6 +7340,8 @@ static PickerObservation ExecutePickerEffect(
         }
         case PickerEffectKind::ReadPopup: {
             observation.event=PickerEvent::ReadbackCompleted;
+            if(g_picker.transition.popupRoute!=PickerPopupRoute::Managed)
+                break;
             PickerTraceWindowDesktopFacts facts;
             ReadPickerWindowDesktop(
                 g_main,observation.popupRead,
@@ -7611,6 +7648,7 @@ static void QueuePickerEffect(const PickerEffect& effect) noexcept {
 struct PickerRuntimeTerminalTraceSnapshot {
     PickerTraceTransitionTerminalEvent terminal;
     HWND target=nullptr;
+    PickerPopupRoute popupRoute=PickerPopupRoute::Managed;
     uint64_t effectSerial=0;
 };
 
@@ -7653,6 +7691,7 @@ CapturePickerRuntimeTerminalTraceSnapshot() noexcept {
     result.terminal.popupDesktop=transition.observedPopupDesktop;
     result.terminal.currentDesktop=transition.observedCurrentDesktop;
     result.target=reinterpret_cast<HWND>(transition.target.hwnd);
+    result.popupRoute=transition.popupRoute;
     result.effectSerial=transition.effectSerial;
     return result;
 }
@@ -7667,13 +7706,15 @@ static void ReadPickerRuntimeTerminalTraceSnapshot(
     EmitPickerTraceWindowDesktopFacts(
         PickerTraceApiKind::GetWindowDesktopIdTarget,snapshot.target,
         snapshot.terminal.generation,snapshot.effectSerial,targetFacts);
-    PickerTraceWindowDesktopFacts popupFacts;
-    ReadPickerWindowDesktop(
-        g_main,snapshot.terminal.popupRead,
-        snapshot.terminal.popupDesktop,&popupFacts);
-    EmitPickerTraceWindowDesktopFacts(
-        PickerTraceApiKind::GetWindowDesktopIdPopup,g_main,
-        snapshot.terminal.generation,snapshot.effectSerial,popupFacts);
+    if(snapshot.popupRoute==PickerPopupRoute::Managed){
+        PickerTraceWindowDesktopFacts popupFacts;
+        ReadPickerWindowDesktop(
+            g_main,snapshot.terminal.popupRead,
+            snapshot.terminal.popupDesktop,&popupFacts);
+        EmitPickerTraceWindowDesktopFacts(
+            PickerTraceApiKind::GetWindowDesktopIdPopup,g_main,
+            snapshot.terminal.generation,snapshot.effectSerial,popupFacts);
+    }
     PickerTraceCurrentDesktopFacts currentFacts;
     snapshot.terminal.currentDesktop=CurrentDesktopGuid(&currentFacts);
     snapshot.terminal.currentRead=currentFacts.validity;
@@ -8237,17 +8278,8 @@ static PickerTraceMoveBeginReason BeginVerifiedPickerMove(
         PickerTraceCurrentDesktopFacts currentFacts;
         const GUID currentOrigin=CurrentDesktopGuid(&currentFacts);
         EmitPickerTraceCurrentDesktopFacts(0,0,currentFacts);
-        PickerReadValidity popupValidity=PickerReadValidity::Unavailable;
-        GUID popupOrigin={0};
-        PickerTraceWindowDesktopFacts popupFacts;
-        ReadPickerWindowDesktop(
-            g_main,popupValidity,popupOrigin,&popupFacts);
-        EmitPickerTraceWindowDesktopFacts(
-            PickerTraceApiKind::GetWindowDesktopIdPopup,
-            g_main,0,0,popupFacts);
         traceEvent.destination=destination;
         traceEvent.currentOrigin=currentOrigin;
-        traceEvent.popupOrigin=popupOrigin;
         if(GuidIsZero(destination))
             return finish(PickerTraceMoveBeginReason::DestinationZero);
         PickerTraceDesktopLookupContext lookupContext;
@@ -8261,8 +8293,60 @@ static PickerTraceMoveBeginReason BeginVerifiedPickerMove(
         if(GuidIsZero(currentOrigin))
             return finish(
                 PickerTraceMoveBeginReason::CurrentDesktopUnavailable);
-        if(popupValidity!=PickerReadValidity::Valid ||
-           GuidIsZero(popupOrigin))
+
+        PickerPopupBindingFacts popupBindingFacts;
+        const PickerPopupBindingResult popupBinding=
+            DrivePickerPopupBinding(
+                currentOrigin,
+                [&]() -> PickerPopupDesktopRead {
+                    PickerReadValidity validity=
+                        PickerReadValidity::Unavailable;
+                    GUID observed{};
+                    PickerTraceWindowDesktopFacts facts;
+                    ReadPickerWindowDesktop(
+                        g_main,validity,observed,&facts);
+                    EmitPickerTraceWindowDesktopFacts(
+                        PickerTraceApiKind::GetWindowDesktopIdPopup,
+                        g_main,0,0,facts);
+                    return PickerPopupDesktopRead(
+                        facts.result,validity,observed);
+                },
+                [&](const GUID& requested) -> PickerPopupDesktopMove {
+                    bool invoked=false;
+                    HRESULT result=E_FAIL;
+                    try {
+                        invoked=true;
+                        result=g_vdmDoc->MoveWindowToDesktop(
+                            g_main,currentOrigin);
+                    } catch(...) {
+                        result=E_FAIL;
+                    }
+                    EmitPickerTraceHResult(
+                        PickerTraceApiKind::MoveWindowToDesktop,
+                        0,0,result,invoked,g_main,requested);
+                    return PickerPopupDesktopMove(invoked,result);
+                },popupBindingFacts);
+        const bool popupIsToolWindow=
+            (GetWindowLongPtrW(g_main,GWL_EXSTYLE)&WS_EX_TOOLWINDOW)!=0;
+        const PickerPopupRoute popupRoute=DecidePickerPopupRoute(
+            popupBinding,popupBindingFacts,popupIsToolWindow);
+        PickerReadValidity popupValidity=PickerReadValidity::Unavailable;
+        GUID popupOrigin{};
+        if(popupBinding==PickerPopupBindingResult::UseObserved){
+            popupValidity=popupBindingFacts.initial.validity;
+            popupOrigin=popupBindingFacts.initial.desktop;
+        } else if(popupBinding==PickerPopupBindingResult::Repaired){
+            popupValidity=popupBindingFacts.verify.validity;
+            popupOrigin=popupBindingFacts.verify.desktop;
+        }
+        traceEvent.popupOrigin=popupOrigin;
+        const bool popupRouteAccepted=
+            (popupRoute==PickerPopupRoute::Managed &&
+             popupValidity==PickerReadValidity::Valid &&
+             !GuidIsZero(popupOrigin)) ||
+            (popupRoute==PickerPopupRoute::StickyUnmanaged &&
+             GuidIsZero(popupOrigin));
+        if(!popupRouteAccepted)
             return finish(
                 PickerTraceMoveBeginReason::PopupDesktopUnavailable);
 
@@ -8327,6 +8411,7 @@ static PickerTraceMoveBeginReason BeginVerifiedPickerMove(
         prepared.app=fast.app;
         prepared.targetOrigin=fast.desktop;
         prepared.popupOrigin=popupOrigin;
+        prepared.popupRoute=popupRoute;
         prepared.currentOrigin=currentOrigin;
         prepared.destination=destination;
         prepared.capturedTitle=fast.title;

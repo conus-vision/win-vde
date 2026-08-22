@@ -255,6 +255,8 @@ const char* PickerTraceEnumDecisionName(PickerTraceEnumDecision value) noexcept 
     VDE_TRACE_NAME_CASE(PickerTraceEnumDecision,DisplayOnlyPidUnavailable,"display_only_pid_unavailable");
     VDE_TRACE_NAME_CASE(PickerTraceEnumDecision,DisplayOnlyProcessStartUnavailable,"display_only_process_start_unavailable");
     VDE_TRACE_NAME_CASE(PickerTraceEnumDecision,DisplayOnlyIdentityIndeterminate,"display_only_identity_indeterminate");
+    VDE_TRACE_NAME_CASE(PickerTraceEnumDecision,DisplayOnlyCurrentDesktopFallback,"display_only_current_desktop_fallback");
+    VDE_TRACE_NAME_CASE(PickerTraceEnumDecision,VerifiedCurrentDesktopFallback,"verified_current_desktop_fallback");
     VDE_TRACE_NAME_CASE(PickerTraceEnumDecision,Verified,"verified");
     VDE_TRACE_NAME_CASE(PickerTraceEnumDecision,AllocationFailure,"allocation_failure");
     VDE_TRACE_NAME_CASE(PickerTraceEnumDecision,GlobalSnapshotFailure,"global_snapshot_failure");

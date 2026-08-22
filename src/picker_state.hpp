@@ -469,6 +469,7 @@ inline PickerEffectExecutionRoute RoutePickerEffectExecution(
 
 enum class PickerReadValidity { Unknown, Valid, Unavailable };
 enum class PickerIdentityValidity { Unknown, Match, Lost, Indeterminate };
+enum class PickerPopupRoute { Managed, StickyUnmanaged, Reject };
 enum class PopupSaveStatus { NotTracked, Saved, Failed };
 enum class PopupSaveFailure {
     None, IdentityLost, IdentityIndeterminate, Classification,
@@ -523,6 +524,7 @@ struct PickerTransition {
     std::wstring capturedTitle;
     GUID targetOrigin={0};
     GUID popupOrigin={0};
+    PickerPopupRoute popupRoute=PickerPopupRoute::Managed;
     GUID currentOrigin={0};
     GUID destination={0};
     GUID observedTargetDesktop={0};
@@ -578,6 +580,7 @@ struct PickerTransition {
         capturedTitle.swap(other.capturedTitle);
         std::swap(targetOrigin,other.targetOrigin);
         std::swap(popupOrigin,other.popupOrigin);
+        std::swap(popupRoute,other.popupRoute);
         std::swap(currentOrigin,other.currentOrigin);
         std::swap(destination,other.destination);
         std::swap(observedTargetDesktop,other.observedTargetDesktop);
@@ -1968,6 +1971,8 @@ inline PickerEffect PickerIssueTarget(PickerState& state,
 inline PickerEffect PickerIssuePopup(PickerState& state,
                                      bool rollback) noexcept {
     PickerTransition& transition=state.transition;
+    if(transition.popupRoute!=PickerPopupRoute::Managed)
+        return PickerNoEffect();
     int& attempts=rollback ? transition.rollbackPopupAttempts
                            : transition.forwardPopupAttempts;
     if(attempts>=4) return PickerNoEffect();
@@ -2006,6 +2011,8 @@ inline PickerEffect PickerContinueRollbackAfterPopup(
 
 inline PickerEffect PickerContinueRollbackAfterTarget(
         PickerState& state) noexcept {
+    if(state.transition.popupRoute==PickerPopupRoute::StickyUnmanaged)
+        return PickerContinueRollbackAfterPopup(state);
     if(state.transition.popupMayHaveMoved)
         return PickerIssuePopup(state,true);
     if(state.transition.rollbackVerificationRequired){
@@ -2043,6 +2050,26 @@ inline PickerEffect PickerForwardFailed(PickerState& state,
     return PickerBeginRollback(state,diagnostic);
 }
 
+inline PickerEffect PickerContinueForwardToDestination(
+        PickerState& state) noexcept {
+    PickerTransition& transition=state.transition;
+    const bool popupReady=
+        transition.popupRoute==PickerPopupRoute::StickyUnmanaged ||
+        PickerReadMatches(transition.observedPopupValidity,
+            transition.observedPopupDesktop,transition.destination);
+    if(PickerReadMatches(transition.observedCurrentValidity,
+            transition.observedCurrentDesktop,transition.destination) &&
+       popupReady){
+        transition.phase=PickerPhase::SaveExactTarget;
+        transition.commitCutoffReached=true;
+        return EmitPickerEffect(state,PickerEffectKind::SaveExactTarget);
+    }
+    if(transition.forwardSwitchAttempts>=4)
+        return PickerForwardFailed(
+            state,L"The desktop switch attempt budget was exhausted.");
+    return PickerIssueSwitch(state,false);
+}
+
 inline PickerEffect PickerResumeAfterHide(PickerState& state) noexcept {
     PickerTransition& transition=state.transition;
     switch(transition.resumeAfterHide){
@@ -2062,6 +2089,8 @@ inline PickerEffect PickerResumeAfterHide(PickerState& state) noexcept {
         return PickerContinueRollbackAfterTarget(state);
     case PickerPhase::RollbackPopupIssue:
     case PickerPhase::RollbackPopupVerify:
+        if(transition.popupRoute==PickerPopupRoute::StickyUnmanaged)
+            return PickerContinueRollbackAfterPopup(state);
         if(transition.popupMayHaveMoved ||
            transition.rollbackVerificationRequired){
             transition.phase=PickerPhase::RollbackPopupVerify;
@@ -2093,6 +2122,11 @@ inline PickerEffect AdvancePickerTransition(
         return PickerNoEffect();
 
     if(observation.event==PickerEvent::Begin){
+        const bool popupRouteValid=
+            (transition.popupRoute==PickerPopupRoute::Managed &&
+             !GuidIsZero(transition.popupOrigin)) ||
+            (transition.popupRoute==PickerPopupRoute::StickyUnmanaged &&
+             GuidIsZero(transition.popupOrigin));
         if(transition.phase!=PickerPhase::Idle ||
            transition.pendingEffect!=PickerEffectKind::None ||
            transition.reservationToken.owner!=MoveOwner::Picker ||
@@ -2105,7 +2139,7 @@ inline PickerEffect AdvancePickerTransition(
            !GuidEq(state.selectedDesktop,transition.destination) ||
            !GuidEq(state.currentDesktop,transition.currentOrigin) ||
            GuidIsZero(transition.targetOrigin) ||
-           GuidIsZero(transition.popupOrigin) ||
+           !popupRouteValid ||
            GuidIsZero(transition.currentOrigin) ||
            GuidIsZero(transition.destination))
             return PickerNoEffect();
@@ -2136,10 +2170,15 @@ inline PickerEffect AdvancePickerTransition(
         transition.switchUnresolvedBeforeIssue=false;
         transition.postSwitchPopupRepair=false;
         transition.observedTargetDesktop=transition.targetOrigin;
-        transition.observedPopupDesktop=transition.popupOrigin;
+        transition.observedPopupDesktop=
+            transition.popupRoute==PickerPopupRoute::Managed
+                ? transition.popupOrigin : GUID{};
         transition.observedCurrentDesktop=transition.currentOrigin;
         transition.observedTargetValidity=PickerReadValidity::Valid;
-        transition.observedPopupValidity=PickerReadValidity::Valid;
+        transition.observedPopupValidity=
+            transition.popupRoute==PickerPopupRoute::Managed
+                ? PickerReadValidity::Valid
+                : PickerReadValidity::Unavailable;
         transition.observedCurrentValidity=PickerReadValidity::Valid;
         transition.diagnostic.clear();
         return PickerIssueTarget(state,false);
@@ -2249,6 +2288,10 @@ inline PickerEffect AdvancePickerTransition(
                 return PickerForwardFailed(
                     state,L"The target identity changed before moving the picker.");
             }
+            if(transition.popupRoute==PickerPopupRoute::StickyUnmanaged){
+                transition.phase=PickerPhase::IdentityVerifyBeforeSwitch;
+                return PickerContinueForwardToDestination(state);
+            }
             return PickerIssuePopup(state,false);
         }
         break;
@@ -2309,21 +2352,7 @@ inline PickerEffect AdvancePickerTransition(
                 return PickerForwardFailed(
                     state,L"The target identity changed before switching desktops.");
             }
-            if(PickerReadMatches(transition.observedCurrentValidity,
-                    transition.observedCurrentDesktop,
-                    transition.destination) &&
-               PickerReadMatches(transition.observedPopupValidity,
-                    transition.observedPopupDesktop,
-                    transition.destination)){
-                transition.phase=PickerPhase::SaveExactTarget;
-                transition.commitCutoffReached=true;
-                return EmitPickerEffect(
-                    state,PickerEffectKind::SaveExactTarget);
-            }
-            if(transition.forwardSwitchAttempts>=4)
-                return PickerForwardFailed(
-                    state,L"The desktop switch attempt budget was exhausted.");
-            return PickerIssueSwitch(state,false);
+            return PickerContinueForwardToDestination(state);
         }
         break;
 
@@ -2355,6 +2384,13 @@ inline PickerEffect AdvancePickerTransition(
             transition.observedCurrentDesktop=observation.actualCurrentDesktop;
             if(PickerReadMatches(observation.currentRead,
                     observation.actualCurrentDesktop,transition.destination)){
+                if(transition.popupRoute==
+                        PickerPopupRoute::StickyUnmanaged){
+                    transition.phase=PickerPhase::SaveExactTarget;
+                    transition.commitCutoffReached=true;
+                    return EmitPickerEffect(
+                        state,PickerEffectKind::SaveExactTarget);
+                }
                 return EmitPickerEffect(state,PickerEffectKind::ReadPopup);
             }
             transition.switchMayHaveChanged=!PickerReadMatches(
@@ -2662,6 +2698,171 @@ inline bool CompletePickerTargetRecapture(
 }
 
 enum class PickerRowAdmission { Skip, DisplayOnly, Verified };
+
+enum class PickerDesktopTileRoute { Exact, CurrentDesktopFallback, Skip };
+
+inline PickerDesktopTileRoute DecidePickerDesktopTileRoute(
+        bool exactTileAvailable,bool currentTileAvailable,
+        HRESULT currentMembershipResult,bool onCurrentDesktop) noexcept {
+    if(exactTileAvailable) return PickerDesktopTileRoute::Exact;
+    if(currentTileAvailable && SUCCEEDED(currentMembershipResult) &&
+       onCurrentDesktop)
+        return PickerDesktopTileRoute::CurrentDesktopFallback;
+    return PickerDesktopTileRoute::Skip;
+}
+
+template<class Decision>
+struct PickerFinalRowRoute {
+    PickerRowAdmission admission;
+    Decision decision;
+
+    PickerFinalRowRoute(PickerRowAdmission finalAdmission,
+                        Decision finalDecision) noexcept
+        : admission(finalAdmission),decision(finalDecision) {}
+};
+
+template<class Decision>
+inline PickerFinalRowRoute<Decision> FinalizePickerRowRoute(
+        PickerRowAdmission baseAdmission,
+        PickerDesktopTileRoute desktopRoute,
+        Decision baseDecision,Decision displayOnlyFallbackDecision,
+        Decision verifiedFallbackDecision) noexcept {
+    if(desktopRoute==PickerDesktopTileRoute::Skip)
+        return PickerFinalRowRoute<Decision>(
+            PickerRowAdmission::Skip,baseDecision);
+    if(desktopRoute==PickerDesktopTileRoute::CurrentDesktopFallback &&
+       baseAdmission==PickerRowAdmission::Verified)
+        return PickerFinalRowRoute<Decision>(
+            PickerRowAdmission::Verified,verifiedFallbackDecision);
+    if(desktopRoute==PickerDesktopTileRoute::CurrentDesktopFallback &&
+       baseAdmission==PickerRowAdmission::DisplayOnly)
+        return PickerFinalRowRoute<Decision>(
+            PickerRowAdmission::DisplayOnly,displayOnlyFallbackDecision);
+    return PickerFinalRowRoute<Decision>(baseAdmission,baseDecision);
+}
+
+enum class PickerPopupDesktopAssociation {
+    UseObserved,
+    RepairToCurrent,
+    Reject
+};
+
+inline PickerPopupDesktopAssociation DecidePickerPopupDesktopAssociation(
+        PickerReadValidity validity,const GUID& observed,
+        const GUID& current) noexcept {
+    if(GuidIsZero(current))
+        return PickerPopupDesktopAssociation::Reject;
+    if(validity==PickerReadValidity::Valid)
+        return !GuidIsZero(observed)
+            ? PickerPopupDesktopAssociation::UseObserved
+            : PickerPopupDesktopAssociation::RepairToCurrent;
+    if(validity==PickerReadValidity::Unavailable && GuidIsZero(observed))
+        return PickerPopupDesktopAssociation::RepairToCurrent;
+    return PickerPopupDesktopAssociation::Reject;
+}
+
+struct PickerPopupDesktopRead {
+    HRESULT result=E_NOINTERFACE;
+    PickerReadValidity validity=PickerReadValidity::Unavailable;
+    GUID desktop{};
+
+    PickerPopupDesktopRead() noexcept=default;
+    PickerPopupDesktopRead(HRESULT value,PickerReadValidity readValidity,
+                           const GUID& readDesktop) noexcept
+        : result(value),validity(readValidity),desktop(readDesktop) {}
+};
+
+struct PickerPopupDesktopMove {
+    bool invoked=false;
+    HRESULT result=E_NOINTERFACE;
+
+    PickerPopupDesktopMove() noexcept=default;
+    PickerPopupDesktopMove(bool wasInvoked,HRESULT value) noexcept
+        : invoked(wasInvoked),result(value) {}
+};
+
+struct PickerPopupBindingFacts {
+    PickerPopupDesktopRead initial;
+    PickerPopupDesktopMove move;
+    PickerPopupDesktopRead verify;
+    bool moveAttempted=false;
+    bool verifyAttempted=false;
+};
+
+enum class PickerPopupBindingResult {
+    UseObserved,
+    Repaired,
+    CurrentUnavailable,
+    InitialUnsupported,
+    MoveUnavailable,
+    VerifyUnavailable,
+    VerifyMismatch,
+    Exception
+};
+
+template<class ReadCallback,class MoveCallback>
+inline PickerPopupBindingResult DrivePickerPopupBinding(
+        const GUID& current,ReadCallback&& read,MoveCallback&& move,
+        PickerPopupBindingFacts& facts) noexcept {
+    facts=PickerPopupBindingFacts{};
+    if(GuidIsZero(current))
+        return PickerPopupBindingResult::CurrentUnavailable;
+    try {
+        facts.initial=read();
+        const PickerPopupDesktopAssociation association=
+            DecidePickerPopupDesktopAssociation(
+                facts.initial.validity,facts.initial.desktop,current);
+        if(association==PickerPopupDesktopAssociation::UseObserved)
+            return PickerPopupBindingResult::UseObserved;
+        if(association!=PickerPopupDesktopAssociation::RepairToCurrent)
+            return PickerPopupBindingResult::InitialUnsupported;
+
+        const bool elementNotFound=
+            facts.initial.result==TYPE_E_ELEMENTNOTFOUND;
+        if(!elementNotFound)
+            return PickerPopupBindingResult::InitialUnsupported;
+
+        facts.moveAttempted=true;
+        facts.move=move(current);
+        if(!facts.move.invoked)
+            return PickerPopupBindingResult::MoveUnavailable;
+
+        facts.verifyAttempted=true;
+        facts.verify=read();
+        if(facts.verify.validity!=PickerReadValidity::Valid ||
+           GuidIsZero(facts.verify.desktop))
+            return PickerPopupBindingResult::VerifyUnavailable;
+        if(!GuidEq(facts.verify.desktop,current))
+            return PickerPopupBindingResult::VerifyMismatch;
+        return PickerPopupBindingResult::Repaired;
+    } catch(...) {
+        return PickerPopupBindingResult::Exception;
+    }
+}
+
+inline PickerPopupRoute DecidePickerPopupRoute(
+        PickerPopupBindingResult binding,
+        const PickerPopupBindingFacts& facts,
+        bool popupIsToolWindow) noexcept {
+    if(binding==PickerPopupBindingResult::UseObserved ||
+       binding==PickerPopupBindingResult::Repaired)
+        return PickerPopupRoute::Managed;
+    const bool exactUnmanagedSignature=
+        binding==PickerPopupBindingResult::VerifyUnavailable &&
+        popupIsToolWindow &&
+        facts.initial.result==TYPE_E_ELEMENTNOTFOUND &&
+        facts.initial.validity==PickerReadValidity::Unavailable &&
+        GuidIsZero(facts.initial.desktop) &&
+        facts.moveAttempted && facts.move.invoked &&
+        facts.move.result==S_OK &&
+        facts.verifyAttempted &&
+        facts.verify.result==TYPE_E_ELEMENTNOTFOUND &&
+        facts.verify.validity==PickerReadValidity::Unavailable &&
+        GuidIsZero(facts.verify.desktop);
+    return exactUnmanagedSignature
+        ? PickerPopupRoute::StickyUnmanaged
+        : PickerPopupRoute::Reject;
+}
 
 inline PickerRowAdmission DecidePickerRowAdmission(
         bool altTabEligible,bool desktopAvailable,bool titleAvailable,

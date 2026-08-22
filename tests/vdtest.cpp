@@ -1941,6 +1941,326 @@ static void test_picker_row_admission_keeps_displayable_unverified_windows(){
     CHECK(!PickerRowUsesStableIdentity(PickerRowAdmission::Skip));
 }
 
+static void test_picker_evidence_routes_are_fail_closed(){
+    CHECK(DecidePickerDesktopTileRoute(
+              true,false,E_FAIL,false)==PickerDesktopTileRoute::Exact);
+    CHECK(DecidePickerDesktopTileRoute(
+              false,true,S_OK,true)==
+          PickerDesktopTileRoute::CurrentDesktopFallback);
+    CHECK(DecidePickerDesktopTileRoute(
+              false,true,E_FAIL,true)==PickerDesktopTileRoute::Skip);
+    CHECK(DecidePickerDesktopTileRoute(
+              false,true,S_OK,false)==PickerDesktopTileRoute::Skip);
+    CHECK(DecidePickerDesktopTileRoute(
+              false,false,S_OK,true)==PickerDesktopTileRoute::Skip);
+
+    auto finalRoute=FinalizePickerRowRoute(
+        PickerRowAdmission::Verified,
+        PickerDesktopTileRoute::Exact,
+        PickerTraceEnumDecision::Verified,
+        PickerTraceEnumDecision::DisplayOnlyCurrentDesktopFallback,
+        PickerTraceEnumDecision::VerifiedCurrentDesktopFallback);
+    CHECK(finalRoute.admission==PickerRowAdmission::Verified);
+    CHECK(finalRoute.decision==PickerTraceEnumDecision::Verified);
+    finalRoute=FinalizePickerRowRoute(
+        PickerRowAdmission::Verified,
+        PickerDesktopTileRoute::CurrentDesktopFallback,
+        PickerTraceEnumDecision::Verified,
+        PickerTraceEnumDecision::DisplayOnlyCurrentDesktopFallback,
+        PickerTraceEnumDecision::VerifiedCurrentDesktopFallback);
+    CHECK(finalRoute.admission==PickerRowAdmission::Verified);
+    CHECK(finalRoute.decision==PickerTraceEnumDecision::
+          VerifiedCurrentDesktopFallback);
+    CHECK(PickerRowUsesStableIdentity(finalRoute.admission));
+    finalRoute=FinalizePickerRowRoute(
+        PickerRowAdmission::DisplayOnly,
+        PickerDesktopTileRoute::CurrentDesktopFallback,
+        PickerTraceEnumDecision::DisplayOnlyIdentityIndeterminate,
+        PickerTraceEnumDecision::DisplayOnlyCurrentDesktopFallback,
+        PickerTraceEnumDecision::VerifiedCurrentDesktopFallback);
+    CHECK(finalRoute.admission==PickerRowAdmission::DisplayOnly);
+    CHECK(finalRoute.decision==PickerTraceEnumDecision::
+          DisplayOnlyCurrentDesktopFallback);
+    finalRoute=FinalizePickerRowRoute(
+        PickerRowAdmission::Skip,
+        PickerDesktopTileRoute::CurrentDesktopFallback,
+        PickerTraceEnumDecision::SkipIdentityLost,
+        PickerTraceEnumDecision::DisplayOnlyCurrentDesktopFallback,
+        PickerTraceEnumDecision::VerifiedCurrentDesktopFallback);
+    CHECK(finalRoute.admission==PickerRowAdmission::Skip);
+    CHECK(finalRoute.decision==PickerTraceEnumDecision::SkipIdentityLost);
+    finalRoute=FinalizePickerRowRoute(
+        PickerRowAdmission::Verified,
+        PickerDesktopTileRoute::Skip,
+        PickerTraceEnumDecision::SkipDesktopTileMissing,
+        PickerTraceEnumDecision::DisplayOnlyCurrentDesktopFallback,
+        PickerTraceEnumDecision::VerifiedCurrentDesktopFallback);
+    CHECK(finalRoute.admission==PickerRowAdmission::Skip);
+    CHECK(finalRoute.decision==
+          PickerTraceEnumDecision::SkipDesktopTileMissing);
+
+    const GUID current=G(
+        L"{19190000-0000-0000-0000-000000000001}");
+    const GUID observed=G(
+        L"{19190000-0000-0000-0000-000000000002}");
+    CHECK(DecidePickerPopupDesktopAssociation(
+              PickerReadValidity::Valid,current,current)==
+          PickerPopupDesktopAssociation::UseObserved);
+    CHECK(DecidePickerPopupDesktopAssociation(
+              PickerReadValidity::Unavailable,GUID{},current)==
+          PickerPopupDesktopAssociation::RepairToCurrent);
+    CHECK(DecidePickerPopupDesktopAssociation(
+              PickerReadValidity::Valid,GUID{},current)==
+          PickerPopupDesktopAssociation::RepairToCurrent);
+    CHECK(DecidePickerPopupDesktopAssociation(
+              PickerReadValidity::Unavailable,GUID{},GUID{})==
+          PickerPopupDesktopAssociation::Reject);
+    CHECK(DecidePickerPopupDesktopAssociation(
+              PickerReadValidity::Valid,observed,current)==
+          PickerPopupDesktopAssociation::UseObserved);
+    CHECK(DecidePickerPopupDesktopAssociation(
+              PickerReadValidity::Unknown,GUID{},current)==
+          PickerPopupDesktopAssociation::Reject);
+
+    PickerPopupBindingFacts facts;
+    int readCalls=0,moveCalls=0;
+    std::vector<int> order;
+    PickerPopupBindingResult result=DrivePickerPopupBinding(
+        GUID{},
+        [&](){
+            ++readCalls;
+            return PickerPopupDesktopRead{};
+        },
+        [&](const GUID&){
+            ++moveCalls;
+            return PickerPopupDesktopMove{};
+        },facts);
+    CHECK(result==PickerPopupBindingResult::CurrentUnavailable);
+    CHECK(readCalls==0 && moveCalls==0);
+
+    readCalls=0; moveCalls=0; order.clear();
+    result=DrivePickerPopupBinding(
+        current,
+        [&](){
+            ++readCalls; order.push_back(1);
+            return PickerPopupDesktopRead(
+                S_OK,PickerReadValidity::Valid,current);
+        },
+        [&](const GUID&){
+            ++moveCalls; order.push_back(2);
+            return PickerPopupDesktopMove(true,S_OK);
+        },facts);
+    CHECK(result==PickerPopupBindingResult::UseObserved);
+    CHECK(readCalls==1 && moveCalls==0);
+    CHECK((order==std::vector<int>{1}));
+
+    readCalls=0; moveCalls=0; order.clear();
+    result=DrivePickerPopupBinding(
+        current,
+        [&](){
+            ++readCalls; order.push_back(1);
+            return readCalls==1
+                ? PickerPopupDesktopRead(
+                    TYPE_E_ELEMENTNOTFOUND,
+                    PickerReadValidity::Unavailable,GUID{})
+                : PickerPopupDesktopRead(
+                    S_OK,PickerReadValidity::Valid,current);
+        },
+        [&](const GUID& requested){
+            ++moveCalls; order.push_back(2);
+            CHECK(GuidEq(requested,current));
+            return PickerPopupDesktopMove(true,E_FAIL);
+        },facts);
+    CHECK(result==PickerPopupBindingResult::Repaired);
+    CHECK(readCalls==2 && moveCalls==1);
+    CHECK((order==std::vector<int>{1,2,1}));
+    CHECK(facts.move.invoked && facts.move.result==E_FAIL);
+    CHECK(facts.verify.validity==PickerReadValidity::Valid);
+    CHECK(GuidEq(facts.verify.desktop,current));
+
+    readCalls=0; moveCalls=0; order.clear();
+    result=DrivePickerPopupBinding(
+        current,
+        [&](){
+            ++readCalls; order.push_back(1);
+            return PickerPopupDesktopRead(
+                TYPE_E_ELEMENTNOTFOUND,
+                PickerReadValidity::Unavailable,GUID{});
+        },
+        [&](const GUID&){
+            ++moveCalls; order.push_back(2);
+            return PickerPopupDesktopMove(false,S_OK);
+        },facts);
+    CHECK(result==PickerPopupBindingResult::MoveUnavailable);
+    CHECK(readCalls==1 && moveCalls==1);
+    CHECK((order==std::vector<int>{1,2}));
+
+    readCalls=0; moveCalls=0;
+    result=DrivePickerPopupBinding(
+        current,
+        [&](){
+            ++readCalls;
+            return readCalls==1
+                ? PickerPopupDesktopRead(
+                    TYPE_E_ELEMENTNOTFOUND,
+                    PickerReadValidity::Unavailable,GUID{})
+                : PickerPopupDesktopRead(
+                    E_FAIL,PickerReadValidity::Unavailable,GUID{});
+        },
+        [&](const GUID&){
+            ++moveCalls;
+            return PickerPopupDesktopMove(true,S_OK);
+        },facts);
+    CHECK(result==PickerPopupBindingResult::VerifyUnavailable);
+    CHECK(readCalls==2 && moveCalls==1);
+
+    readCalls=0; moveCalls=0;
+    result=DrivePickerPopupBinding(
+        current,
+        [&](){
+            ++readCalls;
+            return readCalls==1
+                ? PickerPopupDesktopRead(
+                    TYPE_E_ELEMENTNOTFOUND,
+                    PickerReadValidity::Unavailable,GUID{})
+                : PickerPopupDesktopRead(
+                    S_OK,PickerReadValidity::Valid,observed);
+        },
+        [&](const GUID&){
+            ++moveCalls;
+            return PickerPopupDesktopMove(true,S_OK);
+        },facts);
+    CHECK(result==PickerPopupBindingResult::VerifyMismatch);
+    CHECK(readCalls==2 && moveCalls==1);
+
+    readCalls=0; moveCalls=0;
+    result=DrivePickerPopupBinding(
+        current,
+        [&](){
+            ++readCalls;
+            return PickerPopupDesktopRead(
+                E_ACCESSDENIED,PickerReadValidity::Unavailable,GUID{});
+        },
+        [&](const GUID&){
+            ++moveCalls;
+            return PickerPopupDesktopMove(true,S_OK);
+        },facts);
+    CHECK(result==PickerPopupBindingResult::InitialUnsupported);
+    CHECK(readCalls==1 && moveCalls==0);
+
+    readCalls=0; moveCalls=0;
+    result=DrivePickerPopupBinding(
+        current,
+        [&]() -> PickerPopupDesktopRead {
+            ++readCalls;
+            throw std::runtime_error("read");
+        },
+        [&](const GUID&){
+            ++moveCalls;
+            return PickerPopupDesktopMove(true,S_OK);
+        },facts);
+    CHECK(result==PickerPopupBindingResult::Exception);
+    CHECK(readCalls==1 && moveCalls==0);
+
+    readCalls=0; moveCalls=0;
+    result=DrivePickerPopupBinding(
+        current,
+        [&](){
+            ++readCalls;
+            return PickerPopupDesktopRead(
+                TYPE_E_ELEMENTNOTFOUND,
+                PickerReadValidity::Unavailable,GUID{});
+        },
+        [&](const GUID&) -> PickerPopupDesktopMove {
+            ++moveCalls;
+            throw std::runtime_error("move");
+        },facts);
+    CHECK(result==PickerPopupBindingResult::Exception);
+    CHECK(readCalls==1 && moveCalls==1);
+
+    readCalls=0; moveCalls=0;
+    result=DrivePickerPopupBinding(
+        current,
+        [&]() -> PickerPopupDesktopRead {
+            ++readCalls;
+            if(readCalls==1)
+                return PickerPopupDesktopRead(
+                    TYPE_E_ELEMENTNOTFOUND,
+                    PickerReadValidity::Unavailable,GUID{});
+            throw std::runtime_error("verify");
+        },
+        [&](const GUID&){
+            ++moveCalls;
+            return PickerPopupDesktopMove(true,S_OK);
+        },facts);
+    CHECK(result==PickerPopupBindingResult::Exception);
+    CHECK(readCalls==2 && moveCalls==1);
+
+    readCalls=0; moveCalls=0;
+    result=DrivePickerPopupBinding(
+        current,
+        [&](){
+            ++readCalls;
+            return readCalls==1
+                ? PickerPopupDesktopRead(
+                    S_OK,PickerReadValidity::Valid,observed)
+                : PickerPopupDesktopRead(
+                    S_OK,PickerReadValidity::Valid,current);
+        },
+        [&](const GUID&){
+            ++moveCalls;
+            return PickerPopupDesktopMove(true,S_OK);
+        },facts);
+    CHECK(result==PickerPopupBindingResult::UseObserved);
+    CHECK(readCalls==1 && moveCalls==0);
+
+    readCalls=0; moveCalls=0;
+    result=DrivePickerPopupBinding(
+        current,
+        [&](){
+            ++readCalls;
+            return PickerPopupDesktopRead(
+                S_OK,PickerReadValidity::Valid,GUID{});
+        },
+        [&](const GUID&){
+            ++moveCalls;
+            return PickerPopupDesktopMove(true,S_OK);
+        },facts);
+    CHECK(result==PickerPopupBindingResult::InitialUnsupported);
+    CHECK(readCalls==1 && moveCalls==0);
+
+    PickerPopupBindingFacts stickyFacts;
+    stickyFacts.initial=PickerPopupDesktopRead(
+        TYPE_E_ELEMENTNOTFOUND,
+        PickerReadValidity::Unavailable,GUID{});
+    stickyFacts.moveAttempted=true;
+    stickyFacts.move=PickerPopupDesktopMove(true,S_OK);
+    stickyFacts.verifyAttempted=true;
+    stickyFacts.verify=PickerPopupDesktopRead(
+        TYPE_E_ELEMENTNOTFOUND,
+        PickerReadValidity::Unavailable,GUID{});
+    CHECK(DecidePickerPopupRoute(
+              PickerPopupBindingResult::VerifyUnavailable,
+              stickyFacts,true)==PickerPopupRoute::StickyUnmanaged);
+    CHECK(DecidePickerPopupRoute(
+              PickerPopupBindingResult::VerifyUnavailable,
+              stickyFacts,false)==PickerPopupRoute::Reject);
+    stickyFacts.move.result=E_FAIL;
+    CHECK(DecidePickerPopupRoute(
+              PickerPopupBindingResult::VerifyUnavailable,
+              stickyFacts,true)==PickerPopupRoute::Reject);
+    stickyFacts.move.result=S_FALSE;
+    CHECK(DecidePickerPopupRoute(
+              PickerPopupBindingResult::VerifyUnavailable,
+              stickyFacts,true)==PickerPopupRoute::Reject);
+    CHECK(DecidePickerPopupRoute(
+              PickerPopupBindingResult::UseObserved,
+              PickerPopupBindingFacts{},true)==PickerPopupRoute::Managed);
+    CHECK(DecidePickerPopupRoute(
+              PickerPopupBindingResult::Repaired,
+              PickerPopupBindingFacts{},true)==PickerPopupRoute::Managed);
+}
+
 static void test_picker_async_search_joins_by_full_identity(){
     const WindowIdentityKey row=IK(0x1234,77,9001);
     CHECK(PickerSearchResultMatches(row,row));
@@ -1966,6 +2286,7 @@ static void test_picker_state_whole_object_swap_includes_generation_sentinel(){
     left.transition.runtimeKey="runtime-left";
     left.transition.capturedTitle=L"captured title";
     left.transition.capturedTitleComplete=true;
+    left.transition.popupRoute=PickerPopupRoute::StickyUnmanaged;
     left.scrollByDesktop[GuidKey(leftDesktop)]=4;
     left.paintGeneration=101;
     right.currentDesktop=rightDesktop;
@@ -1988,6 +2309,7 @@ static void test_picker_state_whole_object_swap_includes_generation_sentinel(){
     CHECK(right.transition.runtimeKey=="runtime-left");
     CHECK(right.transition.capturedTitle==L"captured title");
     CHECK(right.transition.capturedTitleComplete);
+    CHECK(right.transition.popupRoute==PickerPopupRoute::StickyUnmanaged);
     CHECK(right.scrollByDesktop.at(GuidKey(leftDesktop))==4);
     CHECK(right.paintGeneration==101);
     SwapPickerState(left,right);
@@ -2194,6 +2516,148 @@ static void test_picker_transition_success_has_exact_verified_effect_order(){
     CHECK(order==expected);
     CHECK(state.transition.phase==PickerPhase::Idle);
     CHECK(!state.transition.targetMayHaveMoved);
+}
+
+static void test_picker_sticky_popup_success_skips_popup_effects(){
+    PickerState state=PickerTransitionFixture(42);
+    state.transition.popupRoute=PickerPopupRoute::StickyUnmanaged;
+    state.transition.popupOrigin=GUID{};
+    std::vector<PickerEffectKind> order;
+    const auto record=[&](const PickerEffect& value){
+        CHECK(value.kind!=PickerEffectKind::None);
+        order.push_back(value.kind);
+        return value;
+    };
+
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=state.transition.generation;
+    PickerEffect effect=record(AdvancePickerTransition(state,begin));
+    CHECK(effect.kind==PickerEffectKind::MoveTarget);
+    CHECK(state.transition.observedPopupValidity==
+          PickerReadValidity::Unavailable);
+
+    PickerObservation issued=PickerObservationFor(
+        effect,PickerEvent::ApiCompleted);
+    issued.identity=PickerIdentityValidity::Match;
+    issued.apiInvoked=true;
+    effect=record(AdvancePickerTransition(state,issued));
+    CHECK(effect.kind==PickerEffectKind::ReadTarget);
+
+    PickerObservation target=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    target.identity=PickerIdentityValidity::Match;
+    target.targetRead=PickerReadValidity::Valid;
+    target.actualTargetDesktop=state.transition.destination;
+    effect=record(AdvancePickerTransition(state,target));
+    CHECK(effect.kind==PickerEffectKind::ValidateTarget);
+
+    PickerObservation identity=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    identity.identity=PickerIdentityValidity::Match;
+    effect=record(AdvancePickerTransition(state,identity));
+    CHECK(effect.kind==PickerEffectKind::SwitchDesktop);
+
+    issued=PickerObservationFor(effect,PickerEvent::ApiCompleted);
+    issued.identity=PickerIdentityValidity::Match;
+    issued.apiInvoked=true;
+    effect=record(AdvancePickerTransition(state,issued));
+    CHECK(effect.kind==PickerEffectKind::ReadCurrent);
+
+    PickerObservation current=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    current.currentRead=PickerReadValidity::Valid;
+    current.actualCurrentDesktop=state.transition.destination;
+    effect=record(AdvancePickerTransition(state,current));
+    CHECK(effect.kind==PickerEffectKind::SaveExactTarget);
+    CHECK(state.transition.commitCutoffReached);
+
+    PickerObservation saved=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    saved.identity=PickerIdentityValidity::Match;
+    saved.saveStatus=PopupSaveStatus::Saved;
+    effect=record(AdvancePickerTransition(state,saved));
+    CHECK(effect.kind==PickerEffectKind::Refresh);
+    PickerObservation refreshed=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    refreshed.apiAccepted=true;
+    effect=record(AdvancePickerTransition(state,refreshed));
+    CHECK(effect.kind==PickerEffectKind::ShowAndFocus);
+    PickerObservation focused=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    focused.popupIsForeground=true;
+    CHECK(AdvancePickerTransition(state,focused).kind==
+          PickerEffectKind::None);
+    CHECK(state.transition.terminalAcknowledged);
+
+    const std::vector<PickerEffectKind> expected={
+        PickerEffectKind::MoveTarget,
+        PickerEffectKind::ReadTarget,
+        PickerEffectKind::ValidateTarget,
+        PickerEffectKind::SwitchDesktop,
+        PickerEffectKind::ReadCurrent,
+        PickerEffectKind::SaveExactTarget,
+        PickerEffectKind::Refresh,
+        PickerEffectKind::ShowAndFocus
+    };
+    CHECK(order==expected);
+    CHECK(std::count(order.begin(),order.end(),
+          PickerEffectKind::MovePopup)==0);
+    CHECK(std::count(order.begin(),order.end(),
+          PickerEffectKind::ReadPopup)==0);
+    CHECK(state.transition.forwardPopupAttempts==0);
+    CHECK(state.transition.rollbackPopupAttempts==0);
+    CHECK(!state.transition.popupMayHaveMoved);
+
+    PickerState same=PickerTransitionFixture(43);
+    same.transition.popupRoute=PickerPopupRoute::StickyUnmanaged;
+    same.transition.popupOrigin=GUID{};
+    same.transition.destination=same.currentDesktop;
+    CHECK(SetPickerSelection(same,0,same.currentDesktop));
+    begin.generation=same.transition.generation;
+    effect=AdvancePickerTransition(same,begin);
+    issued=PickerObservationFor(effect,PickerEvent::ApiCompleted);
+    issued.identity=PickerIdentityValidity::Match;
+    issued.apiInvoked=true;
+    effect=AdvancePickerTransition(same,issued);
+    target=PickerObservationFor(effect,PickerEvent::ReadbackCompleted);
+    target.identity=PickerIdentityValidity::Match;
+    target.targetRead=PickerReadValidity::Valid;
+    target.actualTargetDesktop=same.transition.destination;
+    effect=AdvancePickerTransition(same,target);
+    identity=PickerObservationFor(effect,PickerEvent::EffectCompleted);
+    identity.identity=PickerIdentityValidity::Match;
+    effect=AdvancePickerTransition(same,identity);
+    CHECK(effect.kind==PickerEffectKind::SaveExactTarget);
+    CHECK(same.transition.forwardSwitchAttempts==0);
+    CHECK(same.transition.forwardPopupAttempts==0);
+
+    PickerState rollback=PickerTransitionFixture(44);
+    rollback.transition.popupRoute=PickerPopupRoute::StickyUnmanaged;
+    rollback.transition.popupOrigin=GUID{};
+    rollback.transition.rollbackVerificationRequired=true;
+    rollback.transition.switchMayHaveChanged=true;
+    effect=PickerContinueRollbackAfterTarget(rollback);
+    CHECK(effect.kind==PickerEffectKind::SwitchDesktop);
+    CHECK(rollback.transition.rollbackPopupAttempts==0);
+
+    PickerState verify=PickerTransitionFixture(45);
+    verify.transition.popupRoute=PickerPopupRoute::StickyUnmanaged;
+    verify.transition.popupOrigin=GUID{};
+    verify.transition.rollbackVerificationRequired=true;
+    effect=PickerContinueRollbackAfterTarget(verify);
+    CHECK(effect.kind==PickerEffectKind::ReadCurrent);
+    CHECK(verify.transition.rollbackPopupAttempts==0);
+
+    PickerState resumed=PickerTransitionFixture(46);
+    resumed.transition.popupRoute=PickerPopupRoute::StickyUnmanaged;
+    resumed.transition.popupOrigin=GUID{};
+    resumed.transition.resumeAfterHide=PickerPhase::RollbackPopupVerify;
+    resumed.transition.rollbackVerificationRequired=true;
+    resumed.transition.switchMayHaveChanged=true;
+    effect=PickerResumeAfterHide(resumed);
+    CHECK(effect.kind==PickerEffectKind::SwitchDesktop);
+    CHECK(resumed.transition.rollbackPopupAttempts==0);
 }
 
 static void test_picker_transition_rejects_stale_duplicate_and_wrong_effect_acks(){
@@ -3422,6 +3886,19 @@ static void test_picker_begin_gate_rejects_incomplete_or_busy_state_atomically()
         begin.event=PickerEvent::Begin;
         begin.generation=state.transition.generation;
         CHECK(AdvancePickerTransition(state,begin).kind==PickerEffectKind::None);
+        CHECK(state.transition.phase==PickerPhase::Idle);
+        CHECK(state.transition.pendingEffect==PickerEffectKind::None);
+    }
+    for(PickerPopupRoute invalidRoute : {
+            PickerPopupRoute::StickyUnmanaged,PickerPopupRoute::Reject}){
+        PickerState state=PickerTransitionFixture(
+            265+static_cast<uint64_t>(invalidRoute));
+        state.transition.popupRoute=invalidRoute;
+        PickerObservation begin;
+        begin.event=PickerEvent::Begin;
+        begin.generation=state.transition.generation;
+        CHECK(AdvancePickerTransition(state,begin).kind==
+              PickerEffectKind::None);
         CHECK(state.transition.phase==PickerPhase::Idle);
         CHECK(state.transition.pendingEffect==PickerEffectKind::None);
     }
@@ -11694,7 +12171,7 @@ static void test_picker_icon_loading_is_bounded_and_outside_paint(){
         source,"static BOOL CALLBACK EnumAll(",
         "static bool PopulatePickerFilteredRows(");
     CHECK(!enumerate.empty());
-    CHECK(enumerate.find("RuntimeKey(fast)")!=std::string::npos);
+    CHECK(enumerate.find("RuntimeKey(identity)")!=std::string::npos);
     CHECK(enumerate.find("liveKeys")!=std::string::npos);
     CHECK(enumerate.find("WM_GETICON")==std::string::npos);
     CHECK(enumerate.find("GetClassLongPtrW")==std::string::npos);
@@ -20657,8 +21134,8 @@ static void test_picker_trace_enum_decisions_cover_every_final_branch(){
         {PickerTraceAltTabReason::Eligible,true,S_OK,true,0,1,1,true,true,WindowIdentityRecapture::Match,PickerTraceEnumDecision::Verified,"verified"}
     };
     static_assert(sizeof(cases)/sizeof(cases[0])==
-        static_cast<size_t>(PickerTraceEnumDecision::Count)-2,
-        "pure decision cases must cover every non-exception outcome");
+        static_cast<size_t>(PickerTraceEnumDecision::Count)-4,
+        "pure cases exclude externally selected and exception outcomes");
     for(const Case& value:cases){
         const PickerTraceEnumDecision actual=DecidePickerTraceEnumDecision(
             value.alt,value.service,value.desktopResult,value.guid,value.tile,
@@ -20693,6 +21170,8 @@ static void test_picker_trace_enum_decisions_cover_every_final_branch(){
         {PickerTraceEnumDecision::DisplayOnlyPidUnavailable,"display_only_pid_unavailable"},
         {PickerTraceEnumDecision::DisplayOnlyProcessStartUnavailable,"display_only_process_start_unavailable"},
         {PickerTraceEnumDecision::DisplayOnlyIdentityIndeterminate,"display_only_identity_indeterminate"},
+        {PickerTraceEnumDecision::DisplayOnlyCurrentDesktopFallback,"display_only_current_desktop_fallback"},
+        {PickerTraceEnumDecision::VerifiedCurrentDesktopFallback,"verified_current_desktop_fallback"},
         {PickerTraceEnumDecision::Verified,"verified"},
         {PickerTraceEnumDecision::AllocationFailure,"allocation_failure"},
         {PickerTraceEnumDecision::GlobalSnapshotFailure,"global_snapshot_failure"}
@@ -22393,6 +22872,7 @@ static void CheckPickerTraceReducerStateForTest(
     CHECK(a.capturedTitle==b.capturedTitle);
     CHECK(GuidEq(a.targetOrigin,b.targetOrigin));
     CHECK(GuidEq(a.popupOrigin,b.popupOrigin));
+    CHECK(a.popupRoute==b.popupRoute);
     CHECK(GuidEq(a.currentOrigin,b.currentOrigin));
     CHECK(GuidEq(a.destination,b.destination));
     CHECK(a.effectSerial==b.effectSerial && a.pendingEffect==b.pendingEffect);
@@ -23937,17 +24417,23 @@ static void test_picker_trace_task9_runtime_wiring_is_causal_and_private(){
     CHECK(snapshot.find("transition.runtimeKey")==std::string::npos);
     CHECK(snapshot.find("transition.pendingRecordId")==std::string::npos);
     CHECK(snapshot.find("transition.capturedTitle")==std::string::npos);
+    CHECK(snapshot.find("result.popupRoute=transition.popupRoute;")!=
+          std::string::npos);
     CHECK(readback.find("g_picker.transition")==std::string::npos);
     const size_t targetReadback=readback.find("ReadPickerWindowDesktop(\n"
         "        snapshot.target");
+    const size_t popupRouteGuard=readback.find(
+        "if(snapshot.popupRoute==PickerPopupRoute::Managed)",targetReadback);
     const size_t popupReadback=readback.find("ReadPickerWindowDesktop(\n"
-        "        g_main",targetReadback);
+        "            g_main",popupRouteGuard);
     const size_t currentReadback=readback.find("CurrentDesktopGuid(",
                                                popupReadback);
     CHECK(targetReadback!=std::string::npos);
+    CHECK(popupRouteGuard!=std::string::npos);
     CHECK(popupReadback!=std::string::npos);
     CHECK(currentReadback!=std::string::npos);
-    CHECK(targetReadback<popupReadback && popupReadback<currentReadback);
+    CHECK(targetReadback<popupRouteGuard &&
+          popupRouteGuard<popupReadback && popupReadback<currentReadback);
 
     const size_t capture=finalizer.find(
         "result.snapshot=CapturePickerRuntimeTerminalTraceSnapshot()");
@@ -24372,10 +24858,10 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
         PickerTraceEventAssignmentsForTest(source);
     const std::vector<std::string> moduleEventAssignments=
         PickerTraceEventAssignmentsForTest(traceSource);
-    CHECK(vdeEventAssignments.size()==160);
+    CHECK(vdeEventAssignments.size()==161);
     CHECK(moduleEventAssignments.size()==74);
     CHECK(PickerTraceAssignmentDigestForTest(vdeEventAssignments)==
-          "3422a4d9b758b3eadeda2951c5f52a2872e64c00b391e56a2f34744356aa96c4");
+          "46f0c96ca1eed1ad52b9891431db4551570f08f997570d4960f99214acfe5aea");
     CHECK(PickerTraceAssignmentDigestForTest(moduleEventAssignments)==
           "3cf0a4ba0d03558355119c432dd5c642014b7ac987858d2ade5c62a01a4cf493");
     CHECK(std::find(moduleEventAssignments.begin(),
@@ -24689,6 +25175,101 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
     CHECK(modulePath<moduleFinalComponent && moduleFinalComponent<moduleSafe);
 }
 
+static void test_picker_evidence_fixes_have_guarded_product_wiring(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string enumerate=SourceSection(
+        source,"static BOOL CALLBACK EnumAll(",
+        "static bool PopulatePickerFilteredRows(");
+    const std::string begin=SourceSection(
+        source,"static PickerTraceMoveBeginReason BeginVerifiedPickerMove(",
+        "class PickerTraceCaptureEmitScope");
+    const std::string build=SourceSection(
+        source,"static bool BuildModel(",
+        "static bool SetPickerSelectionCurrent(");
+    CHECK(!enumerate.empty() && !begin.empty() && !build.empty());
+
+    const size_t exactTile=enumerate.find("if(GuidEq(candidate.guid,desktop))");
+    const size_t membership=enumerate.find(
+        "IsWindowOnCurrentVirtualDesktop(hwnd,&onCurrentDesktop)",
+        exactTile);
+    const size_t route=enumerate.find(
+        "DecidePickerDesktopTileRoute(",membership);
+    const size_t tileCurrent=enumerate.find("tile=currentTile;",route);
+    const size_t effectiveTileIndex=enumerate.find(
+        "traceEvent.tileIndex=tile->index;",tileCurrent);
+    const size_t finalizer=enumerate.find(
+        "FinalizePickerRowRoute(",effectiveTileIndex);
+    const size_t displayOnlyFallback=enumerate.find(
+        "DisplayOnlyCurrentDesktopFallback",finalizer);
+    const size_t verifiedFallback=enumerate.find(
+        "VerifiedCurrentDesktopFallback",displayOnlyFallback);
+    const size_t finalAdmission=enumerate.find(
+        "const PickerRowAdmission admission=finalRoute.admission;",
+        verifiedFallback);
+    const size_t stableIdentity=enumerate.find(
+        "item.identity=identity;",finalAdmission);
+    const size_t stableRuntimeKey=enumerate.find(
+        "item.runtimeKey=RuntimeKey(identity);",stableIdentity);
+    const size_t rowPublication=enumerate.find(
+        "tile->windows.push_back",stableRuntimeKey);
+    CHECK(exactTile!=std::string::npos);
+    CHECK(membership!=std::string::npos);
+    CHECK(route!=std::string::npos);
+    CHECK(tileCurrent!=std::string::npos);
+    CHECK(effectiveTileIndex!=std::string::npos);
+    CHECK(finalizer!=std::string::npos);
+    CHECK(displayOnlyFallback!=std::string::npos);
+    CHECK(verifiedFallback!=std::string::npos);
+    CHECK(finalAdmission!=std::string::npos);
+    CHECK(stableIdentity!=std::string::npos);
+    CHECK(stableRuntimeKey!=std::string::npos);
+    CHECK(rowPublication!=std::string::npos);
+    CHECK(exactTile<membership && membership<route && route<tileCurrent &&
+          tileCurrent<effectiveTileIndex && effectiveTileIndex<finalizer &&
+          finalizer<displayOnlyFallback &&
+          displayOnlyFallback<verifiedFallback &&
+          verifiedFallback<finalAdmission && finalAdmission<stableIdentity &&
+          stableIdentity<stableRuntimeKey && stableRuntimeKey<rowPublication);
+    const size_t currentPublication=build.find(
+        "enumContext.currentDesktop=observedCurrent;");
+    const size_t enumWindows=build.find("return EnumWindows(",
+        currentPublication);
+    CHECK(currentPublication!=std::string::npos);
+    CHECK(enumWindows!=std::string::npos);
+    CHECK(currentPublication<enumWindows);
+
+    const size_t currentGuard=begin.find(
+        "PickerTraceMoveBeginReason::CurrentDesktopUnavailable");
+    const size_t popupDriver=begin.find("DrivePickerPopupBinding(");
+    const size_t firstPopupRead=begin.find(
+        "ReadPickerWindowDesktop(",popupDriver);
+    const size_t popupAssign=begin.find(
+        "g_vdmDoc->MoveWindowToDesktop(\n"
+        "                            g_main,currentOrigin)",
+        firstPopupRead);
+    const size_t popupRoute=begin.find(
+        "DecidePickerPopupRoute(",popupAssign);
+    const size_t popupGuard=begin.find(
+        "PickerTraceMoveBeginReason::PopupDesktopUnavailable",
+        popupRoute);
+    const size_t targetCapture=begin.find("CaptureFastWindowForMove(",
+        popupGuard);
+    const size_t routePublish=begin.find(
+        "prepared.popupRoute=popupRoute;",targetCapture);
+    CHECK(popupDriver!=std::string::npos);
+    CHECK(firstPopupRead!=std::string::npos);
+    CHECK(popupAssign!=std::string::npos);
+    CHECK(popupRoute!=std::string::npos);
+    CHECK(popupGuard!=std::string::npos);
+    CHECK(targetCapture!=std::string::npos);
+    CHECK(routePublish!=std::string::npos);
+    CHECK(currentGuard!=std::string::npos);
+    CHECK(currentGuard<popupDriver && popupDriver<firstPopupRead &&
+          firstPopupRead<popupAssign &&
+          popupAssign<popupRoute && popupRoute<popupGuard &&
+          popupGuard<targetCapture && targetCapture<routePublish);
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
@@ -24749,6 +25330,7 @@ int main(){
     test_picker_trace_task9_vocabulary_is_exhaustive();
     test_picker_trace_task9_runtime_wiring_is_causal_and_private();
     test_picker_trace_task10_runtime_anchors_and_privacy_are_locked();
+    test_picker_evidence_fixes_have_guarded_product_wiring();
     test_picker_uses_self_contained_gdi_buffer();
     test_picker_icon_loading_is_bounded_and_outside_paint();
     test_picker_enum_publishes_display_only_rows_safely();
@@ -24820,9 +25402,11 @@ int main(){
     test_picker_model_publish_invalidates_cache_before_reentry();
     test_picker_volatile_rows_skip_but_structural_failures_abort();
     test_picker_row_admission_keeps_displayable_unverified_windows();
+    test_picker_evidence_routes_are_fail_closed();
     test_picker_async_search_joins_by_full_identity();
     test_picker_state_whole_object_swap_includes_generation_sentinel();
     test_picker_transition_success_has_exact_verified_effect_order();
+    test_picker_sticky_popup_success_skips_popup_effects();
     test_picker_transition_rejects_stale_duplicate_and_wrong_effect_acks();
     test_picker_identity_loss_rolls_back_without_switch_or_save();
     test_picker_escape_hides_once_rolls_back_and_never_refocuses();

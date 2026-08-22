@@ -56,7 +56,9 @@ enum class PickerTraceEnumDecision : uint8_t {
     SkipSecondTitleReadFailed, SkipIdentityLost,
     DisplayOnlyPidUnavailable, DisplayOnlyProcessStartUnavailable,
     DisplayOnlyIdentityIndeterminate, Verified,
-    AllocationFailure, GlobalSnapshotFailure, Count
+    AllocationFailure, GlobalSnapshotFailure,
+    DisplayOnlyCurrentDesktopFallback,
+    VerifiedCurrentDesktopFallback, Count
 };
 
 enum class PickerTraceActivationSource : uint8_t { Mouse, Keyboard };
