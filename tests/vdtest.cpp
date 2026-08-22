@@ -526,6 +526,274 @@ static void test_footer_first_route_consumes_before_search_and_tiles(){
     CHECK(tile.target==PickerPointerTarget::Tile && tile.tileIndex==4);
 }
 
+static void test_picker_row_hit_priority_is_exact(){
+    PickerFooterActivation none;
+    PickerPointerActivation row=ResolvePickerPointerActivation(
+        none,false,false,3,4);
+    CHECK(row.target==PickerPointerTarget::Row);
+    CHECK(row.rowIndex==3 && row.tileIndex==4);
+
+    CHECK(ResolvePickerPointerActivation(
+        none,true,true,3,4).target==
+        PickerPointerTarget::ClearSearch);
+    CHECK(ResolvePickerPointerActivation(
+        none,false,true,3,4).target==
+        PickerPointerTarget::Search);
+    CHECK(ResolvePickerPointerActivation(
+        none,false,false,-1,4).target==
+        PickerPointerTarget::Tile);
+
+    PickerFooterActivation footer;
+    footer.consumed=true;
+    footer.link=PickerFooterLink::Repository;
+    footer.url=FooterRepoUrl();
+    CHECK(ResolvePickerPointerActivation(
+        footer,true,true,3,4).target==
+        PickerPointerTarget::Footer);
+
+    int rowCalls=0,tileCalls=0;
+    CHECK(DispatchPickerPointerActivation(
+        row,[](const PickerFooterActivation&) noexcept {},
+        []() noexcept {},[]() noexcept {},
+        [&](int rowIndex,int tileIndex){
+            ++rowCalls;
+            CHECK(rowIndex==3 && tileIndex==4);
+        },[&](int){ ++tileCalls; }));
+    CHECK(rowCalls==1 && tileCalls==0);
+}
+
+static void test_picker_row_snapshot_separates_presentation_and_drag(){
+    static_assert(std::is_trivially_copyable<
+        PickerRowActionSnapshot>::value,
+        "captured row action must remain allocation-free");
+    static_assert(!std::is_trivially_copyable<
+        PickerRowHitSnapshot>::value,
+        "published row hit owns presentation strings");
+
+    PickerRowActionSnapshot row;
+    row.hwnd=0x1111;
+    row.admission=PickerRowAdmission::DisplayOnly;
+    row.tileIndex=2;
+    row.displayedDesktop=G(
+        L"{251A0000-0000-0000-0000-000000000001}");
+    row.modelGeneration=5;
+    row.rowLayoutEpoch=9;
+    CHECK(PickerRowPresentationCurrent(row,5,9));
+    CHECK(!PickerRowActionableForDrag(row,5,9));
+
+    row.identity=IK(0x1111,7,70);
+    row.admission=PickerRowAdmission::Verified;
+    CHECK(PickerRowActionableForDrag(row,5,9));
+    CHECK(!PickerRowPresentationCurrent(row,6,9));
+    CHECK(!PickerRowActionableForDrag(row,5,10));
+
+    PickerRowHitSnapshot hit;
+    hit.fullTitle=L"A presentation title";
+    hit.runtimeKey="runtime-key";
+    hit.action=row;
+    CHECK(hit.action.hwnd==row.hwnd);
+    CHECK(hit.fullTitle==L"A presentation title");
+    CHECK(hit.runtimeKey=="runtime-key");
+
+    CHECK(TargetRouteFromPickerTileRoute(
+        PickerDesktopTileRoute::Exact)==TargetDesktopRoute::Exact);
+    CHECK(TargetRouteFromPickerTileRoute(
+        PickerDesktopTileRoute::GloballyVisibleCurrentDesktopFallback)==
+        TargetDesktopRoute::GloballyVisible);
+    CHECK(TargetRouteFromPickerTileRoute(
+        PickerDesktopTileRoute::CurrentDesktopFallback)==
+        TargetDesktopRoute::Indeterminate);
+    CHECK(TargetRouteFromPickerTileRoute(
+        PickerDesktopTileRoute::Skip)==
+        TargetDesktopRoute::Indeterminate);
+}
+
+static PickerRowActionSnapshot GestureRow(
+        PickerRowAdmission admission=PickerRowAdmission::Verified){
+    PickerRowActionSnapshot row;
+    row.tileIndex=2;
+    row.windowIndex=3;
+    row.hwnd=0x1111;
+    row.displayedDesktop=G(
+        L"{251A0000-0000-0000-0000-000000000001}");
+    row.observedDesktop=row.displayedDesktop;
+    row.baseDesktop=row.displayedDesktop;
+    row.identity=IK(0x1111,7,70);
+    row.admission=admission;
+    row.desktopRoute=TargetDesktopRoute::Exact;
+    row.mobility=TargetMobility::Movable;
+    row.modelGeneration=5;
+    row.rowLayoutEpoch=9;
+    row.paintGeneration=11;
+    return row;
+}
+
+static void test_picker_drag_threshold_boundaries_are_overflow_safe(){
+    const POINT down={100,100};
+    CHECK(!PickerDragThresholdCrossed(down,POINT{101,101},4,4));
+    CHECK(PickerDragThresholdCrossed(down,POINT{102,100},4,4));
+    CHECK(!PickerDragThresholdCrossed(down,POINT{98,100},4,4));
+    CHECK(PickerDragThresholdCrossed(down,POINT{97,100},4,4));
+    CHECK(PickerDragThresholdCrossed(down,POINT{100,102},4,4));
+    CHECK(!PickerDragThresholdCrossed(down,POINT{100,98},4,4));
+    CHECK(PickerDragThresholdCrossed(down,POINT{100,97},4,4));
+
+    for(int metric : {0,1}){
+        CHECK(!PickerDragThresholdCrossed(
+            down,down,metric,metric));
+        CHECK(PickerDragThresholdCrossed(
+            down,POINT{99,100},metric,metric));
+        CHECK(PickerDragThresholdCrossed(
+            down,POINT{101,100},metric,metric));
+    }
+    CHECK(!PickerDragThresholdCrossed(
+        down,POINT{102,102},5,5));
+    CHECK(PickerDragThresholdCrossed(
+        down,POINT{103,100},5,5));
+    CHECK(PickerDragThresholdCrossed(
+        down,POINT{97,100},5,5));
+
+    const POINT low={LONG_MIN,LONG_MIN};
+    const POINT high={LONG_MAX,LONG_MAX};
+    CHECK(PickerDragThresholdCrossed(low,high,4,4));
+    CHECK(PickerDragThresholdCrossed(high,low,4,4));
+}
+
+static void test_picker_drag_threshold_and_drop_are_deterministic(){
+    PickerPointerGesture gesture;
+    PickerRowActionSnapshot row=GestureRow();
+    CHECK(ArmPickerRowGesture(
+        gesture,row,POINT{100,100},true,5,9));
+    CHECK(UpdatePickerRowGesture(
+        gesture,POINT{101,101},4,4,5,9,4)==
+        PickerGestureAction::None);
+    CHECK(gesture.phase==PickerPointerPhase::Armed);
+    CHECK(UpdatePickerRowGesture(
+        gesture,POINT{102,100},4,4,5,9,4)==
+        PickerGestureAction::DragStarted);
+    CHECK(gesture.phase==PickerPointerPhase::Dragging);
+    CHECK(UpdatePickerRowGesture(
+        gesture,POINT{120,100},4,4,5,9,5)==
+        PickerGestureAction::None);
+    PickerGestureResolution drop=ResolvePickerRowButtonUp(
+        gesture,nullptr,true,5,9);
+    CHECK(drop.action==PickerGestureAction::Drop);
+    CHECK(drop.ctrlAtDown);
+    CHECK(drop.row.hwnd==row.hwnd && drop.dropTileIndex==5);
+    CHECK(SameIdentity(drop.row.identity,row.identity));
+
+    PickerPointerGesture sameTile;
+    CHECK(ArmPickerRowGesture(
+        sameTile,row,POINT{100,100},false,5,9));
+    CHECK(UpdatePickerRowGesture(
+        sameTile,POINT{102,100},4,4,5,9,row.tileIndex)==
+        PickerGestureAction::DragStarted);
+    CHECK(ResolvePickerRowButtonUp(
+        sameTile,nullptr,true,5,9).action==
+        PickerGestureAction::NoOp);
+
+    PickerPointerGesture outside;
+    CHECK(ArmPickerRowGesture(
+        outside,row,POINT{100,100},false,5,9));
+    CHECK(UpdatePickerRowGesture(
+        outside,POINT{102,100},4,4,5,9,-1)==
+        PickerGestureAction::DragStarted);
+    CHECK(ResolvePickerRowButtonUp(
+        outside,nullptr,false,5,9).action==
+        PickerGestureAction::Cancel);
+}
+
+static void test_picker_drag_stationary_click_and_source_erase_are_exact(){
+    PickerPointerGesture gesture;
+    PickerRowActionSnapshot row=GestureRow();
+    CHECK(ArmPickerRowGesture(
+        gesture,row,POINT{100,100},false,5,9));
+    CHECK(ResolvePickerRowButtonUp(
+        gesture,&row,true,5,9).action==PickerGestureAction::Click);
+
+    PickerRowActionSnapshot other=row;
+    other.windowIndex+=1;
+    CHECK(ArmPickerRowGesture(
+        gesture,row,POINT{100,100},false,5,9));
+    CHECK(ResolvePickerRowButtonUp(
+        gesture,&other,true,5,9).action==PickerGestureAction::Cancel);
+
+    row.visuallyAssigned=true;
+    row.baseDesktop=G(
+        L"{251A0000-0000-0000-0000-000000000009}");
+    CHECK(ArmPickerRowGesture(
+        gesture,row,POINT{100,100},false,5,9));
+    CHECK(UpdatePickerRowGesture(
+        gesture,POINT{102,100},4,4,5,9,0)==
+        PickerGestureAction::DragStarted);
+    const PickerGestureResolution erase=ResolvePickerRowButtonUp(
+        gesture,nullptr,true,5,9);
+    CHECK(erase.action==PickerGestureAction::Drop);
+    CHECK(erase.row.visuallyAssigned);
+    CHECK(GuidEq(erase.row.baseDesktop,row.baseDesktop));
+    CHECK(GuidEq(erase.row.displayedDesktop,row.displayedDesktop));
+}
+
+static void test_picker_display_only_can_click_but_cannot_drag(){
+    PickerPointerGesture gesture;
+    PickerRowActionSnapshot row=GestureRow(
+        PickerRowAdmission::DisplayOnly);
+    row.identity=WindowIdentityKey{};
+    CHECK(ArmPickerRowGesture(
+        gesture,row,POINT{100,100},false,5,9));
+    PickerGestureResolution click=ResolvePickerRowButtonUp(
+        gesture,&row,true,5,9);
+    CHECK(click.action==PickerGestureAction::Click);
+
+    CHECK(ArmPickerRowGesture(
+        gesture,row,POINT{100,100},false,5,9));
+    CHECK(UpdatePickerRowGesture(
+        gesture,POINT{102,100},4,4,5,9,4)==
+        PickerGestureAction::Cancel);
+    CHECK(gesture.phase==PickerPointerPhase::Idle);
+}
+
+static void test_picker_stale_plain_click_degrades_but_ctrl_cancels(){
+    PickerPointerGesture gesture;
+    PickerRowActionSnapshot row=GestureRow();
+    CHECK(ArmPickerRowGesture(
+        gesture,row,POINT{100,100},false,5,9));
+    CHECK(ResolvePickerRowButtonUp(
+        gesture,&row,true,6,9).action==
+        PickerGestureAction::SwitchOnly);
+    CHECK(ArmPickerRowGesture(
+        gesture,row,POINT{100,100},true,5,9));
+    CHECK(ResolvePickerRowButtonUp(
+        gesture,&row,true,6,9).action==
+        PickerGestureAction::Cancel);
+
+    CHECK(ArmPickerRowGesture(
+        gesture,row,POINT{100,100},false,5,9));
+    CHECK(UpdatePickerRowGesture(
+        gesture,POINT{101,101},4,4,5,10,4)==
+        PickerGestureAction::Cancel);
+    CHECK(gesture.phase==PickerPointerPhase::Idle);
+}
+
+static void test_picker_drag_escape_and_capture_loss_reset_everything(){
+    for(int reason=0;reason<2;++reason){
+        PickerPointerGesture gesture;
+        const PickerRowActionSnapshot row=GestureRow();
+        CHECK(ArmPickerRowGesture(
+            gesture,row,POINT{100,100},reason!=0,5,9));
+        CancelPickerRowGesture(gesture);
+        CHECK(gesture.phase==PickerPointerPhase::Idle);
+        CHECK(gesture.row.hwnd==0);
+        CHECK(gesture.down.x==0 && gesture.down.y==0);
+        CHECK(!gesture.ctrlAtDown);
+        CHECK(gesture.dropTileIndex==-1);
+        CHECK(gesture.rowLayoutEpoch==0);
+        CHECK(ResolvePickerRowButtonUp(
+            gesture,nullptr,false,5,9).action==
+            PickerGestureAction::Cancel);
+    }
+}
+
 static void test_footer_hover_event_state_covers_every_reset_path(){
     PickerHoverEventState state;
     state.rowTooltipActive=true;
@@ -2593,6 +2861,7 @@ static void test_picker_state_whole_object_swap_includes_generation_sentinel(){
     left.visualAssignments["state-runtime"]=visualAssignment;
     left.scrollByDesktop[GuidKey(leftDesktop)]=4;
     left.paintGeneration=101;
+    left.rowLayoutEpoch=303;
     right.currentDesktop=rightDesktop;
     right.selectedDesktop=leftDesktop;
     right.selectedIndex=7;
@@ -2600,6 +2869,7 @@ static void test_picker_state_whole_object_swap_includes_generation_sentinel(){
     right.searchText=L"right";
     right.scrollByDesktop[GuidKey(rightDesktop)]=8;
     right.paintGeneration=202;
+    right.rowLayoutEpoch=404;
 
     CHECK(noexcept(SwapPickerState(left,right)));
     CHECK(noexcept(left.swap(right)));
@@ -2607,6 +2877,7 @@ static void test_picker_state_whole_object_swap_includes_generation_sentinel(){
     CHECK(IsCurrentDesktop(left,rightDesktop));
     CHECK(left.selectedIndex==7 && left.searchText==L"right");
     CHECK(left.paintGeneration==202);
+    CHECK(left.rowLayoutEpoch==404);
     CHECK(IsCurrentDesktop(right,leftDesktop));
     CHECK(right.selectedIndex==3 && right.searchText==L"left");
     CHECK(right.searchActive && right.controlledTransition());
@@ -2635,8 +2906,10 @@ static void test_picker_state_whole_object_swap_includes_generation_sentinel(){
         rightDesktop));
     CHECK(right.scrollByDesktop.at(GuidKey(leftDesktop))==4);
     CHECK(right.paintGeneration==101);
+    CHECK(right.rowLayoutEpoch==303);
     SwapPickerState(left,right);
     CHECK(left.paintGeneration==101 && right.paintGeneration==202);
+    CHECK(left.rowLayoutEpoch==303 && right.rowLayoutEpoch==404);
 }
 
 static PickerState PickerTransitionFixture(uint64_t generation=41){
@@ -24088,6 +24361,7 @@ static void CheckPickerTraceReducerStateForTest(
     CHECK(left.scrollByDesktop==right.scrollByDesktop);
     CHECK(left.modelGeneration==right.modelGeneration);
     CHECK(left.paintGeneration==right.paintGeneration);
+    CHECK(left.rowLayoutEpoch==right.rowLayoutEpoch);
 }
 
 static void CheckPickerTraceReducerEquivalentForTest(
@@ -26531,6 +26805,14 @@ int main(){
     test_footer_cache_and_activation_are_transactional();
     test_composite_picker_cache_cannot_omit_footer_state();
     test_footer_first_route_consumes_before_search_and_tiles();
+    test_picker_row_hit_priority_is_exact();
+    test_picker_row_snapshot_separates_presentation_and_drag();
+    test_picker_drag_threshold_boundaries_are_overflow_safe();
+    test_picker_drag_threshold_and_drop_are_deterministic();
+    test_picker_drag_stationary_click_and_source_erase_are_exact();
+    test_picker_display_only_can_click_but_cannot_drag();
+    test_picker_stale_plain_click_degrades_but_ctrl_cancels();
+    test_picker_drag_escape_and_capture_loss_reset_everything();
     test_footer_hover_event_state_covers_every_reset_path();
     test_footer_mousemove_resets_tooltip_only_once_per_transition();
     test_visible_branding_and_help_retention_are_exact();

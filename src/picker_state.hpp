@@ -3,6 +3,7 @@
 #include "str_util.hpp"
 #include "move_queue.hpp"
 #include "window_identity.hpp"
+#include "window_mobility.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -238,23 +239,98 @@ inline bool DispatchPickerFooterActivation(
     return true;
 }
 
+enum class PickerRowAdmission {
+    Skip,
+    DisplayOnly,
+    Verified
+};
+
+enum class PickerDesktopTileRoute {
+    Exact,
+    CurrentDesktopFallback,
+    GloballyVisibleCurrentDesktopFallback,
+    Skip
+};
+
+inline TargetDesktopRoute TargetRouteFromPickerTileRoute(
+        PickerDesktopTileRoute route) noexcept {
+    switch(route){
+    case PickerDesktopTileRoute::Exact:
+        return TargetDesktopRoute::Exact;
+    case PickerDesktopTileRoute::GloballyVisibleCurrentDesktopFallback:
+        return TargetDesktopRoute::GloballyVisible;
+    case PickerDesktopTileRoute::CurrentDesktopFallback:
+    case PickerDesktopTileRoute::Skip:
+        return TargetDesktopRoute::Indeterminate;
+    }
+    return TargetDesktopRoute::Indeterminate;
+}
+
+struct PickerRowActionSnapshot {
+    int tileIndex=-1;
+    size_t windowIndex=0;
+    uintptr_t hwnd=0;
+    GUID displayedDesktop={0};
+    GUID observedDesktop={0};
+    GUID baseDesktop={0};
+    WindowIdentityKey identity;
+    PickerRowAdmission admission=PickerRowAdmission::DisplayOnly;
+    TargetDesktopRoute desktopRoute=
+        TargetDesktopRoute::Indeterminate;
+    TargetMobility mobility=TargetMobility::Indeterminate;
+    bool visuallyAssigned=false;
+    uint64_t modelGeneration=0;
+    uint64_t rowLayoutEpoch=0;
+    uint64_t paintGeneration=0;
+};
+
+struct PickerRowHitSnapshot {
+    RECT hitRect={0,0,0,0};
+    RECT textRect={0,0,0,0};
+    std::wstring fullTitle;
+    std::string runtimeKey;
+    bool truncated=false;
+    PickerRowActionSnapshot action;
+};
+
+inline bool PickerRowPresentationCurrent(
+        const PickerRowActionSnapshot& row,uint64_t modelGeneration,
+        uint64_t rowLayoutEpoch) noexcept {
+    return row.hwnd!=0 && row.tileIndex>=0 &&
+           !GuidIsZero(row.displayedDesktop) &&
+           row.modelGeneration==modelGeneration &&
+           row.rowLayoutEpoch==rowLayoutEpoch;
+}
+
+inline bool PickerRowActionableForDrag(
+        const PickerRowActionSnapshot& row,uint64_t modelGeneration,
+        uint64_t rowLayoutEpoch) noexcept {
+    return PickerRowPresentationCurrent(
+           row,modelGeneration,rowLayoutEpoch) &&
+           row.admission==PickerRowAdmission::Verified &&
+           row.hwnd==row.identity.hwnd &&
+           SameIdentity(row.identity,row.identity);
+}
+
 enum class PickerPointerTarget {
     None,
     Footer,
     ClearSearch,
     Search,
+    Row,
     Tile
 };
 
 struct PickerPointerActivation {
     PickerPointerTarget target=PickerPointerTarget::None;
     PickerFooterActivation footer;
+    int rowIndex=-1;
     int tileIndex=-1;
 };
 
 inline PickerPointerActivation ResolvePickerPointerActivation(
         const PickerFooterActivation& footer,bool clearSearchHit,
-        bool searchHit,int tileIndex) noexcept {
+        bool searchHit,int rowIndex,int tileIndex) noexcept {
     PickerPointerActivation activation;
     if(footer.consumed){
         activation.target=PickerPointerTarget::Footer;
@@ -263,6 +339,10 @@ inline PickerPointerActivation ResolvePickerPointerActivation(
         activation.target=PickerPointerTarget::ClearSearch;
     } else if(searchHit){
         activation.target=PickerPointerTarget::Search;
+    } else if(rowIndex>=0 && tileIndex>=0){
+        activation.target=PickerPointerTarget::Row;
+        activation.rowIndex=rowIndex;
+        activation.tileIndex=tileIndex;
     } else if(tileIndex>=0){
         activation.target=PickerPointerTarget::Tile;
         activation.tileIndex=tileIndex;
@@ -270,11 +350,19 @@ inline PickerPointerActivation ResolvePickerPointerActivation(
     return activation;
 }
 
-template<class OnFooter,class OnClearSearch,class OnSearch,class OnTile>
+inline PickerPointerActivation ResolvePickerPointerActivation(
+        const PickerFooterActivation& footer,bool clearSearchHit,
+        bool searchHit,int tileIndex) noexcept {
+    return ResolvePickerPointerActivation(
+        footer,clearSearchHit,searchHit,-1,tileIndex);
+}
+
+template<class OnFooter,class OnClearSearch,class OnSearch,
+         class OnRow,class OnTile>
 inline bool DispatchPickerPointerActivation(
         const PickerPointerActivation& activation,
         OnFooter&& onFooter,OnClearSearch&& onClearSearch,
-        OnSearch&& onSearch,OnTile&& onTile) noexcept {
+        OnSearch&& onSearch,OnRow&& onRow,OnTile&& onTile) noexcept {
     try {
         switch(activation.target){
         case PickerPointerTarget::Footer:
@@ -286,6 +374,9 @@ inline bool DispatchPickerPointerActivation(
         case PickerPointerTarget::Search:
             onSearch();
             return true;
+        case PickerPointerTarget::Row:
+            onRow(activation.rowIndex,activation.tileIndex);
+            return true;
         case PickerPointerTarget::Tile:
             onTile(activation.tileIndex);
             return true;
@@ -296,6 +387,175 @@ inline bool DispatchPickerPointerActivation(
         return activation.target!=PickerPointerTarget::None;
     }
     return false;
+}
+
+template<class OnFooter,class OnClearSearch,class OnSearch,class OnTile>
+inline bool DispatchPickerPointerActivation(
+        const PickerPointerActivation& activation,
+        OnFooter&& onFooter,OnClearSearch&& onClearSearch,
+        OnSearch&& onSearch,OnTile&& onTile) noexcept {
+    return DispatchPickerPointerActivation(
+        activation,
+        std::forward<OnFooter>(onFooter),
+        std::forward<OnClearSearch>(onClearSearch),
+        std::forward<OnSearch>(onSearch),
+        [](int,int) noexcept {},
+        std::forward<OnTile>(onTile));
+}
+
+inline bool PickerDragThresholdCrossed(
+        POINT down,POINT current,int dragWidth,int dragHeight) noexcept {
+    const long long width=std::max<long long>(1,dragWidth);
+    const long long height=std::max<long long>(1,dragHeight);
+    const long long left=width/2;
+    const long long right=width-left;
+    const long long top=height/2;
+    const long long bottom=height-top;
+    const long long dx=
+        static_cast<long long>(current.x)-down.x;
+    const long long dy=
+        static_cast<long long>(current.y)-down.y;
+    return dx < -left || dx >= right ||
+           dy < -top || dy >= bottom;
+}
+
+enum class PickerPointerPhase {
+    Idle,
+    Armed,
+    Dragging
+};
+
+enum class PickerGestureAction {
+    None,
+    DragStarted,
+    Click,
+    SwitchOnly,
+    Drop,
+    NoOp,
+    Cancel
+};
+
+struct PickerPointerGesture {
+    PickerPointerPhase phase=PickerPointerPhase::Idle;
+    PickerRowActionSnapshot row;
+    POINT down={0,0};
+    bool ctrlAtDown=false;
+    int dropTileIndex=-1;
+    uint64_t rowLayoutEpoch=0;
+};
+
+struct PickerGestureResolution {
+    PickerGestureAction action=PickerGestureAction::None;
+    PickerRowActionSnapshot row;
+    bool ctrlAtDown=false;
+    int dropTileIndex=-1;
+};
+
+inline void CancelPickerRowGesture(
+        PickerPointerGesture& gesture) noexcept {
+    gesture.phase=PickerPointerPhase::Idle;
+    gesture.row=PickerRowActionSnapshot{};
+    gesture.down=POINT{0,0};
+    gesture.ctrlAtDown=false;
+    gesture.dropTileIndex=-1;
+    gesture.rowLayoutEpoch=0;
+}
+
+inline bool SamePickerRowActionSnapshot(
+        const PickerRowActionSnapshot& left,
+        const PickerRowActionSnapshot& right) noexcept {
+    return left.hwnd!=0 && left.hwnd==right.hwnd &&
+           left.tileIndex==right.tileIndex &&
+           left.windowIndex==right.windowIndex &&
+           left.modelGeneration==right.modelGeneration &&
+           left.rowLayoutEpoch==right.rowLayoutEpoch;
+}
+
+inline bool ArmPickerRowGesture(
+        PickerPointerGesture& gesture,
+        const PickerRowActionSnapshot& row,POINT down,
+        bool ctrlAtDown,uint64_t modelGeneration,
+        uint64_t rowLayoutEpoch) noexcept {
+    if(!PickerRowPresentationCurrent(
+            row,modelGeneration,rowLayoutEpoch))
+        return false;
+    PickerPointerGesture staged;
+    staged.phase=PickerPointerPhase::Armed;
+    staged.row=row;
+    staged.down=down;
+    staged.ctrlAtDown=ctrlAtDown;
+    staged.rowLayoutEpoch=rowLayoutEpoch;
+    gesture=staged;
+    return true;
+}
+
+inline PickerGestureAction UpdatePickerRowGesture(
+        PickerPointerGesture& gesture,POINT current,
+        int dragWidth,int dragHeight,
+        uint64_t modelGeneration,uint64_t rowLayoutEpoch,
+        int candidateDropTile) noexcept {
+    if(gesture.phase==PickerPointerPhase::Idle)
+        return PickerGestureAction::None;
+    if(!PickerRowPresentationCurrent(
+            gesture.row,modelGeneration,rowLayoutEpoch)){
+        CancelPickerRowGesture(gesture);
+        return PickerGestureAction::Cancel;
+    }
+    if(gesture.phase==PickerPointerPhase::Armed){
+        if(!PickerDragThresholdCrossed(
+                gesture.down,current,dragWidth,dragHeight))
+            return PickerGestureAction::None;
+        if(!PickerRowActionableForDrag(
+                gesture.row,modelGeneration,rowLayoutEpoch)){
+            CancelPickerRowGesture(gesture);
+            return PickerGestureAction::Cancel;
+        }
+        gesture.phase=PickerPointerPhase::Dragging;
+        gesture.dropTileIndex=candidateDropTile;
+        return PickerGestureAction::DragStarted;
+    }
+    gesture.dropTileIndex=candidateDropTile;
+    return PickerGestureAction::None;
+}
+
+inline PickerGestureResolution ResolvePickerRowButtonUp(
+        const PickerPointerGesture& gesture,
+        const PickerRowActionSnapshot* releaseRow,
+        bool destinationExists,uint64_t modelGeneration,
+        uint64_t rowLayoutEpoch) noexcept {
+    PickerGestureResolution result;
+    result.row=gesture.row;
+    result.ctrlAtDown=gesture.ctrlAtDown;
+    result.dropTileIndex=gesture.dropTileIndex;
+    if(gesture.phase==PickerPointerPhase::Idle){
+        result.action=PickerGestureAction::Cancel;
+        return result;
+    }
+    const bool presentationCurrent=PickerRowPresentationCurrent(
+        gesture.row,modelGeneration,rowLayoutEpoch);
+    if(gesture.phase==PickerPointerPhase::Armed){
+        if(!presentationCurrent){
+            result.action=!gesture.ctrlAtDown && destinationExists
+                ? PickerGestureAction::SwitchOnly
+                : PickerGestureAction::Cancel;
+            return result;
+        }
+        result.action=releaseRow &&
+            SamePickerRowActionSnapshot(gesture.row,*releaseRow)
+                ? PickerGestureAction::Click
+                : PickerGestureAction::Cancel;
+        return result;
+    }
+    if(!PickerRowActionableForDrag(
+            gesture.row,modelGeneration,rowLayoutEpoch) ||
+       !destinationExists || gesture.dropTileIndex<0){
+        result.action=PickerGestureAction::Cancel;
+        return result;
+    }
+    result.action=gesture.dropTileIndex==gesture.row.tileIndex
+        ? PickerGestureAction::NoOp
+        : PickerGestureAction::Drop;
+    return result;
 }
 
 inline bool PickerPointInRect(const RECT& rect,POINT point) noexcept {
@@ -1465,6 +1725,7 @@ struct PickerState {
     PickerVisualAssignments visualAssignments;
     std::map<std::string,int> scrollByDesktop;
     uint64_t modelGeneration=0;
+    uint64_t rowLayoutEpoch=0;
     uint64_t paintGeneration=0;
 
     bool controlledTransition() const noexcept {
@@ -1505,6 +1766,9 @@ struct PickerState {
         const uint64_t model= modelGeneration;
         modelGeneration=other.modelGeneration;
         other.modelGeneration=model;
+        const uint64_t rowLayout=rowLayoutEpoch;
+        rowLayoutEpoch=other.rowLayoutEpoch;
+        other.rowLayoutEpoch=rowLayout;
         const uint64_t generation=paintGeneration;
         paintGeneration=other.paintGeneration;
         other.paintGeneration=generation;
@@ -3136,10 +3400,6 @@ inline bool CompletePickerTargetRecapture(
     capture.title.clear();
     return false;
 }
-
-enum class PickerRowAdmission { Skip, DisplayOnly, Verified };
-
-enum class PickerDesktopTileRoute { Exact, CurrentDesktopFallback, Skip };
 
 inline PickerDesktopTileRoute DecidePickerDesktopTileRoute(
         bool exactTileAvailable,bool currentTileAvailable,
