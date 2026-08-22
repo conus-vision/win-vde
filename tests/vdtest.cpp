@@ -2778,6 +2778,330 @@ static void test_picker_begin_preconditions_are_mode_specific(){
 }
 
 static PickerObservation PickerObservationFor(
+    const PickerEffect& effect,PickerEvent event);
+
+static PickerState PickerRowMoveFixture(uint64_t generation){
+    PickerState state=PickerTransitionFixture(generation);
+    const WindowIdentityKey active=IK(0x1111,71,9001);
+    const WindowIdentityKey row=IK(0x2222,72,9002);
+    state.activeWindow=active;
+    state.transition.popupActiveTarget=active;
+    state.transition.target=row;
+    state.transition.runtimeKey=RuntimeKey(row);
+    state.transition.mode=PickerTransitionMode::RowMoveOnly;
+    return state;
+}
+
+static PickerEffect PickerAdvanceRowMoveToSave(PickerState& state){
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=state.transition.generation;
+    PickerEffect effect=AdvancePickerTransition(state,begin);
+    CHECK(effect.kind==PickerEffectKind::MoveTarget);
+
+    PickerObservation moved=PickerObservationFor(
+        effect,PickerEvent::ApiCompleted);
+    moved.identity=PickerIdentityValidity::Match;
+    moved.apiInvoked=true;
+    moved.apiAccepted=true;
+    effect=AdvancePickerTransition(state,moved);
+    CHECK(effect.kind==PickerEffectKind::ReadTarget);
+
+    PickerObservation read=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    read.identity=PickerIdentityValidity::Match;
+    read.targetRead=PickerReadValidity::Valid;
+    read.actualTargetDesktop=state.transition.destination;
+    effect=AdvancePickerTransition(state,read);
+    CHECK(effect.kind==PickerEffectKind::SaveExactTarget);
+    return effect;
+}
+
+static bool PickerRowOrderHasForbiddenEffect(
+        const std::vector<PickerEffectKind>& order){
+    for(PickerEffectKind kind : order)
+        if(kind==PickerEffectKind::ValidateTarget ||
+           kind==PickerEffectKind::MovePopup ||
+           kind==PickerEffectKind::ReadPopup ||
+           kind==PickerEffectKind::SwitchDesktop ||
+           kind==PickerEffectKind::ReadCurrent ||
+           kind==PickerEffectKind::Hide ||
+           kind==PickerEffectKind::ShowAndFocus ||
+           kind==PickerEffectKind::ReportFailure)
+            return true;
+    return false;
+}
+
+static void test_picker_row_move_only_has_exact_order_and_keeps_active(){
+    PickerState state=PickerRowMoveFixture(511);
+    const GUID current=state.currentDesktop;
+    const GUID selected=state.selectedDesktop;
+    const int selectedIndex=state.selectedIndex;
+    const WindowIdentityKey active=state.activeWindow;
+    const WindowIdentityKey popupActive=
+        state.transition.popupActiveTarget;
+
+    std::vector<PickerEffectKind> order;
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=state.transition.generation;
+    PickerEffect effect=AdvancePickerTransition(state,begin);
+    order.push_back(effect.kind);
+    CHECK(effect.kind==PickerEffectKind::MoveTarget);
+
+    PickerObservation moved=PickerObservationFor(
+        effect,PickerEvent::ApiCompleted);
+    moved.identity=PickerIdentityValidity::Match;
+    moved.apiInvoked=true;
+    moved.apiAccepted=true;
+    effect=AdvancePickerTransition(state,moved);
+    order.push_back(effect.kind);
+    CHECK(effect.kind==PickerEffectKind::ReadTarget);
+
+    PickerObservation read=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    read.identity=PickerIdentityValidity::Match;
+    read.targetRead=PickerReadValidity::Valid;
+    read.actualTargetDesktop=state.transition.destination;
+    effect=AdvancePickerTransition(state,read);
+    order.push_back(effect.kind);
+    CHECK(effect.kind==PickerEffectKind::SaveExactTarget);
+
+    PickerObservation saved=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    saved.identity=PickerIdentityValidity::Match;
+    saved.saveStatus=PopupSaveStatus::NotTracked;
+    saved.saveFailure=PopupSaveFailure::None;
+    effect=AdvancePickerTransition(state,saved);
+    order.push_back(effect.kind);
+    CHECK(effect.kind==PickerEffectKind::Refresh);
+
+    PickerObservation refreshed=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    refreshed.apiAccepted=true;
+    effect=AdvancePickerTransition(state,refreshed);
+    CHECK(effect.kind==PickerEffectKind::None);
+    CHECK(state.transition.terminalAcknowledged);
+
+    const std::vector<PickerEffectKind> expected={
+        PickerEffectKind::MoveTarget,
+        PickerEffectKind::ReadTarget,
+        PickerEffectKind::SaveExactTarget,
+        PickerEffectKind::Refresh
+    };
+    CHECK(order==expected);
+    CHECK(!PickerRowOrderHasForbiddenEffect(order));
+    CHECK(GuidEq(state.currentDesktop,current));
+    CHECK(GuidEq(state.selectedDesktop,selected));
+    CHECK(state.selectedIndex==selectedIndex);
+    CHECK(SameIdentity(state.activeWindow,active));
+    CHECK(SameIdentity(
+        state.transition.popupActiveTarget,popupActive));
+}
+
+static void test_picker_row_move_save_commit_table_is_fail_closed(){
+    struct SaveCase {
+        PopupSaveStatus status;
+        PopupSaveFailure failure;
+        bool commits;
+    };
+    const SaveCase cases[]={
+        {PopupSaveStatus::Saved,PopupSaveFailure::None,true},
+        {PopupSaveStatus::NotTracked,PopupSaveFailure::None,true},
+        {PopupSaveStatus::Failed,PopupSaveFailure::FlushFailed,true},
+        {PopupSaveStatus::Failed,PopupSaveFailure::StorageReadOnly,false},
+        {PopupSaveStatus::Failed,PopupSaveFailure::None,false}
+    };
+    uint64_t generation=520;
+    for(const SaveCase& value : cases){
+        CHECK(PickerRowMoveSaveCommits(
+            value.status,value.failure)==value.commits);
+        PickerState state=PickerRowMoveFixture(generation++);
+        PickerEffect effect=PickerAdvanceRowMoveToSave(state);
+        PickerObservation saved=PickerObservationFor(
+            effect,PickerEvent::EffectCompleted);
+        saved.identity=PickerIdentityValidity::Match;
+        saved.saveStatus=value.status;
+        saved.saveFailure=value.failure;
+        effect=AdvancePickerTransition(state,saved);
+        if(value.commits){
+            CHECK(effect.kind==PickerEffectKind::Refresh);
+            CHECK(state.transition.commitCutoffReached);
+        } else {
+            CHECK(effect.kind==PickerEffectKind::MoveTarget);
+            CHECK(GuidEq(effect.desktop,
+                         state.transition.targetOrigin));
+            CHECK(!state.transition.commitCutoffReached);
+        }
+    }
+
+    const PopupSaveFailure nonNoneFailures[]={
+        PopupSaveFailure::IdentityLost,
+        PopupSaveFailure::IdentityIndeterminate,
+        PopupSaveFailure::Classification,
+        PopupSaveFailure::StorageUnavailable,
+        PopupSaveFailure::StorageReadOnly,
+        PopupSaveFailure::ReservationUnavailable,
+        PopupSaveFailure::InvalidRecordId,
+        PopupSaveFailure::DesktopUnavailable,
+        PopupSaveFailure::WrongProfile,
+        PopupSaveFailure::FingerprintUnavailable,
+        PopupSaveFailure::IncompleteTitle,
+        PopupSaveFailure::StageRejected,
+        PopupSaveFailure::IdentityChanged,
+        PopupSaveFailure::FlushFailed,
+        PopupSaveFailure::Unexpected
+    };
+    for(PopupSaveFailure failure : nonNoneFailures)
+        CHECK(!PickerRowMoveSaveCommits(
+            PopupSaveStatus::NotTracked,failure));
+}
+
+static void test_picker_row_move_cancellation_never_dismisses_popup(){
+    PickerState beforeIssue=PickerRowMoveFixture(531);
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=beforeIssue.transition.generation;
+    PickerEffect effect=AdvancePickerTransition(beforeIssue,begin);
+    CHECK(effect.kind==PickerEffectKind::MoveTarget);
+    PickerObservation cancel;
+    cancel.event=PickerEvent::CancelRequested;
+    cancel.generation=beforeIssue.transition.generation;
+    cancel.unissuedEffectCancelled=true;
+    effect=AdvancePickerTransition(beforeIssue,cancel);
+    CHECK(effect.kind==PickerEffectKind::Refresh);
+    CHECK(!beforeIssue.transition.dismissed);
+    CHECK(effect.kind!=PickerEffectKind::Hide);
+
+    PickerState duringRead=PickerRowMoveFixture(532);
+    begin.generation=duringRead.transition.generation;
+    effect=AdvancePickerTransition(duringRead,begin);
+    PickerObservation moved=PickerObservationFor(
+        effect,PickerEvent::ApiCompleted);
+    moved.identity=PickerIdentityValidity::Match;
+    moved.apiInvoked=true;
+    effect=AdvancePickerTransition(duringRead,moved);
+    CHECK(effect.kind==PickerEffectKind::ReadTarget);
+    cancel.generation=duringRead.transition.generation;
+    cancel.unissuedEffectCancelled=false;
+    CHECK(AdvancePickerTransition(duringRead,cancel).kind==
+          PickerEffectKind::None);
+    CHECK(duringRead.transition.pendingEffect==
+          PickerEffectKind::ReadTarget);
+    PickerObservation read=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    read.identity=PickerIdentityValidity::Match;
+    read.targetRead=PickerReadValidity::Valid;
+    read.actualTargetDesktop=duringRead.transition.destination;
+    effect=AdvancePickerTransition(duringRead,read);
+    CHECK(effect.kind==PickerEffectKind::MoveTarget);
+    CHECK(GuidEq(effect.desktop,duringRead.transition.targetOrigin));
+    CHECK(!duringRead.transition.dismissed);
+
+    PickerState duringSave=PickerRowMoveFixture(533);
+    effect=PickerAdvanceRowMoveToSave(duringSave);
+    cancel.generation=duringSave.transition.generation;
+    cancel.unissuedEffectCancelled=true;
+    CHECK(AdvancePickerTransition(duringSave,cancel).kind==
+          PickerEffectKind::None);
+    CHECK(duringSave.transition.pendingEffect==
+          PickerEffectKind::SaveExactTarget);
+    PickerObservation saved=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    saved.identity=PickerIdentityValidity::Match;
+    saved.saveStatus=PopupSaveStatus::NotTracked;
+    saved.saveFailure=PopupSaveFailure::None;
+    effect=AdvancePickerTransition(duringSave,saved);
+    CHECK(effect.kind==PickerEffectKind::Refresh);
+    CHECK(!duringSave.transition.dismissed);
+}
+
+static void test_picker_row_move_rollback_is_target_only(){
+    PickerState state=PickerRowMoveFixture(541);
+    PickerEffect effect=PickerAdvanceRowMoveToSave(state);
+    state.transition.popupMayHaveMoved=true;
+    state.transition.switchMayHaveChanged=true;
+    PickerObservation saved=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    saved.identity=PickerIdentityValidity::Match;
+    saved.saveStatus=PopupSaveStatus::Failed;
+    saved.saveFailure=PopupSaveFailure::StorageReadOnly;
+    std::vector<PickerEffectKind> order;
+    effect=AdvancePickerTransition(state,saved);
+    order.push_back(effect.kind);
+    CHECK(effect.kind==PickerEffectKind::MoveTarget);
+    CHECK(GuidEq(effect.desktop,state.transition.targetOrigin));
+
+    PickerObservation rolled=PickerObservationFor(
+        effect,PickerEvent::ApiCompleted);
+    rolled.identity=PickerIdentityValidity::Match;
+    rolled.apiInvoked=true;
+    effect=AdvancePickerTransition(state,rolled);
+    order.push_back(effect.kind);
+    CHECK(effect.kind==PickerEffectKind::ReadTarget);
+
+    PickerObservation verified=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    verified.identity=PickerIdentityValidity::Match;
+    verified.targetRead=PickerReadValidity::Valid;
+    verified.actualTargetDesktop=state.transition.targetOrigin;
+    effect=AdvancePickerTransition(state,verified);
+    order.push_back(effect.kind);
+    CHECK(effect.kind==PickerEffectKind::Refresh);
+
+    PickerObservation refreshed=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    refreshed.apiAccepted=true;
+    CHECK(AdvancePickerTransition(state,refreshed).kind==
+          PickerEffectKind::None);
+    CHECK(state.transition.terminalAcknowledged);
+    CHECK(!PickerRowOrderHasForbiddenEffect(order));
+    CHECK(std::count(order.begin(),order.end(),
+          PickerEffectKind::MoveTarget)==1);
+}
+
+static void test_picker_row_move_committed_refresh_retries_without_rollback(){
+    struct PublishedCase {
+        PopupSaveStatus status;
+        PopupSaveFailure failure;
+    };
+    const PublishedCase cases[]={
+        {PopupSaveStatus::Saved,PopupSaveFailure::None},
+        {PopupSaveStatus::NotTracked,PopupSaveFailure::None},
+        {PopupSaveStatus::Failed,PopupSaveFailure::FlushFailed}
+    };
+    uint64_t generation=550;
+    for(const PublishedCase& value : cases){
+        PickerState state=PickerRowMoveFixture(generation++);
+        PickerEffect effect=PickerAdvanceRowMoveToSave(state);
+        PickerObservation saved=PickerObservationFor(
+            effect,PickerEvent::EffectCompleted);
+        saved.identity=PickerIdentityValidity::Match;
+        saved.saveStatus=value.status;
+        saved.saveFailure=value.failure;
+        effect=AdvancePickerTransition(state,saved);
+        CHECK(effect.kind==PickerEffectKind::Refresh);
+        const int rollbackAttempts=state.transition.rollbackTargetAttempts;
+
+        PickerObservation failed=PickerObservationFor(
+            effect,PickerEvent::EffectCompleted);
+        failed.apiAccepted=false;
+        effect=AdvancePickerTransition(state,failed);
+        CHECK(effect.kind==PickerEffectKind::Refresh);
+        CHECK(state.transition.commitCutoffReached);
+        CHECK(state.transition.rollbackTargetAttempts==rollbackAttempts);
+        CHECK(!state.transition.terminalAcknowledged);
+
+        PickerObservation rebuilt=PickerObservationFor(
+            effect,PickerEvent::EffectCompleted);
+        rebuilt.apiAccepted=true;
+        CHECK(AdvancePickerTransition(state,rebuilt).kind==
+              PickerEffectKind::None);
+        CHECK(state.transition.terminalAcknowledged);
+    }
+}
+
+static PickerObservation PickerObservationFor(
         const PickerEffect& effect,PickerEvent event){
     PickerObservation observation;
     observation.event=event;
@@ -25861,6 +26185,11 @@ int main(){
     test_picker_transition_policy_table_is_closed();
     test_picker_row_action_preserves_popup_active_target();
     test_picker_begin_preconditions_are_mode_specific();
+    test_picker_row_move_only_has_exact_order_and_keeps_active();
+    test_picker_row_move_save_commit_table_is_fail_closed();
+    test_picker_row_move_cancellation_never_dismisses_popup();
+    test_picker_row_move_rollback_is_target_only();
+    test_picker_row_move_committed_refresh_retries_without_rollback();
     test_picker_transition_success_has_exact_verified_effect_order();
     test_picker_sticky_popup_success_skips_popup_effects();
     test_picker_transition_rejects_stale_duplicate_and_wrong_effect_acks();

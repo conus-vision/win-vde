@@ -1243,6 +1243,13 @@ inline bool PickerSavePublishesOperationLifetimeClaim(
          failure==PopupSaveFailure::FlushFailed);
 }
 
+inline bool PickerRowMoveSaveCommits(
+        PopupSaveStatus status,PopupSaveFailure failure) noexcept {
+    return (status==PopupSaveStatus::NotTracked &&
+            failure==PopupSaveFailure::None) ||
+           PickerSavePublishesOperationLifetimeClaim(status,failure);
+}
+
 template<class ClaimMap>
 inline bool MarkPickerOperationLifetimeClaimPublished(
         ClaimMap& claims,const std::string& runtimeKey,
@@ -2227,6 +2234,8 @@ inline PickerEffect PickerContinueRollbackAfterPopup(
 
 inline PickerEffect PickerContinueRollbackAfterTarget(
         PickerState& state) noexcept {
+    if(state.transition.mode==PickerTransitionMode::RowMoveOnly)
+        return PickerStartRefresh(state);
     if(state.transition.popupRoute==PickerPopupRoute::StickyUnmanaged)
         return PickerContinueRollbackAfterPopup(state);
     if(state.transition.popupMayHaveMoved)
@@ -2243,6 +2252,23 @@ inline PickerEffect PickerBeginRollback(PickerState& state,
     PickerTransition& transition=state.transition;
     transition.failed=true;
     PickerAppendDiagnostic(transition,diagnostic);
+    if(transition.mode==PickerTransitionMode::RowMoveOnly){
+        transition.rollbackVerificationRequired=
+            transition.rollbackVerificationRequired ||
+            transition.targetMayHaveMoved;
+        if(!transition.rollbackVerificationRequired)
+            return PickerStartRefresh(state);
+        if(transition.targetIdentityUnusable){
+            PickerAppendDiagnostic(
+                transition,
+                L"The target identity cannot be safely rolled back.");
+            return PickerStartRefresh(state);
+        }
+        if(transition.targetMayHaveMoved)
+            return PickerIssueTarget(state,true);
+        transition.phase=PickerPhase::RollbackTargetVerify;
+        return EmitPickerEffect(state,PickerEffectKind::ReadTarget);
+    }
     transition.rollbackVerificationRequired=
         transition.rollbackVerificationRequired ||
         transition.targetMayHaveMoved || transition.popupMayHaveMoved ||
@@ -2390,6 +2416,27 @@ inline PickerEffect AdvancePickerTransition(
     if(observation.event==PickerEvent::CancelRequested){
         if(transition.phase==PickerPhase::Idle || transition.dismissed)
             return PickerNoEffect();
+        if(transition.mode==PickerTransitionMode::RowMoveOnly){
+            if(transition.cancelRequested)
+                return PickerNoEffect();
+            transition.cancelRequested=true;
+            transition.failed=true;
+            PickerAppendDiagnostic(
+                transition,L"The picker move was cancelled.");
+            if(transition.phase==PickerPhase::SaveExactTarget ||
+               transition.phase==PickerPhase::RefreshModel)
+                return PickerNoEffect();
+            if(observation.unissuedEffectCancelled){
+                if(transition.pendingEffect==PickerEffectKind::MoveTarget)
+                    transition.targetMayHaveMoved=
+                        transition.targetUnresolvedBeforeIssue;
+                transition.pendingEffect=PickerEffectKind::None;
+                return PickerBeginRollback(state,nullptr);
+            }
+            if(transition.pendingEffect!=PickerEffectKind::None)
+                return PickerNoEffect();
+            return PickerBeginRollback(state,nullptr);
+        }
         transition.resumeAfterHide=transition.phase;
         transition.cancelRequested=true;
         transition.dismissed=true;
@@ -2450,6 +2497,9 @@ inline PickerEffect AdvancePickerTransition(
                 return PickerForwardFailed(
                     state,L"The target move was not safely invoked.");
             }
+            if(transition.mode==PickerTransitionMode::RowMoveOnly &&
+               transition.cancelRequested)
+                return PickerBeginRollback(state,nullptr);
             transition.phase=PickerPhase::TargetVerify;
             return EmitPickerEffect(state,PickerEffectKind::ReadTarget);
         }
@@ -2466,8 +2516,27 @@ inline PickerEffect AdvancePickerTransition(
             }
             transition.observedTargetValidity=observation.targetRead;
             transition.observedTargetDesktop=observation.actualTargetDesktop;
+            if(transition.mode==PickerTransitionMode::RowMoveOnly &&
+               transition.cancelRequested){
+                transition.targetMayHaveMoved=
+                    !PickerReadMatches(
+                        observation.targetRead,
+                        observation.actualTargetDesktop,
+                        transition.targetOrigin);
+                if(!transition.targetMayHaveMoved){
+                    transition.rollbackVerificationRequired=false;
+                    return PickerStartRefresh(state);
+                }
+                return PickerBeginRollback(state,nullptr);
+            }
             if(PickerReadMatches(observation.targetRead,
                     observation.actualTargetDesktop,transition.destination)){
+                if(transition.mode==PickerTransitionMode::RowMoveOnly){
+                    transition.phase=PickerPhase::SaveExactTarget;
+                    transition.commitCutoffReached=true;
+                    return EmitPickerEffect(
+                        state,PickerEffectKind::SaveExactTarget);
+                }
                 transition.phase=PickerPhase::IdentityVerifyBeforePopup;
                 return EmitPickerEffect(state,PickerEffectKind::ValidateTarget);
             }
@@ -2748,6 +2817,31 @@ inline PickerEffect AdvancePickerTransition(
     case PickerPhase::SaveExactTarget:
         if(acknowledged==PickerEffectKind::SaveExactTarget &&
            observation.event==PickerEvent::EffectCompleted){
+            if(transition.mode==PickerTransitionMode::RowMoveOnly){
+                const bool commits=PickerRowMoveSaveCommits(
+                    observation.saveStatus,observation.saveFailure);
+                if(observation.saveStatus==PopupSaveStatus::Failed){
+                    transition.failed=true;
+                    PickerAppendDiagnostic(
+                        transition,PickerSaveFailureDiagnostic(
+                            observation.saveFailure));
+                }
+                if(!PickerIdentityMatches(observation.identity)){
+                    PickerInvalidateObservedTarget(transition);
+                    transition.failed=true;
+                    PickerAppendDiagnostic(
+                        transition,PickerPostSaveIdentityDiagnostic(
+                            observation.saveStatus,
+                            observation.identity));
+                }
+                if(commits){
+                    transition.commitCutoffReached=true;
+                    return PickerStartRefresh(state);
+                }
+                transition.commitCutoffReached=false;
+                return PickerBeginRollback(
+                    state,L"The target assignment was not published.");
+            }
             if(observation.saveStatus==PopupSaveStatus::Failed){
                 transition.failed=true;
                 PickerAppendDiagnostic(
@@ -2773,6 +2867,17 @@ inline PickerEffect AdvancePickerTransition(
     case PickerPhase::RefreshModel:
         if(acknowledged==PickerEffectKind::Refresh &&
            observation.event==PickerEvent::EffectCompleted){
+            if(transition.mode==PickerTransitionMode::RowMoveOnly){
+                if(!observation.apiAccepted){
+                    transition.failed=true;
+                    PickerAppendDiagnostic(
+                        transition,
+                        L"The picker model could not be refreshed.");
+                    return PickerStartRefresh(state);
+                }
+                PickerAcknowledgeTerminal(transition);
+                return PickerNoEffect();
+            }
             if(!observation.apiAccepted){
                 transition.failed=true;
                 PickerAppendDiagnostic(
