@@ -2,8 +2,9 @@
 
 A small tray utility that remembers which **virtual desktop** each browser
 window belongs to and puts them back automatically after a reboot or a browser
-restart. It also adds a fast keyboard-driven picker for moving the active
-window between desktops.
+restart. It also adds a fast searchable picker for moving the active
+window between desktops, activating an exact listed window, and dragging window
+rows between desktop tiles.
 
 - **Author:** Volodymyr Moskvin — <info@conus.vision>
 - **Repository:** https://github.com/conus-vision/win-vde
@@ -11,8 +12,9 @@ window between desktops.
 
 **➡ [Download the latest `vde.exe`](https://github.com/conus-vision/win-vde/releases/latest)** — a single file, no installer. Or build it from source (see [Quick start](#quick-start)).
 
-> Supports **Firefox, Chrome, and Edge** today. The picker has search, scrolling,
-> and full-name tooltips.
+> Automatic layout memory supports **Firefox, Chrome, and Edge** today. The
+> picker also lists eligible ordinary windows from other applications, with app
+> icons, active-window highlighting, search, scrolling, and full-name tooltips.
 
 <p align="center"><img src="docs/overview.svg" alt="How win-vde works: Windows scatters browser windows across virtual desktops after a reboot; win-vde remembers the layout and restores it; plus a fast searchable desktop picker" width="840"></p>
 
@@ -55,14 +57,25 @@ restart, and moves each matched window to the desktop it was saved on.
   expiry, VDE restores it before updating the saved layout.
 - **Two layouts** — a rolling *auto* layout plus a manual checkpoint you save on
   demand.
-- **Desktop picker** — global hotkey (default `Ctrl+Alt+D`) opens a grid of
-  desktops. Click to switch; `Ctrl`+click to move the active window there. Type
-  to filter windows — matching **any of their browser tabs**, not just the
-  active one, by tab title *or* full **URL** (address bar) — scroll tiles with
-  the wheel, hover a clipped name for its full title.
-- **Persistent Ctrl+Click picker** — moving the active window also switches to
-  the destination desktop while keeping the picker open and its active context
-  highlighted.
+- **All-window desktop picker** — the global hotkey (default `Ctrl+Alt+D`)
+  opens a grid of desktops on the primary monitor, containing eligible ordinary
+  application windows, not only tracked browsers. Rows show application icons,
+  the exact active window, a full-row hover highlight, and tooltips for clipped
+  names.
+- **Exact click behavior** — click a window row to switch to its displayed
+  desktop and activate that exact window. Click a desktop title or empty tile
+  area to switch desktops without requesting activation of a listed window.
+- **Ctrl+Click and row Drag & Drop** — stationary `Ctrl`+click moves the
+  captured active window, follows it to the destination, and keeps the picker
+  open. Drag an exact row to another desktop to move that window without
+  switching desktops or closing the picker.
+- **Pinned/global-window safety** — windows shown on every desktop, individually
+  pinned views, and application-wide pins are never physically moved. Only the
+  selected row is visually assigned to the destination for the current popup
+  session; Windows pin state and saved layouts remain unchanged.
+- **Searchable window rows** — type to filter by window title. Browser windows
+  additionally match **any tab**, not just the active one, by tab title or full
+  **URL** (address bar). Scroll individual desktop tiles with the mouse wheel.
 - **Start with Windows** — optional run-at-logon toggle.
 - **Honest about breakage** — if a Windows update changes the undocumented
   interfaces, the app explains what happened and runs in a limited mode instead
@@ -72,12 +85,29 @@ restart, and moves each matched window to the desktop it was saved on.
 
 - Automatic window memory covers every Firefox, Google Chrome, and Microsoft
   Edge top-level browser window, and no other application.
+- The picker displays eligible ordinary top-level windows from other
+  applications as well. This does not broaden automatic save/restore beyond
+  Firefox, Chrome, and Edge.
 - A closed browser window remains remembered for exactly 30 days. Reopening it
   before expiry restores its remembered virtual desktop before the rolling
   layout is updated; records expire at the 30-day boundary.
-- Ctrl+Click moves the active window, switches to the target desktop, and keeps
-  the picker open with the current desktop and active window highlighted.
-  Ordinary click switches desktops and closes the picker.
+- Hovering a window row highlights its complete clickable area, including the
+  icon; the active-window highlight remains visually stronger.
+- A plain click on a window row switches to the row's displayed desktop, closes
+  the picker, and attempts to activate that exact window. A click on a desktop
+  title or empty tile area only switches desktops and does not explicitly
+  activate any listed window.
+- Stationary Ctrl+Click anywhere in a desktop tile moves the captured active
+  window, switches to the destination, and keeps the picker open with its active
+  context highlighted.
+- Dragging a row to another desktop moves that exact window while leaving the
+  current desktop unchanged and the picker open. Verified Firefox, Chrome, and
+  Edge moves update their supported saved assignment; moves for other
+  applications affect the current live window but create no restore record.
+- A globally visible, view-pinned, or application-pinned window is never sent
+  through a physical move. The picker instead shows only the selected row under
+  the destination tile until the popup session ends, then reconstructs the next
+  popup from actual Windows state.
 - The footer links to [Virtual Desktop Extension](https://github.com/conus-vision/win-vde)
   and [Conus Vision](https://conus.vision).
 - Layout v4 is migrated automatically from v2/v3. The legacy
@@ -115,8 +145,12 @@ icon for:
 | **About…** | Version, author, contact, project link |
 | **Exit** | Quit after saving the current automatic layout |
 
-**Picker:** click a desktop to switch to it; `Ctrl`+click to move the active
-window there. Arrow keys / number keys navigate; `Esc` closes.
+**Picker:** click a window row to switch to its displayed desktop and activate
+that exact window. Click a desktop title or empty tile area to switch without
+activating a listed window. `Ctrl`+click a tile to move the captured active
+window there and keep the picker open. Drag a row to move that exact window
+without switching desktops or closing the picker. Arrow keys / number keys
+navigate; `Esc` closes.
 
 **Command line:**
 
@@ -170,12 +204,18 @@ restore work unattended.
   Windows build to <info@conus.vision> so a fix can be published.
 - Only the **virtual desktop** of each window is saved/restored — on-screen size
   and position are left to the browser's own session restore.
+- Persistent automatic/manual window memory remains limited to Firefox, Chrome,
+  and Edge. The picker can display, activate, and move eligible windows from
+  other applications, but it does not create restore records for them.
+- Globally visible or pinned windows are protected from physical moves. Their
+  session-only visual placement in the picker disappears when the popup closes.
 - Private Firefox windows aren't in the session store, so they're matched by
   title only.
 
 ## Roadmap
 
-- Generic (user-defined) multi-window apps beyond the three built-in browsers.
+- Persistent restore profiles for generic (user-defined) multi-window apps
+  beyond the three built-in browsers.
 - Optional restore of on-screen geometry (size/position), not just the desktop.
 
 ## License
