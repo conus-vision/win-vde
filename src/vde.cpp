@@ -5839,6 +5839,48 @@ static bool CapturePickerDragPreview(
     }
 }
 
+static bool CurrentPickerDragPreviewBounds(
+        HWND owner,RECT& bounds) noexcept {
+    bounds=RECT{0,0,0,0};
+    const bool identityMatches=
+        g_pickerDragPreview.captured &&
+        SameIdentity(
+            g_pickerDragPreview.identity,
+            g_pickerGesture.row.identity);
+    if(!PickerDragPreviewPaintable(
+            g_pickerGesture.phase,
+            owner && GetCapture()==owner,
+            identityMatches,
+            g_pickerDragPreview.modelGeneration,
+            g_picker.modelGeneration,
+            g_pickerDragPreview.rowLayoutEpoch,
+            g_picker.rowLayoutEpoch) ||
+       !PickerDragPreviewGeometryValid(
+            g_pickerDragPreview.size,
+            g_pickerDragPreview.grabOffset))
+        return false;
+    bounds=PickerDragPreviewBounds(
+        g_pickerDragPreview.pointer,
+        g_pickerDragPreview.size,
+        g_pickerDragPreview.grabOffset);
+    return bounds.right>bounds.left && bounds.bottom>bounds.top;
+}
+
+static bool CurrentPickerDragPreviewClientBounds(
+        HWND owner,RECT& bounds) noexcept {
+    RECT raw={0,0,0,0};
+    RECT client={0,0,0,0};
+    if(!CurrentPickerDragPreviewBounds(owner,raw) || !owner ||
+       !GetClientRect(owner,&client)){
+        bounds=RECT{0,0,0,0};
+        return false;
+    }
+    const PickerDragPreviewBlit clipped=
+        ResolvePickerDragPreviewBlit(raw,client);
+    bounds=clipped.destination;
+    return clipped.visible;
+}
+
 static int HitPickerTile(POINT point) noexcept {
     for(size_t index=0;index<g_tiles.size();++index)
         if(PtInRect(&g_tiles[index].rc,point))
@@ -10836,6 +10878,12 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     case WM_MOUSEMOVE:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
         if(g_picker.controlledTransition()) return 0;
         if(g_pickerGesture.phase!=PickerPointerPhase::Idle){
+            RECT oldPreviewBounds={0,0,0,0};
+            const bool oldPreviewVisible=
+                CurrentPickerDragPreviewClientBounds(
+                    hwnd,oldPreviewBounds);
+            if(g_pickerDragPreview.captured)
+                g_pickerDragPreview.pointer=pt;
             const PickerPointerGesture gestureFacts=g_pickerGesture;
             const PickerPointerPhase priorPhase=g_pickerGesture.phase;
             const int priorDropTileIndex=
@@ -10849,6 +10897,14 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                     g_picker.modelGeneration,
                     g_picker.rowLayoutEpoch,
                     candidateDropTile);
+            RECT newPreviewBounds={0,0,0,0};
+            const bool newPreviewVisible=
+                CurrentPickerDragPreviewClientBounds(
+                    hwnd,newPreviewBounds);
+            const RECT previewDirty=
+                PickerDragPreviewDirtyBounds(
+                    oldPreviewVisible,oldPreviewBounds,
+                    newPreviewVisible,newPreviewBounds);
             if(gestureAction==PickerGestureAction::Cancel){
                 EmitPickerGestureTrace(
                     gestureFacts,priorPhase,PickerPointerPhase::Idle,
@@ -10868,6 +10924,9 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                     priorDropTileIndex!=
                         g_pickerGesture.dropTileIndex)
                     InvalidateRect(hwnd,nullptr,FALSE);
+                else if(previewDirty.right>previewDirty.left &&
+                        previewDirty.bottom>previewDirty.top)
+                    InvalidateRect(hwnd,&previewDirty,FALSE);
             }
             return 0;
         }

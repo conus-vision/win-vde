@@ -28490,6 +28490,74 @@ static void test_picker_drag_preview_snapshot_is_presentation_only(){
     CHECK(dispatch.find("CapturePickerDragPreview")==std::string::npos);
 }
 
+static void test_picker_drag_preview_motion_is_current_and_precise(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    CHECK(!source.empty());
+
+    const std::string current=SourceSection(
+        source,"static bool CurrentPickerDragPreviewBounds(",
+        "static int HitPickerTile(");
+    CHECK(!current.empty());
+    CHECK(current.find("GetCapture()==owner")!=std::string::npos);
+    CHECK(current.find("SameIdentity(")!=std::string::npos);
+    CHECK(current.find("g_pickerDragPreview.identity")!=
+          std::string::npos);
+    CHECK(current.find("g_pickerGesture.row.identity")!=
+          std::string::npos);
+    CHECK(current.find("PickerDragPreviewPaintable(")!=
+          std::string::npos);
+    CHECK(current.find("g_picker.modelGeneration")!=
+          std::string::npos);
+    CHECK(current.find("g_picker.rowLayoutEpoch")!=
+          std::string::npos);
+    CHECK(current.find("PickerDragPreviewBounds(")!=
+          std::string::npos);
+    CHECK(current.find("ResolvePickerDragPreviewBlit(")!=
+          std::string::npos);
+
+    const std::string move=SourceSection(
+        source,"case WM_MOUSEMOVE:","case WM_LBUTTONUP:");
+    const size_t gestureBranch=move.find(
+        "if(g_pickerGesture.phase!=PickerPointerPhase::Idle)");
+    const size_t oldVisible=move.find(
+        "const bool oldPreviewVisible=",gestureBranch);
+    const size_t updatePointer=move.find(
+        "g_pickerDragPreview.pointer=pt;",oldVisible);
+    const size_t reducer=move.find(
+        "UpdatePickerRowGesture(",updatePointer);
+    const size_t newVisible=move.find(
+        "const bool newPreviewVisible=",reducer);
+    const size_t dirty=move.find(
+        "PickerDragPreviewDirtyBounds(",newVisible);
+    const size_t partialInvalidate=move.find(
+        "InvalidateRect(hwnd,&previewDirty,FALSE)",dirty);
+    const size_t idleHover=move.find(
+        "const bool cacheReady=",gestureBranch);
+    CHECK(gestureBranch!=std::string::npos &&
+          oldVisible!=std::string::npos &&
+          updatePointer!=std::string::npos && reducer!=std::string::npos &&
+          newVisible!=std::string::npos && dirty!=std::string::npos &&
+          partialInvalidate!=std::string::npos &&
+          idleHover!=std::string::npos);
+    CHECK(gestureBranch<oldVisible && oldVisible<updatePointer &&
+          updatePointer<reducer && reducer<newVisible &&
+          newVisible<dirty && dirty<partialInvalidate &&
+          partialInvalidate<idleHover);
+
+    const std::string gestureOnly=
+        gestureBranch!=std::string::npos && idleHover!=std::string::npos
+        ?move.substr(gestureBranch,idleHover-gestureBranch)
+        :std::string();
+    CHECK(!gestureOnly.empty());
+    CHECK(gestureOnly.find("hitSnapshot")==std::string::npos);
+    CHECK(gestureOnly.find("g_pickerPaintCache.hoverRows")==
+          std::string::npos);
+    CHECK(gestureOnly.find("SetPickerSelectionCurrent(")==
+          std::string::npos);
+    CHECK(gestureOnly.find("RefreshPickerPaintCache(")==
+          std::string::npos);
+}
+
 static void test_picker_row_hover_runtime_uses_full_hit_geometry(){
     const std::string source=ReadSourceFile(L"src\\vde.cpp");
     CHECK(!source.empty());
@@ -28917,6 +28985,7 @@ int main(){
     test_picker_trace_task10_runtime_anchors_and_privacy_are_locked();
     test_picker_drag_runtime_wiring_and_conflict_gates_are_explicit();
     test_picker_drag_preview_snapshot_is_presentation_only();
+    test_picker_drag_preview_motion_is_current_and_precise();
     test_picker_row_hover_runtime_uses_full_hit_geometry();
     test_picker_exact_activation_runtime_has_no_fallback_target();
     test_picker_visual_session_runtime_end_paths_are_explicit();
