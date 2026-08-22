@@ -3224,6 +3224,75 @@ static void test_picker_transition_policy_table_is_closed(){
     CHECK(effect.hideDisposition==PickerHideDisposition::None);
 }
 
+static void test_picker_action_intent_dispatch_table_is_exact(){
+    auto decision=DecidePickerActionIntent(
+        false,false,false,PickerRowAdmission::DisplayOnly,
+        false,TargetMoveDisposition::Reject);
+    CHECK(decision.accepted);
+    CHECK(decision.intent==PickerActionIntent::TileSwitch);
+
+    decision=DecidePickerActionIntent(
+        true,false,false,PickerRowAdmission::Verified,
+        true,TargetMoveDisposition::Reject);
+    CHECK(decision.accepted);
+    CHECK(decision.intent==PickerActionIntent::ActivateExact);
+    decision=DecidePickerActionIntent(
+        true,false,false,PickerRowAdmission::DisplayOnly,
+        false,TargetMoveDisposition::Physical);
+    CHECK(decision.accepted);
+    CHECK(decision.intent==PickerActionIntent::TileSwitch);
+
+    decision=DecidePickerActionIntent(
+        true,true,false,PickerRowAdmission::DisplayOnly,
+        true,TargetMoveDisposition::Physical);
+    CHECK(!decision.accepted);
+    decision=DecidePickerActionIntent(
+        true,true,false,PickerRowAdmission::Verified,
+        true,TargetMoveDisposition::Physical);
+    CHECK(decision.accepted);
+    CHECK(decision.intent==PickerActionIntent::RowMoveOnly);
+    decision=DecidePickerActionIntent(
+        true,true,true,PickerRowAdmission::Verified,
+        true,TargetMoveDisposition::VisualOnly);
+    CHECK(decision.accepted);
+    CHECK(decision.intent==PickerActionIntent::VisualOnly);
+    decision=DecidePickerActionIntent(
+        true,true,false,PickerRowAdmission::Verified,
+        true,TargetMoveDisposition::Reject);
+    CHECK(!decision.accepted);
+
+    for(bool hasRow : {false,true}){
+        decision=DecidePickerActionIntent(
+            hasRow,false,true,PickerRowAdmission::Verified,
+            true,TargetMoveDisposition::Physical);
+        CHECK(decision.accepted);
+        CHECK(decision.intent==PickerActionIntent::MoveAndFollow);
+        decision=DecidePickerActionIntent(
+            hasRow,false,true,PickerRowAdmission::Verified,
+            true,TargetMoveDisposition::VisualOnly);
+        CHECK(decision.accepted);
+        CHECK(decision.intent==PickerActionIntent::VisualAndFollow);
+        decision=DecidePickerActionIntent(
+            hasRow,false,true,PickerRowAdmission::Verified,
+            true,TargetMoveDisposition::Reject);
+        CHECK(!decision.accepted);
+    }
+
+    CHECK(PickerActionUsesPopupActiveTarget(
+        PickerActionIntent::MoveAndFollow));
+    CHECK(PickerActionUsesPopupActiveTarget(
+        PickerActionIntent::VisualAndFollow));
+    CHECK(!PickerActionUsesPopupActiveTarget(
+        PickerActionIntent::RowMoveOnly));
+    CHECK(!PickerActionUsesPopupActiveTarget(
+        PickerActionIntent::VisualOnly));
+    PickerActionRequest request;
+    CHECK(request.intent==PickerActionIntent::TileSwitch);
+    CHECK(!request.hasRow && request.activationId==0);
+    static_assert(std::is_trivially_copyable<PickerActionRequest>::value,
+        "picker action requests must be value-only");
+}
+
 static void test_picker_row_action_preserves_popup_active_target(){
     PickerState state=PickerTransitionFixture(501);
     const WindowIdentityKey active=IK(0x1111,71,9001);
@@ -3967,6 +4036,36 @@ static void test_picker_visual_publication_failure_rolls_back_popup_only(){
     CHECK(GuidEq(effect.desktop,state.transition.currentOrigin));
     CHECK(effect.kind!=PickerEffectKind::MoveTarget);
     CHECK(!state.transition.targetMayHaveMoved);
+
+    PickerObservation popupRollback=PickerObservationFor(
+        effect,PickerEvent::ApiCompleted);
+    popupRollback.apiInvoked=true;
+    effect=AdvancePickerTransition(state,popupRollback);
+    CHECK(effect.kind==PickerEffectKind::ReadPopup);
+    PickerObservation popupRestored=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    popupRestored.popupRead=PickerReadValidity::Valid;
+    popupRestored.actualPopupDesktop=state.transition.currentOrigin;
+    effect=AdvancePickerTransition(state,popupRestored);
+    CHECK(effect.kind==PickerEffectKind::SwitchDesktop);
+    PickerObservation switchRollback=PickerObservationFor(
+        effect,PickerEvent::ApiCompleted);
+    switchRollback.apiInvoked=true;
+    effect=AdvancePickerTransition(state,switchRollback);
+    CHECK(effect.kind==PickerEffectKind::ReadCurrent);
+    PickerObservation originRestored=PickerObservationFor(
+        effect,PickerEvent::ReadbackCompleted);
+    originRestored.currentRead=PickerReadValidity::Valid;
+    originRestored.actualCurrentDesktop=state.transition.currentOrigin;
+    effect=AdvancePickerTransition(state,originRestored);
+    CHECK(effect.kind==PickerEffectKind::Refresh);
+    PickerObservation refreshed=PickerObservationFor(
+        effect,PickerEvent::EffectCompleted);
+    refreshed.apiAccepted=true;
+    effect=AdvancePickerTransition(state,refreshed);
+    CHECK(effect.kind==PickerEffectKind::None);
+    CHECK(state.transition.terminalAcknowledged);
+    CHECK(!state.transition.failureReported);
 }
 
 static void test_picker_hide_disposition_controls_visual_session_end(){
@@ -23463,6 +23562,76 @@ static void test_picker_trace_move_begin_reasons_have_stable_json_names(){
     }
 }
 
+static void test_picker_trace_action_fields_have_stable_json_names(){
+    struct IntentCase { PickerActionIntent value; const char* name; };
+    const IntentCase intents[]={
+        {PickerActionIntent::TileSwitch,"tile_switch"},
+        {PickerActionIntent::ActivateExact,"activate_exact"},
+        {PickerActionIntent::MoveAndFollow,"move_and_follow"},
+        {PickerActionIntent::RowMoveOnly,"row_move_only"},
+        {PickerActionIntent::VisualAndFollow,"visual_and_follow"},
+        {PickerActionIntent::VisualOnly,"visual_only"}
+    };
+    static_assert(sizeof(intents)/sizeof(intents[0])==
+        static_cast<size_t>(PickerActionIntent::VisualOnly)+1,
+        "picker action intent trace names must be exhaustive");
+    size_t ordinal=0;
+    for(const IntentCase& value:intents){
+        CHECK(static_cast<size_t>(value.value)==ordinal++);
+        CHECK(std::string(PickerTraceActionIntentName(value.value))==
+              value.name);
+    }
+
+    struct ModeCase { PickerTransitionMode value; const char* name; };
+    const ModeCase modes[]={
+        {PickerTransitionMode::MoveAndFollow,"move_and_follow"},
+        {PickerTransitionMode::RowMoveOnly,"row_move_only"},
+        {PickerTransitionMode::VisualAndFollow,"visual_and_follow"},
+        {PickerTransitionMode::VisualOnly,"visual_only"}
+    };
+    static_assert(sizeof(modes)/sizeof(modes[0])==
+        static_cast<size_t>(PickerTransitionMode::VisualOnly)+1,
+        "picker transition mode trace names must be exhaustive");
+    ordinal=0;
+    for(const ModeCase& value:modes){
+        CHECK(static_cast<size_t>(value.value)==ordinal++);
+        CHECK(std::string(PickerTraceTransitionModeName(value.value))==
+              value.name);
+    }
+
+    struct MobilityCase { TargetMobility value; const char* name; };
+    const MobilityCase mobilities[]={
+        {TargetMobility::Movable,"movable"},
+        {TargetMobility::ViewPinned,"view_pinned"},
+        {TargetMobility::AppPinned,"app_pinned"},
+        {TargetMobility::Immovable,"immovable"},
+        {TargetMobility::Indeterminate,"indeterminate"}
+    };
+    static_assert(sizeof(mobilities)/sizeof(mobilities[0])==
+        static_cast<size_t>(TargetMobility::Indeterminate)+1,
+        "target mobility trace names must be exhaustive");
+    ordinal=0;
+    for(const MobilityCase& value:mobilities){
+        CHECK(static_cast<size_t>(value.value)==ordinal++);
+        CHECK(std::string(PickerTraceTargetMobilityName(value.value))==
+              value.name);
+    }
+
+    PickerTraceMoveBeginEvent event;
+    event.intent=PickerActionIntent::VisualAndFollow;
+    event.mode=PickerTransitionMode::VisualAndFollow;
+    event.mobility=TargetMobility::AppPinned;
+    std::string line;
+    CHECK(SerializePickerTraceLine(PickerTraceEnvelope{},event,line));
+    CHECK(PickerTraceStrictJsonLineForTest(line));
+    CHECK(line.find("\"intent\":\"visual_and_follow\"")!=
+          std::string::npos);
+    CHECK(line.find("\"mode\":\"visual_and_follow\"")!=
+          std::string::npos);
+    CHECK(line.find("\"mobility\":\"app_pinned\"")!=
+          std::string::npos);
+}
+
 static void test_picker_trace_move_begin_exception_distinguishes_publication(){
     PickerTraceMoveBeginExceptionEvent before;
     before.activationId=71;
@@ -23516,11 +23685,11 @@ static void test_picker_trace_activation_runtime_wiring_is_causal(){
     const std::string source=ReadSourceFile(L"src\\vde.cpp");
     const std::string begin=SourceSection(
         source,
-        "static PickerTraceMoveBeginReason BeginVerifiedPickerMove(",
+        "static PickerActionDispatchResult BeginPickerAction(",
         "class PickerTraceCaptureEmitScope");
     CHECK(!begin.empty());
     CHECK(begin.find("nextCorrelationId(")==std::string::npos);
-    CHECK(begin.find("traceEvent.activationId=activationId;")!=
+    CHECK(begin.find("traceEvent.activationId=request.activationId;")!=
           std::string::npos);
     CHECK(begin.find("traceEvent.tileIndex=index;")!=std::string::npos);
     CHECK(begin.find("traceEvent.generation=prepared.generation;")!=
@@ -23535,9 +23704,9 @@ static void test_picker_trace_activation_runtime_wiring_is_causal(){
           std::string::npos);
     CHECK(begin.find("traceEvent.firstEffect=effect.kind;")!=
           std::string::npos);
-    CHECK(begin.find("event.activationId=activationId;")!=
+    CHECK(begin.find("event.activationId=request.activationId;")!=
           std::string::npos);
-    CHECK(CountSourceText(begin,"return finish(")==28);
+    CHECK(CountSourceText(begin,"return finish(")==37);
     CHECK(begin.find("return;")==std::string::npos);
     CHECK(CountSourceText(begin,"PickerTraceMoveBeginExceptionEvent")==1);
     const size_t acceptedEmit=begin.find(
@@ -23565,7 +23734,9 @@ static void test_picker_trace_activation_runtime_wiring_is_causal(){
         activate,"PickerTraceActivationRequestEvent")==1);
     CHECK(CountSourceText(
         activate,"PickerTraceActivationResultEvent")==1);
-    CHECK(activate.find("BeginVerifiedPickerMove(index,id)")!=
+    CHECK(activate.find("request.activationId=id;")!=
+          std::string::npos);
+    CHECK(activate.find("BeginPickerAction(request)")!=
           std::string::npos);
 
     const std::string keyboard=SourceSection(
@@ -25018,7 +25189,7 @@ static void test_picker_trace_terminal_classifiers_follow_real_reductions(){
 static void test_picker_trace_task8_runtime_wiring_is_explicit(){
     const std::string source=ReadSourceFile(L"src\\vde.cpp");
     const std::string begin=SourceSection(
-        source,"static PickerTraceMoveBeginReason BeginVerifiedPickerMove(",
+        source,"static PickerActionDispatchResult BeginPickerAction(",
         "class PickerTraceCaptureEmitScope");
     const std::string effects=SourceSection(
         source,"static PickerObservation ExecutePickerEffect(",
@@ -26017,7 +26188,7 @@ static void test_picker_trace_task9_runtime_wiring_is_causal_and_private(){
         source,"static bool DrainPickerForShutdown() noexcept {",
         "static bool CaptureFastWindowForMove(");
     const std::string begin=SourceSection(
-        source,"static PickerTraceMoveBeginReason BeginVerifiedPickerMove(",
+        source,"static PickerActionDispatchResult BeginPickerAction(",
         "class PickerTraceCaptureEmitScope {");
     CHECK(!release.empty() && !queue.empty() && !snapshot.empty() &&
           !readback.empty() && !finalizer.empty() && !pump.empty() &&
@@ -26293,11 +26464,11 @@ static void test_picker_trace_task9_runtime_wiring_is_causal_and_private(){
           acceptedGeneration<noInitialSwap && noInitialSwap<noInitialReset &&
           noInitialReset<noInitialReturn);
     CHECK(CountSourceText(begin,
-        "ResetPickerTracePendingTerminalDelivery(")==2);
+        "ResetPickerTracePendingTerminalDelivery(")==4);
     CHECK(CountSourceText(quiesce,
         "ResetPickerTracePendingTerminalDelivery(")==1);
     CHECK(CountSourceText(source,
-        "ResetPickerTracePendingTerminalDelivery(")==4);
+        "ResetPickerTracePendingTerminalDelivery(")==6);
     CHECK(CountSourceText(source,"StorePickerTraceTerminalDelivery(")==5);
     CHECK(CountSourceText(source,
         "StorePickerTracePendingTerminalDelivery(")==2);
@@ -26391,7 +26562,11 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
         {"PickerTraceMoveBeginEvent",
          "uint64_tactivationId=0;uint64_tgeneration=0;inttileIndex=-1;"
          "PickerTraceMoveBeginReasonreason="
-         "PickerTraceMoveBeginReason::InvalidIndex;GUIDtargetOrigin{};"
+         "PickerTraceMoveBeginReason::InvalidIndex;"
+         "PickerActionIntentintent=PickerActionIntent::TileSwitch;"
+         "PickerTransitionModemode=PickerTransitionMode::MoveAndFollow;"
+         "TargetMobilitymobility=TargetMobility::Indeterminate;"
+         "GUIDtargetOrigin{};"
          "GUIDpopupOrigin{};GUIDcurrentOrigin{};GUIDdestination{};"
          "PickerEffectKindfirstEffect=PickerEffectKind::None;"},
         {"PickerTraceMoveBeginExceptionEvent",
@@ -26579,10 +26754,10 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
         PickerTraceEventAssignmentsForTest(source);
     const std::vector<std::string> moduleEventAssignments=
         PickerTraceEventAssignmentsForTest(traceSource);
-    CHECK(vdeEventAssignments.size()==167);
+    CHECK(vdeEventAssignments.size()==176);
     CHECK(moduleEventAssignments.size()==74);
     CHECK(PickerTraceAssignmentDigestForTest(vdeEventAssignments)==
-          "4a500c17df514965da708d738b780a8ea9f69c482de4d4d8b1b76159cdbf1505");
+          "278d89168985da21a1251a2b803254cec38bbfee46ee5e4761a34f90222bcbef");
     CHECK(PickerTraceAssignmentDigestForTest(moduleEventAssignments)==
           "3cf0a4ba0d03558355119c432dd5c642014b7ac987858d2ade5c62a01a4cf493");
     CHECK(std::find(moduleEventAssignments.begin(),
@@ -26638,7 +26813,7 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
         source,"static void Activate(",
         "// --------------------------- settings window");
     const std::string moveBegin=SourceSection(
-        source,"static PickerTraceMoveBeginReason BeginVerifiedPickerMove(",
+        source,"static PickerActionDispatchResult BeginPickerAction(",
         "class PickerTraceCaptureEmitScope");
     const std::string effects=SourceSection(
         source,"static PickerObservation ExecutePickerEffect(",
@@ -26903,7 +27078,7 @@ static void test_picker_evidence_fixes_have_guarded_product_wiring(){
         source,"static BOOL CALLBACK EnumAll(",
         "static bool PopulatePickerFilteredRows(");
     const std::string begin=SourceSection(
-        source,"static PickerTraceMoveBeginReason BeginVerifiedPickerMove(",
+        source,"static PickerActionDispatchResult BeginPickerAction(",
         "class PickerTraceCaptureEmitScope");
     const std::string build=SourceSection(
         source,"static bool BuildModel(",
@@ -27135,7 +27310,7 @@ static void test_target_move_guard_is_single_complete_boundary(){
         source,"static PickerObservation ExecutePickerEffect(",
         "static void PumpPickerTransitionWork()");
     const std::string binding=SourceSection(
-        source,"static PickerTraceMoveBeginReason BeginVerifiedPickerMove(",
+        source,"static PickerActionDispatchResult BeginPickerAction(",
         "class PickerTraceCaptureEmitScope");
     const std::string compactGuard=
         NormalizeCppForPickerTraceAudit(guard);
@@ -27236,7 +27411,7 @@ static void test_new_desktop_observations_require_concrete_membership(){
         source,"static ReservedAutoIdentity ReservationForManualMove(",
         "static bool QueueManualMove(");
     const std::string picker=SourceSection(
-        source,"static PickerTraceMoveBeginReason BeginVerifiedPickerMove(",
+        source,"static PickerActionDispatchResult BeginPickerAction(",
         "class PickerTraceCaptureEmitScope");
     const std::string postMove=SourceSection(
         source,"static PopupSaveResult SavePopupMovedWindow(",
@@ -27277,7 +27452,7 @@ static void test_picker_model_overlay_and_row_geometry_are_one_publication(){
     const std::string paint=SourceSection(
         source,"static void Paint(","static void TipDeactivate(");
     const std::string refresh=SourceSection(
-        source,"static bool RefreshPickerModelPreservingUi() noexcept {",
+        source,"static bool RefreshPickerModelPreservingUi(",
         "struct PickerForegroundHandoffProductContext");
     CHECK(!row.empty() && !model.empty() && !cache.empty() &&
           !paint.empty() && !refresh.empty());
@@ -27332,6 +27507,73 @@ static void test_picker_model_overlay_and_row_geometry_are_one_publication(){
     CHECK(mouse.find("snapshot.hitRect")==std::string::npos);
 }
 
+static void test_picker_action_entry_keeps_active_and_row_targets_separate(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string mobilityProbe=SourceSection(
+        source,"static TargetMobilityDecision QueryTargetWindowMobility(",
+        "static bool CaptureGenericWindowIdentity(");
+    const std::string begin=SourceSection(
+        source,"static PickerActionDispatchResult BeginPickerAction(",
+        "class PickerTraceCaptureEmitScope");
+    const std::string effects=SourceSection(
+        source,"static PickerObservation ExecutePickerEffect(",
+        "static void PumpPickerTransitionWork() noexcept;");
+    CHECK(!mobilityProbe.empty() && !begin.empty() && !effects.empty());
+    CHECK(source.find("BeginVerifiedPickerMove")==std::string::npos);
+    const size_t admission=begin.find(
+        "request.row.admission!=PickerRowAdmission::Verified");
+    const size_t mobility=begin.find("QueryTargetWindowMobility(");
+    const size_t reservation=begin.find("BeginReservationHandoff(");
+    CHECK(admission!=std::string::npos);
+    CHECK(mobility!=std::string::npos);
+    CHECK(reservation!=std::string::npos);
+    CHECK(admission<mobility && admission<reservation);
+    const size_t routeEvidence=mobilityProbe.find(
+        "evidence.desktopRoute=knownRoute;");
+    const size_t missingView=mobilityProbe.find("if(!view)",routeEvidence);
+    const size_t routeDecision=mobilityProbe.find(
+        "facts.decision=DecideTargetMobility(evidence);",missingView);
+    CHECK(routeEvidence!=std::string::npos);
+    CHECK(missingView!=std::string::npos);
+    CHECK(routeDecision!=std::string::npos);
+    CHECK(routeEvidence<missingView && missingView<routeDecision);
+    CHECK(begin.find("if(FAILED(viewResult) || !actionView)")==
+          std::string::npos);
+    CHECK(begin.find(
+        "prepared.popupActiveTarget=request.popupActiveTarget;")!=
+          std::string::npos);
+    CHECK(begin.find(
+        "prepared.target=actionTarget;")!=std::string::npos);
+    CHECK(begin.find("g_picker.activeWindow=")==std::string::npos);
+    CHECK(begin.find("g_target=")==std::string::npos);
+    CHECK(begin.find("g_targetTitle=")==std::string::npos);
+    CHECK(begin.find("PickerTransitionMode::MoveAndFollow")!=
+          std::string::npos);
+    CHECK(begin.find("PickerTransitionMode::RowMoveOnly")!=
+          std::string::npos);
+    CHECK(begin.find("PickerTransitionMode::VisualAndFollow")!=
+          std::string::npos);
+    CHECK(begin.find("PickerTransitionMode::VisualOnly")!=
+          std::string::npos);
+
+    const size_t publishCase=effects.find(
+        "case PickerEffectKind::PublishVisualAssignment:");
+    const size_t modelBuild=effects.find("BuildModel(",publishCase);
+    const size_t mutation=effects.find(
+        "g_picker.transition.visualMutation",modelBuild);
+    CHECK(publishCase!=std::string::npos);
+    CHECK(modelBuild!=std::string::npos);
+    CHECK(mutation!=std::string::npos);
+    CHECK(publishCase<modelBuild && modelBuild<mutation);
+    CHECK(effects.find("IssueGuardedTargetMove(")!=std::string::npos);
+    CHECK(effects.find("IssuePickerPopupMove(")!=std::string::npos);
+    CHECK(effects.find(
+        "RefreshPickerModelPreservingUi(\n"
+        "                g_picker.transition.mode!=\n"
+        "                    PickerTransitionMode::RowMoveOnly)")!=
+          std::string::npos);
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
@@ -27370,6 +27612,7 @@ int main(){
     test_picker_trace_activation_dispatches_every_guard_once();
     test_picker_trace_activation_sources_have_stable_json_names();
     test_picker_trace_move_begin_reasons_have_stable_json_names();
+    test_picker_trace_action_fields_have_stable_json_names();
     test_picker_trace_move_begin_exception_distinguishes_publication();
     test_picker_trace_activation_is_trace_behavior_equivalent();
     test_picker_trace_activation_runtime_wiring_is_causal();
@@ -27484,6 +27727,7 @@ int main(){
     test_picker_row_admission_keeps_displayable_unverified_windows();
     test_picker_evidence_routes_are_fail_closed();
     test_picker_model_overlay_and_row_geometry_are_one_publication();
+    test_picker_action_entry_keeps_active_and_row_targets_separate();
     test_target_mobility_fails_closed_and_positive_signals_win();
     test_target_desktop_route_requires_concrete_snapshot_membership();
     test_target_mobility_probe_adapters_are_fail_closed();
@@ -27492,6 +27736,7 @@ int main(){
     test_picker_async_search_joins_by_full_identity();
     test_picker_state_whole_object_swap_includes_generation_sentinel();
     test_picker_transition_policy_table_is_closed();
+    test_picker_action_intent_dispatch_table_is_exact();
     test_picker_row_action_preserves_popup_active_target();
     test_picker_begin_preconditions_are_mode_specific();
     test_picker_row_move_only_has_exact_order_and_keeps_active();

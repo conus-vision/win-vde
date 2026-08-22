@@ -328,6 +328,83 @@ struct PickerPointerActivation {
     int tileIndex=-1;
 };
 
+enum class PickerActionIntent {
+    TileSwitch,
+    ActivateExact,
+    MoveAndFollow,
+    RowMoveOnly,
+    VisualAndFollow,
+    VisualOnly
+};
+
+struct PickerActionRequest {
+    PickerActionIntent intent=PickerActionIntent::TileSwitch;
+    GUID destination={0};
+    bool hasRow=false;
+    PickerRowActionSnapshot row;
+    WindowIdentityKey popupActiveTarget;
+    bool ctrlAtDown=false;
+    uint64_t activationId=0;
+};
+
+enum class PickerActionDispatchResult {
+    Rejected,
+    SwitchedOnly,
+    ActivationStarted,
+    TransitionStarted
+};
+
+struct PickerActionIntentDecision {
+    bool accepted=false;
+    PickerActionIntent intent=PickerActionIntent::TileSwitch;
+};
+
+inline bool PickerActionUsesPopupActiveTarget(
+        PickerActionIntent intent) noexcept {
+    return intent==PickerActionIntent::MoveAndFollow ||
+           intent==PickerActionIntent::VisualAndFollow;
+}
+
+inline bool PickerActionIsRowMove(
+        PickerActionIntent intent) noexcept {
+    return intent==PickerActionIntent::RowMoveOnly ||
+           intent==PickerActionIntent::VisualOnly;
+}
+
+inline PickerActionIntentDecision DecidePickerActionIntent(
+        bool hasRow,bool rowDrop,bool ctrlAtDown,
+        PickerRowAdmission admission,bool identityUpgraded,
+        TargetMoveDisposition disposition) noexcept {
+    PickerActionIntentDecision decision;
+    if(rowDrop){
+        if(!hasRow || admission!=PickerRowAdmission::Verified)
+            return decision;
+        if(disposition==TargetMoveDisposition::Physical){
+            decision.accepted=true;
+            decision.intent=PickerActionIntent::RowMoveOnly;
+        } else if(disposition==TargetMoveDisposition::VisualOnly){
+            decision.accepted=true;
+            decision.intent=PickerActionIntent::VisualOnly;
+        }
+        return decision;
+    }
+    if(ctrlAtDown){
+        if(disposition==TargetMoveDisposition::Physical){
+            decision.accepted=true;
+            decision.intent=PickerActionIntent::MoveAndFollow;
+        } else if(disposition==TargetMoveDisposition::VisualOnly){
+            decision.accepted=true;
+            decision.intent=PickerActionIntent::VisualAndFollow;
+        }
+        return decision;
+    }
+    decision.accepted=true;
+    decision.intent=hasRow && identityUpgraded
+        ? PickerActionIntent::ActivateExact
+        : PickerActionIntent::TileSwitch;
+    return decision;
+}
+
 inline PickerPointerActivation ResolvePickerPointerActivation(
         const PickerFooterActivation& footer,bool clearSearchHit,
         bool searchHit,int rowIndex,int tileIndex) noexcept {
@@ -3343,6 +3420,16 @@ inline PickerEffect AdvancePickerTransition(
                         transition,
                         L"The picker model could not be refreshed.");
                     return PickerStartRefresh(state);
+                }
+                PickerAcknowledgeTerminal(transition);
+                return PickerNoEffect();
+            }
+            if(PickerPolicyFor(transition.mode).publishesVisual){
+                if(!observation.apiAccepted){
+                    transition.failed=true;
+                    PickerAppendDiagnostic(
+                        transition,
+                        L"The picker model could not be refreshed.");
                 }
                 PickerAcknowledgeTerminal(transition);
                 return PickerNoEffect();

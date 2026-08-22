@@ -380,6 +380,9 @@ struct PickerTraceMoveBeginEvent {
     uint64_t generation=0;
     int tileIndex=-1;
     PickerTraceMoveBeginReason reason=PickerTraceMoveBeginReason::InvalidIndex;
+    PickerActionIntent intent=PickerActionIntent::TileSwitch;
+    PickerTransitionMode mode=PickerTransitionMode::MoveAndFollow;
+    TargetMobility mobility=TargetMobility::Indeterminate;
     GUID targetOrigin{};
     GUID popupOrigin{};
     GUID currentOrigin{};
@@ -801,6 +804,9 @@ const char* PickerTraceActivationSourceName(
 const char* PickerTraceActivationResultName(
     PickerTraceActivationResult) noexcept;
 const char* PickerTraceMoveBeginReasonName(PickerTraceMoveBeginReason) noexcept;
+const char* PickerTraceActionIntentName(PickerActionIntent) noexcept;
+const char* PickerTraceTransitionModeName(PickerTransitionMode) noexcept;
+const char* PickerTraceTargetMobilityName(TargetMobility) noexcept;
 const char* PickerTraceEffectStageName(PickerTraceEffectStage) noexcept;
 const char* PickerTraceApiKindName(PickerTraceApiKind) noexcept;
 const char* PickerTraceDesktopLookupStageName(

@@ -322,6 +322,40 @@ const char* PickerTraceMoveBeginReasonName(
     return "unknown";
 }
 
+const char* PickerTraceActionIntentName(PickerActionIntent value) noexcept {
+    switch(value){
+    VDE_TRACE_NAME_CASE(PickerActionIntent,TileSwitch,"tile_switch");
+    VDE_TRACE_NAME_CASE(PickerActionIntent,ActivateExact,"activate_exact");
+    VDE_TRACE_NAME_CASE(PickerActionIntent,MoveAndFollow,"move_and_follow");
+    VDE_TRACE_NAME_CASE(PickerActionIntent,RowMoveOnly,"row_move_only");
+    VDE_TRACE_NAME_CASE(PickerActionIntent,VisualAndFollow,"visual_and_follow");
+    VDE_TRACE_NAME_CASE(PickerActionIntent,VisualOnly,"visual_only");
+    }
+    return "unknown";
+}
+
+const char* PickerTraceTransitionModeName(
+        PickerTransitionMode value) noexcept {
+    switch(value){
+    VDE_TRACE_NAME_CASE(PickerTransitionMode,MoveAndFollow,"move_and_follow");
+    VDE_TRACE_NAME_CASE(PickerTransitionMode,RowMoveOnly,"row_move_only");
+    VDE_TRACE_NAME_CASE(PickerTransitionMode,VisualAndFollow,"visual_and_follow");
+    VDE_TRACE_NAME_CASE(PickerTransitionMode,VisualOnly,"visual_only");
+    }
+    return "unknown";
+}
+
+const char* PickerTraceTargetMobilityName(TargetMobility value) noexcept {
+    switch(value){
+    VDE_TRACE_NAME_CASE(TargetMobility,Movable,"movable");
+    VDE_TRACE_NAME_CASE(TargetMobility,ViewPinned,"view_pinned");
+    VDE_TRACE_NAME_CASE(TargetMobility,AppPinned,"app_pinned");
+    VDE_TRACE_NAME_CASE(TargetMobility,Immovable,"immovable");
+    VDE_TRACE_NAME_CASE(TargetMobility,Indeterminate,"indeterminate");
+    }
+    return "unknown";
+}
+
 const char* PickerTraceEffectStageName(PickerTraceEffectStage value) noexcept {
     switch(value){
     VDE_TRACE_NAME_CASE(PickerTraceEffectStage,Queue,"queue");
@@ -1385,6 +1419,9 @@ bool SerializePickerTraceLine(const PickerTraceEnvelope& envelope,
             json.unsignedNumber("generation",event.generation) &&
             json.signedNumber("tile_index",event.tileIndex) &&
             json.string("reason",PickerTraceMoveBeginReasonName(event.reason)) &&
+            json.string("intent",PickerTraceActionIntentName(event.intent)) &&
+            json.string("mode",PickerTraceTransitionModeName(event.mode)) &&
+            json.string("mobility",PickerTraceTargetMobilityName(event.mobility)) &&
             json.guid("target_origin",event.targetOrigin) &&
             json.guid("popup_origin",event.popupOrigin) &&
             json.guid("current_origin",event.currentOrigin) &&
