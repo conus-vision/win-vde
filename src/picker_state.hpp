@@ -587,6 +587,86 @@ enum class PickerPointerPhase {
     Dragging
 };
 
+struct PickerDragPreviewBlit {
+    RECT destination={0,0,0,0};
+    POINT source={0,0};
+    bool visible=false;
+};
+
+inline bool PickerDragPreviewGeometryValid(
+        SIZE size,POINT grab) noexcept {
+    return size.cx>0 && size.cy>0 &&
+           grab.x>=0 && grab.y>=0 &&
+           grab.x<size.cx && grab.y<size.cy;
+}
+
+inline RECT PickerDragPreviewBounds(
+        POINT pointer,SIZE size,POINT grab) noexcept {
+    if(!PickerDragPreviewGeometryValid(size,grab))
+        return RECT{0,0,0,0};
+    const long long left=
+        static_cast<long long>(pointer.x)-grab.x;
+    const long long top=
+        static_cast<long long>(pointer.y)-grab.y;
+    return RECT{
+        PickerSaturatingInt(left),
+        PickerSaturatingInt(top),
+        PickerSaturatingInt(left+size.cx),
+        PickerSaturatingInt(top+size.cy)};
+}
+
+inline PickerDragPreviewBlit ResolvePickerDragPreviewBlit(
+        RECT preview,RECT client) noexcept {
+    PickerDragPreviewBlit result;
+    const long long previewWidth=
+        static_cast<long long>(preview.right)-preview.left;
+    const long long previewHeight=
+        static_cast<long long>(preview.bottom)-preview.top;
+    if(previewWidth<=0 || previewHeight<=0 ||
+       previewWidth>(std::numeric_limits<LONG>::max)() ||
+       previewHeight>(std::numeric_limits<LONG>::max)() ||
+       client.right<=client.left || client.bottom<=client.top)
+        return result;
+
+    result.destination.left=std::max(preview.left,client.left);
+    result.destination.top=std::max(preview.top,client.top);
+    result.destination.right=std::min(preview.right,client.right);
+    result.destination.bottom=std::min(preview.bottom,client.bottom);
+    if(result.destination.right<=result.destination.left ||
+       result.destination.bottom<=result.destination.top){
+        result.destination=RECT{0,0,0,0};
+        return result;
+    }
+    result.source.x=result.destination.left-preview.left;
+    result.source.y=result.destination.top-preview.top;
+    result.visible=true;
+    return result;
+}
+
+inline RECT PickerDragPreviewDirtyBounds(
+        bool oldVisible,RECT oldBounds,
+        bool newVisible,RECT newBounds) noexcept {
+    if(!oldVisible && !newVisible)
+        return RECT{0,0,0,0};
+    if(!oldVisible) return newBounds;
+    if(!newVisible) return oldBounds;
+    return RECT{
+        std::min(oldBounds.left,newBounds.left),
+        std::min(oldBounds.top,newBounds.top),
+        std::max(oldBounds.right,newBounds.right),
+        std::max(oldBounds.bottom,newBounds.bottom)};
+}
+
+inline bool PickerDragPreviewPaintable(
+        PickerPointerPhase phase,bool captured,bool identityMatches,
+        uint64_t previewGeneration,uint64_t modelGeneration,
+        uint64_t previewEpoch,uint64_t rowLayoutEpoch) noexcept {
+    return phase==PickerPointerPhase::Dragging && captured &&
+           identityMatches && previewGeneration!=0 &&
+           previewGeneration==modelGeneration && previewEpoch!=0 &&
+           previewEpoch==rowLayoutEpoch;
+}
+
 enum class PickerGestureAction {
     None,
     DragStarted,

@@ -660,6 +660,99 @@ static void test_picker_drag_threshold_boundaries_are_overflow_safe(){
     CHECK(PickerDragThresholdCrossed(high,low,4,4));
 }
 
+static void test_picker_drag_preview_preserves_grab_offset(){
+    const SIZE size={140,22};
+    const POINT grab={35,10};
+    const POINT pointer={300,200};
+    CHECK(PickerDragPreviewGeometryValid(size,grab));
+
+    const RECT bounds=PickerDragPreviewBounds(pointer,size,grab);
+    CHECK(bounds.left==265);
+    CHECK(bounds.top==190);
+    CHECK(bounds.right==405);
+    CHECK(bounds.bottom==212);
+
+    CHECK(!PickerDragPreviewGeometryValid(SIZE{0,22},grab));
+    CHECK(!PickerDragPreviewGeometryValid(SIZE{140,0},grab));
+    CHECK(!PickerDragPreviewGeometryValid(size,POINT{-1,10}));
+    CHECK(!PickerDragPreviewGeometryValid(size,POINT{140,10}));
+    CHECK(!PickerDragPreviewGeometryValid(size,POINT{35,22}));
+}
+
+static void test_picker_drag_preview_clips_and_unions_dirty_bounds(){
+    const RECT client={0,0,400,300};
+    PickerDragPreviewBlit clipped=ResolvePickerDragPreviewBlit(
+        RECT{265,190,405,212},client);
+    CHECK(clipped.visible);
+    CHECK(clipped.destination.left==265);
+    CHECK(clipped.destination.top==190);
+    CHECK(clipped.destination.right==400);
+    CHECK(clipped.destination.bottom==212);
+    CHECK(clipped.source.x==0);
+    CHECK(clipped.source.y==0);
+
+    clipped=ResolvePickerDragPreviewBlit(
+        RECT{-25,40,115,62},client);
+    CHECK(clipped.visible);
+    CHECK(clipped.destination.left==0);
+    CHECK(clipped.destination.right==115);
+    CHECK(clipped.source.x==25);
+    CHECK(clipped.source.y==0);
+
+    clipped=ResolvePickerDragPreviewBlit(
+        RECT{50,-8,190,14},client);
+    CHECK(clipped.visible);
+    CHECK(clipped.destination.top==0);
+    CHECK(clipped.destination.bottom==14);
+    CHECK(clipped.source.x==0);
+    CHECK(clipped.source.y==8);
+
+    clipped=ResolvePickerDragPreviewBlit(
+        RECT{50,290,190,312},client);
+    CHECK(clipped.visible);
+    CHECK(clipped.destination.top==290);
+    CHECK(clipped.destination.bottom==300);
+    CHECK(clipped.source.x==0);
+    CHECK(clipped.source.y==0);
+
+    CHECK(!ResolvePickerDragPreviewBlit(
+        RECT{401,40,541,62},client).visible);
+    CHECK(!ResolvePickerDragPreviewBlit(
+        RECT{10,10,20,20},RECT{0,0,0,0}).visible);
+
+    RECT dirty=PickerDragPreviewDirtyBounds(
+        true,RECT{10,10,30,30},true,RECT{20,5,50,25});
+    CHECK(dirty.left==10);
+    CHECK(dirty.top==5);
+    CHECK(dirty.right==50);
+    CHECK(dirty.bottom==30);
+    dirty=PickerDragPreviewDirtyBounds(
+        false,RECT{0,0,0,0},true,RECT{20,5,50,25});
+    CHECK(dirty.left==20 && dirty.top==5);
+    CHECK(dirty.right==50 && dirty.bottom==25);
+    dirty=PickerDragPreviewDirtyBounds(
+        false,RECT{10,10,30,30},false,RECT{20,5,50,25});
+    CHECK(dirty.left==0 && dirty.top==0);
+    CHECK(dirty.right==0 && dirty.bottom==0);
+}
+
+static void test_picker_drag_preview_eligibility_fails_closed(){
+    CHECK(PickerDragPreviewPaintable(
+        PickerPointerPhase::Dragging,true,true,8,8,13,13));
+    CHECK(!PickerDragPreviewPaintable(
+        PickerPointerPhase::Armed,true,true,8,8,13,13));
+    CHECK(!PickerDragPreviewPaintable(
+        PickerPointerPhase::Idle,true,true,8,8,13,13));
+    CHECK(!PickerDragPreviewPaintable(
+        PickerPointerPhase::Dragging,false,true,8,8,13,13));
+    CHECK(!PickerDragPreviewPaintable(
+        PickerPointerPhase::Dragging,true,false,8,8,13,13));
+    CHECK(!PickerDragPreviewPaintable(
+        PickerPointerPhase::Dragging,true,true,7,8,13,13));
+    CHECK(!PickerDragPreviewPaintable(
+        PickerPointerPhase::Dragging,true,true,8,8,12,13));
+}
+
 static void test_picker_drag_threshold_and_drop_are_deterministic(){
     PickerPointerGesture gesture;
     PickerRowActionSnapshot row=GestureRow();
@@ -28746,6 +28839,9 @@ int main(){
     test_picker_row_hit_priority_is_exact();
     test_picker_row_snapshot_separates_presentation_and_drag();
     test_picker_drag_threshold_boundaries_are_overflow_safe();
+    test_picker_drag_preview_preserves_grab_offset();
+    test_picker_drag_preview_clips_and_unions_dirty_bounds();
+    test_picker_drag_preview_eligibility_fails_closed();
     test_picker_drag_threshold_and_drop_are_deterministic();
     test_picker_drag_stationary_click_and_source_erase_are_exact();
     test_picker_display_only_can_click_but_cannot_drag();
