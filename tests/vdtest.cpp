@@ -758,6 +758,211 @@ static void test_picker_refresh_transaction_publishes_only_complete_stage(){
     CHECK(state.selectedIndex==0 && state.searchText==L"preserve");
 }
 
+static void test_picker_visual_assignment_and_model_publish_atomically(){
+    const GUID oldDesktop=G(
+        L"{231A0000-0000-0000-0000-000000000001}");
+    const GUID newDesktop=G(
+        L"{231A0000-0000-0000-0000-000000000002}");
+    std::vector<int> model{7};
+    std::vector<int> paintCache{70};
+    PickerState state;
+    PickerVisualAssignment oldAssignment;
+    oldAssignment.baseDesktop=oldDesktop;
+    oldAssignment.destination=oldDesktop;
+    state.visualAssignments["old-runtime"]=oldAssignment;
+
+    PickerVisualAssignmentMutation mutation;
+    mutation.kind=PickerVisualMutationKind::Upsert;
+    mutation.runtimeKey="selected-runtime";
+    mutation.baseDesktop=oldDesktop;
+    mutation.destination=newDesktop;
+
+    CHECK(!RunPickerVisualRefreshTransaction(
+        model,paintCache,state,mutation,
+        [&](std::vector<int>& stagedModel,
+            std::vector<int>& stagedPaintCache,
+            PickerState& stagedState)->bool {
+            CHECK(GuidEq(
+                stagedState.visualAssignments.at(
+                    "selected-runtime").destination,
+                newDesktop));
+            stagedModel.push_back(8);
+            stagedPaintCache.push_back(80);
+            return false;
+        }));
+    CHECK((model==std::vector<int>{7}));
+    CHECK((paintCache==std::vector<int>{70}));
+    CHECK(state.visualAssignments.count("selected-runtime")==0);
+    CHECK(GuidEq(
+        state.visualAssignments.at("old-runtime").baseDesktop,
+        oldDesktop));
+
+    CHECK(RunPickerVisualRefreshTransaction(
+        model,paintCache,state,mutation,
+        [&](std::vector<int>& stagedModel,
+            std::vector<int>& stagedPaintCache,
+            PickerState& stagedState)->bool {
+            CHECK(GuidEq(
+                stagedState.visualAssignments.at(
+                    "selected-runtime").destination,
+                newDesktop));
+            stagedModel.push_back(9);
+            stagedPaintCache.push_back(90);
+            return true;
+        }));
+    CHECK((model==std::vector<int>{9}));
+    CHECK((paintCache==std::vector<int>{90}));
+    CHECK(GuidEq(
+        state.visualAssignments.at(
+            "selected-runtime").destination,newDesktop));
+}
+
+static void test_picker_visual_assignment_is_exact_runtime_only(){
+    const WindowIdentityKey first=IK(0x1001,77,900);
+    const WindowIdentityKey sibling=IK(0x1002,77,900);
+    PickerState state;
+    PickerVisualAssignmentMutation mutation;
+    mutation.kind=PickerVisualMutationKind::Upsert;
+    mutation.runtimeKey=RuntimeKey(first);
+    mutation.baseDesktop=G(
+        L"{231A0000-0000-0000-0000-000000000001}");
+    mutation.destination=G(
+        L"{231A0000-0000-0000-0000-000000000003}");
+    CHECK(StagePickerVisualAssignmentMutation(state,mutation));
+    CHECK(state.visualAssignments.count(RuntimeKey(first))==1);
+    CHECK(state.visualAssignments.count(RuntimeKey(sibling))==0);
+}
+
+static void test_picker_visual_assignment_mutations_are_strong_and_exact(){
+    const GUID base=G(
+        L"{231A0000-0000-0000-0000-000000000011}");
+    const GUID second=G(
+        L"{231A0000-0000-0000-0000-000000000012}");
+    const GUID third=G(
+        L"{231A0000-0000-0000-0000-000000000013}");
+    PickerState state;
+
+    PickerVisualAssignmentMutation none;
+    CHECK(StagePickerVisualAssignmentMutation(state,none));
+    CHECK(state.visualAssignments.empty());
+
+    PickerVisualAssignmentMutation invalid;
+    invalid.kind=PickerVisualMutationKind::Upsert;
+    invalid.baseDesktop=base;
+    invalid.destination=second;
+    CHECK(!StagePickerVisualAssignmentMutation(state,invalid));
+    invalid.runtimeKey="runtime";
+    invalid.baseDesktop=GUID{};
+    CHECK(!StagePickerVisualAssignmentMutation(state,invalid));
+    invalid.baseDesktop=base;
+    invalid.destination=GUID{};
+    CHECK(!StagePickerVisualAssignmentMutation(state,invalid));
+    invalid.kind=static_cast<PickerVisualMutationKind>(99);
+    invalid.destination=second;
+    CHECK(!StagePickerVisualAssignmentMutation(state,invalid));
+    CHECK(state.visualAssignments.empty());
+
+    PickerVisualAssignmentMutation upsert;
+    upsert.kind=PickerVisualMutationKind::Upsert;
+    upsert.runtimeKey="runtime";
+    upsert.baseDesktop=base;
+    upsert.destination=second;
+    CHECK(StagePickerVisualAssignmentMutation(state,upsert));
+    CHECK(GuidEq(
+        state.visualAssignments.at("runtime").baseDesktop,base));
+    CHECK(GuidEq(
+        state.visualAssignments.at("runtime").destination,second));
+
+    upsert.baseDesktop=third;
+    upsert.destination=third;
+    CHECK(StagePickerVisualAssignmentMutation(state,upsert));
+    CHECK(GuidEq(
+        state.visualAssignments.at("runtime").baseDesktop,base));
+    CHECK(GuidEq(
+        state.visualAssignments.at("runtime").destination,third));
+
+    upsert.destination=base;
+    CHECK(StagePickerVisualAssignmentMutation(state,upsert));
+    CHECK(state.visualAssignments.count("runtime")==0);
+
+    PickerVisualAssignmentMutation erase;
+    erase.kind=PickerVisualMutationKind::Erase;
+    CHECK(!StagePickerVisualAssignmentMutation(state,erase));
+    erase.runtimeKey="missing";
+    CHECK(StagePickerVisualAssignmentMutation(state,erase));
+    CHECK(state.visualAssignments.empty());
+}
+
+static void test_picker_visual_refresh_failures_publish_nothing(){
+    const GUID base=G(
+        L"{231A0000-0000-0000-0000-000000000021}");
+    const GUID destination=G(
+        L"{231A0000-0000-0000-0000-000000000022}");
+    std::vector<int> model{1};
+    std::vector<int> paintCache{2};
+    PickerState state;
+    state.searchText=L"preserved";
+    PickerVisualAssignmentMutation mutation;
+    mutation.kind=PickerVisualMutationKind::Upsert;
+    mutation.runtimeKey="runtime";
+    mutation.baseDesktop=base;
+    mutation.destination=destination;
+
+    CHECK(!RunPickerVisualRefreshTransaction(
+        model,paintCache,state,mutation,
+        [](std::vector<int>& stagedModel,
+           std::vector<int>&,PickerState&)->bool {
+            stagedModel.push_back(9);
+            return false;
+        }));
+    CHECK((model==std::vector<int>{1}));
+    CHECK((paintCache==std::vector<int>{2}));
+    CHECK(state.visualAssignments.empty());
+
+    CHECK(!RunPickerVisualRefreshTransaction(
+        model,paintCache,state,mutation,
+        [](std::vector<int>& stagedModel,
+           std::vector<int>& stagedPaintCache,
+           PickerState&)->bool {
+            stagedModel.push_back(10);
+            stagedPaintCache.push_back(20);
+            throw std::runtime_error("builder");
+        }));
+    CHECK((model==std::vector<int>{1}));
+    CHECK((paintCache==std::vector<int>{2}));
+    CHECK(state.visualAssignments.empty());
+    CHECK(state.searchText==L"preserved");
+
+    bool buildCalled=false;
+    mutation.runtimeKey.clear();
+    CHECK(!RunPickerVisualRefreshTransaction(
+        model,paintCache,state,mutation,
+        [&](std::vector<int>&,std::vector<int>&,
+            PickerState&)->bool {
+            buildCalled=true;
+            return true;
+        }));
+    CHECK(!buildCalled);
+    CHECK((model==std::vector<int>{1}));
+    CHECK((paintCache==std::vector<int>{2}));
+}
+
+static void test_picker_visual_session_end_clears_only_assignments(){
+    PickerState state;
+    state.searchText=L"keep";
+    state.activeWindow=IK(0x3001,91,1200);
+    PickerVisualAssignment assignment;
+    assignment.baseDesktop=G(
+        L"{231A0000-0000-0000-0000-000000000031}");
+    assignment.destination=G(
+        L"{231A0000-0000-0000-0000-000000000032}");
+    state.visualAssignments["runtime"]=assignment;
+    EndPickerVisualSession(state);
+    CHECK(state.visualAssignments.empty());
+    CHECK(state.searchText==L"keep");
+    CHECK(SameIdentity(state.activeWindow,IK(0x3001,91,1200)));
+}
+
 static void test_blend_color_respects_channels_and_alpha_endpoints(){
     const COLORREF background=RGB(10,20,30);
     const COLORREF accent=RGB(110,120,130);
@@ -2377,6 +2582,15 @@ static void test_picker_state_whole_object_swap_includes_generation_sentinel(){
     left.transition.popupActiveTarget=IK(31,32,33);
     left.transition.pendingHideDisposition=
         PickerHideDisposition::DismissSession;
+    left.transition.visualMutation.kind=
+        PickerVisualMutationKind::Upsert;
+    left.transition.visualMutation.runtimeKey="transition-runtime";
+    left.transition.visualMutation.baseDesktop=leftDesktop;
+    left.transition.visualMutation.destination=rightDesktop;
+    PickerVisualAssignment visualAssignment;
+    visualAssignment.baseDesktop=leftDesktop;
+    visualAssignment.destination=rightDesktop;
+    left.visualAssignments["state-runtime"]=visualAssignment;
     left.scrollByDesktop[GuidKey(leftDesktop)]=4;
     left.paintGeneration=101;
     right.currentDesktop=rightDesktop;
@@ -2405,6 +2619,20 @@ static void test_picker_state_whole_object_swap_includes_generation_sentinel(){
         right.transition.popupActiveTarget,IK(31,32,33)));
     CHECK(right.transition.pendingHideDisposition==
           PickerHideDisposition::DismissSession);
+    CHECK(right.transition.visualMutation.kind==
+          PickerVisualMutationKind::Upsert);
+    CHECK(right.transition.visualMutation.runtimeKey==
+          "transition-runtime");
+    CHECK(GuidEq(
+        right.transition.visualMutation.baseDesktop,leftDesktop));
+    CHECK(GuidEq(
+        right.transition.visualMutation.destination,rightDesktop));
+    CHECK(GuidEq(
+        right.visualAssignments.at("state-runtime").baseDesktop,
+        leftDesktop));
+    CHECK(GuidEq(
+        right.visualAssignments.at("state-runtime").destination,
+        rightDesktop));
     CHECK(right.scrollByDesktop.at(GuidKey(leftDesktop))==4);
     CHECK(right.paintGeneration==101);
     SwapPickerState(left,right);
@@ -23085,6 +23313,12 @@ static void CheckPickerTraceReducerStateForTest(
     CHECK(a.mode==b.mode);
     CHECK(SameIdentity(a.popupActiveTarget,b.popupActiveTarget));
     CHECK(a.pendingHideDisposition==b.pendingHideDisposition);
+    CHECK(a.visualMutation.kind==b.visualMutation.kind);
+    CHECK(a.visualMutation.runtimeKey==b.visualMutation.runtimeKey);
+    CHECK(GuidEq(a.visualMutation.baseDesktop,
+                 b.visualMutation.baseDesktop));
+    CHECK(GuidEq(a.visualMutation.destination,
+                 b.visualMutation.destination));
     CHECK(GuidEq(a.currentOrigin,b.currentOrigin));
     CHECK(GuidEq(a.destination,b.destination));
     CHECK(a.effectSerial==b.effectSerial && a.pendingEffect==b.pendingEffect);
@@ -25574,6 +25808,11 @@ int main(){
     test_picker_selection_updates_pair_without_touching_current();
     test_picker_refresh_preserves_search_scroll_and_identity();
     test_picker_refresh_transaction_publishes_only_complete_stage();
+    test_picker_visual_assignment_and_model_publish_atomically();
+    test_picker_visual_assignment_is_exact_runtime_only();
+    test_picker_visual_assignment_mutations_are_strong_and_exact();
+    test_picker_visual_refresh_failures_publish_nothing();
+    test_picker_visual_session_end_clears_only_assignments();
     test_blend_color_respects_channels_and_alpha_endpoints();
     test_picker_dim_search_keeps_current_and_selection_distinct();
     test_picker_visible_scroll_clamps_without_mutating_saved_value();

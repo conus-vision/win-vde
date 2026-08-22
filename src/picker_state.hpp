@@ -527,6 +527,27 @@ inline PickerTransitionPolicy PickerPolicyFor(
     return policy;
 }
 
+struct PickerVisualAssignment {
+    GUID baseDesktop={0};
+    GUID destination={0};
+};
+
+using PickerVisualAssignments=
+    std::map<std::string,PickerVisualAssignment>;
+
+enum class PickerVisualMutationKind {
+    None,
+    Upsert,
+    Erase
+};
+
+struct PickerVisualAssignmentMutation {
+    PickerVisualMutationKind kind=PickerVisualMutationKind::None;
+    std::string runtimeKey;
+    GUID baseDesktop={0};
+    GUID destination={0};
+};
+
 enum class PopupSaveStatus { NotTracked, Saved, Failed };
 enum class PopupSaveFailure {
     None, IdentityLost, IdentityIndeterminate, Classification,
@@ -576,6 +597,7 @@ struct PickerTransition {
     uint64_t generation=0;
     MoveToken reservationToken;
     PickerTransitionMode mode=PickerTransitionMode::MoveAndFollow;
+    PickerVisualAssignmentMutation visualMutation;
     WindowIdentityKey target;
     WindowIdentityKey popupActiveTarget;
     std::string runtimeKey;
@@ -636,6 +658,13 @@ struct PickerTransition {
         std::swap(generation,other.generation);
         std::swap(reservationToken,other.reservationToken);
         std::swap(mode,other.mode);
+        std::swap(visualMutation.kind,other.visualMutation.kind);
+        visualMutation.runtimeKey.swap(
+            other.visualMutation.runtimeKey);
+        std::swap(visualMutation.baseDesktop,
+                  other.visualMutation.baseDesktop);
+        std::swap(visualMutation.destination,
+                  other.visualMutation.destination);
         std::swap(target,other.target);
         std::swap(popupActiveTarget,other.popupActiveTarget);
         runtimeKey.swap(other.runtimeKey);
@@ -1418,6 +1447,7 @@ struct PickerState {
     std::wstring searchText;
     bool searchActive=false;
     PickerTransition transition;
+    PickerVisualAssignments visualAssignments;
     std::map<std::string,int> scrollByDesktop;
     uint64_t modelGeneration=0;
     uint64_t paintGeneration=0;
@@ -1434,6 +1464,9 @@ struct PickerState {
         static_assert(noexcept(scrollByDesktop.swap(
                           other.scrollByDesktop)),
                       "picker scroll swap must be noexcept");
+        static_assert(noexcept(visualAssignments.swap(
+                          other.visualAssignments)),
+                      "picker visual assignment swap must be noexcept");
         GUID guid=currentDesktop;
         currentDesktop=other.currentDesktop;
         other.currentDesktop=guid;
@@ -1452,6 +1485,7 @@ struct PickerState {
         searchActive=other.searchActive;
         other.searchActive=active;
         transition.swap(other.transition);
+        visualAssignments.swap(other.visualAssignments);
         scrollByDesktop.swap(other.scrollByDesktop);
         const uint64_t model= modelGeneration;
         modelGeneration=other.modelGeneration;
@@ -1461,6 +1495,50 @@ struct PickerState {
         other.paintGeneration=generation;
     }
 };
+
+inline bool StagePickerVisualAssignmentMutation(
+        PickerState& state,
+        const PickerVisualAssignmentMutation& mutation) noexcept {
+    if(mutation.kind==PickerVisualMutationKind::None)
+        return true;
+    if(mutation.runtimeKey.empty())
+        return false;
+    if(mutation.kind==PickerVisualMutationKind::Upsert &&
+       (GuidIsZero(mutation.baseDesktop) ||
+        GuidIsZero(mutation.destination)))
+        return false;
+    try {
+        PickerVisualAssignments staged=state.visualAssignments;
+        if(mutation.kind==PickerVisualMutationKind::Erase){
+            staged.erase(mutation.runtimeKey);
+        } else if(mutation.kind==PickerVisualMutationKind::Upsert){
+            PickerVisualAssignment assignment;
+            const auto existing=staged.find(mutation.runtimeKey);
+            assignment.baseDesktop=existing==staged.end()
+                ? mutation.baseDesktop
+                : existing->second.baseDesktop;
+            if(GuidIsZero(assignment.baseDesktop))
+                return false;
+            assignment.destination=mutation.destination;
+            if(GuidEq(assignment.baseDesktop,
+                      assignment.destination))
+                staged.erase(mutation.runtimeKey);
+            else
+                staged[mutation.runtimeKey]=assignment;
+        } else {
+            return false;
+        }
+        state.visualAssignments.swap(staged);
+        return true;
+    } catch(...) {
+        return false;
+    }
+}
+
+inline void EndPickerVisualSession(PickerState& state) noexcept {
+    PickerVisualAssignments empty;
+    state.visualAssignments.swap(empty);
+}
 
 inline bool PickerTransitionTargetsAuthorized(
         const PickerState& state,
@@ -3177,6 +3255,36 @@ inline bool RunPickerRefreshTransaction(Model& publishedModel,
         static_assert(noexcept(publishedModel.swap(stagedModel)),
                       "picker model publication must be noexcept");
         publishedModel.swap(stagedModel);
+        SwapPickerState(publishedState,stagedState);
+        return true;
+    } catch(...) {
+        return false;
+    }
+}
+
+template<class Model,class Cache,class Build>
+inline bool RunPickerVisualRefreshTransaction(
+        Model& publishedModel,Cache& publishedCache,
+        PickerState& publishedState,
+        const PickerVisualAssignmentMutation& mutation,
+        Build&& build) noexcept {
+    try {
+        Model stagedModel;
+        Cache stagedCache;
+        PickerState stagedState=PreservePickerUi(publishedState);
+        if(!StagePickerVisualAssignmentMutation(
+                stagedState,mutation))
+            return false;
+        if(!build(stagedModel,stagedCache,stagedState))
+            return false;
+        static_assert(noexcept(
+            publishedModel.swap(stagedModel)),
+            "picker model publication must be noexcept");
+        static_assert(noexcept(
+            publishedCache.swap(stagedCache)),
+            "picker paint publication must be noexcept");
+        publishedModel.swap(stagedModel);
+        publishedCache.swap(stagedCache);
         SwapPickerState(publishedState,stagedState);
         return true;
     } catch(...) {
