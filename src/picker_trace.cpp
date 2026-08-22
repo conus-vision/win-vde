@@ -1018,7 +1018,30 @@ const char* PickerTracePointerTargetName(PickerPointerTarget value) noexcept {
     VDE_TRACE_NAME_CASE(PickerPointerTarget,Footer,"footer");
     VDE_TRACE_NAME_CASE(PickerPointerTarget,ClearSearch,"clear_search");
     VDE_TRACE_NAME_CASE(PickerPointerTarget,Search,"search");
+    VDE_TRACE_NAME_CASE(PickerPointerTarget,Row,"row");
     VDE_TRACE_NAME_CASE(PickerPointerTarget,Tile,"tile");
+    }
+    return "unknown";
+}
+
+const char* PickerTracePointerPhaseName(PickerPointerPhase value) noexcept {
+    switch(value){
+    VDE_TRACE_NAME_CASE(PickerPointerPhase,Idle,"idle");
+    VDE_TRACE_NAME_CASE(PickerPointerPhase,Armed,"armed");
+    VDE_TRACE_NAME_CASE(PickerPointerPhase,Dragging,"dragging");
+    }
+    return "unknown";
+}
+
+const char* PickerTraceGestureActionName(PickerGestureAction value) noexcept {
+    switch(value){
+    VDE_TRACE_NAME_CASE(PickerGestureAction,None,"none");
+    VDE_TRACE_NAME_CASE(PickerGestureAction,DragStarted,"drag_started");
+    VDE_TRACE_NAME_CASE(PickerGestureAction,Click,"click");
+    VDE_TRACE_NAME_CASE(PickerGestureAction,SwitchOnly,"switch_only");
+    VDE_TRACE_NAME_CASE(PickerGestureAction,Drop,"drop");
+    VDE_TRACE_NAME_CASE(PickerGestureAction,NoOp,"no_op");
+    VDE_TRACE_NAME_CASE(PickerGestureAction,Cancel,"cancel");
     }
     return "unknown";
 }
@@ -1385,9 +1408,37 @@ bool SerializePickerTraceLine(const PickerTraceEnvelope& envelope,
             json.signedNumber("y",event.y) &&
             json.boolean("ctrl",event.ctrl) &&
             json.boolean("controlled",event.controlled) &&
+            json.boolean("gesture_active",event.gestureActive) &&
             json.boolean("search_active",event.searchActive) &&
             json.string("target",PickerTracePointerTargetName(event.target)) &&
+            json.signedNumber("row_index",event.rowIndex) &&
             json.signedNumber("tile_index",event.tileIndex);
+    },output);
+}
+
+bool SerializePickerTraceLine(const PickerTraceEnvelope& envelope,
+                              const PickerTraceGestureEvent& event,
+                              std::string& output) noexcept {
+    return PickerTraceSerialize(envelope,"pointer.gesture",[&](auto& json){
+        return json.string(
+                "phase_before",PickerTracePointerPhaseName(
+                    event.phaseBefore)) &&
+            json.string(
+                "phase_after",PickerTracePointerPhaseName(
+                    event.phaseAfter)) &&
+            json.string(
+                "action",PickerTraceGestureActionName(event.action)) &&
+            json.string("intent",PickerTraceActionIntentName(event.intent)) &&
+            json.signedNumber(
+                "source_tile_index",event.sourceTileIndex) &&
+            json.signedNumber(
+                "destination_tile_index",event.destinationTileIndex) &&
+            json.boolean("ctrl_at_down",event.ctrlAtDown) &&
+            json.boolean("threshold_crossed",event.thresholdCrossed) &&
+            json.boolean(
+                "model_generation_valid",event.modelGenerationValid) &&
+            json.boolean(
+                "row_layout_epoch_valid",event.rowLayoutEpochValid);
     },output);
 }
 
@@ -1719,6 +1770,7 @@ VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceEnumBeginEvent)
 VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceEnumWindowEvent)
 VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceEnumEndEvent)
 VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceMouseDownEvent)
+VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceGestureEvent)
 VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceActivationRequestEvent)
 VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceActivationResultEvent)
 VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceMoveBeginEvent)
@@ -2836,6 +2888,7 @@ VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceEnumBeginEvent)
 VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceEnumWindowEvent)
 VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceEnumEndEvent)
 VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceMouseDownEvent)
+VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceGestureEvent)
 VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceActivationRequestEvent)
 VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceActivationResultEvent)
 VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceMoveBeginEvent)

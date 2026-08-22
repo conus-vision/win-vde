@@ -497,7 +497,7 @@ static void test_footer_first_route_consumes_before_search_and_tiles(){
     for(intptr_t shellResult : {static_cast<intptr_t>(32),
                                 static_cast<intptr_t>(33)}){
         const PickerPointerActivation route=ResolvePickerPointerActivation(
-            repo,true,true,4);
+            repo,true,true,-1,4);
         CHECK(route.target==PickerPointerTarget::Footer);
         int footerCalls=0,searchCalls=0,tileCalls=0,notifications=0;
         CHECK(DispatchPickerPointerActivation(route,
@@ -509,6 +509,7 @@ static void test_footer_first_route_consumes_before_search_and_tiles(){
             },
             [&](){ ++searchCalls; },
             [&](){ ++searchCalls; },
+            [&](int,int){ ++tileCalls; },
             [&](int){ ++tileCalls; }));
         CHECK(footerCalls==1 && searchCalls==0 && tileCalls==0);
         CHECK(notifications==(shellResult<=32?1:0));
@@ -516,13 +517,13 @@ static void test_footer_first_route_consumes_before_search_and_tiles(){
 
     PickerFooterActivation none;
     PickerPointerActivation clear=ResolvePickerPointerActivation(
-        none,true,true,4);
+        none,true,true,-1,4);
     CHECK(clear.target==PickerPointerTarget::ClearSearch);
     PickerPointerActivation search=ResolvePickerPointerActivation(
-        none,false,true,4);
+        none,false,true,-1,4);
     CHECK(search.target==PickerPointerTarget::Search);
     PickerPointerActivation tile=ResolvePickerPointerActivation(
-        none,false,false,4);
+        none,false,false,-1,4);
     CHECK(tile.target==PickerPointerTarget::Tile && tile.tileIndex==4);
 }
 
@@ -792,6 +793,33 @@ static void test_picker_drag_escape_and_capture_loss_reset_everything(){
             gesture,nullptr,false,5,9).action==
             PickerGestureAction::Cancel);
     }
+}
+
+static void test_picker_interaction_busy_and_drop_highlight_are_state_free(){
+    PickerState state;
+    PickerPointerGesture gesture;
+    CHECK(!PickerInteractionBusy(state,gesture));
+
+    state.transition.phase=PickerPhase::TargetIssue;
+    CHECK(PickerInteractionBusy(state,gesture));
+    state.transition.phase=PickerPhase::Idle;
+
+    const PickerRowActionSnapshot row=GestureRow();
+    state.selectedIndex=7;
+    state.rowLayoutEpoch=9;
+    CHECK(ArmPickerRowGesture(
+        gesture,row,POINT{100,100},false,5,9));
+    CHECK(PickerInteractionBusy(state,gesture));
+    CHECK(UpdatePickerRowGesture(
+        gesture,POINT{102,100},4,4,5,9,4)==
+        PickerGestureAction::DragStarted);
+    CHECK(PickerInteractionBusy(state,gesture));
+    CHECK(gesture.dropTileIndex==4);
+    CHECK(state.selectedIndex==7);
+    CHECK(state.rowLayoutEpoch==9);
+
+    CancelPickerRowGesture(gesture);
+    CHECK(!PickerInteractionBusy(state,gesture));
 }
 
 static void test_footer_hover_event_state_covers_every_reset_path(){
@@ -22128,6 +22156,7 @@ static void test_picker_trace_every_schema_event_is_strict_jsonl(){
     check(PickerTraceEnumWindowEvent{});
     check(PickerTraceEnumEndEvent{});
     check(PickerTraceMouseDownEvent{});
+    check(PickerTraceGestureEvent{});
     check(PickerTraceActivationRequestEvent{});
     check(PickerTraceActivationResultEvent{});
     check(PickerTraceMoveBeginEvent{});
@@ -23512,6 +23541,71 @@ static void test_picker_trace_activation_sources_have_stable_json_names(){
     }
 }
 
+static void test_picker_trace_gesture_fields_have_stable_private_names(){
+    CHECK(std::string(PickerTracePointerTargetName(
+        PickerPointerTarget::Row))=="row");
+
+    struct PhaseCase { PickerPointerPhase value; const char* name; };
+    const PhaseCase phases[]={
+        {PickerPointerPhase::Idle,"idle"},
+        {PickerPointerPhase::Armed,"armed"},
+        {PickerPointerPhase::Dragging,"dragging"}
+    };
+    for(const PhaseCase& value:phases)
+        CHECK(std::string(PickerTracePointerPhaseName(value.value))==
+              value.name);
+
+    struct ActionCase { PickerGestureAction value; const char* name; };
+    const ActionCase actions[]={
+        {PickerGestureAction::None,"none"},
+        {PickerGestureAction::DragStarted,"drag_started"},
+        {PickerGestureAction::Click,"click"},
+        {PickerGestureAction::SwitchOnly,"switch_only"},
+        {PickerGestureAction::Drop,"drop"},
+        {PickerGestureAction::NoOp,"no_op"},
+        {PickerGestureAction::Cancel,"cancel"}
+    };
+    for(const ActionCase& value:actions)
+        CHECK(std::string(PickerTraceGestureActionName(value.value))==
+              value.name);
+
+    PickerTraceGestureEvent event;
+    event.phaseBefore=PickerPointerPhase::Armed;
+    event.phaseAfter=PickerPointerPhase::Dragging;
+    event.action=PickerGestureAction::DragStarted;
+    event.intent=PickerActionIntent::RowMoveOnly;
+    event.sourceTileIndex=2;
+    event.destinationTileIndex=4;
+    event.ctrlAtDown=true;
+    event.thresholdCrossed=true;
+    event.modelGenerationValid=true;
+    event.rowLayoutEpochValid=false;
+    std::string line;
+    CHECK(SerializePickerTraceLine(PickerTraceEnvelope{},event,line));
+    CHECK(PickerTraceStrictJsonLineForTest(line));
+    CHECK(line.find("\"event\":\"pointer.gesture\"")!=
+          std::string::npos);
+    CHECK(line.find("\"phase_before\":\"armed\"")!=
+          std::string::npos);
+    CHECK(line.find("\"phase_after\":\"dragging\"")!=
+          std::string::npos);
+    CHECK(line.find("\"action\":\"drag_started\"")!=
+          std::string::npos);
+    CHECK(line.find("\"intent\":\"row_move_only\"")!=
+          std::string::npos);
+    CHECK(line.find("\"source_tile_index\":2")!=std::string::npos);
+    CHECK(line.find("\"destination_tile_index\":4")!=
+          std::string::npos);
+    CHECK(line.find("\"ctrl_at_down\":true")!=std::string::npos);
+    CHECK(line.find("\"threshold_crossed\":true")!=
+          std::string::npos);
+    CHECK(line.find("\"model_generation_valid\":true")!=
+          std::string::npos);
+    CHECK(line.find("\"row_layout_epoch_valid\":false")!=
+          std::string::npos);
+    CHECK(line.find("title")==std::string::npos);
+}
+
 static void test_picker_trace_move_begin_reasons_have_stable_json_names(){
     struct Case { PickerTraceMoveBeginReason reason; const char* name; };
     const Case cases[]={
@@ -23745,10 +23839,10 @@ static void test_picker_trace_activation_runtime_wiring_is_causal(){
         keyboard,"PickerTraceActivationSource::Keyboard")==3);
     const size_t firstKeyboardActivation=keyboard.find("Activate(");
     const size_t genericControlledGate=keyboard.find(
-        "if(g_picker.controlledTransition()) return 0;");
+        "if(PickerInteractionBusy(g_picker,g_pickerGesture)) return 0;");
     CHECK(firstKeyboardActivation!=std::string::npos &&
           genericControlledGate!=std::string::npos &&
-          firstKeyboardActivation<genericControlledGate);
+          genericControlledGate<firstKeyboardActivation);
 
     const std::string mouse=SourceSection(
         source,"case WM_LBUTTONDOWN:","case WM_MOUSEMOVE:");
@@ -26482,6 +26576,7 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
     CheckPickerTraceEventPrivacyTypeForTest<PickerTraceEnumWindowEvent>();
     CheckPickerTraceEventPrivacyTypeForTest<PickerTraceEnumEndEvent>();
     CheckPickerTraceEventPrivacyTypeForTest<PickerTraceMouseDownEvent>();
+    CheckPickerTraceEventPrivacyTypeForTest<PickerTraceGestureEvent>();
     CheckPickerTraceEventPrivacyTypeForTest<
         PickerTraceActivationRequestEvent>();
     CheckPickerTraceEventPrivacyTypeForTest<
@@ -26550,9 +26645,19 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
          "boolmodelPublished=false;"},
         {"PickerTraceMouseDownEvent",
          "uint64_trawWparam=0;intx=0;inty=0;boolctrl=false;"
-         "boolcontrolled=false;boolsearchActive=false;"
+         "boolcontrolled=false;boolgestureActive=false;"
+         "boolsearchActive=false;"
          "PickerPointerTargettarget=PickerPointerTarget::None;"
-         "inttileIndex=-1;"},
+         "introwIndex=-1;inttileIndex=-1;"},
+        {"PickerTraceGestureEvent",
+         "PickerPointerPhasephaseBefore=PickerPointerPhase::Idle;"
+         "PickerPointerPhasephaseAfter=PickerPointerPhase::Idle;"
+         "PickerGestureActionaction=PickerGestureAction::None;"
+         "PickerActionIntentintent=PickerActionIntent::TileSwitch;"
+         "intsourceTileIndex=-1;intdestinationTileIndex=-1;"
+         "boolctrlAtDown=false;boolthresholdCrossed=false;"
+         "boolmodelGenerationValid=false;"
+         "boolrowLayoutEpochValid=false;"},
         {"PickerTraceActivationRequestEvent",
          "uint64_tactivationId=0;PickerTraceActivationSourcesource="
          "PickerTraceActivationSource::Mouse;boolctrl=false;inttileIndex=-1;"},
@@ -26647,7 +26752,7 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
          "boolpeTimestampAvailable=false;boolprocessSessionAvailable=false;"
          "boolintegrityAvailable=false;boolelevated=false;"}
     };
-    static_assert(sizeof(schemas)/sizeof(schemas[0])==15,
+    static_assert(sizeof(schemas)/sizeof(schemas[0])==16,
         "every public picker trace event schema must be allowlisted");
     for(const SchemaCase& schema:schemas)
         CHECK(PickerTraceStructBodyForTest(traceHeader,schema.name)==
@@ -26657,6 +26762,7 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
         "PickerTraceCaptureEvent","PickerTraceOpenEvent",
         "PickerTraceEnumBeginEvent","PickerTraceEnumWindowEvent",
         "PickerTraceEnumEndEvent","PickerTraceMouseDownEvent",
+        "PickerTraceGestureEvent",
         "PickerTraceActivationRequestEvent",
         "PickerTraceActivationResultEvent","PickerTraceMoveBeginEvent",
         "PickerTraceMoveBeginExceptionEvent","PickerTraceEffectEvent",
@@ -26664,7 +26770,7 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
         "PickerTraceTerminalizationAttemptEvent",
         "PickerTraceTransitionTerminalEvent"
     };
-    static_assert(sizeof(emitTypes)/sizeof(emitTypes[0])==14,
+    static_assert(sizeof(emitTypes)/sizeof(emitTypes[0])==15,
         "writer and session emit surfaces must stay exact");
     std::multiset<std::string> expectedEmitDeclarations;
     std::vector<std::string> eventTypeNames;
@@ -26754,10 +26860,10 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
         PickerTraceEventAssignmentsForTest(source);
     const std::vector<std::string> moduleEventAssignments=
         PickerTraceEventAssignmentsForTest(traceSource);
-    CHECK(vdeEventAssignments.size()==176);
+    CHECK(vdeEventAssignments.size()==188);
     CHECK(moduleEventAssignments.size()==74);
     CHECK(PickerTraceAssignmentDigestForTest(vdeEventAssignments)==
-          "278d89168985da21a1251a2b803254cec38bbfee46ee5e4761a34f90222bcbef");
+          "5ebdbc5ce9ca3f4c7bfb31b3b5c3b9ff96b41c741c8d1889f58427fefa131b05");
     CHECK(PickerTraceAssignmentDigestForTest(moduleEventAssignments)==
           "3cf0a4ba0d03558355119c432dd5c642014b7ac987858d2ade5c62a01a4cf493");
     CHECK(std::find(moduleEventAssignments.begin(),
@@ -26993,7 +27099,7 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
         "observer->context,emission.attempt",
         "observer->context,*terminal","startEvent,appVersion"
     };
-    CHECK(emitArguments.size()==26);
+    CHECK(emitArguments.size()==27);
     for(const std::string& argument:emitArguments){
         CHECK(allowedArguments.find(argument)!=allowedArguments.end());
         const char* forbidden[]={
@@ -27574,6 +27680,141 @@ static void test_picker_action_entry_keeps_active_and_row_targets_separate(){
           std::string::npos);
 }
 
+static void test_picker_drag_runtime_wiring_and_conflict_gates_are_explicit(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string state=ReadSourceFile(L"src\\picker_state.hpp");
+    CHECK(!source.empty() && !state.empty());
+
+    CHECK(source.find("static PickerPointerGesture g_pickerGesture;")!=
+          std::string::npos);
+    CHECK(CountSourceText(state,
+        "inline PickerPointerActivation ResolvePickerPointerActivation(")==1);
+    CHECK(CountSourceText(state,
+        "inline bool DispatchPickerPointerActivation(")==1);
+
+    const std::string down=SourceSection(
+        source,"case WM_LBUTTONDOWN:","case WM_MOUSEMOVE:");
+    const size_t rowHit=down.find("HitPickerRow(pt)");
+    const size_t tileHit=down.find("HitPickerTile(pt)");
+    const size_t arm=down.find("ArmPickerRowGesture(");
+    const size_t setCapture=down.find("SetCapture(hwnd)");
+    const size_t getCapture=down.find("GetCapture()==hwnd");
+    CHECK(rowHit!=std::string::npos && tileHit!=std::string::npos &&
+          rowHit<tileHit);
+    CHECK(arm!=std::string::npos && setCapture!=std::string::npos &&
+          getCapture!=std::string::npos && arm<setCapture &&
+          setCapture<getCapture);
+    CHECK(down.find("ResolvePickerPointerActivation(")!=std::string::npos);
+    CHECK(down.find("DispatchPickerPointerActivation(")!=std::string::npos);
+    CHECK(down.find("mouseEvent.rowIndex=activation.rowIndex;")!=
+          std::string::npos);
+    CHECK(down.find("EmitPickerGestureTrace(")!=std::string::npos);
+    CHECK(down.find("fullTitle")==std::string::npos);
+    CHECK(down.find("runtimeKey")==std::string::npos);
+
+    const std::string move=SourceSection(
+        source,"case WM_MOUSEMOVE:","case WM_LBUTTONUP:");
+    CHECK(move.find("SM_CXDRAG")!=std::string::npos);
+    CHECK(move.find("SM_CYDRAG")!=std::string::npos);
+    CHECK(move.find("UpdatePickerRowGesture(")!=std::string::npos);
+    CHECK(move.find("dropTileIndex")!=std::string::npos);
+    const size_t gestureBranch=move.find(
+        "if(g_pickerGesture.phase!=PickerPointerPhase::Idle)");
+    const size_t idleHover=move.find("const bool cacheReady=",gestureBranch);
+    const std::string gestureOnly=
+        gestureBranch!=std::string::npos && idleHover!=std::string::npos
+        ?move.substr(gestureBranch,idleHover-gestureBranch)
+        :std::string();
+    CHECK(!gestureOnly.empty());
+    CHECK(gestureOnly.find("SetPickerSelectionCurrent(")==std::string::npos);
+    CHECK(gestureOnly.find("RefreshPickerPaintCache(")==std::string::npos);
+    CHECK(gestureOnly.find("EmitPickerGestureTrace(")!=std::string::npos);
+
+    const std::string up=SourceSection(
+        source,"case WM_LBUTTONUP:","case WM_MOUSELEAVE:");
+    const size_t resolve=up.find("ResolvePickerRowButtonUp(");
+    const size_t reset=up.find("ResetPickerPointerGesture(hwnd,true,false)");
+    CHECK(resolve!=std::string::npos && reset!=std::string::npos &&
+          resolve<reset);
+    const std::string resetHelper=SourceSection(
+        source,"static bool ResetPickerPointerGesture(",
+        "static std::wstring LowerW(");
+    const size_t cancel=resetHelper.find(
+        "CancelPickerRowGesture(g_pickerGesture)");
+    const size_t release=resetHelper.find("ReleaseCapture()");
+    CHECK(cancel!=std::string::npos && release!=std::string::npos &&
+          cancel<release);
+    CHECK(up.find("case WM_CAPTURECHANGED:")!=std::string::npos);
+    CHECK(up.find("case WM_CANCELMODE:")!=std::string::npos);
+    CHECK(up.find("PickerActionIntent::RowMoveOnly")!=std::string::npos);
+    CHECK(up.find("EmitPickerGestureTrace(")!=std::string::npos);
+    CHECK(up.find("request.row=resolution.row;")!=std::string::npos);
+
+    const std::string keys=SourceSection(
+        source,"case WM_KEYDOWN:","case WM_KEYUP:");
+    CHECK(keys.find("PickerInteractionBusy(g_picker,g_pickerGesture)")!=
+          std::string::npos);
+    CHECK(keys.find("ResetPickerPointerGesture(hwnd,true)")!=
+          std::string::npos);
+    const std::string wheel=SourceSection(
+        source,"case WM_MOUSEWHEEL:","case WM_COMMAND:");
+    CHECK(wheel.find("PickerInteractionBusy(g_picker,g_pickerGesture)")!=
+          std::string::npos);
+    const std::string command=SourceSection(
+        source,"case WM_COMMAND:","case WM_MOVE_CANCEL_RETRY:");
+    CHECK(command.find("PickerInteractionBusy(g_picker,g_pickerGesture)")!=
+          std::string::npos);
+
+    const std::string publish=SourceSection(
+        source,"static bool PublishPickerModelPaintUpdate(",
+        "static bool RebuildPickerFilteredRows()");
+    CHECK(publish.find("PickerInteractionBusy(g_picker,g_pickerGesture)")!=
+          std::string::npos);
+    const std::string refresh=SourceSection(
+        source,"static bool RefreshPickerPaintCache(\n"
+               "        bool allowHiddenPreparation) noexcept {",
+        "struct PickerLightweightSnapshot");
+    CHECK(refresh.find("PickerInteractionBusy(g_picker,g_pickerGesture)")!=
+          std::string::npos);
+    const std::string lightweight=SourceSection(
+        source,"static bool RefreshPickerHighlightsLightweight() noexcept {",
+        "static void ArmPickerIdleRefresh()");
+    CHECK(lightweight.find("PickerInteractionBusy(g_picker,g_pickerGesture)")!=
+          std::string::npos);
+    const std::string edit=SourceSection(
+        source,"static LRESULT CALLBACK EditProc(",
+        "static void EnsurePickerChildren()");
+    CHECK(edit.find("PickerInteractionBusy(g_picker,g_pickerGesture)")!=
+          std::string::npos);
+    const std::string reconcile=SourceSection(
+        source,"static void HandleSearchReconcileResult(",
+        "static void CleanupPickerTabSearchEnsureOperation(");
+    CHECK(reconcile.find("PickerInteractionBusy(g_picker,g_pickerGesture)")!=
+          std::string::npos);
+
+    const std::string paint=SourceSection(
+        source,"static void Paint(","static void TipDeactivate()");
+    CHECK(paint.find("g_pickerGesture.dropTileIndex")!=std::string::npos);
+    CHECK(paint.find("g_picker.selectedIndex=g_pickerGesture.dropTileIndex")==
+          std::string::npos);
+    const std::string hide=SourceSection(
+        source,"static void HidePicker() noexcept {",
+        "// Search EDIT subclass");
+    CHECK(hide.find("ResetPickerPointerGesture(g_main,true)")!=
+          std::string::npos);
+    const std::string deactivate=SourceSection(
+        source,"case WM_ACTIVATE:","case WM_SESSION_RESULT:");
+    CHECK(deactivate.find(
+        "!PickerInteractionBusy(g_picker,g_pickerGesture)")!=
+          std::string::npos);
+    CHECK(deactivate.find("HidePicker();")!=std::string::npos);
+    const std::string lifetime=SourceSection(
+        source,"case WM_QUERYENDSESSION:",
+        "return DefWindowProcW(hwnd,msg,wp,lp);");
+    CHECK(CountSourceText(
+        lifetime,"ResetPickerPointerGesture(hwnd,true)")==3);
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
@@ -27611,6 +27852,7 @@ int main(){
     test_picker_trace_snapshot_observer_reports_failures_no_throw();
     test_picker_trace_activation_dispatches_every_guard_once();
     test_picker_trace_activation_sources_have_stable_json_names();
+    test_picker_trace_gesture_fields_have_stable_private_names();
     test_picker_trace_move_begin_reasons_have_stable_json_names();
     test_picker_trace_action_fields_have_stable_json_names();
     test_picker_trace_move_begin_exception_distinguishes_publication();
@@ -27635,6 +27877,7 @@ int main(){
     test_picker_trace_task9_vocabulary_is_exhaustive();
     test_picker_trace_task9_runtime_wiring_is_causal_and_private();
     test_picker_trace_task10_runtime_anchors_and_privacy_are_locked();
+    test_picker_drag_runtime_wiring_and_conflict_gates_are_explicit();
     test_picker_evidence_fixes_have_guarded_product_wiring();
     test_picker_pin_probe_is_optional_read_only_and_private();
     test_target_move_guard_is_single_complete_boundary();
@@ -27665,6 +27908,7 @@ int main(){
     test_picker_display_only_can_click_but_cannot_drag();
     test_picker_stale_plain_click_degrades_but_ctrl_cancels();
     test_picker_drag_escape_and_capture_loss_reset_everything();
+    test_picker_interaction_busy_and_drop_highlight_are_state_free();
     test_footer_hover_event_state_covers_every_reset_path();
     test_footer_mousemove_resets_tooltip_only_once_per_transition();
     test_visible_branding_and_help_retention_are_exact();

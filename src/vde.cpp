@@ -114,6 +114,7 @@ static const wchar_t* APP_VERSION = L"1.1.0";
 static HWND g_main=nullptr;
 static void Balloon(const std::wstring& text);
 static PickerState g_picker;
+static PickerPointerGesture g_pickerGesture;
 static PickerTraceSession g_pickerTrace;
 static PickerTabSearchCacheState g_pickerTabSearchCache;
 static bool g_suppressPickerCtrlSpaceChar=false;
@@ -5759,6 +5760,79 @@ struct RowRec { PickerRowHitSnapshot snapshot; };
 using PickerPaintCache=PickerPaintCacheState<RowRec>;
 static PickerPaintCache g_pickerPaintCache;
 static PickerHoverEventState g_pickerHoverState;
+
+static int HitPickerTile(POINT point) noexcept {
+    for(size_t index=0;index<g_tiles.size();++index)
+        if(PtInRect(&g_tiles[index].rc,point))
+            return static_cast<int>(index);
+    return -1;
+}
+
+static int HitPickerRow(POINT point) noexcept {
+    if(!PickerPaintCacheMatches(
+            g_picker,g_pickerPaintCache.generation)) return -1;
+    for(size_t index=0;index<g_pickerPaintCache.hoverRows.size();++index)
+        if(PtInRect(
+                &g_pickerPaintCache.hoverRows[index].snapshot.hitRect,
+                point)) return static_cast<int>(index);
+    return -1;
+}
+
+static PickerActionIntent PickerGestureTraceIntent(
+        PickerPointerPhase phase,PickerGestureAction action,
+        bool ctrlAtDown) noexcept {
+    if(phase==PickerPointerPhase::Dragging ||
+       action==PickerGestureAction::DragStarted ||
+       action==PickerGestureAction::Drop ||
+       action==PickerGestureAction::NoOp)
+        return PickerActionIntent::RowMoveOnly;
+    if(action==PickerGestureAction::SwitchOnly)
+        return PickerActionIntent::TileSwitch;
+    return ctrlAtDown
+        ?PickerActionIntent::MoveAndFollow
+        :PickerActionIntent::ActivateExact;
+}
+
+static void EmitPickerGestureTrace(
+        const PickerPointerGesture& facts,
+        PickerPointerPhase before,PickerPointerPhase after,
+        PickerGestureAction action,bool thresholdCrossed,
+        int destinationTileIndex) noexcept {
+    PickerTraceGestureEvent event;
+    event.phaseBefore=before;
+    event.phaseAfter=after;
+    event.action=action;
+    event.intent=PickerGestureTraceIntent(
+        before,action,facts.ctrlAtDown);
+    event.sourceTileIndex=facts.row.tileIndex;
+    event.destinationTileIndex=destinationTileIndex;
+    event.ctrlAtDown=facts.ctrlAtDown;
+    event.thresholdCrossed=thresholdCrossed;
+    event.modelGenerationValid=
+        facts.row.modelGeneration==g_picker.modelGeneration;
+    event.rowLayoutEpochValid=
+        facts.rowLayoutEpoch==g_picker.rowLayoutEpoch;
+    g_pickerTrace.emit(event);
+}
+
+static bool ResetPickerPointerGesture(
+        HWND owner,bool releaseCapture,
+        bool emitCancellation=true) noexcept {
+    const bool changed=
+        g_pickerGesture.phase!=PickerPointerPhase::Idle;
+    const PickerPointerGesture facts=g_pickerGesture;
+    CancelPickerRowGesture(g_pickerGesture);
+    if(changed && emitCancellation)
+        EmitPickerGestureTrace(
+            facts,facts.phase,PickerPointerPhase::Idle,
+            PickerGestureAction::Cancel,false,
+            facts.dropTileIndex);
+    if(releaseCapture && owner && GetCapture()==owner)
+        ReleaseCapture();
+    if(changed && owner) InvalidateRect(owner,nullptr,FALSE);
+    return changed;
+}
+
 static std::wstring LowerW(std::wstring s){ if(!s.empty()) CharLowerW(&s[0]); return s; }
 static bool MatchesSearch(const std::wstring& title){ return g_picker.searchText.empty() || LowerW(title).find(g_picker.searchText)!=std::wstring::npos; }
 // ---- picker palette (per mockup) ----
@@ -6559,6 +6633,7 @@ static bool RememberPickerScroll(Tile& tile,int scroll) noexcept {
 template<class Mutate>
 static bool PublishPickerModelPaintUpdate(
         Mutate&& mutate,bool rowLayoutChanges) noexcept {
+    if(PickerInteractionBusy(g_picker,g_pickerGesture)) return false;
     try {
         std::vector<Tile> stagedTiles=g_tiles;
         PickerPaintCache stagedCache;
@@ -6704,6 +6779,7 @@ static void HandleSearchReconcileResult(std::unique_ptr<ReconcileResult> result)
     const bool currentPickerSearch=PickerTabSearchAttemptMatches(
         g_pickerTabSearchCache,result->operationId,
         g_picker.modelGeneration,g_picker.searchText) &&
+        !PickerInteractionBusy(g_picker,g_pickerGesture) &&
         operation->second.pickerModelGeneration==g_picker.modelGeneration &&
         operation->second.pickerQuery==g_picker.searchText;
     auto captured=operation->second.snapshots.find(result->app);
@@ -7243,6 +7319,7 @@ static void InvalidatePublishedPickerPaintCache() noexcept {
 
 static bool RefreshPickerPaintCache(
         bool allowHiddenPreparation) noexcept {
+    if(PickerInteractionBusy(g_picker,g_pickerGesture)) return false;
     const uint64_t generation=
         g_picker.paintGeneration==
             (std::numeric_limits<uint64_t>::max)()
@@ -7274,6 +7351,7 @@ struct PickerLightweightSnapshot {
 };
 
 static bool RefreshPickerHighlightsLightweight() noexcept {
+    if(PickerInteractionBusy(g_picker,g_pickerGesture)) return false;
     PickerLightweightSnapshot adopted;
     PickerLightweightActiveUpdate activeUpdate=
         PickerLightweightActiveUpdate::Preserved;
@@ -7350,7 +7428,7 @@ static bool RefreshPickerHighlightsLightweight() noexcept {
 }
 
 static void ArmPickerIdleRefresh() noexcept {
-    if(g_main && !g_picker.controlledTransition() &&
+    if(g_main && !PickerInteractionBusy(g_picker,g_pickerGesture) &&
        IsWindowVisible(g_main))
         SetTimer(g_main,TIMER_PICKER_TRANSITION,
                  PICKER_IDLE_REFRESH_MS,nullptr);
@@ -7409,12 +7487,17 @@ static void Paint(HDC hdcReal,HDC hdc,RECT client){
         const Tile& t=g_tiles[tileIndex];
         const bool isCurrent=IsCurrentDesktop(g_picker,t.guid);
         const bool isSelected=IsSelectedDesktop(g_picker,t.guid);
+        const bool isDropTarget=
+            g_pickerGesture.phase==PickerPointerPhase::Dragging &&
+            g_pickerGesture.dropTileIndex==static_cast<int>(tileIndex);
         const bool dim=searching && t.filtered.empty();
-        const COLORREF fill=PickerTileFill(
+        COLORREF fill=PickerTileFill(
             CLR_TILE,currentTile,CLR_TILE_DIM,isCurrent,dim);
+        if(isDropTarget) fill=BlendColor(fill,CLR_ACTIVE,64);
         FillRoundRect(hdc,t.rc,S(10),fill,
-            PickerTileBorder(isSelected,CLR_ACTIVE,CLR_PASSIVE),
-            isSelected?S(2):S(1));
+            PickerTileBorder(
+                isSelected || isDropTarget,CLR_ACTIVE,CLR_PASSIVE),
+            isDropTarget?S(3):(isSelected?S(2):S(1)));
         SelectObject(hdc,fN); SetTextColor(hdc,dim?CLR_DIM:CLR_HEAD);
         RECT nr=t.rc; nr.left+=S(14); nr.top+=S(10); nr.right-=S(12); nr.bottom=nr.top+S(22);
         DrawTextW(hdc,t.displayName.c_str(),-1,&nr,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
@@ -7529,6 +7612,7 @@ static void TrackPickerHoverTooltip(HWND hwnd,const RowRec& row,
 }
 static void HidePicker() noexcept {
     if(g_picker.controlledTransition()) return;
+    ResetPickerPointerGesture(g_main,true);
     if(g_main) KillTimer(g_main,TIMER_PICKER_TRANSITION);
     CancelPickerIconPreload(g_main);
     ResetPickerHoverState(PickerHoverResetReason::Hide);
@@ -7537,7 +7621,7 @@ static void HidePicker() noexcept {
 }
 // Search EDIT subclass: forward navigation keys to the grid; let letters/numbers type.
 static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM wp, LPARAM lp){
-    if(g_picker.controlledTransition()){
+    if(PickerInteractionBusy(g_picker,g_pickerGesture)){
         if((m==WM_CHAR && wp==L' ') ||
            (m==WM_KEYUP && wp==VK_SPACE) || m==WM_KILLFOCUS)
             g_suppressPickerCtrlSpaceChar=false;
@@ -9677,7 +9761,7 @@ static void ShowPicker(PickerTargetCaptureState capture){
         traceEvent.result=PickerTraceOpenResult::Degraded;
         return;   // desktop COM unavailable; startup dialog + tray tip already explain
     }
-    if(g_picker.controlledTransition()){
+    if(PickerInteractionBusy(g_picker,g_pickerGesture)){
         traceEvent.result=PickerTraceOpenResult::ControlledTransition;
         return;
     }
@@ -9767,7 +9851,7 @@ static void ShowPicker(PickerTargetCaptureState capture){
     ArmPickerIdleRefresh();
     traceEvent.result=PickerTraceOpenResult::Shown;
 }
-static void MoveSel(int dx,int dy){ if(g_picker.controlledTransition()||g_tiles.empty())return; int selected=g_picker.selectedIndex; if(selected<0||selected>=(int)g_tiles.size())selected=0; int r=selected/g_cols,c=selected%g_cols; c+=dx;r+=dy; int n=(int)g_tiles.size();
+static void MoveSel(int dx,int dy){ if(PickerInteractionBusy(g_picker,g_pickerGesture)||g_tiles.empty())return; int selected=g_picker.selectedIndex; if(selected<0||selected>=(int)g_tiles.size())selected=0; int r=selected/g_cols,c=selected%g_cols; c+=dx;r+=dy; int n=(int)g_tiles.size();
     if(c<0)c=0; if(c>=g_cols)c=g_cols-1; if(r<0)r=0; int idx=r*g_cols+c; if(idx>=n)idx=n-1; if(idx<0)idx=0; SetPickerSelectionCurrent(idx); RefreshPickerPaintCache(); InvalidateRect(g_main,nullptr,FALSE); }
 
 // ================================ GUI: tray ==================================
@@ -10214,7 +10298,8 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
        g_runtimeQuiescence.acceptsDispatch())
         PumpPickerTransitionWork();
     if(msg!=WM_TIMER && msg!=WM_PICKER_SEARCH_RETRY &&
-       !g_pickerShutdownDrain && !g_picker.controlledTransition() &&
+       !g_pickerShutdownDrain &&
+       !PickerInteractionBusy(g_picker,g_pickerGesture) &&
        g_runtimeQuiescence.acceptsDispatch() &&
        PickerTabSearchRetryDeliveryKickNeeded(
            g_pickerTabSearchCache,g_picker.modelGeneration,
@@ -10232,7 +10317,8 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     case WM_PICKER_SEARCH_RETRY:
         if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
         if(AcquirePickerTabSearchRetryPostLeaseWhenIdle(
-                g_pickerTabSearchCache,g_picker.controlledTransition(),
+                g_pickerTabSearchCache,
+                PickerInteractionBusy(g_picker,g_pickerGesture),
                 g_picker.modelGeneration,g_picker.searchText))
             EnsureTabSearch();
         return 0;
@@ -10271,9 +10357,12 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         if(wp==VK_CONTROL){ InvalidateRect(hwnd,nullptr,FALSE); return 0; }
         if(wp==VK_ESCAPE){
             if(g_picker.controlledTransition()) RequestPickerCancellation();
+            else if(g_pickerGesture.phase!=PickerPointerPhase::Idle)
+                ResetPickerPointerGesture(hwnd,true);
             else HidePicker();
             return 0;
         }
+        if(PickerInteractionBusy(g_picker,g_pickerGesture)) return 0;
         if(wp==VK_RETURN||wp==VK_SPACE){
             Activate(g_picker.selectedIndex,ctrl,
                      PickerTraceActivationSource::Keyboard);
@@ -10288,7 +10377,6 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             Activate(9,ctrl,PickerTraceActivationSource::Keyboard);
             return 0;
         }
-        if(g_picker.controlledTransition()) return 0;
         if(wp==VK_LEFT){MoveSel(-1,0);return 0;} if(wp==VK_RIGHT){MoveSel(1,0);return 0;}
         if(wp==VK_UP){MoveSel(0,-1);return 0;} if(wp==VK_DOWN){MoveSel(0,1);return 0;}
         if(wp==VK_TAB){ bool sh=(GetKeyState(VK_SHIFT)&0x8000)!=0; int n=(int)g_tiles.size(); if(n){int selected=g_picker.selectedIndex; if(selected<0||selected>=n)selected=0; SetPickerSelectionCurrent((selected+(sh?-1:1)+n)%n); RefreshPickerPaintCache(); InvalidateRect(hwnd,nullptr,FALSE);} return 0; }
@@ -10304,8 +10392,10 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         mouseEvent.y=pt.y;
         mouseEvent.ctrl=ctrl;
         mouseEvent.controlled=g_picker.controlledTransition();
+        mouseEvent.gestureActive=
+            g_pickerGesture.phase!=PickerPointerPhase::Idle;
         mouseEvent.searchActive=g_picker.searchActive;
-        if(mouseEvent.controlled){
+        if(mouseEvent.controlled || mouseEvent.gestureActive){
             g_pickerTrace.emit(mouseEvent);
             return 0;
         }
@@ -10321,17 +10411,19 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         RECT client={0,0,0,0};
         const bool searchHit=GetClientRect(hwnd,&client) &&
             PickerPointInRect(SearchBoxRect(client.right),pt);
-        int tileIndex=-1;
-        for(size_t index=0;index<g_tiles.size();++index)
-            if(PtInRect(&g_tiles[index].rc,pt)){
-                tileIndex=static_cast<int>(index);
-                break;
-            }
+        const int rowIndex=HitPickerRow(pt);
+        int tileIndex=HitPickerTile(pt);
+        if(rowIndex>=0 &&
+           rowIndex<static_cast<int>(g_pickerPaintCache.hoverRows.size()))
+            tileIndex=g_pickerPaintCache.hoverRows[
+                rowIndex].snapshot.action.tileIndex;
         const PickerPointerActivation activation=
             ResolvePickerPointerActivation(
-                footerActivation,clearSearchHit,searchHit,tileIndex);
+                footerActivation,clearSearchHit,searchHit,
+                rowIndex,tileIndex);
         mouseEvent.target=activation.target;
         mouseEvent.tileIndex=activation.tileIndex;
+        mouseEvent.rowIndex=activation.rowIndex;
         g_pickerTrace.emit(mouseEvent);
         if(DispatchPickerPointerActivation(activation,
             [&](const PickerFooterActivation& footer){
@@ -10347,6 +10439,26 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                 RefreshPickerPaintCache();
                 SetFocus(g_search);
                 InvalidateRect(hwnd,nullptr,FALSE);
+            },[&](int hitIndex,int rowTileIndex){
+                if(hitIndex<0 ||
+                   hitIndex>=static_cast<int>(
+                       g_pickerPaintCache.hoverRows.size())) return;
+                const PickerRowActionSnapshot row=
+                    g_pickerPaintCache.hoverRows[
+                        hitIndex].snapshot.action;
+                if(row.tileIndex!=rowTileIndex ||
+                   !ArmPickerRowGesture(
+                       g_pickerGesture,row,pt,ctrl,
+                       g_picker.modelGeneration,
+                       g_picker.rowLayoutEpoch)) return;
+                EmitPickerGestureTrace(
+                    g_pickerGesture,PickerPointerPhase::Idle,
+                    PickerPointerPhase::Armed,
+                    PickerGestureAction::None,false,-1);
+                SetCapture(hwnd);
+                const bool captureOwned=GetCapture()==hwnd;
+                if(!captureOwned)
+                    ResetPickerPointerGesture(hwnd,false);
             },[&](int index){
                 if(g_picker.searchActive){
                     g_picker.searchActive=false;
@@ -10364,6 +10476,39 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     }
     case WM_MOUSEMOVE:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
         if(g_picker.controlledTransition()) return 0;
+        if(g_pickerGesture.phase!=PickerPointerPhase::Idle){
+            const PickerPointerGesture gestureFacts=g_pickerGesture;
+            const PickerPointerPhase priorPhase=g_pickerGesture.phase;
+            const int priorDropTileIndex=
+                g_pickerGesture.dropTileIndex;
+            const int candidateDropTile=HitPickerTile(pt);
+            const PickerGestureAction gestureAction=
+                UpdatePickerRowGesture(
+                    g_pickerGesture,pt,
+                    GetSystemMetrics(SM_CXDRAG),
+                    GetSystemMetrics(SM_CYDRAG),
+                    g_picker.modelGeneration,
+                    g_picker.rowLayoutEpoch,
+                    candidateDropTile);
+            if(gestureAction==PickerGestureAction::Cancel){
+                EmitPickerGestureTrace(
+                    gestureFacts,priorPhase,PickerPointerPhase::Idle,
+                    PickerGestureAction::Cancel,false,
+                    candidateDropTile);
+                ResetPickerPointerGesture(hwnd,true,false);
+                InvalidateRect(hwnd,nullptr,FALSE);
+            } else {
+                if(gestureAction==PickerGestureAction::DragStarted)
+                    EmitPickerGestureTrace(
+                        gestureFacts,priorPhase,g_pickerGesture.phase,
+                        gestureAction,true,candidateDropTile);
+                if(priorPhase!=g_pickerGesture.phase ||
+                    priorDropTileIndex!=
+                        g_pickerGesture.dropTileIndex)
+                    InvalidateRect(hwnd,nullptr,FALSE);
+            }
+            return 0;
+        }
         const bool cacheReady=PickerPaintCacheMatches(g_picker,g_pickerPaintCache.generation);
         const PickerFooterLink footerHover=HitCurrentPickerFooterLink(
             g_picker,g_pickerPaintCache.generation,
@@ -10395,6 +10540,75 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         for(size_t i=0;i<g_tiles.size();++i) if(PtInRect(&g_tiles[i].rc,pt)){ if(g_picker.selectedIndex!=(int)i){SetPickerSelectionCurrent((int)i); RefreshPickerPaintCache(); InvalidateRect(hwnd,nullptr,FALSE);} break; }
         TRACKMOUSEEVENT tme={sizeof(tme)}; tme.dwFlags=TME_LEAVE; tme.hwndTrack=hwnd; TrackMouseEvent(&tme);
         return 0; }
+    case WM_LBUTTONUP:{
+        if(g_pickerGesture.phase==PickerPointerPhase::Idle) return 0;
+        const PickerPointerGesture gestureFacts=g_pickerGesture;
+        const POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+        PickerRowActionSnapshot releaseRow;
+        const int releaseRowIndex=HitPickerRow(pt);
+        const PickerRowActionSnapshot* releaseRowPointer=nullptr;
+        if(releaseRowIndex>=0 &&
+           releaseRowIndex<static_cast<int>(
+               g_pickerPaintCache.hoverRows.size())){
+            releaseRow=g_pickerPaintCache.hoverRows[
+                releaseRowIndex].snapshot.action;
+            releaseRowPointer=&releaseRow;
+        }
+        const bool dragging=
+            g_pickerGesture.phase==PickerPointerPhase::Dragging;
+        const int destinationIndex=dragging
+            ?g_pickerGesture.dropTileIndex
+            :g_pickerGesture.row.tileIndex;
+        const bool destinationExists=destinationIndex>=0 &&
+            destinationIndex<static_cast<int>(g_tiles.size());
+        const PickerGestureResolution resolution=
+            ResolvePickerRowButtonUp(
+                g_pickerGesture,releaseRowPointer,destinationExists,
+                g_picker.modelGeneration,g_picker.rowLayoutEpoch);
+        ResetPickerPointerGesture(hwnd,true,false);
+        EmitPickerGestureTrace(
+            gestureFacts,gestureFacts.phase,PickerPointerPhase::Idle,
+            resolution.action,false,resolution.dropTileIndex);
+        switch(resolution.action){
+        case PickerGestureAction::Click:
+            Activate(resolution.row.tileIndex,resolution.ctrlAtDown,
+                     PickerTraceActivationSource::Mouse);
+            break;
+        case PickerGestureAction::SwitchOnly:
+            Activate(resolution.row.tileIndex,false,
+                     PickerTraceActivationSource::Mouse);
+            break;
+        case PickerGestureAction::Drop:
+            if(resolution.dropTileIndex>=0 &&
+               resolution.dropTileIndex<
+                   static_cast<int>(g_tiles.size())){
+                PickerActionRequest request;
+                request.intent=PickerActionIntent::RowMoveOnly;
+                request.destination=
+                    g_tiles[resolution.dropTileIndex].guid;
+                request.hasRow=true;
+                request.row=resolution.row;
+                request.popupActiveTarget=g_picker.activeWindow;
+                request.ctrlAtDown=resolution.ctrlAtDown;
+                request.activationId=
+                    g_pickerTrace.nextCorrelationId();
+                (void)BeginPickerAction(request);
+            }
+            break;
+        case PickerGestureAction::None:
+        case PickerGestureAction::DragStarted:
+        case PickerGestureAction::NoOp:
+        case PickerGestureAction::Cancel:
+            break;
+        }
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+        ResetPickerPointerGesture(hwnd,false);
+        return 0;
+    case WM_CANCELMODE:
+        ResetPickerPointerGesture(hwnd,true);
+        return 0;
     case WM_MOUSELEAVE:{
         const bool footerChanged=
             g_pickerHoverState.footerLink!=PickerFooterLink::None;
@@ -10406,7 +10620,7 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         return 0;
     }
     case WM_MOUSEWHEEL:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; ScreenToClient(hwnd,&pt); int delta=GET_WHEEL_DELTA_WPARAM(wp);   // R8: scroll a tile's window list
-        if(g_picker.controlledTransition()) return 0;
+        if(PickerInteractionBusy(g_picker,g_pickerGesture)) return 0;
         for(size_t tileIndex=0;tileIndex<g_tiles.size();++tileIndex){
             const Tile& t=g_tiles[tileIndex];
             if(!PtInRect(&t.rc,pt)) continue;
@@ -10433,7 +10647,7 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         }
         return 0; }
     case WM_COMMAND:                                            // R7: live-filter as the search text changes
-        if(g_picker.controlledTransition()) return 0;
+        if(PickerInteractionBusy(g_picker,g_pickerGesture)) return 0;
         if(g_search && (HWND)lp==g_search && HIWORD(wp)==EN_CHANGE){
             int n=GetWindowTextLengthW(g_search); std::wstring s(n+1,0); GetWindowTextW(g_search,&s[0],n+1); s.resize(wcslen(s.c_str()));
             std::wstring searchText=LowerW(s);
@@ -10485,7 +10699,8 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         if(wp==TIMER_PICKER_SEARCH_RETRY){
             KillTimer(hwnd,TIMER_PICKER_SEARCH_RETRY);
             if(PickerTabSearchRetryDeliveryReadyWhenIdle(
-                    g_pickerTabSearchCache,g_picker.controlledTransition(),
+                    g_pickerTabSearchCache,
+                    PickerInteractionBusy(g_picker,g_pickerGesture),
                     g_picker.modelGeneration,g_picker.searchText))
                 EnsureTabSearch();
             return 0;
@@ -10496,6 +10711,8 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                g_pickerTerminalizationPending){
                 PumpPickerTransitionWork();
             } else {
+                if(g_pickerGesture.phase!=PickerPointerPhase::Idle)
+                    return 0;
                 if(PickerTabSearchRetryDeliveryKickNeeded(
                         g_pickerTabSearchCache,g_picker.modelGeneration,
                         g_picker.searchText)){
@@ -10565,7 +10782,11 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             },[](){},[](){ MaintainAutoFlushTimer(); });
         }
         return 0;
-    case WM_ACTIVATE: if(LOWORD(wp)==WA_INACTIVE)HidePicker(); return 0;
+    case WM_ACTIVATE:
+        if(LOWORD(wp)==WA_INACTIVE &&
+           !PickerInteractionBusy(g_picker,g_pickerGesture))
+            HidePicker();
+        return 0;
     case WM_SESSION_RESULT: {
         std::unique_ptr<SessionResult> result((SessionResult*)lp);
         if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
@@ -10632,16 +10853,19 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             ShowPicker(CapturePickerTarget());
         return 0;
     case WM_QUERYENDSESSION:
+        ResetPickerPointerGesture(hwnd,true);
         DrainPickerForShutdown();
         CheckpointAutoLayout(CheckpointReason::QueryEndSession);
         return TRUE;
     case WM_ENDSESSION:
+        ResetPickerPointerGesture(hwnd,true);
         if(wp!=0) DrainPickerForShutdown();
         FinalizeSessionAndQuiesce(wp!=0,
             [](){ return FinalizeAutoLayout(); },
             [=](){ return QuiesceRuntime(hwnd); });
         return 0;
     case WM_DESTROY:
+        ResetPickerPointerGesture(hwnd,true);
         DrainPickerForShutdown();
         FinalizeAutoLayout();
         QuiesceRuntime(hwnd);

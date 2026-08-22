@@ -315,9 +315,24 @@ struct PickerTraceMouseDownEvent {
     int y=0;
     bool ctrl=false;
     bool controlled=false;
+    bool gestureActive=false;
     bool searchActive=false;
     PickerPointerTarget target=PickerPointerTarget::None;
+    int rowIndex=-1;
     int tileIndex=-1;
+};
+
+struct PickerTraceGestureEvent {
+    PickerPointerPhase phaseBefore=PickerPointerPhase::Idle;
+    PickerPointerPhase phaseAfter=PickerPointerPhase::Idle;
+    PickerGestureAction action=PickerGestureAction::None;
+    PickerActionIntent intent=PickerActionIntent::TileSwitch;
+    int sourceTileIndex=-1;
+    int destinationTileIndex=-1;
+    bool ctrlAtDown=false;
+    bool thresholdCrossed=false;
+    bool modelGenerationValid=false;
+    bool rowLayoutEpochValid=false;
 };
 
 struct PickerTraceActivationRequestEvent {
@@ -833,6 +848,8 @@ const char* PickerTraceIdentityValidityName(PickerIdentityValidity) noexcept;
 const char* PickerTraceReadValidityName(PickerReadValidity) noexcept;
 const char* PickerTraceRecaptureName(WindowIdentityRecapture) noexcept;
 const char* PickerTracePointerTargetName(PickerPointerTarget) noexcept;
+const char* PickerTracePointerPhaseName(PickerPointerPhase) noexcept;
+const char* PickerTraceGestureActionName(PickerGestureAction) noexcept;
 
 #define VDE_DECLARE_PICKER_TRACE_SERIALIZER(EventType) \
     bool SerializePickerTraceLine(const PickerTraceEnvelope& envelope, \
@@ -845,6 +862,7 @@ VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceEnumBeginEvent);
 VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceEnumWindowEvent);
 VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceEnumEndEvent);
 VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceMouseDownEvent);
+VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceGestureEvent);
 VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceActivationRequestEvent);
 VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceActivationResultEvent);
 VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceMoveBeginEvent);
@@ -886,6 +904,7 @@ public:
     void emit(const PickerTraceEnumWindowEvent&) noexcept;
     void emit(const PickerTraceEnumEndEvent&) noexcept;
     void emit(const PickerTraceMouseDownEvent&) noexcept;
+    void emit(const PickerTraceGestureEvent&) noexcept;
     void emit(const PickerTraceActivationRequestEvent&) noexcept;
     void emit(const PickerTraceActivationResultEvent&) noexcept;
     void emit(const PickerTraceMoveBeginEvent&) noexcept;
@@ -1043,6 +1062,7 @@ public:
     void emit(const PickerTraceEnumWindowEvent&) noexcept;
     void emit(const PickerTraceEnumEndEvent&) noexcept;
     void emit(const PickerTraceMouseDownEvent&) noexcept;
+    void emit(const PickerTraceGestureEvent&) noexcept;
     void emit(const PickerTraceActivationRequestEvent&) noexcept;
     void emit(const PickerTraceActivationResultEvent&) noexcept;
     void emit(const PickerTraceMoveBeginEvent&) noexcept;

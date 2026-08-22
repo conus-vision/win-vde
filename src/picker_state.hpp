@@ -427,13 +427,6 @@ inline PickerPointerActivation ResolvePickerPointerActivation(
     return activation;
 }
 
-inline PickerPointerActivation ResolvePickerPointerActivation(
-        const PickerFooterActivation& footer,bool clearSearchHit,
-        bool searchHit,int tileIndex) noexcept {
-    return ResolvePickerPointerActivation(
-        footer,clearSearchHit,searchHit,-1,tileIndex);
-}
-
 template<class OnFooter,class OnClearSearch,class OnSearch,
          class OnRow,class OnTile>
 inline bool DispatchPickerPointerActivation(
@@ -464,20 +457,6 @@ inline bool DispatchPickerPointerActivation(
         return activation.target!=PickerPointerTarget::None;
     }
     return false;
-}
-
-template<class OnFooter,class OnClearSearch,class OnSearch,class OnTile>
-inline bool DispatchPickerPointerActivation(
-        const PickerPointerActivation& activation,
-        OnFooter&& onFooter,OnClearSearch&& onClearSearch,
-        OnSearch&& onSearch,OnTile&& onTile) noexcept {
-    return DispatchPickerPointerActivation(
-        activation,
-        std::forward<OnFooter>(onFooter),
-        std::forward<OnClearSearch>(onClearSearch),
-        std::forward<OnSearch>(onSearch),
-        [](int,int) noexcept {},
-        std::forward<OnTile>(onTile));
 }
 
 inline bool PickerDragThresholdCrossed(
@@ -1924,6 +1903,13 @@ struct PickerState {
         other.paintGeneration=generation;
     }
 };
+
+inline bool PickerInteractionBusy(
+        const PickerState& state,
+        const PickerPointerGesture& gesture) noexcept {
+    return state.controlledTransition() ||
+           gesture.phase!=PickerPointerPhase::Idle;
+}
 
 inline bool StagePickerVisualAssignmentMutation(
         PickerState& state,
