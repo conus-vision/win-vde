@@ -470,6 +470,63 @@ inline PickerEffectExecutionRoute RoutePickerEffectExecution(
 enum class PickerReadValidity { Unknown, Valid, Unavailable };
 enum class PickerIdentityValidity { Unknown, Match, Lost, Indeterminate };
 enum class PickerPopupRoute { Managed, StickyUnmanaged, Reject };
+
+enum class PickerTransitionMode {
+    MoveAndFollow,
+    RowMoveOnly,
+    VisualAndFollow,
+    VisualOnly
+};
+
+enum class PickerHideDisposition {
+    None,
+    TransientRelocate,
+    DismissSession
+};
+
+struct PickerTransitionPolicy {
+    bool requiresCapturedActive=false;
+    bool movesTarget=false;
+    bool movesPopup=false;
+    bool switchesDesktop=false;
+    bool persistsTarget=false;
+    bool publishesVisual=false;
+    bool restoresPopupFocus=false;
+    bool cancelDismissesSession=false;
+};
+
+inline PickerTransitionPolicy PickerPolicyFor(
+        PickerTransitionMode mode) noexcept {
+    PickerTransitionPolicy policy;
+    switch(mode){
+    case PickerTransitionMode::MoveAndFollow:
+        policy.requiresCapturedActive=true;
+        policy.movesTarget=true;
+        policy.movesPopup=true;
+        policy.switchesDesktop=true;
+        policy.persistsTarget=true;
+        policy.restoresPopupFocus=true;
+        policy.cancelDismissesSession=true;
+        break;
+    case PickerTransitionMode::RowMoveOnly:
+        policy.movesTarget=true;
+        policy.persistsTarget=true;
+        break;
+    case PickerTransitionMode::VisualAndFollow:
+        policy.requiresCapturedActive=true;
+        policy.movesPopup=true;
+        policy.switchesDesktop=true;
+        policy.publishesVisual=true;
+        policy.restoresPopupFocus=true;
+        policy.cancelDismissesSession=true;
+        break;
+    case PickerTransitionMode::VisualOnly:
+        policy.publishesVisual=true;
+        break;
+    }
+    return policy;
+}
+
 enum class PopupSaveStatus { NotTracked, Saved, Failed };
 enum class PopupSaveFailure {
     None, IdentityLost, IdentityIndeterminate, Classification,
@@ -511,13 +568,16 @@ struct PickerEffect {
     uint64_t generation=0;
     uint64_t effectSerial=0;
     GUID desktop={0};
+    PickerHideDisposition hideDisposition=PickerHideDisposition::None;
 };
 
 struct PickerTransition {
     PickerPhase phase=PickerPhase::Idle;
     uint64_t generation=0;
     MoveToken reservationToken;
+    PickerTransitionMode mode=PickerTransitionMode::MoveAndFollow;
     WindowIdentityKey target;
+    WindowIdentityKey popupActiveTarget;
     std::string runtimeKey;
     std::string app;
     std::string pendingRecordId;
@@ -563,6 +623,8 @@ struct PickerTransition {
     bool suppressFocus=false;
     bool terminalAcknowledged=false;
     bool capturedTitleComplete=false;
+    PickerHideDisposition pendingHideDisposition=
+        PickerHideDisposition::None;
     PickerPhase resumeAfterHide=PickerPhase::Idle;
     uint64_t identityGeneration=0;
     uint64_t lifecycleSaveGeneration=0;
@@ -573,7 +635,9 @@ struct PickerTransition {
         std::swap(phase,other.phase);
         std::swap(generation,other.generation);
         std::swap(reservationToken,other.reservationToken);
+        std::swap(mode,other.mode);
         std::swap(target,other.target);
+        std::swap(popupActiveTarget,other.popupActiveTarget);
         runtimeKey.swap(other.runtimeKey);
         app.swap(other.app);
         pendingRecordId.swap(other.pendingRecordId);
@@ -623,6 +687,8 @@ struct PickerTransition {
         std::swap(suppressFocus,other.suppressFocus);
         std::swap(terminalAcknowledged,other.terminalAcknowledged);
         std::swap(capturedTitleComplete,other.capturedTitleComplete);
+        std::swap(pendingHideDisposition,
+                  other.pendingHideDisposition);
         std::swap(resumeAfterHide,other.resumeAfterHide);
         std::swap(identityGeneration,other.identityGeneration);
         std::swap(lifecycleSaveGeneration,other.lifecycleSaveGeneration);
@@ -1396,6 +1462,75 @@ struct PickerState {
     }
 };
 
+inline bool PickerTransitionTargetsAuthorized(
+        const PickerState& state,
+        const PickerTransition& transition) noexcept {
+    if(!SameIdentity(transition.target,transition.target))
+        return false;
+    const PickerTransitionPolicy policy=
+        PickerPolicyFor(transition.mode);
+    if(!policy.requiresCapturedActive)
+        return true;
+    const bool hasPopupActive=SameIdentity(
+        transition.popupActiveTarget,
+        transition.popupActiveTarget);
+    return hasPopupActive &&
+           SameIdentity(state.activeWindow,
+                        transition.popupActiveTarget) &&
+           SameIdentity(transition.target,
+                        transition.popupActiveTarget);
+}
+
+inline bool PickerTransitionPopupRouteReady(
+        const PickerTransition& transition) noexcept {
+    return (transition.popupRoute==PickerPopupRoute::Managed &&
+            !GuidIsZero(transition.popupOrigin)) ||
+           (transition.popupRoute==PickerPopupRoute::StickyUnmanaged &&
+            GuidIsZero(transition.popupOrigin));
+}
+
+inline bool PickerTransitionBeginPreconditions(
+        const PickerState& state,
+        const PickerTransition& transition) noexcept {
+    if(transition.phase!=PickerPhase::Idle ||
+       transition.generation==0 ||
+       transition.pendingEffect!=PickerEffectKind::None ||
+       transition.reservationToken.owner!=MoveOwner::Picker ||
+       transition.reservationToken.operationId==0 ||
+       transition.reservationToken.jobId==0 ||
+       transition.runtimeKey.empty() ||
+       !PickerTransitionTargetsAuthorized(state,transition) ||
+       GuidIsZero(transition.destination))
+        return false;
+
+    switch(transition.mode){
+    case PickerTransitionMode::MoveAndFollow:
+        return state.selectedIndex>=0 &&
+               GuidEq(state.selectedDesktop,
+                      transition.destination) &&
+               GuidEq(state.currentDesktop,
+                      transition.currentOrigin) &&
+               !GuidIsZero(transition.targetOrigin) &&
+               !GuidIsZero(transition.currentOrigin) &&
+               PickerTransitionPopupRouteReady(transition);
+    case PickerTransitionMode::RowMoveOnly:
+        return !GuidIsZero(transition.targetOrigin) &&
+               !GuidEq(transition.targetOrigin,
+                       transition.destination);
+    case PickerTransitionMode::VisualAndFollow:
+        return state.selectedIndex>=0 &&
+               GuidEq(state.selectedDesktop,
+                      transition.destination) &&
+               GuidEq(state.currentDesktop,
+                      transition.currentOrigin) &&
+               !GuidIsZero(transition.currentOrigin) &&
+               PickerTransitionPopupRouteReady(transition);
+    case PickerTransitionMode::VisualOnly:
+        return true;
+    }
+    return false;
+}
+
 inline bool SetPickerSearchText(PickerState& state,
                                 const std::wstring& editText,
                                 const std::wstring& normalized) noexcept {
@@ -1862,6 +1997,9 @@ inline PickerEffect EmitPickerEffect(PickerState& state,
     effect.generation=state.transition.generation;
     effect.effectSerial=state.transition.effectSerial;
     effect.desktop=PickerEffectDesktop(state.transition,kind);
+    effect.hideDisposition=kind==PickerEffectKind::Hide
+        ? state.transition.pendingHideDisposition
+        : PickerHideDisposition::None;
     return effect;
 }
 
@@ -2122,26 +2260,7 @@ inline PickerEffect AdvancePickerTransition(
         return PickerNoEffect();
 
     if(observation.event==PickerEvent::Begin){
-        const bool popupRouteValid=
-            (transition.popupRoute==PickerPopupRoute::Managed &&
-             !GuidIsZero(transition.popupOrigin)) ||
-            (transition.popupRoute==PickerPopupRoute::StickyUnmanaged &&
-             GuidIsZero(transition.popupOrigin));
-        if(transition.phase!=PickerPhase::Idle ||
-           transition.pendingEffect!=PickerEffectKind::None ||
-           transition.reservationToken.owner!=MoveOwner::Picker ||
-           transition.reservationToken.operationId==0 ||
-           transition.reservationToken.jobId==0 ||
-           !SameIdentity(transition.target,transition.target) ||
-           transition.runtimeKey.empty() ||
-           !SameIdentity(state.activeWindow,transition.target) ||
-           state.selectedIndex<0 ||
-           !GuidEq(state.selectedDesktop,transition.destination) ||
-           !GuidEq(state.currentDesktop,transition.currentOrigin) ||
-           GuidIsZero(transition.targetOrigin) ||
-           !popupRouteValid ||
-           GuidIsZero(transition.currentOrigin) ||
-           GuidIsZero(transition.destination))
+        if(!PickerTransitionBeginPreconditions(state,transition))
             return PickerNoEffect();
         transition.cancelRequested=false;
         transition.dismissed=false;
@@ -2174,12 +2293,18 @@ inline PickerEffect AdvancePickerTransition(
             transition.popupRoute==PickerPopupRoute::Managed
                 ? transition.popupOrigin : GUID{};
         transition.observedCurrentDesktop=transition.currentOrigin;
-        transition.observedTargetValidity=PickerReadValidity::Valid;
+        transition.observedTargetValidity=
+            GuidIsZero(transition.targetOrigin)
+                ? PickerReadValidity::Unavailable
+                : PickerReadValidity::Valid;
         transition.observedPopupValidity=
             transition.popupRoute==PickerPopupRoute::Managed
                 ? PickerReadValidity::Valid
                 : PickerReadValidity::Unavailable;
-        transition.observedCurrentValidity=PickerReadValidity::Valid;
+        transition.observedCurrentValidity=
+            GuidIsZero(transition.currentOrigin)
+                ? PickerReadValidity::Unavailable
+                : PickerReadValidity::Valid;
         transition.diagnostic.clear();
         return PickerIssueTarget(state,false);
     }

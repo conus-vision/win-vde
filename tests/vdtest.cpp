@@ -2373,6 +2373,10 @@ static void test_picker_state_whole_object_swap_includes_generation_sentinel(){
     left.transition.capturedTitle=L"captured title";
     left.transition.capturedTitleComplete=true;
     left.transition.popupRoute=PickerPopupRoute::StickyUnmanaged;
+    left.transition.mode=PickerTransitionMode::VisualOnly;
+    left.transition.popupActiveTarget=IK(31,32,33);
+    left.transition.pendingHideDisposition=
+        PickerHideDisposition::DismissSession;
     left.scrollByDesktop[GuidKey(leftDesktop)]=4;
     left.paintGeneration=101;
     right.currentDesktop=rightDesktop;
@@ -2396,6 +2400,11 @@ static void test_picker_state_whole_object_swap_includes_generation_sentinel(){
     CHECK(right.transition.capturedTitle==L"captured title");
     CHECK(right.transition.capturedTitleComplete);
     CHECK(right.transition.popupRoute==PickerPopupRoute::StickyUnmanaged);
+    CHECK(right.transition.mode==PickerTransitionMode::VisualOnly);
+    CHECK(SameIdentity(
+        right.transition.popupActiveTarget,IK(31,32,33)));
+    CHECK(right.transition.pendingHideDisposition==
+          PickerHideDisposition::DismissSession);
     CHECK(right.scrollByDesktop.at(GuidKey(leftDesktop))==4);
     CHECK(right.paintGeneration==101);
     SwapPickerState(left,right);
@@ -2416,6 +2425,7 @@ static PickerState PickerTransitionFixture(uint64_t generation=41){
     state.transition.reservationToken.operationId=generation;
     state.transition.reservationToken.jobId=generation+1000;
     state.transition.target=state.activeWindow;
+    state.transition.popupActiveTarget=state.activeWindow;
     state.transition.runtimeKey=RuntimeKey(state.activeWindow);
     state.transition.pendingRecordId=
         "{00000000-0000-0000-0000-000000001101}";
@@ -2424,6 +2434,119 @@ static PickerState PickerTransitionFixture(uint64_t generation=41){
     state.transition.currentOrigin=origin;
     state.transition.destination=destination;
     return state;
+}
+
+static void test_picker_transition_policy_table_is_closed(){
+    PickerTransitionPolicy move=PickerPolicyFor(
+        PickerTransitionMode::MoveAndFollow);
+    CHECK(move.requiresCapturedActive && move.movesTarget);
+    CHECK(move.movesPopup && move.switchesDesktop);
+    CHECK(move.persistsTarget && move.restoresPopupFocus);
+    CHECK(!move.publishesVisual && move.cancelDismissesSession);
+
+    PickerTransitionPolicy row=PickerPolicyFor(
+        PickerTransitionMode::RowMoveOnly);
+    CHECK(!row.requiresCapturedActive && row.movesTarget);
+    CHECK(!row.movesPopup && !row.switchesDesktop);
+    CHECK(row.persistsTarget && !row.publishesVisual);
+    CHECK(!row.restoresPopupFocus && !row.cancelDismissesSession);
+
+    PickerTransitionPolicy visualFollow=PickerPolicyFor(
+        PickerTransitionMode::VisualAndFollow);
+    CHECK(visualFollow.requiresCapturedActive);
+    CHECK(!visualFollow.movesTarget && visualFollow.movesPopup);
+    CHECK(visualFollow.switchesDesktop && !visualFollow.persistsTarget);
+    CHECK(visualFollow.publishesVisual &&
+          visualFollow.restoresPopupFocus);
+    CHECK(visualFollow.cancelDismissesSession);
+
+    PickerTransitionPolicy visual=PickerPolicyFor(
+        PickerTransitionMode::VisualOnly);
+    CHECK(!visual.requiresCapturedActive && !visual.movesTarget);
+    CHECK(!visual.movesPopup && !visual.switchesDesktop);
+    CHECK(!visual.persistsTarget && visual.publishesVisual);
+    CHECK(!visual.restoresPopupFocus && !visual.cancelDismissesSession);
+
+    PickerEffect effect;
+    CHECK(effect.hideDisposition==PickerHideDisposition::None);
+}
+
+static void test_picker_row_action_preserves_popup_active_target(){
+    PickerState state=PickerTransitionFixture(501);
+    const WindowIdentityKey active=IK(0x1111,71,9001);
+    const WindowIdentityKey row=IK(0x2222,72,9002);
+    state.activeWindow=active;
+    state.transition.mode=PickerTransitionMode::RowMoveOnly;
+    state.transition.popupActiveTarget=active;
+    state.transition.target=row;
+    CHECK(PickerTransitionTargetsAuthorized(
+        state,state.transition));
+    CHECK(SameIdentity(state.activeWindow,active));
+    CHECK(SameIdentity(state.transition.target,row));
+
+    state.transition.popupActiveTarget=WindowIdentityKey{};
+    CHECK(PickerTransitionTargetsAuthorized(
+        state,state.transition));
+
+    state.transition.mode=PickerTransitionMode::MoveAndFollow;
+    CHECK(!PickerTransitionTargetsAuthorized(
+        state,state.transition));
+    state.transition.popupActiveTarget=active;
+    state.transition.target=active;
+    CHECK(PickerTransitionTargetsAuthorized(
+        state,state.transition));
+
+    state.transition.mode=PickerTransitionMode::VisualAndFollow;
+    CHECK(PickerTransitionTargetsAuthorized(
+        state,state.transition));
+    state.transition.target=WindowIdentityKey{};
+    CHECK(!PickerTransitionTargetsAuthorized(
+        state,state.transition));
+}
+
+static void test_picker_begin_preconditions_are_mode_specific(){
+    PickerState state=PickerTransitionFixture(502);
+    state.transition.mode=PickerTransitionMode::RowMoveOnly;
+    state.selectedDesktop=state.transition.currentOrigin;
+    CHECK(!GuidEq(
+        state.selectedDesktop,state.transition.destination));
+    CHECK(PickerTransitionBeginPreconditions(
+        state,state.transition));
+
+    PickerState sameSource=state;
+    sameSource.transition.destination=
+        sameSource.transition.targetOrigin;
+    CHECK(!PickerTransitionBeginPreconditions(
+        sameSource,sameSource.transition));
+
+    state.transition.mode=PickerTransitionMode::VisualOnly;
+    state.transition.targetOrigin=GUID{};
+    state.transition.popupOrigin=GUID{};
+    state.transition.currentOrigin=GUID{};
+    CHECK(PickerTransitionBeginPreconditions(
+        state,state.transition));
+    PickerState zeroDestination=state;
+    zeroDestination.transition.destination=GUID{};
+    CHECK(!PickerTransitionBeginPreconditions(
+        zeroDestination,zeroDestination.transition));
+
+    PickerState visualFollow=PickerTransitionFixture(503);
+    visualFollow.transition.mode=PickerTransitionMode::VisualAndFollow;
+    visualFollow.transition.targetOrigin=GUID{};
+    CHECK(PickerTransitionBeginPreconditions(
+        visualFollow,visualFollow.transition));
+
+    PickerState move=PickerTransitionFixture(504);
+    move.transition.mode=PickerTransitionMode::MoveAndFollow;
+    move.transition.targetOrigin=GUID{};
+    CHECK(!PickerTransitionBeginPreconditions(
+        move,move.transition));
+
+    PickerState brokenReservation=PickerTransitionFixture(505);
+    brokenReservation.transition.mode=PickerTransitionMode::VisualOnly;
+    brokenReservation.transition.reservationToken.operationId=0;
+    CHECK(!PickerTransitionBeginPreconditions(
+        brokenReservation,brokenReservation.transition));
 }
 
 static PickerObservation PickerObservationFor(
@@ -22959,6 +23082,9 @@ static void CheckPickerTraceReducerStateForTest(
     CHECK(GuidEq(a.targetOrigin,b.targetOrigin));
     CHECK(GuidEq(a.popupOrigin,b.popupOrigin));
     CHECK(a.popupRoute==b.popupRoute);
+    CHECK(a.mode==b.mode);
+    CHECK(SameIdentity(a.popupActiveTarget,b.popupActiveTarget));
+    CHECK(a.pendingHideDisposition==b.pendingHideDisposition);
     CHECK(GuidEq(a.currentOrigin,b.currentOrigin));
     CHECK(GuidEq(a.destination,b.destination));
     CHECK(a.effectSerial==b.effectSerial && a.pendingEffect==b.pendingEffect);
@@ -25493,6 +25619,9 @@ int main(){
     test_target_desktop_route_requires_concrete_snapshot_membership();
     test_picker_async_search_joins_by_full_identity();
     test_picker_state_whole_object_swap_includes_generation_sentinel();
+    test_picker_transition_policy_table_is_closed();
+    test_picker_row_action_preserves_popup_active_target();
+    test_picker_begin_preconditions_are_mode_specific();
     test_picker_transition_success_has_exact_verified_effect_order();
     test_picker_sticky_popup_success_skips_popup_effects();
     test_picker_transition_rejects_stale_duplicate_and_wrong_effect_acks();
