@@ -5,6 +5,9 @@ Status: approved for planning
 Scope: desktop picker input, verified window movement, exact activation, and
 session-only presentation of globally visible windows
 
+Revision: manual QA follow-up adds whole-row hover feedback and requires QA to
+run the feature-branch binary until the branch is accepted and merged.
+
 ## Context
 
 The picker now enumerates ordinary application windows, resolves their icons,
@@ -91,6 +94,17 @@ requires a stable row hit snapshot rather than a late lookup by tile index.
   Dropping outside a valid tile cancels the gesture.
 - A stationary press and release remains a click. A drag gesture always acts on
   the grabbed row; Ctrl does not change the identity of a dragged row.
+
+### Pointer hover feedback
+
+- Hovering any visible window row paints a subtle blended background across the
+  complete row hit rectangle, including the icon area.
+- The existing active-window treatment remains stronger and takes visual
+  precedence over the ordinary hover background.
+- Leaving the row, entering a footer control, beginning a drag, invalidating the
+  paint cache, hiding the popup, or ending the popup session clears the hover.
+- Hover feedback is cosmetic. It does not rebuild the model, change selection,
+  alter hit geometry, activate a window, or close the popup.
 
 ### Popup-session lifetime
 
@@ -430,6 +444,8 @@ strings are not written to diagnostics.
 Automated tests will cover:
 
 - hit-test priority and full-row geometry;
+- whole-row hover entry, row-to-row movement, and reset behavior without model
+  or selection mutation;
 - Armed/Dragging thresholds, same-tile no-op, outside drop, capture loss, and
   Escape, plus release-over-a-different-row cancellation;
 - stationary Ctrl+Click versus crossed-threshold row-drag precedence;
@@ -477,21 +493,28 @@ The complete test suite and production build must pass.
 
 Manual QA will cover:
 
-1. Click a normal row on another desktop and verify exact activation.
-2. Click a desktop title and verify that no listed window is explicitly
+Before testing, verify that the running executable path and feature revision
+match the build under test. Until acceptance and merge, launch the executable
+from the feature worktree rather than the older `main` build or a shortcut that
+targets it.
+
+1. Hover a normal inactive row and verify the subtle full-row background; move
+   to another row and outside the list and verify immediate transfer/clear.
+2. Click a normal row on another desktop and verify exact activation.
+3. Click a desktop title and verify that no listed window is explicitly
    activated.
-3. Drag a normal tracked row to another tile and verify actual movement,
+4. Drag a normal tracked row to another tile and verify actual movement,
    assignment persistence, unchanged current desktop, and an open popup.
-4. Drag a normal untracked application row and verify actual movement, unchanged
+5. Drag a normal untracked application row and verify actual movement, unchanged
    current desktop, an open popup, and no new restore record.
-5. Drag a globally visible single-window pin and confirm only visual movement.
-6. Repeat with an application-wide pin containing multiple windows and confirm
+6. Drag a globally visible single-window pin and confirm only visual movement.
+7. Repeat with an application-wide pin containing multiple windows and confirm
    that only the grabbed row changes tiles.
-7. Refresh and search while the popup stays open, then close and reopen it to
+8. Refresh and search while the popup stays open, then close and reopen it to
    confirm the visual assignment is cleared.
-8. Ctrl+Click a global window and verify visual movement, destination switching,
+9. Ctrl+Click a global window and verify visual movement, destination switching,
    an open popup, and unchanged global Windows behavior.
-9. Cancel drags at each supported stage and verify rollback/no-op behavior.
+10. Cancel drags at each supported stage and verify rollback/no-op behavior.
 
 ## Out of scope
 
@@ -509,6 +532,8 @@ Manual QA will cover:
 The work is complete when:
 
 - row clicks and tile clicks have the distinct agreed activation behavior;
+- every actionable row has clear whole-row hover feedback without changing the
+  picker model or selected desktop;
 - ordinary row drag-and-drop moves and saves without switching desktops or
   closing the popup, with persistent assignment restricted to Firefox, Chrome,
   and Edge;
