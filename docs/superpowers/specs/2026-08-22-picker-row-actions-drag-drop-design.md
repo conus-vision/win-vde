@@ -5,8 +5,12 @@ Status: approved for planning
 Scope: desktop picker input, verified window movement, exact activation, and
 session-only presentation of globally visible windows
 
-Revision: manual QA follow-up adds whole-row hover feedback and requires QA to
-run the feature-branch binary until the branch is accepted and merged.
+Revisions:
+
+- Manual QA follow-up adds whole-row hover feedback and requires QA to run the
+  feature-branch binary until the branch is accepted and merged.
+- Drag-preview follow-up adds an in-popup, semi-transparent copy of the grabbed
+  row, including its application icon and window title.
 
 ## Context
 
@@ -95,6 +99,24 @@ requires a stable row hit snapshot rather than a late lookup by tile index.
 - A stationary press and release remains a click. A drag gesture always acts on
   the grabbed row; Ctrl does not change the identity of a dragged row.
 
+### Drag preview
+
+- No preview is shown while the pointer gesture remains Armed. Crossing the
+  Windows system drag threshold makes the preview visible at the same moment
+  the gesture enters Dragging.
+- The preview is a semi-transparent copy of the grabbed row: the same row size,
+  application icon, window-title font, and ellipsized title. It uses a neutral
+  dark rounded background and approximately 65% opacity.
+- The preview follows the pointer while preserving the original grab offset
+  inside the row, so crossing the drag threshold does not make the row jump.
+- It is painted above the normal picker content and clipped to the popup client
+  area. The existing destination-tile highlight remains visible underneath it.
+- The source row is not hidden, dimmed, or removed before a successful drop.
+- Button-up, cancellation, Escape, capture loss, popup hide, session end, and
+  destruction clear the preview immediately.
+- Preview allocation or paint failure is cosmetic only. It must not cancel,
+  redirect, or otherwise change the underlying click or Drag & Drop action.
+
 ### Pointer hover feedback
 
 - Hovering any visible window row paints a subtle blended background across the
@@ -171,6 +193,31 @@ hit-cache republication. The drop-target highlight is cosmetic: it invalidates
 paint without changing the stable model/layout epoch used by the grabbed
 snapshot. Gesture validity is tied to that stable epoch, not to an incidental
 paint counter.
+
+### 2a. Separate in-buffer drag-preview state
+
+The action gesture remains the non-allocating source of truth for click/drop
+semantics. A separate presentation-only state captures the immutable painted
+row data needed by the preview at button-down: full title, runtime icon key,
+source row size, grab offset, current pointer position, model generation, row
+layout epoch, and exact window identity.
+
+Keeping the owning title and icon key outside PickerPointerGesture ensures an
+allocation failure cannot mutate or cancel the action gesture. If presentation
+capture fails, the gesture continues normally with no preview. The preview
+becomes paintable only after the action gesture reaches Dragging and only while
+its identity and generation still match the action snapshot.
+
+Every Dragging WM_MOUSEMOVE updates the presentation pointer and invalidates the
+old and new preview bounds, even when the destination tile did not change. All
+gesture-reset paths clear both the action gesture and presentation state.
+
+Paint renders the preview last into a reusable compatible scratch buffer, using
+the existing picker font and cached window icon. AlphaBlend composites that
+buffer onto the existing double-buffered picker surface with a constant alpha
+of 166/255. A rounded destination clip prevents opaque rectangle corners. No
+child, layered, or top-level drag window is created, so preview rendering cannot
+participate in foreground activation or popup-dismiss behavior.
 
 ### 3. Separate identity, route, and mobility
 
@@ -389,6 +436,8 @@ publish a persistent assignment.
   remains valid, but it never activates a raw unverified HWND.
 - A destination that disappeared leaves the popup open and reports the failure
   only through the existing diagnostics surface.
+- Failure to capture or render drag-preview presentation data leaves the action
+  gesture valid and produces no transition or persistence effect.
 
 ### RowMoveOnly
 
@@ -450,6 +499,11 @@ Automated tests will cover:
   or selection mutation;
 - Armed/Dragging thresholds, same-tile no-op, outside drop, capture loss, and
   Escape, plus release-over-a-different-row cancellation;
+- drag-preview visibility beginning only at Dragging, stable grab-offset
+  geometry, movement invalidation when the drop tile is unchanged, clipping,
+  and reset on every gesture/popup terminal path;
+- preview capture/paint failure remaining cosmetic and leaving gesture
+  resolution unchanged;
 - stationary Ctrl+Click versus crossed-threshold row-drag precedence;
 - stale model generations and exact identity revalidation;
 - stable drag epochs despite cosmetic drop-target painting, with idle adoption
@@ -487,7 +541,9 @@ Tests will assert that:
 - RowMoveOnly preserves the existing active highlight and desktop selection;
 - failed rollback cannot leave a stale row actionable;
 - no visual mode calls layout persistence;
-- non-browser drag does not broaden the browser-only automatic layout scope.
+- non-browser drag does not broaden the browser-only automatic layout scope;
+- preview wiring uses the existing paint buffer plus AlphaBlend and creates no
+  drag child, layered, or top-level window.
 
 The complete test suite and production build must pass.
 
@@ -502,21 +558,29 @@ targets it.
 
 1. Hover a normal inactive row and verify the subtle full-row background; move
    to another row and outside the list and verify immediate transfer/clear.
-2. Click a normal row on another desktop and verify exact activation.
-3. Click a desktop title and verify that no listed window is explicitly
+2. Press without crossing the drag threshold and verify no preview. Cross the
+   threshold and verify a 65%-opaque row copy containing the same icon and
+   ellipsized title, following the pointer without an initial jump.
+3. Move the preview within a tile, between tiles, and partly outside the popup;
+   verify smooth repaint, popup clipping, an unchanged source row, and a visible
+   destination-tile highlight.
+4. Cancel by Escape and capture loss, then complete both a successful and a
+   no-op drop; verify the preview clears immediately in every case.
+5. Click a normal row on another desktop and verify exact activation.
+6. Click a desktop title and verify that no listed window is explicitly
    activated.
-4. Drag a normal tracked row to another tile and verify actual movement,
+7. Drag a normal tracked row to another tile and verify actual movement,
    assignment persistence, unchanged current desktop, and an open popup.
-5. Drag a normal untracked application row and verify actual movement, unchanged
+8. Drag a normal untracked application row and verify actual movement, unchanged
    current desktop, an open popup, and no new restore record.
-6. Drag a globally visible single-window pin and confirm only visual movement.
-7. Repeat with an application-wide pin containing multiple windows and confirm
+9. Drag a globally visible single-window pin and confirm only visual movement.
+10. Repeat with an application-wide pin containing multiple windows and confirm
    that only the grabbed row changes tiles.
-8. Refresh and search while the popup stays open, then close and reopen it to
+11. Refresh and search while the popup stays open, then close and reopen it to
    confirm the visual assignment is cleared.
-9. Ctrl+Click a global window and verify visual movement, destination switching,
+12. Ctrl+Click a global window and verify visual movement, destination switching,
    an open popup, and unchanged global Windows behavior.
-10. Cancel drags at each supported stage and verify rollback/no-op behavior.
+13. Cancel drags at each supported stage and verify rollback/no-op behavior.
 
 ## Out of scope
 
@@ -527,13 +591,18 @@ targets it.
 - selecting or moving every window belonging to a pinned application;
 - broadening automatic persistence beyond its existing application policy;
 - inventing fallback foreground targets when exact activation fails;
-- changing popup placement on the primary physical monitor.
+- changing popup placement on the primary physical monitor;
+- displaying the drag preview outside the picker popup;
+- adding thumbnails, animation, source-row dimming, or an OS-level drag image.
 
 ## Acceptance criteria
 
 The work is complete when:
 
 - row clicks and tile clicks have the distinct agreed activation behavior;
+- a semi-transparent icon-and-title copy of the grabbed row follows the pointer
+  only during Dragging and clears on every completion/cancellation path without
+  changing gesture semantics;
 - every actionable row has clear whole-row hover feedback without changing the
   picker model or selected desktop;
 - ordinary row drag-and-drop moves and saves without switching desktops or
