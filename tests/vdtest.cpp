@@ -14394,6 +14394,8 @@ static void test_picker_uses_self_contained_gdi_buffer(){
     CHECK(!source.empty());
     CHECK(source.find("#include \"gdi_buffer.hpp\"")!=std::string::npos);
     CHECK(source.find("static GdiBuffer g_pickerBuffer;")!=std::string::npos);
+    CHECK(source.find("static GdiBuffer g_pickerDragBuffer;")!=
+          std::string::npos);
     CHECK(source.find("class PickerBackBuffer")==std::string::npos);
     CHECK(source.find("CreateCompatibleBitmap")==std::string::npos);
 }
@@ -15486,15 +15488,20 @@ static void test_ui_resources_have_one_owned_cleanup_path(){
         "static bool DestroyUiWindow(HWND& window) noexcept {");
     CHECK(!cleanup.empty());
     const size_t buffer=cleanup.find("g_pickerBuffer.reset()");
+    const size_t dragBuffer=cleanup.find("g_pickerDragBuffer.reset()");
     const size_t iconCache=cleanup.find("ClearWindowIconCache()");
     const size_t fonts=cleanup.find("HFONT* fonts[]");
     const size_t brush=cleanup.find("DeleteObject(g_searchBrush)");
     const size_t icons=cleanup.find("for(HICON icon : g_ownedIcons)");
-    CHECK(buffer!=std::string::npos && iconCache!=std::string::npos &&
-          fonts!=std::string::npos && brush!=std::string::npos &&
-          icons!=std::string::npos);
-    CHECK(buffer<iconCache && iconCache<fonts && fonts<brush && brush<icons);
+    CHECK(buffer!=std::string::npos && dragBuffer!=std::string::npos &&
+          iconCache!=std::string::npos && fonts!=std::string::npos &&
+          brush!=std::string::npos && icons!=std::string::npos);
+    CHECK(buffer<dragBuffer && dragBuffer<iconCache && iconCache<fonts &&
+          fonts<brush && brush<icons);
     CHECK(cleanup.find("if(!g_pickerBuffer.released()) return false;")!=
+          std::string::npos);
+    CHECK(cleanup.find(
+        "if(!g_pickerDragBuffer.released()) return false;")!=
           std::string::npos);
     CHECK(cleanup.find("if(!ClearWindowIconCache()) return false;")!=
           std::string::npos);
@@ -28558,6 +28565,67 @@ static void test_picker_drag_preview_motion_is_current_and_precise(){
           std::string::npos);
 }
 
+static void test_picker_drag_preview_paints_icon_and_title_with_alpha(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    CHECK(!source.empty());
+    CHECK(source.find("#pragma comment(lib, \"msimg32.lib\")")!=
+          std::string::npos);
+    CHECK(source.find("static GdiBuffer g_pickerDragBuffer;")!=
+          std::string::npos);
+
+    const std::string preview=SourceSection(
+        source,"static bool PaintPickerDragPreview(",
+        "static void Paint(");
+    CHECK(!preview.empty());
+    CHECK(preview.find("CurrentPickerDragPreviewBounds(")!=
+          std::string::npos);
+    CHECK(preview.find("ResolvePickerDragPreviewBlit(")!=
+          std::string::npos);
+    CHECK(preview.find("g_pickerDragBuffer.ensure(")!=
+          std::string::npos);
+    CHECK(preview.find("g_pickerDragBuffer.get()")!=
+          std::string::npos);
+    CHECK(preview.find(
+        "CachedWindowIcon(g_pickerDragPreview.runtimeKey)")!=
+          std::string::npos);
+    CHECK(preview.find("DrawIconEx(")!=std::string::npos);
+    CHECK(preview.find("SelectObject(scratch,g_fPI)")!=
+          std::string::npos);
+    CHECK(preview.find("g_pickerDragPreview.fullTitle.c_str()")!=
+          std::string::npos);
+    CHECK(preview.find(
+        "DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS|DT_VCENTER")!=
+          std::string::npos);
+    CHECK(preview.find("CreateRoundRectRgn(")!=std::string::npos);
+    CHECK(preview.find("ExtSelectClipRgn(")!=std::string::npos);
+    CHECK(preview.find(
+        "BLENDFUNCTION blend={AC_SRC_OVER,0,166,0};")!=
+          std::string::npos);
+    CHECK(preview.find("AlphaBlend(")!=std::string::npos);
+    CHECK(preview.find("return false;")!=std::string::npos);
+
+    CHECK(preview.find("CreateWindow")==std::string::npos);
+    CHECK(preview.find("UpdateLayeredWindow")==std::string::npos);
+    CHECK(preview.find("ImageList_BeginDrag")==std::string::npos);
+    CHECK(preview.find("BeginPickerAction")==std::string::npos);
+    CHECK(preview.find("MoveViewToDesktop")==std::string::npos);
+    CHECK(preview.find("ActivateExactPickerRow")==std::string::npos);
+
+    const std::string paint=SourceSection(
+        source,"static void Paint(","static void TipDeactivate()");
+    CHECK(!paint.empty());
+    const size_t footer=paint.find(
+        "g_pickerPaintCache.footer.conus.c_str()");
+    const size_t dragPreview=paint.find(
+        "PaintPickerDragPreview(hdc,client)",footer);
+    const size_t finalBlit=paint.find("BitBlt(hdcReal",dragPreview);
+    CHECK(footer!=std::string::npos &&
+          dragPreview!=std::string::npos &&
+          finalBlit!=std::string::npos);
+    CHECK(footer<dragPreview && dragPreview<finalBlit);
+    CHECK(CountSourceText(paint,"PaintPickerDragPreview(")==1);
+}
+
 static void test_picker_row_hover_runtime_uses_full_hit_geometry(){
     const std::string source=ReadSourceFile(L"src\\vde.cpp");
     CHECK(!source.empty());
@@ -28986,6 +29054,7 @@ int main(){
     test_picker_drag_runtime_wiring_and_conflict_gates_are_explicit();
     test_picker_drag_preview_snapshot_is_presentation_only();
     test_picker_drag_preview_motion_is_current_and_precise();
+    test_picker_drag_preview_paints_icon_and_title_with_alpha();
     test_picker_row_hover_runtime_uses_full_hit_geometry();
     test_picker_exact_activation_runtime_has_no_fallback_target();
     test_picker_visual_session_runtime_end_paths_are_explicit();

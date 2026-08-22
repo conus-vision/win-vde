@@ -67,6 +67,7 @@
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "msimg32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -7568,6 +7569,90 @@ public:
 };
 
 static GdiBuffer g_pickerBuffer;
+static GdiBuffer g_pickerDragBuffer;
+
+static bool PaintPickerDragPreview(HDC target,RECT client) noexcept {
+    if(!target) return false;
+    RECT raw={0,0,0,0};
+    if(!CurrentPickerDragPreviewBounds(g_main,raw)) return false;
+    const PickerDragPreviewBlit clipped=
+        ResolvePickerDragPreviewBlit(raw,client);
+    if(!clipped.visible) return false;
+
+    const int width=g_pickerDragPreview.size.cx;
+    const int height=g_pickerDragPreview.size.cy;
+    if(!g_pickerDragBuffer.ensure(target,width,height)) return false;
+    HDC scratch=g_pickerDragBuffer.get();
+    if(!scratch) return false;
+
+    const int savedScratch=SaveDC(scratch);
+    if(savedScratch==0) return false;
+    bool scratchPainted=false;
+    do {
+        HGDIOBJ brush=GetStockObject(DC_BRUSH);
+        HGDIOBJ pen=GetStockObject(DC_PEN);
+        if(!brush || !pen) break;
+        HGDIOBJ oldBrush=SelectObject(scratch,brush);
+        HGDIOBJ oldPen=SelectObject(scratch,pen);
+        if(!oldBrush || oldBrush==HGDI_ERROR ||
+           !oldPen || oldPen==HGDI_ERROR) break;
+        if(SetDCBrushColor(
+                scratch,BlendColor(CLR_TILE,CLR_HEAD,20))==CLR_INVALID ||
+           SetDCPenColor(scratch,CLR_PASSIVE)==CLR_INVALID)
+            break;
+        if(!RoundRect(
+                scratch,0,0,width,height,S(8),S(8)))
+            break;
+        if(SetBkMode(scratch,TRANSPARENT)==0 ||
+           SetTextColor(scratch,CLR_TEXT)==CLR_INVALID)
+            break;
+        HGDIOBJ oldFont=SelectObject(scratch,g_fPI);
+        if(!oldFont || oldFont==HGDI_ERROR) break;
+
+        HICON icon=
+            CachedWindowIcon(g_pickerDragPreview.runtimeKey);
+        if(!icon || !DrawIconEx(
+                scratch,S(6),S(2),icon,S(16),S(16),
+                0,nullptr,DI_NORMAL))
+            break;
+        RECT text={S(30),S(1),width-S(4),height-S(1)};
+        if(g_pickerDragPreview.fullTitle.empty() ||
+           DrawTextW(
+                scratch,g_pickerDragPreview.fullTitle.c_str(),-1,&text,
+                DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS|DT_VCENTER)==0)
+            break;
+        scratchPainted=true;
+    } while(false);
+    const bool scratchRestored=
+        RestoreDC(scratch,savedScratch)!=FALSE;
+    if(!scratchPainted || !scratchRestored) return false;
+
+    HRGN roundedClip=CreateRoundRectRgn(
+        raw.left,raw.top,raw.right,raw.bottom,S(8),S(8));
+    if(!roundedClip) return false;
+    const int savedTarget=SaveDC(target);
+    if(savedTarget==0){
+        DeleteObject(roundedClip);
+        return false;
+    }
+    const bool clipSelected=
+        ExtSelectClipRgn(target,roundedClip,RGN_AND)!=ERROR;
+    const int blendWidth=
+        clipped.destination.right-clipped.destination.left;
+    const int blendHeight=
+        clipped.destination.bottom-clipped.destination.top;
+    BLENDFUNCTION blend={AC_SRC_OVER,0,166,0};
+    const bool blended=clipSelected && AlphaBlend(
+        target,
+        clipped.destination.left,clipped.destination.top,
+        blendWidth,blendHeight,
+        scratch,clipped.source.x,clipped.source.y,
+        blendWidth,blendHeight,blend)!=FALSE;
+    const bool targetRestored=
+        RestoreDC(target,savedTarget)!=FALSE;
+    const bool regionDeleted=DeleteObject(roundedClip)!=FALSE;
+    return blended && targetRestored && regionDeleted;
+}
 
 static void Paint(HDC hdcReal,HDC hdc,RECT client){
     HBRUSH bg=CreateSolidBrush(CLR_BG); FillRect(hdc,&client,bg); DeleteObject(bg); SetBkMode(hdc,TRANSPARENT);
@@ -7695,6 +7780,7 @@ static void Paint(HDC hdcReal,HDC hdc,RECT client){
             g_pickerPaintCache.footer.conus.c_str(),
             static_cast<int>(g_pickerPaintCache.footer.conus.size()));
     }
+    (void)PaintPickerDragPreview(hdc,client);
     if(hdc!=hdcReal)
         BitBlt(hdcReal,0,0,client.right,client.bottom,hdc,0,0,SRCCOPY);
 }
@@ -11331,7 +11417,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 static bool CleanupUiResources() noexcept {
     g_pickerBuffer.reset();
+    g_pickerDragBuffer.reset();
     if(!g_pickerBuffer.released()) return false;
+    if(!g_pickerDragBuffer.released()) return false;
     if(!ClearWindowIconCache()) return false;
     bool released=true;
     HFONT* fonts[]={
