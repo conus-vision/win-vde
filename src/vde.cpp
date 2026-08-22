@@ -7610,13 +7610,24 @@ static void TrackPickerHoverTooltip(HWND hwnd,const RowRec& row,
     SendMessageW(g_tip,TTM_TRACKPOSITION,0,
         (LPARAM)MAKELONG(screenPoint.x+S(16),screenPoint.y+S(20)));
 }
-static void HidePicker() noexcept {
+static void EndPickerVisualSessionRuntime() noexcept {
+    const bool releaseCapture=
+        g_main && GetCapture()==g_main;
+    CancelPickerRowGesture(g_pickerGesture);
+    if(releaseCapture)
+        ReleaseCapture();
+    EndPickerVisualSession(g_picker);
+}
+
+static void HidePicker(PickerHideDisposition disposition) noexcept {
     if(g_picker.controlledTransition()) return;
-    ResetPickerPointerGesture(g_main,true);
+    if(PickerHideEndsVisualSession(disposition))
+        EndPickerVisualSessionRuntime();
+    else
+        ResetPickerPointerGesture(g_main,true);
     if(g_main) KillTimer(g_main,TIMER_PICKER_TRANSITION);
     CancelPickerIconPreload(g_main);
     ResetPickerHoverState(PickerHoverResetReason::Hide);
-    EndPickerVisualSession(g_picker);
     ShowWindow(g_main,SW_HIDE);
 }
 // Search EDIT subclass: forward navigation keys to the grid; let letters/numbers type.
@@ -8090,7 +8101,7 @@ static PickerObservation ExecutePickerEffect(
             CancelPickerIconPreload(g_main);
             ResetPickerHoverState(PickerHoverResetReason::Hide);
             if(PickerHideEndsVisualSession(effect.hideDisposition))
-                EndPickerVisualSession(g_picker);
+                EndPickerVisualSessionRuntime();
             ShowWindow(g_main,SW_HIDE);
             observation.apiAccepted=true;
             break;
@@ -9730,8 +9741,7 @@ static bool GetPrimaryPickerWorkArea(RECT& workArea) noexcept {
 }
 
 static void AbortPickerShowPreparation() noexcept {
-    HidePicker();
-    EndPickerVisualSession(g_picker);
+    HidePicker(PickerHideDisposition::DismissSession);
     g_pickerPaintCache.clear();
     g_target=nullptr;
     g_targetTitle.clear();
@@ -9957,7 +9967,7 @@ static WindowIdentityRecapture PickerProductRecaptureExactIdentity(
 }
 
 static void PickerProductHideExactPopup(void*) noexcept {
-    HidePicker();
+    HidePicker(PickerHideDisposition::DismissSession);
 }
 
 static HRESULT PickerProductSwitchExactDesktop(
@@ -10204,7 +10214,7 @@ static PickerTraceExactActivationResult ActivateExactPickerRow(
 static void GoToDesktop(int idx) noexcept {
     if(g_picker.controlledTransition()) return;
     if(idx<0||idx>=(int)g_tiles.size())return;
-    HidePicker();
+    HidePicker(PickerHideDisposition::DismissSession);
     bool invoked=false;
     (void)SwitchDesktopWithForegroundHandoff(
         g_tiles[idx].guid,invoked);
@@ -10559,7 +10569,8 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     switch(msg){
     case WM_HOTKEY: ShowPicker(CapturePickerTarget()); return 0;
     case WM_CLOSE:
-        if(RoutePickerClose(g_picker)==PickerCloseRoute::Hide) HidePicker();
+        if(RoutePickerClose(g_picker)==PickerCloseRoute::Hide)
+            HidePicker(PickerHideDisposition::DismissSession);
         return 0;
     case WM_PICKER_TRANSITION:
         if(g_runtimeQuiescence.acceptsDispatch())
@@ -10610,7 +10621,7 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             if(g_picker.controlledTransition()) RequestPickerCancellation();
             else if(g_pickerGesture.phase!=PickerPointerPhase::Idle)
                 ResetPickerPointerGesture(hwnd,true);
-            else HidePicker();
+            else HidePicker(PickerHideDisposition::DismissSession);
             return 0;
         }
         if(PickerInteractionBusy(g_picker,g_pickerGesture)) return 0;
@@ -11038,7 +11049,7 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     case WM_ACTIVATE:
         if(LOWORD(wp)==WA_INACTIVE &&
            !PickerInteractionBusy(g_picker,g_pickerGesture))
-            HidePicker();
+            HidePicker(PickerHideDisposition::DismissSession);
         return 0;
     case WM_SESSION_RESULT: {
         std::unique_ptr<SessionResult> result((SessionResult*)lp);
@@ -11111,15 +11122,19 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         CheckpointAutoLayout(CheckpointReason::QueryEndSession);
         return TRUE;
     case WM_ENDSESSION:
-        ResetPickerPointerGesture(hwnd,true);
-        if(wp!=0) DrainPickerForShutdown();
+        if(wp!=0){
+            DrainPickerForShutdown();
+            EndPickerVisualSessionRuntime();
+        } else {
+            ResetPickerPointerGesture(hwnd,true);
+        }
         FinalizeSessionAndQuiesce(wp!=0,
             [](){ return FinalizeAutoLayout(); },
             [=](){ return QuiesceRuntime(hwnd); });
         return 0;
     case WM_DESTROY:
-        ResetPickerPointerGesture(hwnd,true);
         DrainPickerForShutdown();
+        EndPickerVisualSessionRuntime();
         FinalizeAutoLayout();
         QuiesceRuntime(hwnd);
         TrayRemove(); UnregisterHotKey(hwnd,1); PostQuitMessage(0); return 0;
@@ -11210,10 +11225,12 @@ static bool UnregisterUiClasses() noexcept {
 
 static void ShutdownUi() noexcept {
     if(g_uiShutdownComplete) return;
-    g_uiShutdownComplete=g_uiTeardown.run(
+    const bool completed=g_uiTeardown.run(
         [](){ return DestroyAllUiWindows(); },
         [](){ return UnregisterUiClasses(); },
         [](){ return CleanupUiResources(); });
+    EndPickerVisualSessionRuntime();
+    g_uiShutdownComplete=completed;
 }
 
 class ScopedUiShutdown {

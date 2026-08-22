@@ -1085,6 +1085,11 @@ static void test_picker_refresh_preserves_search_scroll_and_identity(){
     CHECK(SetPickerSelection(state,5,desktop));
     state.activeWindow=IK(10,20,30);
     state.scrollByDesktop[GuidKey(desktop)]=3;
+    PickerVisualAssignment assignment;
+    assignment.baseDesktop=desktop;
+    assignment.destination=G(
+        L"{231A0000-0000-0000-0000-000000000002}");
+    state.visualAssignments["preserved-runtime"]=assignment;
 
     PickerState refreshed=PreservePickerUi(state);
     CHECK(refreshed.searchText==L"github");
@@ -1095,11 +1100,18 @@ static void test_picker_refresh_preserves_search_scroll_and_identity(){
     CHECK(refreshed.selectedIndex==5);
     CHECK(IsActiveWindow(refreshed,IK(10,20,30)));
     CHECK(refreshed.scrollByDesktop.at(GuidKey(desktop))==3);
+    CHECK(GuidEq(
+        refreshed.visualAssignments.at(
+            "preserved-runtime").destination,
+        assignment.destination));
 
     refreshed.searchText=L"changed";
     refreshed.scrollByDesktop[GuidKey(desktop)]=9;
     CHECK(state.searchText==L"github");
     CHECK(state.scrollByDesktop.at(GuidKey(desktop))==3);
+    CHECK(GuidEq(
+        state.visualAssignments.at("preserved-runtime").destination,
+        assignment.destination));
 }
 
 static void test_picker_refresh_transaction_publishes_only_complete_stage(){
@@ -14566,7 +14578,8 @@ static void test_picker_show_uses_primary_monitor_only(){
     const size_t nextAbortDefinition=abortDefinition==std::string::npos
         ?std::string::npos
         :source.find(abortSignature,abortDefinition+1);
-    const size_t abortHide=abort.find("HidePicker();");
+    const size_t abortHide=abort.find(
+        "HidePicker(PickerHideDisposition::DismissSession);");
     const size_t abortCache=abort.find("g_pickerPaintCache.clear();");
     const size_t abortTarget=abort.find("g_target=nullptr;");
     const size_t abortTitle=abort.find("g_targetTitle.clear();");
@@ -14831,7 +14844,8 @@ static void test_picker_preloads_only_laid_out_visible_rows(){
     CHECK(controlledHide.find("CancelPickerIconPreload(g_main)")!=
           std::string::npos);
     const std::string idleHide=SourceSection(
-        source,"static void HidePicker()","// Search EDIT subclass");
+        source,"static void HidePicker(PickerHideDisposition disposition)",
+        "// Search EDIT subclass");
     CHECK(idleHide.find("CancelPickerIconPreload(g_main)")!=
           std::string::npos);
 
@@ -27672,6 +27686,10 @@ static void test_picker_evidence_fixes_have_guarded_product_wiring(){
 
 static void test_picker_pin_probe_is_optional_read_only_and_private(){
     const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string stateHeader=
+        ReadSourceFile(L"src\\picker_state.hpp");
+    const std::string layoutHeader=
+        ReadSourceFile(L"src\\layout.hpp");
     const std::string traceHeader=
         ReadSourceFile(L"src\\picker_trace.hpp");
     const std::string traceSource=
@@ -27694,6 +27712,14 @@ static void test_picker_pin_probe_is_optional_read_only_and_private(){
     const std::string traceEvent=SourceSection(
         traceHeader,"struct PickerTraceApiResultEvent {",
         "struct PickerTraceTerminalizationAttemptEvent {");
+    const std::string pickerRow=SourceSection(
+        source,"struct WinItem {","struct Tile {");
+    const std::string layoutRow=SourceSection(
+        layoutHeader,"struct LayoutWin {",
+        "inline int ResolveSavedDesktop(");
+    const std::string pickerState=SourceSection(
+        stateHeader,"struct PickerState {",
+        "inline bool PickerInteractionBusy(");
 
     CHECK(source.find("0xB5A399E7,0x1C87,0x46B8")!=
           std::string::npos);
@@ -27770,6 +27796,10 @@ static void test_picker_pin_probe_is_optional_read_only_and_private(){
     CHECK(facts.find("std::wstring")==std::string::npos);
     CHECK(probe.find("facts.decision=DecideTargetMobility(evidence);")!=
           std::string::npos);
+    CHECK(CountSourceText(probe,"appId.out()")==1);
+    CHECK(CountSourceText(probe,"appId.usable()")==1);
+    CHECK(CountSourceText(probe,"appId.get()")==1);
+    CHECK(CountSourceText(probe,"appId.")==3);
     CHECK(probe.find("appId.get()")!=std::string::npos);
     CHECK(probe.find("return appId")==std::string::npos);
 
@@ -27791,6 +27821,18 @@ static void test_picker_pin_probe_is_optional_read_only_and_private(){
     CHECK(traceEvent.find("PWSTR")==std::string::npos);
     CHECK(traceEvent.find("PCWSTR")==std::string::npos);
     CHECK(traceEvent.find("std::wstring")==std::string::npos);
+    CHECK(!pickerRow.empty() && !layoutRow.empty() &&
+          !pickerState.empty());
+    const std::string privateDestinations[]={
+        traceEvent,pickerRow,layoutRow,pickerState
+    };
+    const char* forbiddenAppIds[]={
+        "appUserModelId","appUserModelID","applicationId",
+        "applicationID","aumid","AUMID","PWSTR","PCWSTR"
+    };
+    for(const std::string& destination:privateDestinations)
+        for(const char* forbidden:forbiddenAppIds)
+            CHECK(destination.find(forbidden)==std::string::npos);
 }
 
 static void test_target_move_guard_is_single_complete_boundary(){
@@ -28195,21 +28237,26 @@ static void test_picker_drag_runtime_wiring_and_conflict_gates_are_explicit(){
     CHECK(paint.find("g_picker.selectedIndex=g_pickerGesture.dropTileIndex")==
           std::string::npos);
     const std::string hide=SourceSection(
-        source,"static void HidePicker() noexcept {",
+        source,"static void HidePicker(PickerHideDisposition disposition) "
+               "noexcept {",
         "// Search EDIT subclass");
-    CHECK(hide.find("ResetPickerPointerGesture(g_main,true)")!=
+    CHECK(hide.find("EndPickerVisualSessionRuntime();")!=
           std::string::npos);
     const std::string deactivate=SourceSection(
         source,"case WM_ACTIVATE:","case WM_SESSION_RESULT:");
     CHECK(deactivate.find(
         "!PickerInteractionBusy(g_picker,g_pickerGesture)")!=
           std::string::npos);
-    CHECK(deactivate.find("HidePicker();")!=std::string::npos);
+    CHECK(deactivate.find(
+        "HidePicker(PickerHideDisposition::DismissSession);")!=
+          std::string::npos);
     const std::string lifetime=SourceSection(
         source,"case WM_QUERYENDSESSION:",
         "return DefWindowProcW(hwnd,msg,wp,lp);");
     CHECK(CountSourceText(
-        lifetime,"ResetPickerPointerGesture(hwnd,true)")==3);
+        lifetime,"ResetPickerPointerGesture(hwnd,true)")==2);
+    CHECK(CountSourceText(
+        lifetime,"EndPickerVisualSessionRuntime();")==2);
 }
 
 static void test_picker_exact_activation_runtime_has_no_fallback_target(){
@@ -28315,6 +28362,195 @@ static void test_picker_exact_activation_runtime_has_no_fallback_target(){
     CHECK(ordinary.find("SetForegroundWindow")==std::string::npos);
 }
 
+static void test_picker_visual_session_runtime_end_paths_are_explicit(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    CHECK(!source.empty());
+
+    const std::string runtimeEnd=SourceSection(
+        source,"static void EndPickerVisualSessionRuntime() noexcept {",
+        "static void HidePicker(");
+    CHECK(!runtimeEnd.empty());
+    const size_t capture=runtimeEnd.find(
+        "g_main && GetCapture()==g_main");
+    const size_t cancel=runtimeEnd.find(
+        "CancelPickerRowGesture(g_pickerGesture)");
+    const size_t release=runtimeEnd.find("ReleaseCapture()",cancel);
+    const size_t clear=runtimeEnd.find(
+        "EndPickerVisualSession(g_picker)",release);
+    CHECK(capture!=std::string::npos && cancel!=std::string::npos &&
+          release!=std::string::npos && clear!=std::string::npos);
+    CHECK(capture<cancel && cancel<release && release<clear);
+    CHECK(runtimeEnd.find("ResetPickerPointerGesture")==std::string::npos);
+
+    const std::string hide=SourceSection(
+        source,
+        "static void HidePicker(PickerHideDisposition disposition) "
+        "noexcept {",
+        "// Search EDIT subclass");
+    CHECK(!hide.empty());
+    CHECK(hide.find("PickerHideEndsVisualSession(disposition)")!=
+          std::string::npos);
+    CHECK(CountSourceText(
+        hide,"EndPickerVisualSessionRuntime();")==1);
+
+    const std::string effects=SourceSection(
+        source,"static PickerObservation ExecutePickerEffect(",
+        "static void PumpPickerTransitionWork() noexcept;");
+    const std::string controlledHide=SourceSection(
+        effects,"case PickerEffectKind::Hide:",
+        "case PickerEffectKind::ReportFailure:");
+    CHECK(!controlledHide.empty());
+    CHECK(controlledHide.find(
+        "PickerHideEndsVisualSession(effect.hideDisposition)")!=
+          std::string::npos);
+    CHECK(CountSourceText(
+        controlledHide,"EndPickerVisualSessionRuntime();")==1);
+
+    const std::string abort=SourceSection(
+        source,"static void AbortPickerShowPreparation() noexcept {",
+        "class PickerTraceOpenEmitScope");
+    CHECK(abort.find(
+        "HidePicker(PickerHideDisposition::DismissSession);")!=
+          std::string::npos);
+    CHECK(abort.find("EndPickerVisualSession(")==std::string::npos);
+
+    const std::string deactivate=SourceSection(
+        source,"case WM_ACTIVATE:","case WM_SESSION_RESULT:");
+    CHECK(deactivate.find(
+        "HidePicker(PickerHideDisposition::DismissSession);")!=
+          std::string::npos);
+
+    const std::string lifetime=SourceSection(
+        source,"case WM_QUERYENDSESSION:",
+        "return DefWindowProcW(hwnd,msg,wp,lp);");
+    const std::string endSession=SourceSection(
+        lifetime,"case WM_ENDSESSION:","case WM_DESTROY:");
+    const size_t endSessionDrain=endSession.find(
+        "DrainPickerForShutdown();");
+    const size_t endSessionClear=endSession.find(
+        "EndPickerVisualSessionRuntime();",endSessionDrain);
+    CHECK(endSessionDrain!=std::string::npos &&
+          endSessionClear!=std::string::npos &&
+          endSessionDrain<endSessionClear);
+    const size_t destroyAt=lifetime.find("case WM_DESTROY:");
+    const std::string destroy=destroyAt==std::string::npos
+        ?std::string():lifetime.substr(destroyAt);
+    const size_t destroyDrain=destroy.find("DrainPickerForShutdown();");
+    const size_t destroyClear=destroy.find(
+        "EndPickerVisualSessionRuntime();",destroyDrain);
+    CHECK(destroyDrain!=std::string::npos &&
+          destroyClear!=std::string::npos && destroyDrain<destroyClear);
+
+    const std::string shutdown=SourceSection(
+        source,"static void ShutdownUi() noexcept {",
+        "class ScopedUiShutdown");
+    const size_t shutdownTeardown=shutdown.find("g_uiTeardown.run(");
+    const size_t shutdownClear=shutdown.find(
+        "EndPickerVisualSessionRuntime();",shutdownTeardown);
+    CHECK(shutdownTeardown!=std::string::npos &&
+          shutdownClear!=std::string::npos &&
+          shutdownTeardown<shutdownClear);
+    CHECK(CountSourceText(
+        source,"EndPickerVisualSession(g_picker);")==1);
+}
+
+static void test_picker_visual_session_preservation_paths_are_explicit(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string model=SourceSection(
+        source,"static bool BuildModel(",
+        "static bool SetPickerSelectionCurrent(");
+    const std::string filter=SourceSection(
+        source,"static bool PopulatePickerFilteredRows(",
+        "struct PickerModelAttemptTraceFacts");
+    const std::string icons=SourceSection(
+        source,"static void PreloadVisiblePickerIcons(",
+        "static bool BuildPickerPaintCache(");
+    const std::string lightweight=SourceSection(
+        source,"static bool RefreshPickerHighlightsLightweight() noexcept {",
+        "static void ArmPickerIdleRefresh() noexcept {");
+    const std::string refresh=SourceSection(
+        source,"static bool RefreshPickerModelPreservingUi(",
+        "struct PickerForegroundHandoffProductContext");
+    const std::string effects=SourceSection(
+        source,"static PickerObservation ExecutePickerEffect(",
+        "static void PumpPickerTransitionWork() noexcept;");
+    CHECK(!model.empty() && !filter.empty() && !icons.empty() &&
+          !lightweight.empty() && !refresh.empty() && !effects.empty());
+
+    const size_t resetGuard=model.find("if(resetUi)");
+    const size_t newSessionClear=model.find(
+        "EndPickerVisualSession(state)",resetGuard);
+    const size_t visualTransaction=model.find(
+        "RunPickerVisualRefreshTransaction(");
+    CHECK(resetGuard!=std::string::npos &&
+          newSessionClear!=std::string::npos &&
+          visualTransaction!=std::string::npos);
+    CHECK(visualTransaction<resetGuard && resetGuard<newSessionClear);
+    CHECK(model.find("EndPickerVisualSessionRuntime")==std::string::npos);
+
+    CHECK(filter.find("EndPickerVisualSession")==std::string::npos);
+    CHECK(icons.find("EndPickerVisualSession")==std::string::npos);
+    CHECK(lightweight.find("EndPickerVisualSession")==std::string::npos);
+    CHECK(refresh.find("EndPickerVisualSession")==std::string::npos);
+
+    const std::string showAndFocus=SourceSection(
+        effects,"case PickerEffectKind::ShowAndFocus:",
+        "case PickerEffectKind::Hide:");
+    CHECK(!showAndFocus.empty());
+    CHECK(showAndFocus.find("EndPickerVisualSession")==std::string::npos);
+    const std::string controlledHide=SourceSection(
+        effects,"case PickerEffectKind::Hide:",
+        "case PickerEffectKind::ReportFailure:");
+    CHECK(controlledHide.find(
+        "if(PickerHideEndsVisualSession(effect.hideDisposition))")!=
+          std::string::npos);
+    CHECK(controlledHide.find(
+        "effect.hideDisposition=="
+        "PickerHideDisposition::TransientRelocate")==std::string::npos);
+}
+
+static void test_picker_final_feature_regressions_are_locked(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string profiles=SourceSection(
+        source,"static std::vector<AppProfile> ActiveProfiles(){",
+        "static uint64_t ProfileConfigSignature(");
+    const std::string enumerate=SourceSection(
+        source,"static BOOL CALLBACK EnumAll(",
+        "static bool PopulatePickerFilteredRows(");
+    const std::string paint=SourceSection(
+        source,"static void Paint(","static void TipDeactivate()");
+    const std::string mouseDown=SourceSection(
+        source,"case WM_LBUTTONDOWN:","case WM_MOUSEMOVE:");
+    const std::string workArea=SourceSection(
+        source,"static bool GetPrimaryPickerWorkArea(",
+        "static void AbortPickerShowPreparation(");
+    const std::string begin=SourceSection(
+        source,"static PickerActionDispatchResult BeginPickerAction(",
+        "class PickerTraceCaptureEmitScope");
+    CHECK(!profiles.empty() && !enumerate.empty() && !paint.empty() &&
+          !mouseDown.empty() && !workArea.empty() && !begin.empty());
+
+    CHECK(profiles.find(
+        "BuiltinProfiles(g_appFirefox,g_appChrome,g_appEdge)")!=
+          std::string::npos);
+    CHECK(enumerate.find("tile->windows.push_back")!=std::string::npos);
+    CHECK(enumerate.find("ClassifyTrackedBrowserWindow")==
+          std::string::npos);
+    CHECK(paint.find(
+        "IsActiveWindow(g_picker,snapshot.action.identity)")!=
+          std::string::npos);
+    CHECK(paint.find("g_appFirefox")==std::string::npos);
+    CHECK(mouseDown.find("PickerMouseControlHeld(wp)")!=
+          std::string::npos);
+    CHECK(mouseDown.find("ArmPickerRowGesture(")!=std::string::npos);
+    CHECK(workArea.find("MONITOR_DEFAULTTOPRIMARY")!=
+          std::string::npos);
+    CHECK(begin.find("PickerTransitionMode::MoveAndFollow")!=
+          std::string::npos);
+    CHECK(begin.find("PopupBrowserClassification::NotTracked")==
+          std::string::npos);
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
@@ -28380,6 +28616,9 @@ int main(){
     test_picker_trace_task10_runtime_anchors_and_privacy_are_locked();
     test_picker_drag_runtime_wiring_and_conflict_gates_are_explicit();
     test_picker_exact_activation_runtime_has_no_fallback_target();
+    test_picker_visual_session_runtime_end_paths_are_explicit();
+    test_picker_visual_session_preservation_paths_are_explicit();
+    test_picker_final_feature_regressions_are_locked();
     test_picker_evidence_fixes_have_guarded_product_wiring();
     test_picker_pin_probe_is_optional_read_only_and_private();
     test_target_move_guard_is_single_complete_boundary();
