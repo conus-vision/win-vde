@@ -3,6 +3,7 @@
 #define UNICODE
 #define _UNICODE
 #include "window_identity.hpp" // must be self-contained at first include
+#include "window_mobility.hpp"
 #include "gdi_buffer.hpp"
 #include "icon_cache.hpp"
 #include "picker_state.hpp"
@@ -2259,6 +2260,91 @@ static void test_picker_evidence_routes_are_fail_closed(){
     CHECK(DecidePickerPopupRoute(
               PickerPopupBindingResult::Repaired,
               PickerPopupBindingFacts{},true)==PickerPopupRoute::Managed);
+}
+
+static void test_target_mobility_fails_closed_and_positive_signals_win(){
+    TargetMobilityEvidence exact;
+    exact.desktopRoute=TargetDesktopRoute::Exact;
+    exact.viewPinned=MobilityEvidence::Negative;
+    exact.appPinned=MobilityEvidence::Negative;
+    exact.canMove=MobilityEvidence::Positive;
+    TargetMobilityDecision decision=DecideTargetMobility(exact);
+    CHECK(decision.mobility==TargetMobility::Movable);
+    CHECK(decision.disposition==TargetMoveDisposition::Physical);
+
+    TargetMobilityEvidence viewPinned=exact;
+    viewPinned.viewPinned=MobilityEvidence::Positive;
+    viewPinned.appPinned=MobilityEvidence::Unknown;
+    viewPinned.canMove=MobilityEvidence::Unknown;
+    decision=DecideTargetMobility(viewPinned);
+    CHECK(decision.mobility==TargetMobility::ViewPinned);
+    CHECK(decision.disposition==TargetMoveDisposition::VisualOnly);
+
+    TargetMobilityEvidence appPinned=exact;
+    appPinned.viewPinned=MobilityEvidence::Unknown;
+    appPinned.appPinned=MobilityEvidence::Positive;
+    appPinned.canMove=MobilityEvidence::Unknown;
+    decision=DecideTargetMobility(appPinned);
+    CHECK(decision.mobility==TargetMobility::AppPinned);
+    CHECK(decision.disposition==TargetMoveDisposition::VisualOnly);
+
+    TargetMobilityEvidence global=exact;
+    global.desktopRoute=TargetDesktopRoute::GloballyVisible;
+    global.viewPinned=MobilityEvidence::Unknown;
+    global.appPinned=MobilityEvidence::Unknown;
+    global.canMove=MobilityEvidence::Unknown;
+    decision=DecideTargetMobility(global);
+    CHECK(decision.mobility==TargetMobility::Indeterminate);
+    CHECK(decision.disposition==TargetMoveDisposition::VisualOnly);
+
+    global.viewPinned=MobilityEvidence::Positive;
+    decision=DecideTargetMobility(global);
+    CHECK(decision.mobility==TargetMobility::ViewPinned);
+    CHECK(decision.disposition==TargetMoveDisposition::VisualOnly);
+
+    global.viewPinned=MobilityEvidence::Unknown;
+    global.appPinned=MobilityEvidence::Positive;
+    decision=DecideTargetMobility(global);
+    CHECK(decision.mobility==TargetMobility::AppPinned);
+    CHECK(decision.disposition==TargetMoveDisposition::VisualOnly);
+
+    TargetMobilityEvidence unknown=exact;
+    unknown.appPinned=MobilityEvidence::Unknown;
+    decision=DecideTargetMobility(unknown);
+    CHECK(decision.mobility==TargetMobility::Indeterminate);
+    CHECK(decision.disposition==TargetMoveDisposition::Reject);
+
+    TargetMobilityEvidence unknownMove=exact;
+    unknownMove.canMove=MobilityEvidence::Unknown;
+    decision=DecideTargetMobility(unknownMove);
+    CHECK(decision.mobility==TargetMobility::Indeterminate);
+    CHECK(decision.disposition==TargetMoveDisposition::Reject);
+
+    TargetMobilityEvidence immovable=exact;
+    immovable.canMove=MobilityEvidence::Negative;
+    decision=DecideTargetMobility(immovable);
+    CHECK(decision.mobility==TargetMobility::Immovable);
+    CHECK(decision.disposition==TargetMoveDisposition::Reject);
+}
+
+static void test_target_desktop_route_requires_concrete_snapshot_membership(){
+    CHECK(DecideTargetDesktopRoute(
+        S_OK,true,true,E_FAIL,false)==TargetDesktopRoute::Exact);
+    CHECK(DecideTargetDesktopRoute(
+        S_OK,false,false,S_OK,true)==
+        TargetDesktopRoute::GloballyVisible);
+    CHECK(DecideTargetDesktopRoute(
+        S_OK,true,false,S_OK,true)==
+        TargetDesktopRoute::GloballyVisible);
+    CHECK(DecideTargetDesktopRoute(
+        S_OK,true,false,S_OK,false)==
+        TargetDesktopRoute::Indeterminate);
+    CHECK(DecideTargetDesktopRoute(
+        E_FAIL,false,false,S_OK,true)==
+        TargetDesktopRoute::Indeterminate);
+    CHECK(DecideTargetDesktopRoute(
+        E_FAIL,false,false,E_FAIL,false)==
+        TargetDesktopRoute::Indeterminate);
 }
 
 static void test_picker_async_search_joins_by_full_identity(){
@@ -25403,6 +25489,8 @@ int main(){
     test_picker_volatile_rows_skip_but_structural_failures_abort();
     test_picker_row_admission_keeps_displayable_unverified_windows();
     test_picker_evidence_routes_are_fail_closed();
+    test_target_mobility_fails_closed_and_positive_signals_win();
+    test_target_desktop_route_requires_concrete_snapshot_membership();
     test_picker_async_search_joins_by_full_identity();
     test_picker_state_whole_object_swap_includes_generation_sentinel();
     test_picker_transition_success_has_exact_verified_effect_order();
