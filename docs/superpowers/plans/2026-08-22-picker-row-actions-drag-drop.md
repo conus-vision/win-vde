@@ -2638,7 +2638,191 @@ git -c safe.directory=F:/_VDESKTOP_FF/win-vde diff --cached --check
 git -c safe.directory=F:/_VDESKTOP_FF/win-vde commit --only -m "fix: finish picker visual session lifecycle" -- src/vde.cpp src/picker_state.hpp src/picker_trace.hpp src/picker_trace.cpp tests/vdtest.cpp
 ~~~
 
-## Task 14: Independent review and manual Windows QA
+## Task 14: Add whole-row hover feedback and pin QA to the feature binary
+
+**Files:**
+
+- Modify: src/picker_state.hpp
+- Modify: src/vde.cpp
+- Modify: tests/vdtest.cpp
+
+- [ ] Confirm the reported click/drag failure is a binary-selection problem,
+  not a row-hit regression:
+
+~~~powershell
+Get-Process vde -ErrorAction SilentlyContinue |
+    Select-Object Id,Path
+git -c safe.directory=F:/_VDESKTOP_FF/win-vde/.worktrees/picker-row-actions rev-parse --short HEAD
+Get-FileHash .\build\vde.exe -Algorithm SHA256
+~~~
+
+  Expected: no VDE process before rebuilding. The branch revision is newer
+  than main, and the worktree executable has a different hash from
+  `F:\_VDESKTOP_FF\win-vde\build\vde.exe`. Do not alter the already-correct
+  row-first `WM_LBUTTONDOWN` path or exact `WM_LBUTTONUP` dispatch without a
+  reproducing test against the feature source.
+
+- [ ] Add and register a RED pure-state test beside the footer-hover tests:
+
+~~~cpp
+static void test_picker_row_hover_tracks_full_row_and_resets(){
+    PickerHoverEventState state;
+    PickerRowHoverUpdate update=UpdatePickerRowHoverEvent(state,3,41);
+    CHECK(update.changed && update.previousRowIndex==-1 &&
+          update.currentRowIndex==3);
+    CHECK(PickerRowHoverMatches(state,3,41));
+
+    update=UpdatePickerRowHoverEvent(state,3,41);
+    CHECK(!update.changed);
+
+    update=UpdatePickerRowHoverEvent(state,7,41);
+    CHECK(update.changed && update.previousRowIndex==3 &&
+          update.currentRowIndex==7);
+    CHECK(!PickerRowHoverMatches(state,3,41));
+    CHECK(PickerRowHoverMatches(state,7,41));
+
+    PickerFooterMouseMoveEffects footer=RoutePickerFooterMouseMove(
+        state,PickerFooterLink::Repository,false);
+    CHECK(footer.invalidateRowHover);
+    CHECK(state.hoveredRowIndex==-1 && state.hoveredRowGeneration==0);
+
+    UpdatePickerRowHoverEvent(state,5,42);
+    ResetPickerHoverEventState(
+        state,PickerHoverResetReason::MouseLeave);
+    CHECK(state.hoveredRowIndex==-1 && state.hoveredRowGeneration==0);
+}
+~~~
+
+- [ ] Add and register a RED source-wiring test proving:
+  - idle `WM_MOUSEMOVE` uses `HitPickerRow(pt)` for the visual hover, while the
+    tooltip alone still checks `snapshot.textRect`;
+  - tile-selection paint-cache refresh occurs before the final row-hover
+    update, so cache publication cannot immediately erase the highlight;
+  - `Paint` blends a rounded background over `snapshot.hitRect` and applies
+    the existing active-row treatment afterward;
+  - drag start, footer entry, cache publication, hide, and `WM_MOUSELEAVE`
+    clear row hover;
+  - hover changes call `InvalidateRect` but neither `BuildModel` nor
+    `RefreshPickerPaintCache`.
+
+- [ ] Run RED:
+
+~~~powershell
+.\build-test.bat
+~~~
+
+  Expected: compilation fails because `PickerRowHoverUpdate`,
+  `UpdatePickerRowHoverEvent`, `PickerRowHoverMatches`, and the row fields do
+  not exist.
+
+- [ ] Extend `PickerHoverEventState` and its pure helpers in
+  src/picker_state.hpp:
+
+~~~cpp
+struct PickerHoverEventState {
+    PickerFooterLink footerLink=PickerFooterLink::None;
+    int hoveredRowIndex=-1;
+    uint64_t hoveredRowGeneration=0;
+    bool rowTooltipActive=false;
+    PickerHoverResetReason lastResetReason=PickerHoverResetReason::None;
+    uint64_t resetCount=0;
+};
+
+struct PickerRowHoverUpdate {
+    int previousRowIndex=-1;
+    int currentRowIndex=-1;
+    bool changed=false;
+};
+
+inline PickerRowHoverUpdate UpdatePickerRowHoverEvent(
+        PickerHoverEventState& state,int rowIndex,
+        uint64_t generation) noexcept {
+    if(rowIndex<0){
+        rowIndex=-1;
+        generation=0;
+    }
+    PickerRowHoverUpdate update;
+    update.previousRowIndex=state.hoveredRowIndex;
+    update.currentRowIndex=rowIndex;
+    update.changed=state.hoveredRowIndex!=rowIndex ||
+        state.hoveredRowGeneration!=generation;
+    if(update.changed){
+        state.hoveredRowIndex=rowIndex;
+        state.hoveredRowGeneration=generation;
+    }
+    return update;
+}
+
+inline bool PickerRowHoverMatches(
+        const PickerHoverEventState& state,int rowIndex,
+        uint64_t generation) noexcept {
+    return rowIndex>=0 && state.hoveredRowIndex==rowIndex &&
+        state.hoveredRowGeneration==generation;
+}
+~~~
+
+  Add `invalidateRowHover` to `PickerFooterMouseMoveEffects`. Footer
+  suppression clears the row through `UpdatePickerRowHoverEvent(state,-1,0)`
+  and reports whether repaint is needed. `ResetPickerHoverEventState` clears
+  both row fields on every existing reset path.
+
+- [ ] In idle `WM_MOUSEMOVE`, update tile selection first when needed, then
+  recompute cache validity and call `HitPickerRow(pt)`. Feed that full-row
+  result to `UpdatePickerRowHoverEvent`. Use `snapshot.textRect` only as an
+  additional tooltip condition. Repaint on a changed row without rebuilding
+  the picker model. Clear hover when drag crosses the system threshold and
+  make `WM_MOUSELEAVE` repaint when either footer or row state changed.
+
+- [ ] In `Paint`, iterate rows with their stable paint-cache index and draw the
+  inactive hover before the icon/text:
+
+~~~cpp
+const bool active=PickerRowUsesStableIdentity(
+        snapshot.action.admission) &&
+    IsActiveWindow(g_picker,snapshot.action.identity);
+const bool hovered=PickerRowHoverMatches(
+    g_pickerHoverState,static_cast<int>(rowIndex),
+    g_pickerPaintCache.generation);
+if(hovered && !active){
+    const COLORREF hoverRow=BlendColor(fill,CLR_HEAD,24);
+    FillRoundRect(
+        hdc,snapshot.hitRect,S(5),hoverRow,hoverRow,S(1));
+}
+~~~
+
+  Keep the current stronger orange active-row fill and bar after this block so
+  active state has precedence.
+
+- [ ] Run GREEN and production build:
+
+~~~powershell
+.\build-test.bat
+.\build.bat
+git -c safe.directory=F:/_VDESKTOP_FF/win-vde/.worktrees/picker-row-actions diff --check
+~~~
+
+- [ ] Commit exactly the three task files:
+
+~~~powershell
+git -c safe.directory=F:/_VDESKTOP_FF/win-vde/.worktrees/picker-row-actions add src/picker_state.hpp src/vde.cpp tests/vdtest.cpp
+git -c safe.directory=F:/_VDESKTOP_FF/win-vde/.worktrees/picker-row-actions diff --cached --check
+git -c safe.directory=F:/_VDESKTOP_FF/win-vde/.worktrees/picker-row-actions commit --only -m "feat: highlight hovered picker rows" -- src/picker_state.hpp src/vde.cpp tests/vdtest.cpp
+~~~
+
+- [ ] Launch only the newly built worktree executable and verify its path:
+
+~~~powershell
+Start-Process -FilePath (Resolve-Path .\build\vde.exe)
+Get-Process vde -ErrorAction Stop |
+    Select-Object Id,Path
+~~~
+
+  Expected path:
+  `F:\_VDESKTOP_FF\win-vde\.worktrees\picker-row-actions\build\vde.exe`.
+  If the path points to main, stop QA and correct the launched executable; do
+  not diagnose feature behavior from the stale build.
+
+## Task 15: Independent review and manual Windows QA
 
 **Files:**
 
@@ -2667,28 +2851,32 @@ Get-FileHash .\build\vde.exe -Algorithm SHA256
 ~~~
 
 - [ ] Manual QA on Windows:
-  1. Click a normal row on another desktop; verify desktop switch, popup close,
+  1. Confirm the running process path is the feature-worktree `build\vde.exe`.
+  2. Hover an inactive row over its icon, text, and remaining row width; verify
+     the same subtle background. Move to another row and then outside the list;
+     verify immediate transfer and clear. Verify the active row remains orange.
+  3. Click a normal row on another desktop; verify desktop switch, popup close,
      and activation of that exact HWND.
-  2. Click a desktop title and empty tile area; verify switch without explicit
+  4. Click a desktop title and empty tile area; verify switch without explicit
      listed-window activation.
-  3. Drag Firefox, Chrome, or Edge to another tile; verify physical move,
+  5. Drag Firefox, Chrome, or Edge to another tile; verify physical move,
      saved assignment, unchanged current desktop, open popup, and preserved
      active highlight.
-  4. Drag a non-browser app; verify physical move, no restore record, unchanged
+  6. Drag a non-browser app; verify physical move, no restore record, unchanged
      current desktop, and open popup.
-  5. Drag a globally visible view; verify only the selected row moves visually
+  7. Drag a globally visible view; verify only the selected row moves visually
      and Windows global state remains unchanged.
-  6. Repeat with an app-wide pin containing at least two windows; verify only
+  8. Repeat with an app-wide pin containing at least two windows; verify only
      the grabbed exact row changes tile.
-  7. Reassign the same visual row, drop it on its displayed tile, and drop it
+  9. Reassign the same visual row, drop it on its displayed tile, and drop it
      back on its observed source; verify update/no-op/erase behavior.
-  8. Search and force refresh while popup remains open; verify overlay
+  10. Search and force refresh while popup remains open; verify overlay
      survival. Close and reopen; verify all overlays are gone.
-  9. Ctrl+Click a global/pinned captured window; verify visual assignment,
+  11. Ctrl+Click a global/pinned captured window; verify visual assignment,
      destination switch, open popup, and unchanged pin/global behavior.
-  10. Cancel before threshold, outside a tile, with Escape, and after starting
+  12. Cancel before threshold, outside a tile, with Escape, and after starting
       RowMoveOnly; verify no false visual claim and verified rollback.
-  11. Disable/fail optional pinned service in a diagnostic build; verify picker
+  13. Disable/fail optional pinned service in a diagnostic build; verify picker
       display/search/switch/activation still work and physical target moves fail
       closed.
 - [ ] Do not declare completion until automated gates, review, and all manual
@@ -2710,5 +2898,7 @@ Get-FileHash .\build\vde.exe -Algorithm SHA256
 - [ ] Drag does not switch desktop, close popup, or change popup active target.
 - [ ] Persistence remains Firefox/Chrome/Edge only.
 - [ ] Exact activation has no fallback HWND.
+- [ ] Every inactive row has whole-hit-rectangle hover feedback; active-row
+  styling remains stronger and every hover reset path repaints.
 - [ ] Full tests, production build, diff checks, independent review, and manual
   QA are complete.
