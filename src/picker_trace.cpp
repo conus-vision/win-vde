@@ -504,6 +504,7 @@ const char* PickerTracePhaseName(PickerPhase value) noexcept {
     VDE_TRACE_NAME_CASE(PickerPhase,IdentityVerifyBeforeSwitch,"identity_verify_before_switch");
     VDE_TRACE_NAME_CASE(PickerPhase,SwitchIssue,"switch_issue");
     VDE_TRACE_NAME_CASE(PickerPhase,DestinationVerify,"destination_verify");
+    VDE_TRACE_NAME_CASE(PickerPhase,PublishVisualAssignment,"publish_visual_assignment");
     VDE_TRACE_NAME_CASE(PickerPhase,RollbackTargetIssue,"rollback_target_issue");
     VDE_TRACE_NAME_CASE(PickerPhase,RollbackTargetVerify,"rollback_target_verify");
     VDE_TRACE_NAME_CASE(PickerPhase,RollbackPopupIssue,"rollback_popup_issue");
@@ -540,6 +541,7 @@ const char* PickerTraceEffectKindName(PickerEffectKind value) noexcept {
     VDE_TRACE_NAME_CASE(PickerEffectKind,ReadPopup,"read_popup");
     VDE_TRACE_NAME_CASE(PickerEffectKind,SwitchDesktop,"switch_desktop");
     VDE_TRACE_NAME_CASE(PickerEffectKind,ReadCurrent,"read_current");
+    VDE_TRACE_NAME_CASE(PickerEffectKind,PublishVisualAssignment,"publish_visual_assignment");
     VDE_TRACE_NAME_CASE(PickerEffectKind,SaveExactTarget,"save_exact_target");
     VDE_TRACE_NAME_CASE(PickerEffectKind,Refresh,"refresh");
     VDE_TRACE_NAME_CASE(PickerEffectKind,ShowAndFocus,"show_and_focus");

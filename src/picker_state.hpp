@@ -403,6 +403,7 @@ enum class PickerPhase {
     PopupIssue, PopupVerify,
     IdentityVerifyBeforeSwitch,
     SwitchIssue, DestinationVerify,
+    PublishVisualAssignment,
     RollbackTargetIssue, RollbackTargetVerify,
     RollbackPopupIssue, RollbackPopupVerify,
     RollbackSwitchIssue, OriginVerify,
@@ -416,7 +417,8 @@ enum class PickerEvent {
 
 enum class PickerEffectKind {
     None, ValidateTarget, MoveTarget, ReadTarget, MovePopup, ReadPopup,
-    SwitchDesktop, ReadCurrent, SaveExactTarget, Refresh,
+    SwitchDesktop, ReadCurrent, PublishVisualAssignment,
+    SaveExactTarget, Refresh,
     ShowAndFocus, Hide, ReportFailure
 };
 
@@ -458,6 +460,7 @@ inline PickerEffectExecutionRoute RoutePickerEffectExecution(
     if(PickerEffectRequiresSettlingDelay(kind))
         return PickerEffectExecutionRoute::DeferUntilDue;
     switch(kind){
+    case PickerEffectKind::PublishVisualAssignment:
     case PickerEffectKind::Refresh:
     case PickerEffectKind::ShowAndFocus:
     case PickerEffectKind::ReportFailure:
@@ -483,6 +486,11 @@ enum class PickerHideDisposition {
     TransientRelocate,
     DismissSession
 };
+
+inline bool PickerHideEndsVisualSession(
+        PickerHideDisposition disposition) noexcept {
+    return disposition==PickerHideDisposition::DismissSession;
+}
 
 struct PickerTransitionPolicy {
     bool requiresCapturedActive=false;
@@ -2111,6 +2119,7 @@ inline bool PickerObservationAcknowledges(
         expected=PickerEvent::ReadbackCompleted;
         break;
     case PickerEffectKind::ValidateTarget:
+    case PickerEffectKind::PublishVisualAssignment:
     case PickerEffectKind::SaveExactTarget:
     case PickerEffectKind::Refresh:
     case PickerEffectKind::ShowAndFocus:
@@ -2252,6 +2261,20 @@ inline PickerEffect PickerBeginRollback(PickerState& state,
     PickerTransition& transition=state.transition;
     transition.failed=true;
     PickerAppendDiagnostic(transition,diagnostic);
+    const PickerTransitionPolicy policy=PickerPolicyFor(transition.mode);
+    if(policy.publishesVisual){
+        transition.targetMayHaveMoved=false;
+        transition.targetUnresolvedBeforeIssue=false;
+        transition.rollbackTargetAttempts=0;
+        transition.rollbackVerificationRequired=
+            transition.popupMayHaveMoved ||
+            transition.switchMayHaveChanged;
+        if(transition.mode==PickerTransitionMode::VisualOnly){
+            PickerAcknowledgeTerminal(transition);
+            return PickerNoEffect();
+        }
+        return PickerContinueRollbackAfterTarget(state);
+    }
     if(transition.mode==PickerTransitionMode::RowMoveOnly){
         transition.rollbackVerificationRequired=
             transition.rollbackVerificationRequired ||
@@ -2290,6 +2313,30 @@ inline PickerEffect PickerBeginRollback(PickerState& state,
 inline PickerEffect PickerForwardFailed(PickerState& state,
                                         const wchar_t* diagnostic) noexcept {
     return PickerBeginRollback(state,diagnostic);
+}
+
+inline PickerEffect PickerStartVisualPublication(
+        PickerState& state) noexcept {
+    state.transition.phase=PickerPhase::PublishVisualAssignment;
+    return EmitPickerEffect(
+        state,PickerEffectKind::PublishVisualAssignment);
+}
+
+inline PickerEffect PickerContinueVisualForwardToDestination(
+        PickerState& state) noexcept {
+    PickerTransition& transition=state.transition;
+    const bool popupReady=
+        transition.popupRoute==PickerPopupRoute::StickyUnmanaged ||
+        PickerReadMatches(transition.observedPopupValidity,
+            transition.observedPopupDesktop,transition.destination);
+    if(PickerReadMatches(transition.observedCurrentValidity,
+            transition.observedCurrentDesktop,transition.destination) &&
+       popupReady)
+        return PickerStartVisualPublication(state);
+    if(transition.forwardSwitchAttempts>=4)
+        return PickerForwardFailed(
+            state,L"The desktop switch attempt budget was exhausted.");
+    return PickerIssueSwitch(state,false);
 }
 
 inline PickerEffect PickerContinueForwardToDestination(
@@ -2377,6 +2424,8 @@ inline PickerEffect AdvancePickerTransition(
         transition.commitCutoffReached=false;
         transition.suppressFocus=false;
         transition.terminalAcknowledged=false;
+        transition.pendingHideDisposition=
+            PickerHideDisposition::None;
         transition.forwardTargetAttempts=0;
         transition.forwardPopupAttempts=0;
         transition.forwardSwitchAttempts=0;
@@ -2410,12 +2459,32 @@ inline PickerEffect AdvancePickerTransition(
                 ? PickerReadValidity::Unavailable
                 : PickerReadValidity::Valid;
         transition.diagnostic.clear();
+        if(PickerPolicyFor(transition.mode).publishesVisual){
+            transition.phase=PickerPhase::IdentityVerifyBeforePopup;
+            return EmitPickerEffect(
+                state,PickerEffectKind::ValidateTarget);
+        }
         return PickerIssueTarget(state,false);
     }
 
     if(observation.event==PickerEvent::CancelRequested){
         if(transition.phase==PickerPhase::Idle || transition.dismissed)
             return PickerNoEffect();
+        if(transition.mode==PickerTransitionMode::VisualOnly){
+            if(transition.cancelRequested)
+                return PickerNoEffect();
+            transition.cancelRequested=true;
+            transition.failed=true;
+            PickerAppendDiagnostic(
+                transition,L"The visual assignment was cancelled.");
+            if(observation.unissuedEffectCancelled){
+                transition.pendingEffect=PickerEffectKind::None;
+                PickerAcknowledgeTerminal(transition);
+            } else if(transition.pendingEffect==PickerEffectKind::None){
+                PickerAcknowledgeTerminal(transition);
+            }
+            return PickerNoEffect();
+        }
         if(transition.mode==PickerTransitionMode::RowMoveOnly){
             if(transition.cancelRequested)
                 return PickerNoEffect();
@@ -2441,6 +2510,8 @@ inline PickerEffect AdvancePickerTransition(
         transition.cancelRequested=true;
         transition.dismissed=true;
         transition.failed=true;
+        transition.pendingHideDisposition=
+            PickerHideDisposition::DismissSession;
         PickerAppendDiagnostic(transition,L"The picker move was cancelled.");
         if(observation.unissuedEffectCancelled){
             if(transition.pendingEffect==PickerEffectKind::MoveTarget)
@@ -2457,7 +2528,11 @@ inline PickerEffect AdvancePickerTransition(
              transition.commitCutoffReached &&
              transition.pendingEffect==PickerEffectKind::SaveExactTarget) ||
             (transition.phase==PickerPhase::RefreshModel &&
-             transition.pendingEffect==PickerEffectKind::Refresh)))
+             transition.pendingEffect==PickerEffectKind::Refresh) ||
+            (transition.phase==PickerPhase::PublishVisualAssignment &&
+             transition.pendingEffect==
+                 PickerEffectKind::PublishVisualAssignment &&
+             !observation.unissuedEffectCancelled)))
             return PickerNoEffect();
         transition.pendingEffect=PickerEffectKind::None;
         transition.hidePending=true;
@@ -2560,6 +2635,23 @@ inline PickerEffect AdvancePickerTransition(
                 return PickerForwardFailed(
                     state,L"The target identity changed before moving the picker.");
             }
+            if(transition.mode==PickerTransitionMode::VisualOnly){
+                if(transition.cancelRequested){
+                    PickerAcknowledgeTerminal(transition);
+                    return PickerNoEffect();
+                }
+                return PickerStartVisualPublication(state);
+            }
+            if(transition.mode==PickerTransitionMode::VisualAndFollow){
+                if(transition.popupRoute==
+                        PickerPopupRoute::StickyUnmanaged){
+                    transition.phase=
+                        PickerPhase::IdentityVerifyBeforeSwitch;
+                    return PickerContinueVisualForwardToDestination(
+                        state);
+                }
+                return PickerIssuePopup(state,false);
+            }
             if(transition.popupRoute==PickerPopupRoute::StickyUnmanaged){
                 transition.phase=PickerPhase::IdentityVerifyBeforeSwitch;
                 return PickerContinueForwardToDestination(state);
@@ -2624,6 +2716,8 @@ inline PickerEffect AdvancePickerTransition(
                 return PickerForwardFailed(
                     state,L"The target identity changed before switching desktops.");
             }
+            if(transition.mode==PickerTransitionMode::VisualAndFollow)
+                return PickerContinueVisualForwardToDestination(state);
             return PickerContinueForwardToDestination(state);
         }
         break;
@@ -2658,6 +2752,9 @@ inline PickerEffect AdvancePickerTransition(
                     observation.actualCurrentDesktop,transition.destination)){
                 if(transition.popupRoute==
                         PickerPopupRoute::StickyUnmanaged){
+                    if(transition.mode==
+                            PickerTransitionMode::VisualAndFollow)
+                        return PickerStartVisualPublication(state);
                     transition.phase=PickerPhase::SaveExactTarget;
                     transition.commitCutoffReached=true;
                     return EmitPickerEffect(
@@ -2681,6 +2778,9 @@ inline PickerEffect AdvancePickerTransition(
             transition.observedPopupDesktop=observation.actualPopupDesktop;
             if(PickerReadMatches(observation.popupRead,
                     observation.actualPopupDesktop,transition.destination)){
+                if(transition.mode==
+                        PickerTransitionMode::VisualAndFollow)
+                    return PickerStartVisualPublication(state);
                 transition.phase=PickerPhase::SaveExactTarget;
                 transition.commitCutoffReached=true;
                 return EmitPickerEffect(
@@ -2699,6 +2799,38 @@ inline PickerEffect AdvancePickerTransition(
             }
             return PickerForwardFailed(
                 state,L"The picker left the selected desktop after the switch.");
+        }
+        break;
+
+    case PickerPhase::PublishVisualAssignment:
+        if(acknowledged==
+                PickerEffectKind::PublishVisualAssignment &&
+           observation.event==PickerEvent::EffectCompleted){
+            if(!observation.apiAccepted){
+                return PickerForwardFailed(
+                    state,L"The visual assignment could not be published.");
+            }
+            if(transition.mode==PickerTransitionMode::VisualOnly){
+                PickerAcknowledgeTerminal(transition);
+                return PickerNoEffect();
+            }
+            if(transition.mode==PickerTransitionMode::VisualAndFollow){
+                if(transition.cancelRequested && transition.dismissed){
+                    transition.resumeAfterHide=
+                        PickerPhase::PublishVisualAssignment;
+                    transition.hidePending=true;
+                    transition.pendingHideDisposition=
+                        PickerHideDisposition::DismissSession;
+                    return EmitPickerEffect(
+                        state,PickerEffectKind::Hide);
+                }
+                transition.phase=PickerPhase::FocusRestore;
+                ++transition.focusAttempts;
+                return EmitPickerEffect(
+                    state,PickerEffectKind::ShowAndFocus);
+            }
+            return PickerForwardFailed(
+                state,L"The visual publication mode was invalid.");
         }
         break;
 
