@@ -803,6 +803,79 @@ struct PickerVisualAssignment {
 using PickerVisualAssignments=
     std::map<std::string,PickerVisualAssignment>;
 
+template<class Tiles,class TileGuid,class TileRows,
+         class RowRuntimeKey,class PublishRow>
+inline bool ApplyPickerVisualAssignmentsToModel(
+        Tiles& tiles,PickerVisualAssignments& assignments,
+        TileGuid&& tileGuid,TileRows&& tileRows,
+        RowRuntimeKey&& rowRuntimeKey,PublishRow&& publishRow) noexcept {
+    try {
+        for(auto assignment=assignments.begin();
+            assignment!=assignments.end();){
+            size_t baseIndex=tiles.size();
+            size_t destinationIndex=tiles.size();
+            for(size_t index=0;index<tiles.size();++index){
+                const GUID& candidate=tileGuid(tiles[index]);
+                if(!GuidIsZero(candidate) &&
+                   GuidEq(candidate,assignment->second.baseDesktop))
+                    baseIndex=index;
+                if(!GuidIsZero(candidate) &&
+                   GuidEq(candidate,assignment->second.destination))
+                    destinationIndex=index;
+            }
+
+            size_t sourceIndex=tiles.size();
+            size_t rowIndex=0;
+            bool duplicate=false;
+            for(size_t tileIndex=0;tileIndex<tiles.size();++tileIndex){
+                auto& rows=tileRows(tiles[tileIndex]);
+                for(size_t index=0;index<rows.size();++index){
+                    if(rowRuntimeKey(rows[index])!=assignment->first)
+                        continue;
+                    if(sourceIndex!=tiles.size()){
+                        duplicate=true;
+                        break;
+                    }
+                    sourceIndex=tileIndex;
+                    rowIndex=index;
+                }
+                if(duplicate) break;
+            }
+
+            const bool stale=GuidIsZero(
+                    assignment->second.baseDesktop) ||
+                GuidIsZero(assignment->second.destination) ||
+                GuidEq(assignment->second.baseDesktop,
+                       assignment->second.destination) ||
+                baseIndex==tiles.size() ||
+                destinationIndex==tiles.size() ||
+                sourceIndex==tiles.size() || duplicate;
+            if(stale){
+                assignment=assignments.erase(assignment);
+                continue;
+            }
+
+            if(sourceIndex==destinationIndex){
+                auto& rows=tileRows(tiles[sourceIndex]);
+                publishRow(rows[rowIndex],assignment->second.baseDesktop,
+                           assignment->second.destination,true);
+            } else {
+                auto& sourceRows=tileRows(tiles[sourceIndex]);
+                auto moved=std::move(sourceRows[rowIndex]);
+                publishRow(moved,assignment->second.baseDesktop,
+                           assignment->second.destination,true);
+                auto& destinationRows=tileRows(tiles[destinationIndex]);
+                destinationRows.push_back(std::move(moved));
+                sourceRows.erase(sourceRows.begin()+rowIndex);
+            }
+            ++assignment;
+        }
+        return true;
+    } catch(...) {
+        return false;
+    }
+}
+
 enum class PickerVisualMutationKind {
     None,
     Upsert,
@@ -3403,12 +3476,25 @@ inline bool CompletePickerTargetRecapture(
 
 inline PickerDesktopTileRoute DecidePickerDesktopTileRoute(
         bool exactTileAvailable,bool currentTileAvailable,
-        HRESULT currentMembershipResult,bool onCurrentDesktop) noexcept {
+        HRESULT desktopReadResult,HRESULT currentMembershipResult,
+        bool onCurrentDesktop) noexcept {
     if(exactTileAvailable) return PickerDesktopTileRoute::Exact;
     if(currentTileAvailable && SUCCEEDED(currentMembershipResult) &&
-       onCurrentDesktop)
-        return PickerDesktopTileRoute::CurrentDesktopFallback;
+       onCurrentDesktop){
+        return SUCCEEDED(desktopReadResult)
+            ? PickerDesktopTileRoute::
+                GloballyVisibleCurrentDesktopFallback
+            : PickerDesktopTileRoute::CurrentDesktopFallback;
+    }
     return PickerDesktopTileRoute::Skip;
+}
+
+inline PickerDesktopTileRoute DecidePickerDesktopTileRoute(
+        bool exactTileAvailable,bool currentTileAvailable,
+        HRESULT currentMembershipResult,bool onCurrentDesktop) noexcept {
+    return DecidePickerDesktopTileRoute(
+        exactTileAvailable,currentTileAvailable,E_FAIL,
+        currentMembershipResult,onCurrentDesktop);
 }
 
 template<class Decision>
@@ -3431,10 +3517,16 @@ inline PickerFinalRowRoute<Decision> FinalizePickerRowRoute(
         return PickerFinalRowRoute<Decision>(
             PickerRowAdmission::Skip,baseDecision);
     if(desktopRoute==PickerDesktopTileRoute::CurrentDesktopFallback &&
+       baseAdmission!=PickerRowAdmission::Skip)
+        return PickerFinalRowRoute<Decision>(
+            PickerRowAdmission::DisplayOnly,displayOnlyFallbackDecision);
+    if(desktopRoute==PickerDesktopTileRoute::
+            GloballyVisibleCurrentDesktopFallback &&
        baseAdmission==PickerRowAdmission::Verified)
         return PickerFinalRowRoute<Decision>(
             PickerRowAdmission::Verified,verifiedFallbackDecision);
-    if(desktopRoute==PickerDesktopTileRoute::CurrentDesktopFallback &&
+    if(desktopRoute==PickerDesktopTileRoute::
+            GloballyVisibleCurrentDesktopFallback &&
        baseAdmission==PickerRowAdmission::DisplayOnly)
         return PickerFinalRowRoute<Decision>(
             PickerRowAdmission::DisplayOnly,displayOnlyFallbackDecision);
@@ -3854,6 +3946,15 @@ inline uint64_t BeginPickerPaintRefresh(PickerState& state) noexcept {
         ++state.paintGeneration;
     if(state.paintGeneration==0) state.paintGeneration=1;
     return state.paintGeneration;
+}
+
+inline uint64_t AdvancePickerRowLayoutEpoch(PickerState& state) noexcept {
+    if(state.rowLayoutEpoch==(std::numeric_limits<uint64_t>::max)())
+        state.rowLayoutEpoch=1;
+    else
+        ++state.rowLayoutEpoch;
+    if(state.rowLayoutEpoch==0) state.rowLayoutEpoch=1;
+    return state.rowLayoutEpoch;
 }
 
 template<class Cache,class ResetHover>

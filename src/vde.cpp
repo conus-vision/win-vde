@@ -5629,6 +5629,12 @@ struct WinItem {
     std::wstring title;
     std::wstring titleLC;
     std::wstring search;
+    GUID observedDesktop={0};
+    GUID baseDesktop={0};
+    GUID displayedDesktop={0};
+    TargetDesktopRoute desktopRoute=TargetDesktopRoute::Indeterminate;
+    TargetMobility mobility=TargetMobility::Indeterminate;
+    bool visuallyAssigned=false;
     PickerRowAdmission admission=PickerRowAdmission::DisplayOnly;
 };   // search = titleLC (+ all-tab text for browser windows)
 struct Tile { GUID guid; std::string guidKey; std::wstring name; std::wstring displayName; int index; std::vector<WinItem> windows; std::vector<size_t> filtered; RECT rc; int scroll=0; };
@@ -5745,7 +5751,7 @@ static void InitMetrics(){
 // ---- picker search / scroll / tooltip state ----
 static HWND g_search=nullptr; static WNDPROC g_searchOrigProc=nullptr;
 static HWND g_tip=nullptr;
-struct RowRec { RECT rc; std::wstring full; bool trunc; };
+struct RowRec { PickerRowHitSnapshot snapshot; };
 using PickerPaintCache=PickerPaintCacheState<RowRec>;
 static PickerPaintCache g_pickerPaintCache;
 static PickerHoverEventState g_pickerHoverState;
@@ -6072,23 +6078,14 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
         traceEvent.desktopResult=
             g_vdmDoc->GetWindowDesktopId(hwnd,&desktop);
         traceEvent.desktop=desktop;
-        if(FAILED(traceEvent.desktopResult))
-            return finish(
-                PickerTraceEnumDecision::SkipDesktopLookupFailed,
-                HandlePickerRowReadResult(
-                    context,PickerRowReadResult::DesktopUnavailable));
-        if(GuidIsZero(desktop))
-            return finish(
-                PickerTraceEnumDecision::SkipDesktopGuidZero,
-                HandlePickerRowReadResult(
-                    context,PickerRowReadResult::DesktopUnavailable));
         Tile* tile=nullptr;
-        for(Tile& candidate : *context.tiles)
-            if(GuidEq(candidate.guid,desktop)){
-                tile=&candidate;
-                traceEvent.tileIndex=candidate.index;
-                break;
-            }
+        if(SUCCEEDED(traceEvent.desktopResult) && !GuidIsZero(desktop))
+            for(Tile& candidate : *context.tiles)
+                if(GuidEq(candidate.guid,desktop)){
+                    tile=&candidate;
+                    traceEvent.tileIndex=candidate.index;
+                    break;
+                }
         Tile* currentTile=nullptr;
         if(!tile && !GuidIsZero(context.currentDesktop))
             for(Tile& candidate : *context.tiles)
@@ -6109,9 +6106,12 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
         const PickerDesktopTileRoute desktopRoute=
             DecidePickerDesktopTileRoute(
                 tile!=nullptr,currentTile!=nullptr,
-                currentMembershipResult,onCurrentDesktop!=FALSE);
+                traceEvent.desktopResult,currentMembershipResult,
+                onCurrentDesktop!=FALSE);
         const bool currentDesktopFallback=
-            desktopRoute==PickerDesktopTileRoute::CurrentDesktopFallback;
+            desktopRoute==PickerDesktopTileRoute::CurrentDesktopFallback ||
+            desktopRoute==PickerDesktopTileRoute::
+                GloballyVisibleCurrentDesktopFallback;
         if(currentDesktopFallback){
             tile=currentTile;
             traceEvent.tileIndex=tile->index;
@@ -6176,10 +6176,12 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
         traceEvent.identityComplete=identityComplete;
         traceEvent.recapture=recapture;
         const PickerRowAdmission baseAdmission=DecidePickerRowAdmission(
-            true,true,true,identityComplete,recapture);
+            true,desktopRoute!=PickerDesktopTileRoute::Skip,true,
+            identityComplete,recapture);
         const PickerTraceEnumDecision baseDecision=
             DecidePickerTraceEnumDecision(
-            altTab.reason,true,traceEvent.desktopResult,true,
+            altTab.reason,true,traceEvent.desktopResult,
+            !GuidIsZero(desktop),
             traceEvent.tileIndex,length,copied,
             traceEvent.tid!=0 && pid!=0,
             traceEvent.processStartAvailable,recapture);
@@ -6198,6 +6200,10 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
         WinItem item;
         item.hwnd=hwnd;
         item.admission=admission;
+        item.observedDesktop=desktop;
+        item.baseDesktop=tile->guid;
+        item.displayedDesktop=tile->guid;
+        item.desktopRoute=TargetRouteFromPickerTileRoute(desktopRoute);
         item.title=title;
         item.titleLC=title;
         if(!item.titleLC.empty()) CharLowerW(&item.titleLC[0]);
@@ -6205,6 +6211,19 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
         if(PickerRowUsesStableIdentity(admission)){
             item.identity=identity;
             item.runtimeKey=RuntimeKey(identity);
+            IApplicationView* rawView=nullptr;
+            HRESULT viewResult=E_NOINTERFACE;
+            if(g_avc){
+                try { viewResult=g_avc->GetViewForHwnd(hwnd,&rawView); }
+                catch(...) { viewResult=E_FAIL; }
+            }
+            ScopedComPtr<IApplicationView> view(rawView);
+            if(SUCCEEDED(viewResult) && view){
+                TargetMobilityProbeFacts mobilityFacts;
+                item.mobility=QueryTargetWindowMobility(
+                    identity,item.desktopRoute,view.get(),
+                    mobilityFacts).mobility;
+            }
             if(!context.liveKeys){
                 const BOOL productResult=HandlePickerRowReadResult(
                     context,PickerRowReadResult::GlobalSnapshotFailure);
@@ -6284,10 +6303,22 @@ static void RecordPickerDesktopSnapshotObservation(
     }
 }
 
+static bool ResolvePickerModelClientSize(
+        bool resetUi,size_t tileCount,int& width,int& height) noexcept;
+static bool BuildPickerPaintCache(
+        PickerPaintCache& cache,std::vector<Tile>& tiles,
+        PickerState& state,int clientWidth,int clientHeight,
+        uint64_t generation) noexcept;
+static void PublishPickerGridMetrics(
+        size_t tileCount,int clientWidth) noexcept;
+static void ResetPickerHoverState(
+        PickerHoverResetReason reason) noexcept;
+
 static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi,
                        bool selectionFromActual=false,
                        PickerTraceDesktopSnapshotFacts* snapshotFacts=nullptr,
-                       PickerModelAttemptTraceFacts* attemptFacts=nullptr){
+                       PickerModelAttemptTraceFacts* attemptFacts=nullptr,
+                       PickerVisualAssignmentMutation visualMutation={}){
     if(snapshotFacts) *snapshotFacts=PickerTraceDesktopSnapshotFacts{};
     const GUID observedCurrent=CurrentDesktopGuid();
     const uint64_t attemptedGeneration=
@@ -6302,9 +6333,13 @@ static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi,
     bool enumAttempted=false;
     BOOL enumWindowsResult=FALSE;
     DWORD enumWindowsError=ERROR_SUCCESS;
-    const bool published=RunPickerRefreshWithCurrent(
-        g_tiles,g_picker,observedCurrent,
-        [&](std::vector<Tile>& tiles,PickerState& state){
+    int publishedClientWidth=0;
+    if(GuidIsZero(observedCurrent))
+        SetPickerCurrentDesktop(g_picker,GUID{});
+    const bool published=RunPickerVisualRefreshTransaction(
+        g_tiles,g_pickerPaintCache,g_picker,visualMutation,
+        [&](std::vector<Tile>& tiles,PickerPaintCache& paintCache,
+            PickerState& state){
             if(!g_vdmi){
                 if(snapshotFacts){
                     snapshotFacts->status=
@@ -6318,8 +6353,10 @@ static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi,
                 state.searchText.clear();
                 state.searchActive=false;
                 state.scrollByDesktop.clear();
+                EndPickerVisualSession(state);
             }
-            state.activeWindow=activeWindow;
+            if(resetUi) state.activeWindow=activeWindow;
+            SetPickerCurrentDesktop(state,observedCurrent);
 
             DesktopCollectionComOps desktopOps;
             std::vector<DesktopCollectionEntry> desktopSnapshot;
@@ -6393,6 +6430,23 @@ static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi,
             enumWindowsResult=enumResult.value;
             enumWindowsError=enumResult.immediateError;
             if(!enumWindowsResult || enumContext.failed) return false;
+            if(!ApplyPickerVisualAssignmentsToModel(
+                    tiles,state.visualAssignments,
+                    [](const Tile& tile)->const GUID& {
+                        return tile.guid;
+                    },
+                    [](Tile& tile)->std::vector<WinItem>& {
+                        return tile.windows;
+                    },
+                    [](const WinItem& item)->const std::string& {
+                        return item.runtimeKey;
+                    },
+                    [](WinItem& item,const GUID& base,
+                       const GUID& displayed,bool assigned) noexcept {
+                        item.baseDesktop=base;
+                        item.displayedDesktop=displayed;
+                        item.visuallyAssigned=assigned;
+                    })) return false;
             if(!PopulatePickerFilteredRows(tiles,state.searchText))
                 return false;
             if(selectionFromActual)
@@ -6400,6 +6454,17 @@ static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi,
             ResolvePickerSelection(state,desktopGuids);
             if(!PrunePickerScrollState(state,desktopGuids)) return false;
             state.modelGeneration=attemptedGeneration;
+            AdvancePickerRowLayoutEpoch(state);
+            const uint64_t paintGeneration=
+                BeginPickerPaintRefresh(state);
+            int clientWidth=0,clientHeight=0;
+            if(!ResolvePickerModelClientSize(
+                    resetUi,tiles.size(),clientWidth,clientHeight))
+                return false;
+            if(!BuildPickerPaintCache(
+                    paintCache,tiles,state,clientWidth,clientHeight,
+                    paintGeneration)) return false;
+            publishedClientWidth=clientWidth;
             return true;
         });
     if(enumAttempted && enumContext.traceActive){
@@ -6413,8 +6478,12 @@ static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi,
         g_pickerTrace.emit(event);
         g_pickerTrace.flushBoundary();
     }
-    if(published) PruneIconCache(liveKeys);
-    if(published) MarkPickerIconPreloadDirty();
+    if(published){
+        PublishPickerGridMetrics(g_tiles.size(),publishedClientWidth);
+        ResetPickerHoverState(PickerHoverResetReason::CachePublication);
+        PruneIconCache(liveKeys);
+        MarkPickerIconPreloadDirty();
+    }
     return published;
 }
 
@@ -6439,17 +6508,30 @@ static bool RememberPickerScroll(Tile& tile,int scroll) noexcept {
         return false;
     }
 }
-static bool RebuildPickerFilteredRows() noexcept {
+
+template<class Mutate>
+static bool PublishPickerModelPaintUpdate(
+        Mutate&& mutate,bool rowLayoutChanges) noexcept {
     try {
-        std::vector<std::vector<size_t>> staged(g_tiles.size());
-        for(size_t index=0;index<g_tiles.size();++index)
-            if(!BuildPickerFilteredIndices(
-                    g_tiles[index].windows,g_picker.searchText,staged[index],
-                    [](const WinItem& item)->const std::wstring& {
-                        return item.search;
-                    })) return false;
-        for(size_t index=0;index<g_tiles.size();++index)
-            g_tiles[index].filtered.swap(staged[index]);
+        std::vector<Tile> stagedTiles=g_tiles;
+        PickerPaintCache stagedCache;
+        PickerState stagedState=PreservePickerUi(g_picker);
+        if(!mutate(stagedTiles,stagedState)) return false;
+        if(rowLayoutChanges) AdvancePickerRowLayoutEpoch(stagedState);
+        const uint64_t generation=BeginPickerPaintRefresh(stagedState);
+        int clientWidth=0,clientHeight=0;
+        if(!ResolvePickerModelClientSize(
+                false,stagedTiles.size(),clientWidth,clientHeight))
+            return false;
+        if(!BuildPickerPaintCache(
+                stagedCache,stagedTiles,stagedState,
+                clientWidth,clientHeight,generation))
+            return false;
+        g_tiles.swap(stagedTiles);
+        g_pickerPaintCache.swap(stagedCache);
+        SwapPickerState(g_picker,stagedState);
+        PublishPickerGridMetrics(g_tiles.size(),clientWidth);
+        ResetPickerHoverState(PickerHoverResetReason::CachePublication);
         MarkPickerIconPreloadDirty();
         return true;
     } catch(...) {
@@ -6457,27 +6539,37 @@ static bool RebuildPickerFilteredRows() noexcept {
     }
 }
 
-static bool ApplyPickerSearchText(const std::wstring& editText,
-                                  const std::wstring& searchText) noexcept {
-    try {
-        std::vector<std::vector<size_t>> staged(g_tiles.size());
-        for(size_t index=0;index<g_tiles.size();++index)
+static bool RebuildPickerFilteredRows() noexcept {
+    return PublishPickerModelPaintUpdate(
+        [](std::vector<Tile>& tiles,PickerState& state){
+        for(size_t index=0;index<tiles.size();++index)
             if(!BuildPickerFilteredIndices(
-                    g_tiles[index].windows,searchText,staged[index],
+                    tiles[index].windows,state.searchText,
+                    tiles[index].filtered,
                     [](const WinItem& item)->const std::wstring& {
                         return item.search;
                     })) return false;
-        if(!SetPickerSearchText(g_picker,editText,searchText)) return false;
-        for(size_t index=0;index<g_tiles.size();++index)
-            g_tiles[index].filtered.swap(staged[index]);
-        MarkPickerIconPreloadDirty();
-        if(searchText.empty())
-            InvalidatePickerTabSearchCache(
-                g_pickerTabSearchCache,g_picker.modelGeneration);
         return true;
-    } catch(...) {
-        return false;
-    }
+    },true);
+}
+
+static bool ApplyPickerSearchText(const std::wstring& editText,
+                                  const std::wstring& searchText) noexcept {
+    const bool published=PublishPickerModelPaintUpdate(
+        [&](std::vector<Tile>& tiles,PickerState& state){
+        for(size_t index=0;index<tiles.size();++index)
+            if(!BuildPickerFilteredIndices(
+                    tiles[index].windows,searchText,
+                    tiles[index].filtered,
+                    [](const WinItem& item)->const std::wstring& {
+                        return item.search;
+                    })) return false;
+        return SetPickerSearchText(state,editText,searchText);
+    },true);
+    if(published && searchText.empty())
+        InvalidatePickerTabSearchCache(
+            g_pickerTabSearchCache,g_picker.modelGeneration);
+    return published;
 }
 
 static void ResetPickerHoverTooltip() noexcept;
@@ -6615,7 +6707,6 @@ static void HandleSearchReconcileResult(std::unique_ptr<ReconcileResult> result)
     }
     if(accepted && g_main){
         RebuildPickerFilteredRows();
-        RefreshPickerPaintCache();
         InvalidateRect(g_main,nullptr,FALSE);
     }
 }
@@ -6720,16 +6811,73 @@ static PickerTabSearchEnsureOutcome EnsureTabSearch() noexcept {
         return PickerTabSearchEnsureOutcome::RetryPreserved;
     }
 }
-static void LayoutTiles(int clientW){
-    int n=(int)g_tiles.size();
-    g_cols=std::max(1,std::min(n,std::max(1,(clientW-PAD)/(TILE_W+PAD)))); g_cols=std::min(g_cols,5);
-    g_rows=(n+g_cols-1)/g_cols;
-    for(int i=0;i<n;++i){ int r=i/g_cols,c=i%g_cols; RECT rc; rc.left=PAD+c*(TILE_W+PAD); rc.top=SEARCH_H+HEADER+PAD+r*(TILE_H+PAD); rc.right=rc.left+TILE_W; rc.bottom=rc.top+TILE_H; g_tiles[i].rc=rc; }
+static int PickerGridColumnCount(size_t tileCount,int clientWidth) noexcept {
+    const int count=tileCount>static_cast<size_t>(
+        (std::numeric_limits<int>::max)())
+        ?(std::numeric_limits<int>::max)()
+        :static_cast<int>(tileCount);
+    int columns=std::max(
+        1,std::min(count,std::max(
+            1,(clientWidth-PAD)/(TILE_W+PAD))));
+    return std::min(columns,5);
+}
+
+static void PublishPickerGridMetrics(
+        size_t tileCount,int clientWidth) noexcept {
+    g_cols=PickerGridColumnCount(tileCount,clientWidth);
+    const int count=tileCount>static_cast<size_t>(
+        (std::numeric_limits<int>::max)())
+        ?(std::numeric_limits<int>::max)()
+        :static_cast<int>(tileCount);
+    g_rows=(count+g_cols-1)/g_cols;
+}
+
+static void LayoutPickerTiles(
+        std::vector<Tile>& tiles,int clientWidth) noexcept {
+    const int columns=PickerGridColumnCount(tiles.size(),clientWidth);
+    for(size_t index=0;index<tiles.size();++index){
+        const int value=static_cast<int>(index);
+        const int row=value/columns;
+        const int column=value%columns;
+        RECT rect;
+        rect.left=PAD+column*(TILE_W+PAD);
+        rect.top=SEARCH_H+HEADER+PAD+row*(TILE_H+PAD);
+        rect.right=rect.left+TILE_W;
+        rect.bottom=rect.top+TILE_H;
+        tiles[index].rc=rect;
+    }
+}
+
+static void LayoutTiles(int clientWidth){
+    PublishPickerGridMetrics(g_tiles.size(),clientWidth);
+    LayoutPickerTiles(g_tiles,clientWidth);
 }
 static SIZE DesiredClientSize(){
     return PickerDesiredClientSize(
         g_tiles.size(),TILE_W,TILE_H,PAD,SEARCH_H,HEADER,
         FOOTER_H,FOOTER_MIN_W);
+}
+
+static bool ResolvePickerModelClientSize(
+        bool resetUi,size_t tileCount,int& width,int& height) noexcept {
+    width=0;
+    height=0;
+    if(!resetUi && g_main){
+        RECT client={0,0,0,0};
+        if(GetClientRect(g_main,&client) &&
+           client.right>0 && client.bottom>0){
+            width=client.right;
+            height=client.bottom;
+            return true;
+        }
+    }
+    const SIZE desired=PickerDesiredClientSize(
+        tileCount,TILE_W,TILE_H,PAD,SEARCH_H,HEADER,
+        FOOTER_H,FOOTER_MIN_W);
+    if(desired.cx<=0 || desired.cy<=0) return false;
+    width=desired.cx;
+    height=desired.cy;
+    return true;
 }
 
 static int PickerTileVisibleRows(const Tile& tile) noexcept {
@@ -6865,15 +7013,17 @@ public:
     HDC get() const noexcept { return dc_; }
 };
 
-static bool RebuildPickerPaintCache(int clientWidth,int clientHeight,
-                                    uint64_t generation) noexcept {
-    return RefreshPickerPaintCacheTransaction(
-        g_pickerPaintCache,[&](PickerPaintCache& cache){
+static bool BuildPickerPaintCache(
+        PickerPaintCache& cache,std::vector<Tile>& tiles,
+        PickerState& state,int clientWidth,int clientHeight,
+        uint64_t generation) noexcept {
+    try {
+        LayoutPickerTiles(tiles,clientWidth);
         cache.generation=generation;
         cache.switchHeader=L"Switch to: ";
-        const int selected=g_picker.selectedIndex;
-        if(selected>=0 && selected<static_cast<int>(g_tiles.size()))
-            cache.switchHeader+=g_tiles[selected].name;
+        const int selected=state.selectedIndex;
+        if(selected>=0 && selected<static_cast<int>(tiles.size()))
+            cache.switchHeader+=tiles[selected].name;
         cache.moveHeader=L"Move window:  ";
         cache.moveHeader+=
             g_targetTitle.empty()?L"(no window)":g_targetTitle;
@@ -6881,7 +7031,7 @@ static bool RebuildPickerPaintCache(int clientWidth,int clientHeight,
         cache.footer.middle=FooterMiddle();
         cache.footer.conus=FooterConusLabel();
 
-        if(g_picker.searchActive){
+        if(state.searchActive){
             const RECT searchBox=SearchBoxRect(clientWidth);
             const int size=S(30);
             const int left=searchBox.right-S(10)-size;
@@ -6913,7 +7063,8 @@ static bool RebuildPickerPaintCache(int clientWidth,int clientHeight,
             clientWidth,clientHeight,PAD,FOOTER_H,FOOTER_LINK_H,
             repoExtent.cx,middleExtent.cx,conusExtent.cx,
             cache.footer.layout)) return false;
-        for(const Tile& tile : g_tiles){
+        for(size_t tileIndex=0;tileIndex<tiles.size();++tileIndex){
+            Tile& tile=tiles[tileIndex];
             RECT name=tile.rc;
             name.left+=S(14);
             name.top+=S(10);
@@ -6926,6 +7077,15 @@ static bool RebuildPickerPaintCache(int clientWidth,int clientHeight,
             const int maximumScroll=PickerTileMaxScroll(tile);
             const int visibleScroll=PickerVisibleScroll(
                 tile.scroll,maximumScroll);
+            if(tile.scroll!=visibleScroll){
+                tile.scroll=visibleScroll;
+                const auto saved=state.scrollByDesktop.find(tile.guidKey);
+                if(saved==state.scrollByDesktop.end())
+                    state.scrollByDesktop.emplace(
+                        tile.guidKey,visibleScroll);
+                else
+                    saved->second=visibleScroll;
+            }
             const bool hasScroll=
                 PickerTileFilteredCount(tile)>visibleRows;
             const int rowRight=tile.rc.right-
@@ -6944,20 +7104,85 @@ static bool RebuildPickerPaintCache(int clientWidth,int clientHeight,
                         static_cast<int>(window.title.size()),&extent))
                     return false;
                 RowRec row;
-                row.rc=text;
-                row.full=window.title;
-                row.trunc=extent.cx>(text.right-text.left);
+                PickerRowHitSnapshot& snapshot=row.snapshot;
+                snapshot.hitRect={
+                    tile.rc.left+S(8),y-S(2),
+                    rowRight,y+S(20)
+                };
+                snapshot.textRect={
+                    tile.rc.left+S(38),y,
+                    rowRight,y+S(18)
+                };
+                snapshot.fullTitle=window.title;
+                snapshot.runtimeKey=window.runtimeKey;
+                snapshot.truncated=
+                    extent.cx>(text.right-text.left);
+                snapshot.action.tileIndex=static_cast<int>(tileIndex);
+                snapshot.action.windowIndex=windowIndex;
+                snapshot.action.hwnd=
+                    reinterpret_cast<uintptr_t>(window.hwnd);
+                snapshot.action.displayedDesktop=
+                    window.displayedDesktop;
+                snapshot.action.observedDesktop=window.observedDesktop;
+                snapshot.action.baseDesktop=window.baseDesktop;
+                snapshot.action.identity=window.identity;
+                snapshot.action.admission=window.admission;
+                snapshot.action.desktopRoute=window.desktopRoute;
+                snapshot.action.mobility=window.mobility;
+                snapshot.action.visuallyAssigned=
+                    window.visuallyAssigned;
+                snapshot.action.modelGeneration=
+                    state.modelGeneration;
+                snapshot.action.rowLayoutEpoch=
+                    state.rowLayoutEpoch;
+                snapshot.action.paintGeneration=
+                    state.paintGeneration;
                 cache.hoverRows.push_back(std::move(row));
                 y+=rowHeight;
             }
         }
         return true;
-    },[]() noexcept {
+    } catch(...) {
+        return false;
+    }
+}
+
+static bool RebuildPickerPaintCache(int clientWidth,int clientHeight,
+                                    uint64_t generation) noexcept {
+    try {
+        std::vector<Tile> stagedTiles=g_tiles;
+        PickerPaintCache stagedCache;
+        PickerState stagedState=PreservePickerUi(g_picker);
+        stagedState.paintGeneration=generation;
+        if(!BuildPickerPaintCache(
+                stagedCache,stagedTiles,stagedState,
+                clientWidth,clientHeight,generation))
+            return false;
+        bool geometryChanged=stagedTiles.size()!=g_tiles.size();
+        for(size_t index=0;!geometryChanged &&
+                index<stagedTiles.size();++index){
+            const RECT& left=stagedTiles[index].rc;
+            const RECT& right=g_tiles[index].rc;
+            geometryChanged=left.left!=right.left ||
+                left.top!=right.top || left.right!=right.right ||
+                left.bottom!=right.bottom ||
+                stagedTiles[index].scroll!=g_tiles[index].scroll;
+        }
+        if(geometryChanged){
+            const uint64_t rowLayoutEpoch=
+                AdvancePickerRowLayoutEpoch(stagedState);
+            for(RowRec& row : stagedCache.hoverRows)
+                row.snapshot.action.rowLayoutEpoch=rowLayoutEpoch;
+        }
+        g_tiles.swap(stagedTiles);
+        g_pickerPaintCache.swap(stagedCache);
+        SwapPickerState(g_picker,stagedState);
+        PublishPickerGridMetrics(g_tiles.size(),clientWidth);
         ResetPickerHoverState(PickerHoverResetReason::CachePublication);
-    },[](PickerPaintCache& cache) noexcept {
-        ResetPickerHoverState(PickerHoverResetReason::CacheFailure);
-        cache.clear();
-    });
+        return true;
+    } catch(...) {
+        return false;
+    }
 }
 
 static void InvalidatePublishedPickerPaintCache() noexcept {
@@ -6971,20 +7196,17 @@ static void InvalidatePublishedPickerPaintCache() noexcept {
 
 static bool RefreshPickerPaintCache(
         bool allowHiddenPreparation) noexcept {
-    const uint64_t generation=BeginPickerPaintRefresh(g_picker);
+    const uint64_t generation=
+        g_picker.paintGeneration==
+            (std::numeric_limits<uint64_t>::max)()
+        ?1:g_picker.paintGeneration+1;
     if(!g_main){
-        ResetPickerHoverState(PickerHoverResetReason::CacheFailure);
-        g_pickerPaintCache.clear();
         return false;
     }
     RECT client={0,0,0,0};
     if(!GetClientRect(g_main,&client)){
-        ResetPickerHoverState(PickerHoverResetReason::CacheFailure);
-        g_pickerPaintCache.clear();
         return false;
     }
-    LayoutTiles(client.right);
-    ClampAllPickerScrolls();
     if(IsWindowVisible(g_main) || allowHiddenPreparation)
         PreloadVisiblePickerIcons();
     else
@@ -7136,7 +7358,8 @@ static void Paint(HDC hdcReal,HDC hdc,RECT client){
     const COLORREF currentTile=BlendColor(CLR_TILE,CLR_ACTIVE,48);
     const COLORREF activeRow=BlendColor(CLR_TILE,CLR_ACTIVE,72);
     const bool searching=!g_picker.searchText.empty();
-    for(const Tile& t : g_tiles){
+    for(size_t tileIndex=0;tileIndex<g_tiles.size();++tileIndex){
+        const Tile& t=g_tiles[tileIndex];
         const bool isCurrent=IsCurrentDesktop(g_picker,t.guid);
         const bool isSelected=IsSelectedDesktop(g_picker,t.guid);
         const bool dim=searching && t.filtered.empty();
@@ -7149,32 +7372,37 @@ static void Paint(HDC hdcReal,HDC hdc,RECT client){
         RECT nr=t.rc; nr.left+=S(14); nr.top+=S(10); nr.right-=S(12); nr.bottom=nr.top+S(22);
         DrawTextW(hdc,t.displayName.c_str(),-1,&nr,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
         SelectObject(hdc,fI); SetTextColor(hdc,CLR_TEXT);
-        int rowH=S(22), listTop=nr.bottom+S(6), listBot=t.rc.bottom-S(10);
+        int listTop=nr.bottom+S(6), listBot=t.rc.bottom-S(10);
         int visRows=PickerTileVisibleRows(t); int maxScroll=PickerTileMaxScroll(t);
         const int visibleScroll=PickerVisibleScroll(t.scroll,maxScroll);
         const int filteredCount=PickerTileFilteredCount(t);
-        bool hasScroll=filteredCount>visRows; int rowRight=t.rc.right-(hasScroll?S(18):S(14));
-        int y=listTop;
-        for(size_t position=static_cast<size_t>(visibleScroll);
-            position<t.filtered.size();++position){
-            if(y+rowH>listBot+S(3)) break;
-            const size_t windowIndex=t.filtered[position];
-            if(windowIndex>=t.windows.size()) break;
-            const WinItem& window=t.windows[windowIndex];
-            if(PickerRowUsesStableIdentity(window.admission) &&
-               IsActiveWindow(g_picker,window.identity)){
-                RECT activeRect={t.rc.left+S(8),y-S(2),rowRight,y+S(19)};
+        bool hasScroll=filteredCount>visRows;
+        if(paintCacheReady)
+        for(const RowRec& row : g_pickerPaintCache.hoverRows){
+            const PickerRowHitSnapshot& snapshot=row.snapshot;
+            if(snapshot.action.tileIndex!=static_cast<int>(tileIndex))
+                continue;
+            if(PickerRowUsesStableIdentity(
+                    snapshot.action.admission) &&
+               IsActiveWindow(g_picker,snapshot.action.identity)){
+                RECT activeRect=row.snapshot.hitRect;
                 FillRoundRect(hdc,activeRect,S(5),activeRow,activeRow,S(1));
                 RECT activeBar={activeRect.left+S(2),activeRect.top+S(3),
                                 activeRect.left+S(5),activeRect.bottom-S(3)};
                 FillRoundRect(hdc,activeBar,S(2),CLR_ACTIVE,CLR_ACTIVE,S(1));
             }
-            HICON icon=PickerRowUsesStableIdentity(window.admission)
-                ? CachedWindowIcon(window.runtimeKey):g_sharedFallbackIcon;
-            if(icon)DrawIconEx(hdc,t.rc.left+S(14),y,icon,S(16),S(16),0,nullptr,DI_NORMAL);
-            RECT ir; ir.left=t.rc.left+S(38); ir.top=y; ir.right=rowRight; ir.bottom=y+S(18);
-            DrawTextW(hdc,window.title.c_str(),-1,&ir,DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
-            y+=rowH;
+            HICON icon=PickerRowUsesStableIdentity(
+                    snapshot.action.admission)
+                ? CachedWindowIcon(snapshot.runtimeKey)
+                :g_sharedFallbackIcon;
+            if(icon) DrawIconEx(
+                hdc,row.snapshot.hitRect.left+S(6),
+                row.snapshot.textRect.top,icon,S(16),S(16),
+                0,nullptr,DI_NORMAL);
+            RECT textRect=row.snapshot.textRect;
+            DrawTextW(
+                hdc,row.snapshot.fullTitle.c_str(),-1,&textRect,
+                DT_LEFT|DT_SINGLELINE|DT_END_ELLIPSIS);
         }
         if(hasScroll){                                   // custom rounded scrollbar
             RECT trk={t.rc.right-S(9),listTop,t.rc.right-S(5),listBot}; FillRoundRect(hdc,trk,S(2),CLR_SCROLL_TRK,CLR_SCROLL_TRK,1);
@@ -7231,7 +7459,7 @@ static void TrackPickerHoverTooltip(HWND hwnd,const RowRec& row,
             rowIndex,generation)){
         ResetPickerHoverTooltip();
         try {
-            g_pickerTooltipText=row.full;
+            g_pickerTooltipText=row.snapshot.fullTitle;
         } catch(...) {
             return;
         }
@@ -7257,6 +7485,7 @@ static void HidePicker() noexcept {
     if(g_main) KillTimer(g_main,TIMER_PICKER_TRANSITION);
     CancelPickerIconPreload(g_main);
     ResetPickerHoverState(PickerHoverResetReason::Hide);
+    EndPickerVisualSession(g_picker);
     ShowWindow(g_main,SW_HIDE);
 }
 // Search EDIT subclass: forward navigation keys to the grid; let letters/numbers type.
@@ -7413,8 +7642,7 @@ static bool RefreshPickerModelPreservingUi() noexcept {
             RememberPickerScroll(tile,tile.scroll);
         std::wstring normalized=LowerW(editText);
         if(!SetPickerSearchText(g_picker,editText,normalized)) return false;
-        const WindowIdentityKey active=g_picker.transition.target;
-        if(!BuildModel(active,false,true)) return false;
+        if(!BuildModel(g_picker.activeWindow,false,true)) return false;
         std::vector<GUID> live;
         live.reserve(g_tiles.size());
         for(const Tile& tile : g_tiles) live.push_back(tile.guid);
@@ -7682,10 +7910,8 @@ static PickerObservation ExecutePickerEffect(
         }
         case PickerEffectKind::Refresh:
             observation.apiAccepted=RefreshPickerModelPreservingUi();
-            if(observation.apiAccepted){
-                RefreshPickerPaintCache();
+            if(observation.apiAccepted)
                 InvalidateRect(g_main,nullptr,FALSE);
-            }
             break;
         case PickerEffectKind::ShowAndFocus:
             if(!g_picker.transition.dismissed){
@@ -7701,6 +7927,8 @@ static PickerObservation ExecutePickerEffect(
         case PickerEffectKind::Hide:
             CancelPickerIconPreload(g_main);
             ResetPickerHoverState(PickerHoverResetReason::Hide);
+            if(PickerHideEndsVisualSession(effect.hideDisposition))
+                EndPickerVisualSession(g_picker);
             ShowWindow(g_main,SW_HIDE);
             observation.apiAccepted=true;
             break;
@@ -9086,6 +9314,7 @@ static bool GetPrimaryPickerWorkArea(RECT& workArea) noexcept {
 
 static void AbortPickerShowPreparation() noexcept {
     HidePicker();
+    EndPickerVisualSession(g_picker);
     g_pickerPaintCache.clear();
     g_target=nullptr;
     g_targetTitle.clear();
@@ -9125,6 +9354,8 @@ static void ShowPicker(PickerTargetCaptureState capture){
         AbortPickerShowPreparation();
         return;
     }
+    g_target=reinterpret_cast<HWND>(capture.hwnd);
+    g_targetTitle.swap(capture.title);
     PickerTraceDesktopSnapshotFacts snapshotFacts;
     PickerModelAttemptTraceFacts attemptFacts;
     const bool traceActive=g_pickerTrace.active();
@@ -9144,12 +9375,9 @@ static void ShowPicker(PickerTargetCaptureState capture){
     }
     if(!modelReady){
         traceEvent.result=PickerTraceOpenResult::ModelUnavailable;
-        RefreshPickerPaintCache();
+        AbortPickerShowPreparation();
         return;
     }
-    InvalidatePublishedPickerPaintCache();
-    g_target=reinterpret_cast<HWND>(capture.hwnd);
-    g_targetTitle.swap(capture.title);
     InvalidatePickerTabSearchCache(
         g_pickerTabSearchCache,g_picker.modelGeneration);
     SIZE sz=DesiredClientSize();
@@ -9185,13 +9413,16 @@ static void ShowPicker(PickerTargetCaptureState capture){
         AbortPickerShowPreparation();
         return;
     }
-    LayoutTiles(cr.right);
     EnsurePickerChildren();
     if(g_search){ SetWindowTextW(g_search,L""); RECT sb=SearchBoxRect(cr.right);
         int eLeft=sb.left+S(14), eRight=sb.right-S(44), eH=S(22), eTop=sb.top+((sb.bottom-sb.top)-eH)/2;
         MoveWindow(g_search,eLeft,eTop,eRight-eLeft,eH,TRUE); ShowWindow(g_search,SW_SHOW); }
     MarkPickerIconPreloadDirty(g_picker.selectedIndex);
-    const bool paintCacheReady=RefreshPickerPaintCache(true);
+    PreloadVisiblePickerIcons();
+    const bool paintCacheReady=
+        cr.right==sz.cx && cr.bottom==sz.cy &&
+        PickerPaintCacheMatches(
+            g_picker,g_pickerPaintCache.generation);
     if(!PickerShowPreparationComplete(modelReady,paintCacheReady)){
         traceEvent.result=PickerTraceOpenResult::PaintCacheFailed;
         AbortPickerShowPreparation();
@@ -9815,8 +10046,8 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             TrackMouseEvent(&tme);
             return 0;
         }
-        int hovRow=-1; if(cacheReady) for(size_t i=0;i<g_pickerPaintCache.hoverRows.size();++i) if(PtInRect(&g_pickerPaintCache.hoverRows[i].rc,pt)){ hovRow=(int)i; break; }
-        if(hovRow>=0 && g_pickerPaintCache.hoverRows[hovRow].trunc && g_tip){    // R9: full name on hover when truncated
+        int hovRow=-1; if(cacheReady) for(size_t i=0;i<g_pickerPaintCache.hoverRows.size();++i) if(PtInRect(&g_pickerPaintCache.hoverRows[i].snapshot.textRect,pt)){ hovRow=(int)i; break; }
+        if(hovRow>=0 && g_pickerPaintCache.hoverRows[hovRow].snapshot.truncated && g_tip){    // R9: full name on hover when truncated
             TrackPickerHoverTooltip(hwnd,g_pickerPaintCache.hoverRows[hovRow],
                 hovRow,g_pickerPaintCache.generation,pt);
         } else if(g_lastHoverRow!=-1){ ResetPickerHoverTooltip(); }
@@ -9836,14 +10067,26 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     case WM_MOUSEWHEEL:{ POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)}; ScreenToClient(hwnd,&pt); int delta=GET_WHEEL_DELTA_WPARAM(wp);   // R8: scroll a tile's window list
         if(g_picker.controlledTransition()) return 0;
         for(size_t tileIndex=0;tileIndex<g_tiles.size();++tileIndex){
-            Tile& t=g_tiles[tileIndex];
+            const Tile& t=g_tiles[tileIndex];
             if(!PtInRect(&t.rc,pt)) continue;
             const int maximum=PickerTileMaxScroll(t);
             const int next=AdvancePickerScroll(t.scroll,maximum,delta);
-            if(next!=t.scroll && RememberPickerScroll(t,next))
-                MarkPickerIconPreloadDirty(
-                    static_cast<int>(tileIndex));
-            RefreshPickerPaintCache();
+            if(next!=t.scroll &&
+               PublishPickerModelPaintUpdate(
+                    [&](std::vector<Tile>& tiles,PickerState& state){
+                        if(tileIndex>=tiles.size()) return false;
+                        Tile& stagedTile=tiles[tileIndex];
+                        stagedTile.scroll=next;
+                        const auto saved=state.scrollByDesktop.find(
+                            stagedTile.guidKey);
+                        if(saved==state.scrollByDesktop.end())
+                            state.scrollByDesktop.emplace(
+                                stagedTile.guidKey,next);
+                        else
+                            saved->second=next;
+                        return true;
+                    },true))
+                PreloadVisiblePickerIcons();
             InvalidateRect(hwnd,nullptr,FALSE);
             break;
         }
@@ -9854,8 +10097,8 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             int n=GetWindowTextLengthW(g_search); std::wstring s(n+1,0); GetWindowTextW(g_search,&s[0],n+1); s.resize(wcslen(s.c_str()));
             std::wstring searchText=LowerW(s);
             if(ApplyPickerSearchText(s,searchText)){
+                PreloadVisiblePickerIcons();
                 if(!g_picker.searchText.empty()) EnsureTabSearch();
-                RefreshPickerPaintCache();
             }
             InvalidateRect(hwnd,nullptr,FALSE);
         }

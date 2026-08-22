@@ -1231,6 +1231,124 @@ static void test_picker_visual_session_end_clears_only_assignments(){
     CHECK(SameIdentity(state.activeWindow,IK(0x3001,91,1200)));
 }
 
+struct PickerOverlayTestRow {
+    std::string runtimeKey;
+    GUID observedDesktop{};
+    GUID baseDesktop{};
+    GUID displayedDesktop{};
+    bool visuallyAssigned=false;
+};
+
+struct PickerOverlayTestTile {
+    GUID guid{};
+    std::vector<PickerOverlayTestRow> windows;
+};
+
+static bool ApplyPickerOverlayTestModel(
+        std::vector<PickerOverlayTestTile>& tiles,
+        PickerVisualAssignments& assignments){
+    return ApplyPickerVisualAssignmentsToModel(
+        tiles,assignments,
+        [](const PickerOverlayTestTile& tile)->const GUID& {
+            return tile.guid;
+        },
+        [](PickerOverlayTestTile& tile)
+                ->std::vector<PickerOverlayTestRow>& {
+            return tile.windows;
+        },
+        [](const PickerOverlayTestRow& row)->const std::string& {
+            return row.runtimeKey;
+        },
+        [](PickerOverlayTestRow& row,const GUID& base,
+           const GUID& displayed,bool assigned) noexcept {
+            row.baseDesktop=base;
+            row.displayedDesktop=displayed;
+            row.visuallyAssigned=assigned;
+        });
+}
+
+static void test_picker_visual_overlay_relocates_only_exact_runtime(){
+    const GUID base=G(
+        L"{231A0000-0000-0000-0000-000000000041}");
+    const GUID destination=G(
+        L"{231A0000-0000-0000-0000-000000000042}");
+    const GUID sentinel=G(
+        L"{231A0000-0000-0000-0000-000000000099}");
+    std::vector<PickerOverlayTestTile> tiles(2);
+    tiles[0].guid=base;
+    tiles[1].guid=destination;
+    PickerOverlayTestRow selected;
+    selected.runtimeKey="1001:77:900";
+    selected.observedDesktop=GUID{};
+    selected.baseDesktop=base;
+    selected.displayedDesktop=base;
+    PickerOverlayTestRow sibling;
+    sibling.runtimeKey="1002:77:900";
+    sibling.observedDesktop=sentinel;
+    sibling.baseDesktop=base;
+    sibling.displayedDesktop=base;
+    tiles[0].windows.push_back(selected);
+    tiles[0].windows.push_back(sibling);
+
+    PickerVisualAssignments assignments;
+    PickerVisualAssignment assignment;
+    assignment.baseDesktop=base;
+    assignment.destination=destination;
+    assignments[selected.runtimeKey]=assignment;
+    CHECK(ApplyPickerOverlayTestModel(tiles,assignments));
+    CHECK(tiles[0].windows.size()==1);
+    CHECK(tiles[0].windows[0].runtimeKey==sibling.runtimeKey);
+    CHECK(GuidEq(tiles[0].windows[0].displayedDesktop,base));
+    CHECK(!tiles[0].windows[0].visuallyAssigned);
+    CHECK(tiles[1].windows.size()==1);
+    CHECK(tiles[1].windows[0].runtimeKey==selected.runtimeKey);
+    CHECK(GuidIsZero(tiles[1].windows[0].observedDesktop));
+    CHECK(GuidEq(tiles[1].windows[0].baseDesktop,base));
+    CHECK(GuidEq(tiles[1].windows[0].displayedDesktop,destination));
+    CHECK(tiles[1].windows[0].visuallyAssigned);
+    CHECK(assignments.size()==1);
+
+    // Fresh global enumeration can initially choose a different tile; the
+    // stored assignment still owns the original concrete base desktop.
+    std::vector<PickerOverlayTestTile> refreshed(2);
+    refreshed[0].guid=base;
+    refreshed[1].guid=destination;
+    selected.baseDesktop=destination;
+    selected.displayedDesktop=destination;
+    refreshed[1].windows.push_back(selected);
+    CHECK(ApplyPickerOverlayTestModel(refreshed,assignments));
+    CHECK(refreshed[1].windows.size()==1);
+    CHECK(GuidEq(refreshed[1].windows[0].baseDesktop,base));
+    CHECK(GuidEq(refreshed[1].windows[0].displayedDesktop,destination));
+}
+
+static void test_picker_visual_overlay_prunes_stale_entries(){
+    const GUID base=G(
+        L"{231A0000-0000-0000-0000-000000000051}");
+    const GUID destination=G(
+        L"{231A0000-0000-0000-0000-000000000052}");
+    std::vector<PickerOverlayTestTile> tiles(1);
+    tiles[0].guid=base;
+    PickerVisualAssignments assignments;
+    PickerVisualAssignment missingRuntime;
+    missingRuntime.baseDesktop=base;
+    missingRuntime.destination=base;
+    assignments["missing-runtime"]=missingRuntime;
+    PickerVisualAssignment missingDestination;
+    missingDestination.baseDesktop=base;
+    missingDestination.destination=destination;
+    assignments["missing-destination"]=missingDestination;
+    PickerOverlayTestRow row;
+    row.runtimeKey="missing-destination";
+    row.baseDesktop=base;
+    row.displayedDesktop=base;
+    tiles[0].windows.push_back(row);
+    CHECK(ApplyPickerOverlayTestModel(tiles,assignments));
+    CHECK(assignments.empty());
+    CHECK(tiles[0].windows.size()==1);
+    CHECK(GuidEq(tiles[0].windows[0].displayedDesktop,base));
+}
+
 static void test_blend_color_respects_channels_and_alpha_endpoints(){
     const COLORREF background=RGB(10,20,30);
     const COLORREF accent=RGB(110,120,130);
@@ -2428,6 +2546,15 @@ static void test_picker_evidence_routes_are_fail_closed(){
     CHECK(DecidePickerDesktopTileRoute(
               false,false,S_OK,true)==PickerDesktopTileRoute::Skip);
 
+    CHECK(DecidePickerDesktopTileRoute(
+              false,true,S_OK,S_OK,true)==
+          PickerDesktopTileRoute::GloballyVisibleCurrentDesktopFallback);
+    CHECK(DecidePickerDesktopTileRoute(
+              false,true,E_FAIL,S_OK,true)==
+          PickerDesktopTileRoute::CurrentDesktopFallback);
+    CHECK(DecidePickerDesktopTileRoute(
+              false,true,S_OK,S_OK,false)==PickerDesktopTileRoute::Skip);
+
     auto finalRoute=FinalizePickerRowRoute(
         PickerRowAdmission::Verified,
         PickerDesktopTileRoute::Exact,
@@ -2438,14 +2565,23 @@ static void test_picker_evidence_routes_are_fail_closed(){
     CHECK(finalRoute.decision==PickerTraceEnumDecision::Verified);
     finalRoute=FinalizePickerRowRoute(
         PickerRowAdmission::Verified,
-        PickerDesktopTileRoute::CurrentDesktopFallback,
-        PickerTraceEnumDecision::Verified,
+        PickerDesktopTileRoute::GloballyVisibleCurrentDesktopFallback,
+        PickerTraceEnumDecision::SkipDesktopGuidZero,
         PickerTraceEnumDecision::DisplayOnlyCurrentDesktopFallback,
         PickerTraceEnumDecision::VerifiedCurrentDesktopFallback);
     CHECK(finalRoute.admission==PickerRowAdmission::Verified);
     CHECK(finalRoute.decision==PickerTraceEnumDecision::
           VerifiedCurrentDesktopFallback);
-    CHECK(PickerRowUsesStableIdentity(finalRoute.admission));
+    finalRoute=FinalizePickerRowRoute(
+        PickerRowAdmission::Verified,
+        PickerDesktopTileRoute::CurrentDesktopFallback,
+        PickerTraceEnumDecision::Verified,
+        PickerTraceEnumDecision::DisplayOnlyCurrentDesktopFallback,
+        PickerTraceEnumDecision::VerifiedCurrentDesktopFallback);
+    CHECK(finalRoute.admission==PickerRowAdmission::DisplayOnly);
+    CHECK(finalRoute.decision==PickerTraceEnumDecision::
+          DisplayOnlyCurrentDesktopFallback);
+    CHECK(!PickerRowUsesStableIdentity(finalRoute.admission));
     finalRoute=FinalizePickerRowRoute(
         PickerRowAdmission::DisplayOnly,
         PickerDesktopTileRoute::CurrentDesktopFallback,
@@ -13723,7 +13859,7 @@ static void test_picker_icon_loading_is_bounded_and_outside_paint(){
     const std::string paint=SourceSection(
         source,"static void Paint(","static void TipDeactivate(");
     CHECK(!paint.empty());
-    CHECK(paint.find("CachedWindowIcon(window.runtimeKey)")!=
+    CHECK(paint.find("CachedWindowIcon(snapshot.runtimeKey)")!=
           std::string::npos);
     CHECK(paint.find("LoadWindowIconOutsidePaint")==std::string::npos);
     CHECK(paint.find("RuntimeKey(")==std::string::npos);
@@ -13738,8 +13874,10 @@ static void test_picker_icon_loading_is_bounded_and_outside_paint(){
         source,"static bool BuildModel(",
         "static bool SetPickerSelectionCurrent(");
     CHECK(!build.empty());
-    CHECK(build.find("if(published) PruneIconCache(liveKeys);")!=
-          std::string::npos);
+    const size_t published=build.find("if(published){");
+    const size_t prune=build.find("PruneIconCache(liveKeys);",published);
+    CHECK(published!=std::string::npos && prune!=std::string::npos &&
+          published<prune);
 }
 
 static void test_picker_enum_publishes_display_only_rows_safely(){
@@ -13782,15 +13920,17 @@ static void test_picker_enum_publishes_display_only_rows_safely(){
         source,"static void Paint(","static void TipDeactivate(");
     CHECK(!paint.empty());
     const size_t activeGuard=paint.find(
-        "PickerRowUsesStableIdentity(window.admission) &&\n"
-        "               IsActiveWindow(g_picker,window.identity)");
+        "PickerRowUsesStableIdentity(\n"
+        "                    snapshot.action.admission) &&\n"
+        "               IsActiveWindow(g_picker,snapshot.action.identity)");
     const size_t activeFill=paint.find("FillRoundRect",activeGuard);
     CHECK(activeGuard!=std::string::npos && activeFill!=std::string::npos &&
           activeGuard<activeFill);
     const size_t iconGuard=paint.find(
-        "HICON icon=PickerRowUsesStableIdentity(window.admission)");
+        "HICON icon=PickerRowUsesStableIdentity(\n"
+        "                    snapshot.action.admission)");
     const size_t cachedIcon=paint.find(
-        "CachedWindowIcon(window.runtimeKey)",iconGuard);
+        "CachedWindowIcon(snapshot.runtimeKey)",iconGuard);
     const size_t fallbackIcon=paint.find("g_sharedFallbackIcon",iconGuard);
     CHECK(iconGuard!=std::string::npos && cachedIcon!=std::string::npos &&
           fallbackIcon!=std::string::npos && iconGuard<cachedIcon &&
@@ -13977,7 +14117,7 @@ static void test_picker_show_uses_primary_monitor_only(){
 
     const size_t buildModel=show.find("BuildModel(");
     const size_t cachePublication=show.find(
-        "InvalidatePublishedPickerPaintCache()");
+        "PickerPaintCacheMatches(");
     const size_t targetPublication=show.find(
         "g_target=reinterpret_cast<HWND>(capture.hwnd)");
     const size_t workAreaGuard=show.find(
@@ -14029,11 +14169,10 @@ static void test_picker_show_uses_primary_monitor_only(){
     const size_t clientRectAbort=show.find(
         "AbortPickerShowPreparation();",clientRectGuard);
     const size_t clientRectReturn=show.find("return;",clientRectAbort);
-    const size_t layoutTiles=show.find("LayoutTiles(cr.right)",setWindowEnd);
     const size_t ensureChildren=show.find(
-        "EnsurePickerChildren()",layoutTiles);
+        "EnsurePickerChildren()",clientRectReturn);
     const size_t paintPreparation=show.find(
-        "RefreshPickerPaintCache(true)",ensureChildren);
+        "PreloadVisiblePickerIcons()",ensureChildren);
     const size_t paintFailure=show.find(
         "if(!PickerShowPreparationComplete(",paintPreparation);
     const size_t paintAbort=show.find(
@@ -14054,8 +14193,8 @@ static void test_picker_show_uses_primary_monitor_only(){
     CHECK(workAreaReturn!=std::string::npos);
     CHECK(workAreaGuard<workAreaLookup &&
           workAreaLookup<workAreaAbort && workAreaAbort<workAreaReturn &&
-          workAreaReturn<buildModel && buildModel<cachePublication &&
-          cachePublication<targetPublication);
+          workAreaReturn<targetPublication &&
+          targetPublication<buildModel);
     CHECK(adjustResult!=std::string::npos);
     CHECK(adjustWindow!=std::string::npos);
     CHECK(adjustGuard!=std::string::npos);
@@ -14079,14 +14218,13 @@ static void test_picker_show_uses_primary_monitor_only(){
     CHECK(clientRectGuard!=std::string::npos);
     CHECK(clientRectAbort!=std::string::npos);
     CHECK(clientRectReturn!=std::string::npos);
-    CHECK(layoutTiles!=std::string::npos);
     CHECK(ensureChildren!=std::string::npos);
     CHECK(paintPreparation!=std::string::npos);
     CHECK(paintFailure!=std::string::npos);
     CHECK(paintAbort!=std::string::npos);
     CHECK(paintReturn!=std::string::npos);
     CHECK(showWindow!=std::string::npos);
-    CHECK(targetPublication<adjustResult && adjustResult<adjustWindow &&
+    CHECK(buildModel<adjustResult && adjustResult<adjustWindow &&
           adjustWindow<adjustGuard && adjustGuard<adjustAbort &&
           adjustAbort<adjustReturn && adjustReturn<outerWidth &&
           outerWidth<outerHeight && outerHeight<outerGuard &&
@@ -14101,9 +14239,10 @@ static void test_picker_show_uses_primary_monitor_only(){
           setWindowReturn<clientRectInit && clientRectInit<clientRectGuard &&
           clientRectGuard<clientRectAbort &&
           clientRectAbort<clientRectReturn &&
-          clientRectReturn<layoutTiles && layoutTiles<ensureChildren &&
+          clientRectReturn<ensureChildren &&
           ensureChildren<paintPreparation &&
-          paintPreparation<paintFailure && paintFailure<paintAbort &&
+          paintPreparation<cachePublication &&
+          cachePublication<paintFailure && paintFailure<paintAbort &&
           paintAbort<paintReturn && paintReturn<showWindow);
     CHECK(!placement.empty());
     CHECK(placement.find("MonitorFrom")==std::string::npos);
@@ -14148,13 +14287,17 @@ static void test_picker_preloads_only_laid_out_visible_rows(){
                "        bool allowHiddenPreparation) noexcept {",
         "struct PickerLightweightSnapshot");
     CHECK(!refresh.empty());
-    const size_t layout=refresh.find("LayoutTiles(client.right)");
-    const size_t clamp=refresh.find("ClampAllPickerScrolls()");
     const size_t preloaded=refresh.find("PreloadVisiblePickerIcons()");
     const size_t rebuild=refresh.find("RebuildPickerPaintCache(");
-    CHECK(layout!=std::string::npos && clamp!=std::string::npos &&
-          preloaded!=std::string::npos && rebuild!=std::string::npos);
-    CHECK(layout<clamp && clamp<preloaded && preloaded<rebuild);
+    CHECK(preloaded!=std::string::npos && rebuild!=std::string::npos);
+    CHECK(preloaded<rebuild);
+    CHECK(refresh.find("LayoutTiles(client.right)")==std::string::npos);
+    CHECK(refresh.find("ClampAllPickerScrolls()")==std::string::npos);
+    const std::string cacheBuilder=SourceSection(
+        source,"static bool BuildPickerPaintCache(",
+        "static bool RebuildPickerPaintCache(");
+    CHECK(cacheBuilder.find("LayoutPickerTiles(tiles,clientWidth)")!=
+          std::string::npos);
     CHECK(source.find("bool allowHiddenPreparation=false")!=
           std::string::npos);
     CHECK(refresh.find("IsWindowVisible(g_main)")!=std::string::npos);
@@ -14176,7 +14319,7 @@ static void test_picker_preloads_only_laid_out_visible_rows(){
     const std::string filtering=SourceSection(
         source,"static bool RebuildPickerFilteredRows() noexcept {",
         "static void ResetPickerHoverTooltip()");
-    CHECK(filtering.find("MarkPickerIconPreloadDirty()")!=
+    CHECK(filtering.find("PublishPickerModelPaintUpdate(")!=
           std::string::npos);
     const std::string model=SourceSection(
         source,"static bool BuildModel(",
@@ -14185,7 +14328,7 @@ static void test_picker_preloads_only_laid_out_visible_rows(){
           std::string::npos);
     const std::string wheel=SourceSection(
         source,"case WM_MOUSEWHEEL:","case WM_COMMAND:");
-    CHECK(wheel.find("MarkPickerIconPreloadDirty(")!=
+    CHECK(wheel.find("PublishPickerModelPaintUpdate(")!=
           std::string::npos);
 
     const std::string selection=SourceSection(
@@ -14230,9 +14373,10 @@ static void test_picker_preloads_only_laid_out_visible_rows(){
     const std::string show=SourceSection(
         source,"static void ShowPicker(","static void MoveSel(");
     const size_t showDirty=show.rfind("MarkPickerIconPreloadDirty(");
-    const size_t showRefresh=show.rfind("RefreshPickerPaintCache(true)");
-    CHECK(showDirty!=std::string::npos && showRefresh!=std::string::npos &&
-          showDirty<showRefresh);
+    const size_t showPreload=show.rfind("PreloadVisiblePickerIcons()");
+    CHECK(showDirty!=std::string::npos && showPreload!=std::string::npos &&
+          showDirty<showPreload);
+    CHECK(show.find("RefreshPickerPaintCache(true)")==std::string::npos);
 }
 
 static void test_picker_wm_paint_requires_the_owned_buffer(){
@@ -22771,7 +22915,7 @@ static void test_picker_trace_runtime_wiring_finalizes_once_and_stays_private(){
           std::string::npos);
     CHECK(finalizer.find("SetLastError(productLastError);")!=
           std::string::npos);
-    CHECK(CountSourceText(enumeration,"return finish(")==11);
+    CHECK(CountSourceText(enumeration,"return finish(")==9);
     CHECK(enumeration.find("return TRUE;")==std::string::npos);
     CHECK(enumeration.find("return FALSE;")==std::string::npos);
     CHECK(enumeration.find("g_pickerTrace.emit(")==std::string::npos);
@@ -27120,6 +27264,74 @@ static void test_new_desktop_observations_require_concrete_membership(){
           std::string::npos);
 }
 
+static void test_picker_model_overlay_and_row_geometry_are_one_publication(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string row=SourceSection(
+        source,"struct WinItem {","struct Tile {");
+    const std::string model=SourceSection(
+        source,"static bool BuildModel(",
+        "static bool SetPickerSelectionCurrent(");
+    const std::string cache=SourceSection(
+        source,"static bool BuildPickerPaintCache(",
+        "static bool RebuildPickerPaintCache(");
+    const std::string paint=SourceSection(
+        source,"static void Paint(","static void TipDeactivate(");
+    const std::string refresh=SourceSection(
+        source,"static bool RefreshPickerModelPreservingUi() noexcept {",
+        "struct PickerForegroundHandoffProductContext");
+    CHECK(!row.empty() && !model.empty() && !cache.empty() &&
+          !paint.empty() && !refresh.empty());
+    CHECK(row.find("GUID observedDesktop")!=std::string::npos);
+    CHECK(row.find("GUID baseDesktop")!=std::string::npos);
+    CHECK(row.find("GUID displayedDesktop")!=std::string::npos);
+    CHECK(row.find("TargetDesktopRoute desktopRoute")!=std::string::npos);
+    CHECK(row.find("TargetMobility mobility")!=std::string::npos);
+    CHECK(row.find("bool visuallyAssigned")!=std::string::npos);
+    CHECK(source.find(
+        "struct RowRec { PickerRowHitSnapshot snapshot; };")!=
+          std::string::npos);
+
+    const size_t transaction=model.find(
+        "RunPickerVisualRefreshTransaction(");
+    const size_t enumerate=model.find("return EnumWindows(",transaction);
+    const size_t overlay=model.find(
+        "ApplyPickerVisualAssignmentsToModel(",enumerate);
+    const size_t filter=model.find(
+        "PopulatePickerFilteredRows(",overlay);
+    const size_t cacheBuild=model.find("BuildPickerPaintCache(",filter);
+    CHECK(transaction!=std::string::npos);
+    CHECK(enumerate!=std::string::npos);
+    CHECK(overlay!=std::string::npos);
+    CHECK(filter!=std::string::npos);
+    CHECK(cacheBuild!=std::string::npos);
+    CHECK(transaction<enumerate && enumerate<overlay && overlay<filter &&
+          filter<cacheBuild);
+    CHECK(model.find("if(resetUi) state.activeWindow=activeWindow;")!=
+          std::string::npos);
+    CHECK(refresh.find("transition.target")==std::string::npos);
+
+    CHECK(cache.find("snapshot.hitRect={")!=std::string::npos);
+    CHECK(cache.find("tile.rc.left+S(8),y-S(2)")!=std::string::npos);
+    CHECK(cache.find("rowRight,y+S(20)")!=std::string::npos);
+    CHECK(cache.find("snapshot.textRect={")!=std::string::npos);
+    CHECK(cache.find("tile.rc.left+S(38),y")!=std::string::npos);
+    CHECK(cache.find("rowRight,y+S(18)")!=std::string::npos);
+    CHECK(cache.find("snapshot.action.modelGeneration=")!=
+          std::string::npos);
+    CHECK(cache.find("snapshot.action.rowLayoutEpoch=")!=
+          std::string::npos);
+    CHECK(cache.find("snapshot.action.paintGeneration=")!=
+          std::string::npos);
+    CHECK(paint.find("row.snapshot.hitRect")!=std::string::npos);
+    CHECK(paint.find("row.snapshot.textRect")!=std::string::npos);
+    CHECK(paint.find("row.snapshot.fullTitle")!=std::string::npos);
+
+    const std::string mouse=SourceSection(
+        source,"case WM_MOUSEMOVE:","case WM_MOUSELEAVE:");
+    CHECK(mouse.find("snapshot.textRect")!=std::string::npos);
+    CHECK(mouse.find("snapshot.hitRect")==std::string::npos);
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
@@ -27228,6 +27440,8 @@ int main(){
     test_picker_visual_assignment_mutations_are_strong_and_exact();
     test_picker_visual_refresh_failures_publish_nothing();
     test_picker_visual_session_end_clears_only_assignments();
+    test_picker_visual_overlay_relocates_only_exact_runtime();
+    test_picker_visual_overlay_prunes_stale_entries();
     test_blend_color_respects_channels_and_alpha_endpoints();
     test_picker_dim_search_keeps_current_and_selection_distinct();
     test_picker_visible_scroll_clamps_without_mutating_saved_value();
@@ -27269,6 +27483,7 @@ int main(){
     test_picker_volatile_rows_skip_but_structural_failures_abort();
     test_picker_row_admission_keeps_displayable_unverified_windows();
     test_picker_evidence_routes_are_fail_closed();
+    test_picker_model_overlay_and_row_geometry_are_one_publication();
     test_target_mobility_fails_closed_and_positive_signals_win();
     test_target_desktop_route_requires_concrete_snapshot_membership();
     test_target_mobility_probe_adapters_are_fail_closed();
