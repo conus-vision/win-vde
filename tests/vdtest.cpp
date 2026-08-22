@@ -822,6 +822,98 @@ static void test_picker_interaction_busy_and_drop_highlight_are_state_free(){
     CHECK(!PickerInteractionBusy(state,gesture));
 }
 
+static void test_picker_exact_activation_plan_and_route_are_fail_closed(){
+    static_assert(std::is_trivially_copyable<
+        PickerExactActivationRequest>::value,
+        "exact activation request must own values only");
+
+    CHECK(DecidePickerExactActivation(
+        false,true,true,false)==
+        PickerExactActivationDecision::RejectKeepPopup);
+    CHECK(DecidePickerExactActivation(
+        true,false,true,false)==
+        PickerExactActivationDecision::SwitchOnly);
+    CHECK(DecidePickerExactActivation(
+        true,true,false,false)==
+        PickerExactActivationDecision::SwitchOnly);
+    CHECK(DecidePickerExactActivation(
+        true,true,true,true)==
+        PickerExactActivationDecision::ActivateOnCurrent);
+    CHECK(DecidePickerExactActivation(
+        true,true,true,false)==
+        PickerExactActivationDecision::SwitchThenActivate);
+
+    PickerExactActivationRequest normal;
+    normal.hwnd=0x1111;
+    normal.identity=IK(0x1111,7,70);
+    normal.admission=PickerRowAdmission::Verified;
+    normal.displayedDesktop=G(
+        L"{251A0000-0000-0000-0000-000000000004}");
+    normal.observedDesktop=normal.displayedDesktop;
+    normal.baseDesktop=normal.displayedDesktop;
+    normal.desktopRoute=TargetDesktopRoute::Exact;
+    normal.mobility=TargetMobility::Movable;
+    normal.modelGeneration=5;
+    normal.rowLayoutEpoch=9;
+    CHECK(!PickerExactActivationUsesVisualRoute(normal));
+    CHECK(ValidatePickerExactActivationRoute(
+        normal,true,normal.displayedDesktop,true,
+        false,false,TargetMoveDisposition::Reject,true)==
+        PickerExactActivationRouteValidation::Exact);
+    CHECK(ValidatePickerExactActivationRoute(
+        normal,true,G(L"{251A0000-0000-0000-0000-000000000005}"),
+        true,false,false,TargetMoveDisposition::Reject,true)==
+        PickerExactActivationRouteValidation::DesktopMismatch);
+    CHECK(ValidatePickerExactActivationRoute(
+        normal,false,normal.displayedDesktop,true,
+        false,false,TargetMoveDisposition::Reject,true)==
+        PickerExactActivationRouteValidation::DesktopMismatch);
+    PickerExactActivationRequest upgradedDisplayOnly=normal;
+    upgradedDisplayOnly.admission=PickerRowAdmission::DisplayOnly;
+    upgradedDisplayOnly.desktopRoute=TargetDesktopRoute::Indeterminate;
+    CHECK(ValidatePickerExactActivationRoute(
+        upgradedDisplayOnly,true,upgradedDisplayOnly.displayedDesktop,true,
+        false,false,TargetMoveDisposition::Reject,true)==
+        PickerExactActivationRouteValidation::Exact);
+
+    PickerExactActivationRequest pinned=normal;
+    pinned.mobility=TargetMobility::AppPinned;
+    pinned.visuallyAssigned=true;
+    pinned.displayedDesktop=G(
+        L"{251A0000-0000-0000-0000-000000000008}");
+    CHECK(PickerExactActivationUsesVisualRoute(pinned));
+    CHECK(ValidatePickerExactActivationRoute(
+        pinned,true,pinned.observedDesktop,true,
+        true,true,TargetMoveDisposition::VisualOnly,true)==
+        PickerExactActivationRouteValidation::VisualOnly);
+    CHECK(ValidatePickerExactActivationRoute(
+        pinned,true,pinned.observedDesktop,true,
+        true,false,TargetMoveDisposition::VisualOnly,true)==
+        PickerExactActivationRouteValidation::GlobalMembershipLost);
+    CHECK(ValidatePickerExactActivationRoute(
+        pinned,true,pinned.observedDesktop,true,
+        true,true,TargetMoveDisposition::Reject,false)==
+        PickerExactActivationRouteValidation::VisualOnly);
+    CHECK(ValidatePickerExactActivationRoute(
+        pinned,true,pinned.observedDesktop,true,
+        true,true,TargetMoveDisposition::Reject,true)==
+        PickerExactActivationRouteValidation::GlobalMembershipLost);
+
+    PickerExactActivationRequest global=normal;
+    global.desktopRoute=TargetDesktopRoute::GloballyVisible;
+    global.mobility=TargetMobility::Indeterminate;
+    CHECK(PickerExactActivationUsesVisualRoute(global));
+    CHECK(ValidatePickerExactActivationRoute(
+        global,false,GUID{},false,true,true,
+        TargetMoveDisposition::VisualOnly,true)==
+        PickerExactActivationRouteValidation::VisualOnly);
+
+    TargetMobilityEvidence movementEvidence;
+    movementEvidence.desktopRoute=TargetDesktopRoute::Exact;
+    CHECK(DecideTargetMobility(movementEvidence).disposition==
+          TargetMoveDisposition::Reject);
+}
+
 static void test_footer_hover_event_state_covers_every_reset_path(){
     PickerHoverEventState state;
     state.rowTooltipActive=true;
@@ -2462,6 +2554,252 @@ static void test_picker_foreground_handoff_covers_popup_and_external_focus(){
     CHECK(noForeground.focusShell);
     CHECK(noForeground.attachDesktop);
     CHECK(!noForeground.attachForeground);
+}
+
+struct PickerExactActivationCallsContextForTest {
+    std::string calls;
+    PickerExactActivationRequest request;
+    WindowIdentityRecapture firstIdentity=WindowIdentityRecapture::Match;
+    WindowIdentityRecapture secondIdentity=WindowIdentityRecapture::Match;
+    int identityCalls=0;
+    bool switchInvoked=true;
+    HRESULT switchResult=S_OK;
+    bool currentRead=true;
+    GUID currentDesktop{};
+    PickerExactActivationRouteValidation route=
+        PickerExactActivationRouteValidation::Exact;
+    HWND initialForeground=reinterpret_cast<HWND>(0x2222);
+    HWND finalForeground=reinterpret_cast<HWND>(0x1111);
+    int foregroundReads=0;
+    DWORD currentThread=10;
+    DWORD foregroundThread=20;
+    DWORD targetThread=30;
+    BOOL foregroundAttach=TRUE;
+    BOOL targetAttach=TRUE;
+    BOOL iconic=TRUE;
+    BOOL setForeground=TRUE;
+    HWND restored=nullptr;
+    HWND focused=nullptr;
+};
+
+static WindowIdentityRecapture PickerExactRecaptureForTest(
+        void* opaque,const WindowIdentityKey&) noexcept {
+    auto& value=*static_cast<
+        PickerExactActivationCallsContextForTest*>(opaque);
+    value.calls.push_back('i');
+    return value.identityCalls++==0
+        ?value.firstIdentity:value.secondIdentity;
+}
+
+static void PickerExactHideForTest(void* opaque) noexcept {
+    auto& value=*static_cast<
+        PickerExactActivationCallsContextForTest*>(opaque);
+    value.calls.push_back('h');
+}
+
+static HRESULT PickerExactSwitchForTest(
+        void* opaque,const GUID&,bool& invoked) noexcept {
+    auto& value=*static_cast<
+        PickerExactActivationCallsContextForTest*>(opaque);
+    value.calls.push_back('s');
+    invoked=value.switchInvoked;
+    return value.switchResult;
+}
+
+static bool PickerExactReadCurrentForTest(
+        void* opaque,GUID& current) noexcept {
+    auto& value=*static_cast<
+        PickerExactActivationCallsContextForTest*>(opaque);
+    value.calls.push_back('r');
+    current=value.currentDesktop;
+    return value.currentRead;
+}
+
+static PickerExactActivationRouteValidation PickerExactRouteForTest(
+        void* opaque,const PickerExactActivationRequest&) noexcept {
+    auto& value=*static_cast<
+        PickerExactActivationCallsContextForTest*>(opaque);
+    value.calls.push_back('v');
+    return value.route;
+}
+
+static HWND PickerExactGetForegroundForTest(void* opaque) noexcept {
+    auto& value=*static_cast<
+        PickerExactActivationCallsContextForTest*>(opaque);
+    value.calls.push_back(value.foregroundReads++==0?'f':'g');
+    return value.foregroundReads==1
+        ?value.initialForeground:value.finalForeground;
+}
+
+static DWORD PickerExactGetWindowThreadForTest(
+        void* opaque,HWND hwnd) noexcept {
+    auto& value=*static_cast<
+        PickerExactActivationCallsContextForTest*>(opaque);
+    if(hwnd==value.initialForeground){
+        value.calls.push_back('p');
+        return value.foregroundThread;
+    }
+    value.calls.push_back('t');
+    return value.targetThread;
+}
+
+static DWORD PickerExactGetCurrentThreadForTest(void* opaque) noexcept {
+    auto& value=*static_cast<
+        PickerExactActivationCallsContextForTest*>(opaque);
+    value.calls.push_back('c');
+    return value.currentThread;
+}
+
+static BOOL PickerExactAttachForTest(
+        void* opaque,DWORD source,DWORD,BOOL attach) noexcept {
+    auto& value=*static_cast<
+        PickerExactActivationCallsContextForTest*>(opaque);
+    const bool foreground=source==value.foregroundThread;
+    value.calls.push_back(foreground
+        ?(attach?'F':'f'):(attach?'T':'t'));
+    return foreground?value.foregroundAttach:value.targetAttach;
+}
+
+static BOOL PickerExactIsIconicForTest(void* opaque,HWND hwnd) noexcept {
+    auto& value=*static_cast<
+        PickerExactActivationCallsContextForTest*>(opaque);
+    value.calls.push_back('m');
+    CHECK(hwnd==reinterpret_cast<HWND>(value.request.hwnd));
+    return value.iconic;
+}
+
+static BOOL PickerExactShowForTest(
+        void* opaque,HWND hwnd,int command) noexcept {
+    auto& value=*static_cast<
+        PickerExactActivationCallsContextForTest*>(opaque);
+    value.calls.push_back('w');
+    value.restored=hwnd;
+    CHECK(command==SW_RESTORE);
+    return FALSE;
+}
+
+static BOOL PickerExactSetForegroundForTest(
+        void* opaque,HWND hwnd) noexcept {
+    auto& value=*static_cast<
+        PickerExactActivationCallsContextForTest*>(opaque);
+    value.calls.push_back('x');
+    value.focused=hwnd;
+    return value.setForeground;
+}
+
+static PickerExactActivationCallOps PickerExactOpsForTest(
+        PickerExactActivationCallsContextForTest& context){
+    PickerExactActivationCallOps ops;
+    ops.context=&context;
+    ops.recaptureIdentity=PickerExactRecaptureForTest;
+    ops.hidePopup=PickerExactHideForTest;
+    ops.switchDesktop=PickerExactSwitchForTest;
+    ops.readCurrentDesktop=PickerExactReadCurrentForTest;
+    ops.validateRoute=PickerExactRouteForTest;
+    ops.getForegroundWindow=PickerExactGetForegroundForTest;
+    ops.getWindowThreadProcessId=PickerExactGetWindowThreadForTest;
+    ops.getCurrentThreadId=PickerExactGetCurrentThreadForTest;
+    ops.attachThreadInput=PickerExactAttachForTest;
+    ops.isIconic=PickerExactIsIconicForTest;
+    ops.showWindow=PickerExactShowForTest;
+    ops.setForegroundWindow=PickerExactSetForegroundForTest;
+    return ops;
+}
+
+static PickerExactActivationCallsContextForTest
+PickerExactContextForTest(){
+    PickerExactActivationCallsContextForTest context;
+    context.request.hwnd=0x1111;
+    context.request.identity=IK(0x1111,7,70);
+    context.request.admission=PickerRowAdmission::Verified;
+    context.request.displayedDesktop=G(
+        L"{251A0000-0000-0000-0000-000000000004}");
+    context.request.observedDesktop=context.request.displayedDesktop;
+    context.request.baseDesktop=context.request.displayedDesktop;
+    context.request.desktopRoute=TargetDesktopRoute::Exact;
+    context.request.mobility=TargetMobility::Movable;
+    context.currentDesktop=context.request.displayedDesktop;
+    return context;
+}
+
+static void test_picker_exact_activation_call_order_is_exact(){
+    auto cross=PickerExactContextForTest();
+    PickerExactActivationCallOps crossOps=PickerExactOpsForTest(cross);
+    const PickerExactActivationCallResult crossResult=
+        ExecutePickerExactActivationCalls(
+            PickerExactActivationDecision::SwitchThenActivate,
+            cross.request,crossOps);
+    CHECK(cross.calls=="ihsrivfcptFTmwxgtf");
+    CHECK(crossResult.outcome==
+          PickerExactActivationCallOutcome::ExactForeground);
+    CHECK(crossResult.switchInvoked &&
+          crossResult.switchResult==S_OK && crossResult.currentRead);
+    CHECK(crossResult.foregroundAttached && crossResult.targetAttached);
+    CHECK(crossResult.restored);
+    CHECK(cross.restored==reinterpret_cast<HWND>(cross.request.hwnd));
+    CHECK(cross.focused==reinterpret_cast<HWND>(cross.request.hwnd));
+
+    auto current=PickerExactContextForTest();
+    PickerExactActivationCallOps currentOps=PickerExactOpsForTest(current);
+    const PickerExactActivationCallResult currentResult=
+        ExecutePickerExactActivationCalls(
+            PickerExactActivationDecision::ActivateOnCurrent,
+            current.request,currentOps);
+    CHECK(current.calls=="ihivfcptFTmwxgtf");
+    CHECK(current.calls.find('s')==std::string::npos);
+    CHECK(current.calls.find('r')==std::string::npos);
+    CHECK(currentResult.outcome==
+          PickerExactActivationCallOutcome::ExactForeground);
+}
+
+static void test_picker_exact_activation_failures_never_focus_fallback(){
+    auto uninvoked=PickerExactContextForTest();
+    uninvoked.switchInvoked=false;
+    PickerExactActivationCallOps uninvokedOps=
+        PickerExactOpsForTest(uninvoked);
+    const auto uninvokedResult=ExecutePickerExactActivationCalls(
+        PickerExactActivationDecision::SwitchThenActivate,
+        uninvoked.request,uninvokedOps);
+    CHECK(uninvokedResult.outcome==
+          PickerExactActivationCallOutcome::DesktopMismatch);
+    CHECK(uninvoked.calls=="ihs");
+    CHECK(uninvoked.focused==nullptr);
+
+    auto identityLost=PickerExactContextForTest();
+    identityLost.secondIdentity=WindowIdentityRecapture::Lost;
+    PickerExactActivationCallOps identityOps=
+        PickerExactOpsForTest(identityLost);
+    const auto identityResult=ExecutePickerExactActivationCalls(
+        PickerExactActivationDecision::SwitchThenActivate,
+        identityLost.request,identityOps);
+    CHECK(identityResult.outcome==
+          PickerExactActivationCallOutcome::IdentityLost);
+    CHECK(identityLost.calls=="ihsri");
+    CHECK(identityLost.focused==nullptr);
+
+    auto membershipLost=PickerExactContextForTest();
+    membershipLost.route=
+        PickerExactActivationRouteValidation::GlobalMembershipLost;
+    PickerExactActivationCallOps membershipOps=
+        PickerExactOpsForTest(membershipLost);
+    const auto membershipResult=ExecutePickerExactActivationCalls(
+        PickerExactActivationDecision::ActivateOnCurrent,
+        membershipLost.request,membershipOps);
+    CHECK(membershipResult.outcome==
+          PickerExactActivationCallOutcome::GlobalMembershipLost);
+    CHECK(membershipLost.calls=="ihiv");
+    CHECK(membershipLost.focused==nullptr);
+
+    auto rejected=PickerExactContextForTest();
+    rejected.setForeground=FALSE;
+    PickerExactActivationCallOps rejectedOps=PickerExactOpsForTest(rejected);
+    const auto rejectedResult=ExecutePickerExactActivationCalls(
+        PickerExactActivationDecision::ActivateOnCurrent,
+        rejected.request,rejectedOps);
+    CHECK(rejectedResult.outcome==
+          PickerExactActivationCallOutcome::ForegroundRejected);
+    CHECK(rejected.calls=="ihivfcptFTmwxgtf");
+    CHECK(rejected.focused==reinterpret_cast<HWND>(rejected.request.hwnd));
 }
 
 static void test_picker_mouse_ctrl_uses_button_message_snapshot(){
@@ -22157,6 +22495,7 @@ static void test_picker_trace_every_schema_event_is_strict_jsonl(){
     check(PickerTraceEnumEndEvent{});
     check(PickerTraceMouseDownEvent{});
     check(PickerTraceGestureEvent{});
+    check(PickerTraceExactActivationEvent{});
     check(PickerTraceActivationRequestEvent{});
     check(PickerTraceActivationResultEvent{});
     check(PickerTraceMoveBeginEvent{});
@@ -23603,6 +23942,55 @@ static void test_picker_trace_gesture_fields_have_stable_private_names(){
           std::string::npos);
     CHECK(line.find("\"row_layout_epoch_valid\":false")!=
           std::string::npos);
+    CHECK(line.find("title")==std::string::npos);
+}
+
+static void test_picker_trace_exact_activation_results_are_stable(){
+    struct Case {
+        PickerTraceExactActivationResult value;
+        const char* name;
+    };
+    const Case cases[]={
+        {PickerTraceExactActivationResult::RejectKeepPopup,
+         "reject_keep_popup"},
+        {PickerTraceExactActivationResult::SwitchOnly,"switch_only"},
+        {PickerTraceExactActivationResult::IdentityLost,"identity_lost"},
+        {PickerTraceExactActivationResult::DesktopMismatch,
+         "desktop_mismatch"},
+        {PickerTraceExactActivationResult::GlobalMembershipLost,
+         "global_membership_lost"},
+        {PickerTraceExactActivationResult::ForegroundRejected,
+         "foreground_rejected"},
+        {PickerTraceExactActivationResult::ExactForeground,
+         "exact_foreground"}
+    };
+    static_assert(sizeof(cases)/sizeof(cases[0])==7,
+        "exact activation trace result table must be exhaustive");
+    for(const Case& value:cases)
+        CHECK(std::string(PickerTraceExactActivationResultName(
+            value.value))==value.name);
+
+    PickerTraceExactActivationEvent event;
+    event.activationId=41;
+    event.decision=
+        PickerExactActivationDecision::SwitchThenActivate;
+    event.result=PickerTraceExactActivationResult::ExactForeground;
+    event.tileIndex=3;
+    event.destination=G(
+        L"{251A0000-0000-0000-0000-000000000004}");
+    event.visualRoute=true;
+    std::string line;
+    CHECK(SerializePickerTraceLine(PickerTraceEnvelope{},event,line));
+    CHECK(PickerTraceStrictJsonLineForTest(line));
+    CHECK(line.find("\"event\":\"activation.exact\"")!=
+          std::string::npos);
+    CHECK(line.find("\"activation_id\":41")!=std::string::npos);
+    CHECK(line.find("\"decision\":\"switch_then_activate\"")!=
+          std::string::npos);
+    CHECK(line.find("\"result\":\"exact_foreground\"")!=
+          std::string::npos);
+    CHECK(line.find("\"tile_index\":3")!=std::string::npos);
+    CHECK(line.find("\"visual_route\":true")!=std::string::npos);
     CHECK(line.find("title")==std::string::npos);
 }
 
@@ -26578,6 +26966,8 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
     CheckPickerTraceEventPrivacyTypeForTest<PickerTraceMouseDownEvent>();
     CheckPickerTraceEventPrivacyTypeForTest<PickerTraceGestureEvent>();
     CheckPickerTraceEventPrivacyTypeForTest<
+        PickerTraceExactActivationEvent>();
+    CheckPickerTraceEventPrivacyTypeForTest<
         PickerTraceActivationRequestEvent>();
     CheckPickerTraceEventPrivacyTypeForTest<
         PickerTraceActivationResultEvent>();
@@ -26658,6 +27048,12 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
          "boolctrlAtDown=false;boolthresholdCrossed=false;"
          "boolmodelGenerationValid=false;"
          "boolrowLayoutEpochValid=false;"},
+        {"PickerTraceExactActivationEvent",
+         "uint64_tactivationId=0;PickerExactActivationDecisiondecision="
+         "PickerExactActivationDecision::RejectKeepPopup;"
+         "PickerTraceExactActivationResultresult="
+         "PickerTraceExactActivationResult::RejectKeepPopup;"
+         "inttileIndex=-1;GUIDdestination{};boolvisualRoute=false;"},
         {"PickerTraceActivationRequestEvent",
          "uint64_tactivationId=0;PickerTraceActivationSourcesource="
          "PickerTraceActivationSource::Mouse;boolctrl=false;inttileIndex=-1;"},
@@ -26752,7 +27148,7 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
          "boolpeTimestampAvailable=false;boolprocessSessionAvailable=false;"
          "boolintegrityAvailable=false;boolelevated=false;"}
     };
-    static_assert(sizeof(schemas)/sizeof(schemas[0])==16,
+    static_assert(sizeof(schemas)/sizeof(schemas[0])==17,
         "every public picker trace event schema must be allowlisted");
     for(const SchemaCase& schema:schemas)
         CHECK(PickerTraceStructBodyForTest(traceHeader,schema.name)==
@@ -26763,6 +27159,7 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
         "PickerTraceEnumBeginEvent","PickerTraceEnumWindowEvent",
         "PickerTraceEnumEndEvent","PickerTraceMouseDownEvent",
         "PickerTraceGestureEvent",
+        "PickerTraceExactActivationEvent",
         "PickerTraceActivationRequestEvent",
         "PickerTraceActivationResultEvent","PickerTraceMoveBeginEvent",
         "PickerTraceMoveBeginExceptionEvent","PickerTraceEffectEvent",
@@ -26770,7 +27167,7 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
         "PickerTraceTerminalizationAttemptEvent",
         "PickerTraceTransitionTerminalEvent"
     };
-    static_assert(sizeof(emitTypes)/sizeof(emitTypes[0])==15,
+    static_assert(sizeof(emitTypes)/sizeof(emitTypes[0])==16,
         "writer and session emit surfaces must stay exact");
     std::multiset<std::string> expectedEmitDeclarations;
     std::vector<std::string> eventTypeNames;
@@ -26860,10 +27257,10 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
         PickerTraceEventAssignmentsForTest(source);
     const std::vector<std::string> moduleEventAssignments=
         PickerTraceEventAssignmentsForTest(traceSource);
-    CHECK(vdeEventAssignments.size()==188);
+    CHECK(vdeEventAssignments.size()==194);
     CHECK(moduleEventAssignments.size()==74);
     CHECK(PickerTraceAssignmentDigestForTest(vdeEventAssignments)==
-          "5ebdbc5ce9ca3f4c7bfb31b3b5c3b9ff96b41c741c8d1889f58427fefa131b05");
+          "d3e2272bd34357ea8ee478c1a1855f49974313190e002bf6d1691e710d002580");
     CHECK(PickerTraceAssignmentDigestForTest(moduleEventAssignments)==
           "3cf0a4ba0d03558355119c432dd5c642014b7ac987858d2ade5c62a01a4cf493");
     CHECK(std::find(moduleEventAssignments.begin(),
@@ -27099,7 +27496,7 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
         "observer->context,emission.attempt",
         "observer->context,*terminal","startEvent,appVersion"
     };
-    CHECK(emitArguments.size()==27);
+    CHECK(emitArguments.size()==28);
     for(const std::string& argument:emitArguments){
         CHECK(allowedArguments.find(argument)!=allowedArguments.end());
         const char* forbidden[]={
@@ -27815,6 +28212,109 @@ static void test_picker_drag_runtime_wiring_and_conflict_gates_are_explicit(){
         lifetime,"ResetPickerPointerGesture(hwnd,true)")==3);
 }
 
+static void test_picker_exact_activation_runtime_has_no_fallback_target(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string traceSource=
+        ReadSourceFile(L"src\\picker_trace.cpp");
+    CHECK(!source.empty() && !traceSource.empty());
+
+    const std::string up=SourceSection(
+        source,"case WM_LBUTTONUP:","case WM_MOUSELEAVE:");
+    const size_t clickCase=up.find("case PickerGestureAction::Click:");
+    const size_t ctrlBranch=up.find("if(resolution.ctrlAtDown)",clickCase);
+    const size_t ctrlActivate=up.find("Activate(",ctrlBranch);
+    const size_t exactActivate=up.find(
+        "ActivateExactPickerRow(resolution.row)",ctrlActivate);
+    CHECK(clickCase!=std::string::npos && ctrlBranch!=std::string::npos &&
+          ctrlActivate!=std::string::npos && exactActivate!=std::string::npos);
+    CHECK(clickCase<ctrlBranch && ctrlBranch<ctrlActivate &&
+          ctrlActivate<exactActivate);
+    const size_t switchOnlyCase=up.find(
+        "case PickerGestureAction::SwitchOnly:");
+    CHECK(switchOnlyCase!=std::string::npos);
+    CHECK(up.find(
+        "ActivateExactPickerRow(resolution.row)",switchOnlyCase)!=
+          std::string::npos);
+
+    const std::string exact=SourceSection(
+        source,"static PickerTraceExactActivationResult "
+               "ActivateExactPickerRow(",
+        "static void GoToDesktop(");
+    CHECK(!exact.empty());
+    CHECK(exact.find("PickerExactActivationFromRow(row)")!=
+          std::string::npos);
+    const size_t liveDestination=exact.find(
+        "GetDesktopByGuid(request.displayedDesktop)");
+    const size_t exactDecision=exact.find(
+        "DecidePickerExactActivation(");
+    CHECK(liveDestination!=std::string::npos);
+    CHECK(exactDecision!=std::string::npos &&
+          liveDestination<exactDecision);
+    CHECK(exact.find("DecidePickerExactActivation(")!=std::string::npos);
+    CHECK(exact.find("CapturePickerWindowIdentity(")!=std::string::npos);
+    CHECK(exact.find("ExecutePickerExactActivationCalls(")!=
+          std::string::npos);
+    CHECK(exact.find("PickerTraceExactActivationEvent")!=
+          std::string::npos);
+    CHECK(exact.find("g_pickerTrace.emit(traceEvent)")!=
+          std::string::npos);
+    CHECK(exact.find("GetWindow(GW_OWNER)")==std::string::npos);
+    CHECK(exact.find("GetLastActivePopup")==std::string::npos);
+    CHECK(exact.find("g_target")==std::string::npos);
+
+    const std::string route=SourceSection(
+        source,"static PickerExactActivationRouteValidation\n"
+               "PickerProductValidateExactActivationRoute(",
+        "static HWND PickerProductGetForegroundWindow(");
+    CHECK(!route.empty());
+    CHECK(route.find("GetWindowDesktopId(")!=std::string::npos);
+    CHECK(route.find("IsWindowOnCurrentVirtualDesktop(")!=
+          std::string::npos);
+    CHECK(route.find("QueryTargetWindowMobility(")!=std::string::npos);
+    CHECK(route.find("request.identity,freshRoute")!=
+          std::string::npos);
+    CHECK(route.find("request.desktopRoute==")==std::string::npos);
+    CHECK(route.find("ValidatePickerExactActivationRoute(")!=
+          std::string::npos);
+    CHECK(route.find("g_pinnedApps!=nullptr")!=std::string::npos);
+
+    const std::string calls=SourceSection(
+        traceSource,"PickerExactActivationCallResult "
+                    "ExecutePickerExactActivationCalls(",
+        "static bool PickerTraceRollbackPhase(");
+    CHECK(!calls.empty());
+    CHECK(calls.find("request.hwnd")!=std::string::npos);
+    CHECK(calls.find("request.identity.hwnd")!=std::string::npos);
+    CHECK(calls.find("GW_OWNER")==std::string::npos);
+    CHECK(calls.find("GetLastActivePopup")==std::string::npos);
+    CHECK(calls.find("fallback")==std::string::npos);
+    const size_t preIdentity=calls.find("recapture()");
+    const size_t hide=calls.find("ops.hidePopup",preIdentity);
+    const size_t switchCall=calls.find("ops.switchDesktop",hide);
+    const size_t readCurrent=calls.find("ops.readCurrentDesktop",switchCall);
+    const size_t postIdentity=calls.find("recapture()",preIdentity+1);
+    const size_t validate=calls.find("ops.validateRoute",postIdentity);
+    const size_t setForeground=calls.find("ops.setForegroundWindow",validate);
+    const size_t verifyForeground=calls.find(
+        "ops.getForegroundWindow",setForeground);
+    CHECK(preIdentity!=std::string::npos && hide!=std::string::npos &&
+          switchCall!=std::string::npos && readCurrent!=std::string::npos &&
+          postIdentity!=std::string::npos && validate!=std::string::npos &&
+          setForeground!=std::string::npos &&
+          verifyForeground!=std::string::npos);
+    CHECK(preIdentity<hide && hide<switchCall &&
+          switchCall<readCurrent && readCurrent<postIdentity &&
+          postIdentity<validate && validate<setForeground &&
+          setForeground<verifyForeground);
+
+    const std::string ordinary=SourceSection(
+        source,"static void GoToDesktop(int idx) noexcept {",
+        "// Клик = переключение");
+    CHECK(ordinary.find("PickerExactActivationRequest")==
+          std::string::npos);
+    CHECK(ordinary.find("SetForegroundWindow")==std::string::npos);
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
@@ -27853,6 +28353,7 @@ int main(){
     test_picker_trace_activation_dispatches_every_guard_once();
     test_picker_trace_activation_sources_have_stable_json_names();
     test_picker_trace_gesture_fields_have_stable_private_names();
+    test_picker_trace_exact_activation_results_are_stable();
     test_picker_trace_move_begin_reasons_have_stable_json_names();
     test_picker_trace_action_fields_have_stable_json_names();
     test_picker_trace_move_begin_exception_distinguishes_publication();
@@ -27878,6 +28379,7 @@ int main(){
     test_picker_trace_task9_runtime_wiring_is_causal_and_private();
     test_picker_trace_task10_runtime_anchors_and_privacy_are_locked();
     test_picker_drag_runtime_wiring_and_conflict_gates_are_explicit();
+    test_picker_exact_activation_runtime_has_no_fallback_target();
     test_picker_evidence_fixes_have_guarded_product_wiring();
     test_picker_pin_probe_is_optional_read_only_and_private();
     test_target_move_guard_is_single_complete_boundary();
@@ -27909,6 +28411,7 @@ int main(){
     test_picker_stale_plain_click_degrades_but_ctrl_cancels();
     test_picker_drag_escape_and_capture_loss_reset_everything();
     test_picker_interaction_busy_and_drop_highlight_are_state_free();
+    test_picker_exact_activation_plan_and_route_are_fail_closed();
     test_footer_hover_event_state_covers_every_reset_path();
     test_footer_mousemove_resets_tooltip_only_once_per_transition();
     test_visible_branding_and_help_retention_are_exact();
@@ -27965,6 +28468,8 @@ int main(){
     test_picker_cache_publication_resets_hover_and_invalidates_failures();
     test_picker_commit_requires_exact_active_identity();
     test_picker_foreground_handoff_covers_popup_and_external_focus();
+    test_picker_exact_activation_call_order_is_exact();
+    test_picker_exact_activation_failures_never_focus_fallback();
     test_picker_mouse_ctrl_uses_button_message_snapshot();
     test_picker_model_publish_invalidates_cache_before_reentry();
     test_picker_volatile_rows_skip_but_structural_failures_abort();

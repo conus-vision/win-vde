@@ -322,6 +322,42 @@ const char* PickerTraceMoveBeginReasonName(
     return "unknown";
 }
 
+const char* PickerTraceExactActivationResultName(
+        PickerTraceExactActivationResult value) noexcept {
+    switch(value){
+    VDE_TRACE_NAME_CASE(PickerTraceExactActivationResult,
+        RejectKeepPopup,"reject_keep_popup");
+    VDE_TRACE_NAME_CASE(PickerTraceExactActivationResult,
+        SwitchOnly,"switch_only");
+    VDE_TRACE_NAME_CASE(PickerTraceExactActivationResult,
+        IdentityLost,"identity_lost");
+    VDE_TRACE_NAME_CASE(PickerTraceExactActivationResult,
+        DesktopMismatch,"desktop_mismatch");
+    VDE_TRACE_NAME_CASE(PickerTraceExactActivationResult,
+        GlobalMembershipLost,"global_membership_lost");
+    VDE_TRACE_NAME_CASE(PickerTraceExactActivationResult,
+        ForegroundRejected,"foreground_rejected");
+    VDE_TRACE_NAME_CASE(PickerTraceExactActivationResult,
+        ExactForeground,"exact_foreground");
+    }
+    return "unknown";
+}
+
+const char* PickerTraceExactActivationDecisionName(
+        PickerExactActivationDecision value) noexcept {
+    switch(value){
+    VDE_TRACE_NAME_CASE(PickerExactActivationDecision,
+        RejectKeepPopup,"reject_keep_popup");
+    VDE_TRACE_NAME_CASE(PickerExactActivationDecision,
+        SwitchOnly,"switch_only");
+    VDE_TRACE_NAME_CASE(PickerExactActivationDecision,
+        ActivateOnCurrent,"activate_on_current");
+    VDE_TRACE_NAME_CASE(PickerExactActivationDecision,
+        SwitchThenActivate,"switch_then_activate");
+    }
+    return "unknown";
+}
+
 const char* PickerTraceActionIntentName(PickerActionIntent value) noexcept {
     switch(value){
     VDE_TRACE_NAME_CASE(PickerActionIntent,TileSwitch,"tile_switch");
@@ -751,6 +787,163 @@ PickerTraceForegroundHandoffResult ExecutePickerForegroundHandoffCalls(
                  result.previousVisibility,0,0,progman,
                  PickerTraceRawResultKind::PreviousVisibility);
     }
+    return result;
+}
+
+PickerExactActivationCallResult ExecutePickerExactActivationCalls(
+        PickerExactActivationDecision decision,
+        const PickerExactActivationRequest& request,
+        const PickerExactActivationCallOps& ops) noexcept {
+    PickerExactActivationCallResult result;
+    if(decision==PickerExactActivationDecision::RejectKeepPopup)
+        return result;
+    if(decision==PickerExactActivationDecision::SwitchOnly){
+        result.outcome=PickerExactActivationCallOutcome::SwitchOnly;
+        return result;
+    }
+    if(request.hwnd==0 || request.identity.hwnd!=request.hwnd ||
+       !SameIdentity(request.identity,request.identity)){
+        result.outcome=PickerExactActivationCallOutcome::IdentityLost;
+        return result;
+    }
+    const auto recapture=[&]() noexcept {
+        try {
+            return ops.recaptureIdentity
+                ?ops.recaptureIdentity(ops.context,request.identity)
+                :WindowIdentityRecapture::Indeterminate;
+        } catch(...) {
+            return WindowIdentityRecapture::Indeterminate;
+        }
+    };
+    if(recapture()!=WindowIdentityRecapture::Match){
+        result.outcome=PickerExactActivationCallOutcome::IdentityLost;
+        return result;
+    }
+    if(!ops.hidePopup) return result;
+    try { ops.hidePopup(ops.context); }
+    catch(...) { return result; }
+
+    if(decision==PickerExactActivationDecision::SwitchThenActivate){
+        try {
+            result.switchResult=ops.switchDesktop
+                ?ops.switchDesktop(
+                    ops.context,request.displayedDesktop,
+                    result.switchInvoked)
+                :E_POINTER;
+        } catch(...) {
+            result.switchInvoked=false;
+            result.switchResult=E_FAIL;
+        }
+        if(!result.switchInvoked || FAILED(result.switchResult)){
+            result.outcome=
+                PickerExactActivationCallOutcome::DesktopMismatch;
+            return result;
+        }
+        try {
+            result.currentRead=ops.readCurrentDesktop &&
+                ops.readCurrentDesktop(
+                    ops.context,result.currentDesktop);
+        } catch(...) {
+            result.currentRead=false;
+            result.currentDesktop=GUID{};
+        }
+        if(!result.currentRead ||
+           !GuidEq(result.currentDesktop,request.displayedDesktop)){
+            result.outcome=
+                PickerExactActivationCallOutcome::DesktopMismatch;
+            return result;
+        }
+    }
+
+    if(recapture()!=WindowIdentityRecapture::Match){
+        result.outcome=PickerExactActivationCallOutcome::IdentityLost;
+        return result;
+    }
+    PickerExactActivationRouteValidation route=
+        PickerExactActivationRouteValidation::DesktopMismatch;
+    try {
+        if(ops.validateRoute)
+            route=ops.validateRoute(ops.context,request);
+    } catch(...) {
+        route=PickerExactActivationRouteValidation::DesktopMismatch;
+    }
+    if(route==PickerExactActivationRouteValidation::DesktopMismatch){
+        result.outcome=PickerExactActivationCallOutcome::DesktopMismatch;
+        return result;
+    }
+    if(route==PickerExactActivationRouteValidation::GlobalMembershipLost){
+        result.outcome=
+            PickerExactActivationCallOutcome::GlobalMembershipLost;
+        return result;
+    }
+
+    HWND foreground=nullptr;
+    try {
+        if(ops.getForegroundWindow)
+            foreground=ops.getForegroundWindow(ops.context);
+    } catch(...) { foreground=nullptr; }
+    DWORD currentThread=0;
+    try {
+        if(ops.getCurrentThreadId)
+            currentThread=ops.getCurrentThreadId(ops.context);
+    } catch(...) { currentThread=0; }
+    const HWND target=reinterpret_cast<HWND>(request.hwnd);
+    DWORD foregroundThread=0,targetThread=0;
+    try {
+        if(foreground && ops.getWindowThreadProcessId)
+            foregroundThread=ops.getWindowThreadProcessId(
+                ops.context,foreground);
+    } catch(...) { foregroundThread=0; }
+    try {
+        if(ops.getWindowThreadProcessId)
+            targetThread=ops.getWindowThreadProcessId(
+                ops.context,target);
+    } catch(...) { targetThread=0; }
+    const auto attach=[&](DWORD thread,BOOL value) noexcept {
+        try {
+            return ops.attachThreadInput
+                ?ops.attachThreadInput(
+                    ops.context,thread,currentThread,value)
+                :FALSE;
+        } catch(...) { return FALSE; }
+    };
+    if(currentThread!=0 && foregroundThread!=0 &&
+       foregroundThread!=currentThread)
+        result.foregroundAttached=
+            attach(foregroundThread,TRUE)!=FALSE;
+    if(currentThread!=0 && targetThread!=0 &&
+       targetThread!=currentThread &&
+       targetThread!=foregroundThread)
+        result.targetAttached=attach(targetThread,TRUE)!=FALSE;
+
+    BOOL iconic=FALSE;
+    try { iconic=ops.isIconic?ops.isIconic(ops.context,target):FALSE; }
+    catch(...) { iconic=FALSE; }
+    if(iconic){
+        result.restored=true;
+        try {
+            if(ops.showWindow)
+                (void)ops.showWindow(ops.context,target,SW_RESTORE);
+        } catch(...) {}
+    }
+    try {
+        result.setForegroundResult=ops.setForegroundWindow
+            ?ops.setForegroundWindow(ops.context,target):FALSE;
+    } catch(...) { result.setForegroundResult=FALSE; }
+    try {
+        if(ops.getForegroundWindow)
+            result.verifiedForeground=
+                ops.getForegroundWindow(ops.context);
+    } catch(...) { result.verifiedForeground=nullptr; }
+
+    if(result.targetAttached)
+        (void)attach(targetThread,FALSE);
+    if(result.foregroundAttached)
+        (void)attach(foregroundThread,FALSE);
+    result.outcome=result.setForegroundResult!=FALSE &&
+        result.verifiedForeground==target
+        ?PickerExactActivationCallOutcome::ExactForeground
+        :PickerExactActivationCallOutcome::ForegroundRejected;
     return result;
 }
 
@@ -1442,6 +1635,24 @@ bool SerializePickerTraceLine(const PickerTraceEnvelope& envelope,
     },output);
 }
 
+bool SerializePickerTraceLine(
+        const PickerTraceEnvelope& envelope,
+        const PickerTraceExactActivationEvent& event,
+        std::string& output) noexcept {
+    return PickerTraceSerialize(envelope,"activation.exact",[&](auto& json){
+        return json.unsignedNumber("activation_id",event.activationId) &&
+            json.string(
+                "decision",PickerTraceExactActivationDecisionName(
+                    event.decision)) &&
+            json.string(
+                "result",PickerTraceExactActivationResultName(
+                    event.result)) &&
+            json.signedNumber("tile_index",event.tileIndex) &&
+            json.guid("destination",event.destination) &&
+            json.boolean("visual_route",event.visualRoute);
+    },output);
+}
+
 bool SerializePickerTraceLine(const PickerTraceEnvelope& envelope,
                               const PickerTraceActivationRequestEvent& event,
                               std::string& output) noexcept {
@@ -1771,6 +1982,7 @@ VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceEnumWindowEvent)
 VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceEnumEndEvent)
 VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceMouseDownEvent)
 VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceGestureEvent)
+VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceExactActivationEvent)
 VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceActivationRequestEvent)
 VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceActivationResultEvent)
 VDE_DEFINE_PICKER_TRACE_EMIT(PickerTraceMoveBeginEvent)
@@ -2889,6 +3101,7 @@ VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceEnumWindowEvent)
 VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceEnumEndEvent)
 VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceMouseDownEvent)
 VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceGestureEvent)
+VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceExactActivationEvent)
 VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceActivationRequestEvent)
 VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceActivationResultEvent)
 VDE_DEFINE_PICKER_TRACE_SESSION_EMIT(PickerTraceMoveBeginEvent)

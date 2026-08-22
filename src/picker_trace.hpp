@@ -68,6 +68,16 @@ enum class PickerTraceActivationResult : uint8_t {
     RoutedPlainSwitch, DispatchedMoveEntry
 };
 
+enum class PickerTraceExactActivationResult : uint8_t {
+    RejectKeepPopup,
+    SwitchOnly,
+    IdentityLost,
+    DesktopMismatch,
+    GlobalMembershipLost,
+    ForegroundRejected,
+    ExactForeground
+};
+
 enum class PickerTraceMoveBeginReason : uint8_t {
     Accepted, AlreadyControlled, InvalidIndex, SelectionIndexMismatch,
     SelectionDesktopMismatch, MainWindowMissing, DesktopManagerMissing,
@@ -335,6 +345,17 @@ struct PickerTraceGestureEvent {
     bool rowLayoutEpochValid=false;
 };
 
+struct PickerTraceExactActivationEvent {
+    uint64_t activationId=0;
+    PickerExactActivationDecision decision=
+        PickerExactActivationDecision::RejectKeepPopup;
+    PickerTraceExactActivationResult result=
+        PickerTraceExactActivationResult::RejectKeepPopup;
+    int tileIndex=-1;
+    GUID destination{};
+    bool visualRoute=false;
+};
+
 struct PickerTraceActivationRequestEvent {
     uint64_t activationId=0;
     PickerTraceActivationSource source=PickerTraceActivationSource::Mouse;
@@ -520,6 +541,43 @@ PickerTraceForegroundHandoffResult ExecutePickerForegroundHandoffCalls(
     DWORD desktopThread,DWORD foregroundThread,DWORD currentThread,
     const PickerTraceForegroundHandoffOps&,
     const PickerTraceApiEventObserver* observer) noexcept;
+
+struct PickerExactActivationCallOps {
+    void* context=nullptr;
+    WindowIdentityRecapture (*recaptureIdentity)(
+        void*,const WindowIdentityKey&)=nullptr;
+    void (*hidePopup)(void*)=nullptr;
+    HRESULT (*switchDesktop)(void*,const GUID&,bool&)=nullptr;
+    bool (*readCurrentDesktop)(void*,GUID&)=nullptr;
+    PickerExactActivationRouteValidation (*validateRoute)(
+        void*,const PickerExactActivationRequest&)=nullptr;
+    HWND (*getForegroundWindow)(void*)=nullptr;
+    DWORD (*getWindowThreadProcessId)(void*,HWND)=nullptr;
+    DWORD (*getCurrentThreadId)(void*)=nullptr;
+    BOOL (*attachThreadInput)(void*,DWORD,DWORD,BOOL)=nullptr;
+    BOOL (*isIconic)(void*,HWND)=nullptr;
+    BOOL (*showWindow)(void*,HWND,int)=nullptr;
+    BOOL (*setForegroundWindow)(void*,HWND)=nullptr;
+};
+
+struct PickerExactActivationCallResult {
+    PickerExactActivationCallOutcome outcome=
+        PickerExactActivationCallOutcome::RejectKeepPopup;
+    bool switchInvoked=false;
+    HRESULT switchResult=E_FAIL;
+    bool currentRead=false;
+    GUID currentDesktop={0};
+    bool foregroundAttached=false;
+    bool targetAttached=false;
+    bool restored=false;
+    BOOL setForegroundResult=FALSE;
+    HWND verifiedForeground=nullptr;
+};
+
+PickerExactActivationCallResult ExecutePickerExactActivationCalls(
+    PickerExactActivationDecision,
+    const PickerExactActivationRequest&,
+    const PickerExactActivationCallOps&) noexcept;
 
 struct PickerTraceScheduleResult {
     bool deferred=false;
@@ -818,6 +876,10 @@ const char* PickerTraceActivationSourceName(
     PickerTraceActivationSource) noexcept;
 const char* PickerTraceActivationResultName(
     PickerTraceActivationResult) noexcept;
+const char* PickerTraceExactActivationResultName(
+    PickerTraceExactActivationResult) noexcept;
+const char* PickerTraceExactActivationDecisionName(
+    PickerExactActivationDecision) noexcept;
 const char* PickerTraceMoveBeginReasonName(PickerTraceMoveBeginReason) noexcept;
 const char* PickerTraceActionIntentName(PickerActionIntent) noexcept;
 const char* PickerTraceTransitionModeName(PickerTransitionMode) noexcept;
@@ -863,6 +925,7 @@ VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceEnumWindowEvent);
 VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceEnumEndEvent);
 VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceMouseDownEvent);
 VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceGestureEvent);
+VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceExactActivationEvent);
 VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceActivationRequestEvent);
 VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceActivationResultEvent);
 VDE_DECLARE_PICKER_TRACE_SERIALIZER(PickerTraceMoveBeginEvent);
@@ -905,6 +968,7 @@ public:
     void emit(const PickerTraceEnumEndEvent&) noexcept;
     void emit(const PickerTraceMouseDownEvent&) noexcept;
     void emit(const PickerTraceGestureEvent&) noexcept;
+    void emit(const PickerTraceExactActivationEvent&) noexcept;
     void emit(const PickerTraceActivationRequestEvent&) noexcept;
     void emit(const PickerTraceActivationResultEvent&) noexcept;
     void emit(const PickerTraceMoveBeginEvent&) noexcept;
@@ -1063,6 +1127,7 @@ public:
     void emit(const PickerTraceEnumEndEvent&) noexcept;
     void emit(const PickerTraceMouseDownEvent&) noexcept;
     void emit(const PickerTraceGestureEvent&) noexcept;
+    void emit(const PickerTraceExactActivationEvent&) noexcept;
     void emit(const PickerTraceActivationRequestEvent&) noexcept;
     void emit(const PickerTraceActivationResultEvent&) noexcept;
     void emit(const PickerTraceMoveBeginEvent&) noexcept;

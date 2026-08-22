@@ -347,6 +347,112 @@ struct PickerActionRequest {
     uint64_t activationId=0;
 };
 
+struct PickerExactActivationRequest {
+    uintptr_t hwnd=0;
+    WindowIdentityKey identity;
+    PickerRowAdmission admission=PickerRowAdmission::DisplayOnly;
+    GUID displayedDesktop={0};
+    GUID observedDesktop={0};
+    GUID baseDesktop={0};
+    TargetDesktopRoute desktopRoute=
+        TargetDesktopRoute::Indeterminate;
+    TargetMobility mobility=TargetMobility::Indeterminate;
+    bool visuallyAssigned=false;
+    uint64_t modelGeneration=0;
+    uint64_t rowLayoutEpoch=0;
+};
+
+enum class PickerExactActivationDecision {
+    RejectKeepPopup,
+    SwitchOnly,
+    ActivateOnCurrent,
+    SwitchThenActivate
+};
+
+inline PickerExactActivationDecision DecidePickerExactActivation(
+        bool destinationExists,bool presentationCurrent,
+        bool identityUpgraded,bool destinationIsCurrent) noexcept {
+    if(!destinationExists)
+        return PickerExactActivationDecision::RejectKeepPopup;
+    if(!presentationCurrent || !identityUpgraded)
+        return PickerExactActivationDecision::SwitchOnly;
+    return destinationIsCurrent
+        ? PickerExactActivationDecision::ActivateOnCurrent
+        : PickerExactActivationDecision::SwitchThenActivate;
+}
+
+inline PickerExactActivationRequest PickerExactActivationFromRow(
+        const PickerRowActionSnapshot& row) noexcept {
+    PickerExactActivationRequest request;
+    request.hwnd=row.hwnd;
+    request.identity=row.identity;
+    request.admission=row.admission;
+    request.displayedDesktop=row.displayedDesktop;
+    request.observedDesktop=row.observedDesktop;
+    request.baseDesktop=row.baseDesktop;
+    request.desktopRoute=row.desktopRoute;
+    request.mobility=row.mobility;
+    request.visuallyAssigned=row.visuallyAssigned;
+    request.modelGeneration=row.modelGeneration;
+    request.rowLayoutEpoch=row.rowLayoutEpoch;
+    return request;
+}
+
+inline bool PickerExactActivationUsesVisualRoute(
+        const PickerExactActivationRequest& request) noexcept {
+    return request.visuallyAssigned ||
+           request.desktopRoute==TargetDesktopRoute::GloballyVisible ||
+           request.mobility==TargetMobility::ViewPinned ||
+           request.mobility==TargetMobility::AppPinned;
+}
+
+inline bool PickerExactActivationHasCachedPositivePin(
+        const PickerExactActivationRequest& request) noexcept {
+    return request.mobility==TargetMobility::ViewPinned ||
+           request.mobility==TargetMobility::AppPinned;
+}
+
+enum class PickerExactActivationRouteValidation {
+    Exact,
+    VisualOnly,
+    DesktopMismatch,
+    GlobalMembershipLost
+};
+
+inline PickerExactActivationRouteValidation
+ValidatePickerExactActivationRoute(
+        const PickerExactActivationRequest& request,
+        bool rawDesktopRead,const GUID& rawDesktop,
+        bool rawDesktopExists,bool membershipRead,
+        bool onCurrentDesktop,
+        TargetMoveDisposition freshDisposition,
+        bool pinServiceAvailable) noexcept {
+    if(!PickerExactActivationUsesVisualRoute(request)){
+        return rawDesktopRead && rawDesktopExists &&
+               !GuidIsZero(request.displayedDesktop) &&
+               GuidEq(rawDesktop,request.displayedDesktop)
+            ? PickerExactActivationRouteValidation::Exact
+            : PickerExactActivationRouteValidation::DesktopMismatch;
+    }
+    if(!membershipRead || !onCurrentDesktop)
+        return PickerExactActivationRouteValidation::GlobalMembershipLost;
+    if(freshDisposition==TargetMoveDisposition::VisualOnly ||
+       (!pinServiceAvailable &&
+        PickerExactActivationHasCachedPositivePin(request)))
+        return PickerExactActivationRouteValidation::VisualOnly;
+    return PickerExactActivationRouteValidation::GlobalMembershipLost;
+}
+
+enum class PickerExactActivationCallOutcome {
+    RejectKeepPopup,
+    SwitchOnly,
+    IdentityLost,
+    DesktopMismatch,
+    GlobalMembershipLost,
+    ForegroundRejected,
+    ExactForeground
+};
+
 enum class PickerActionDispatchResult {
     Rejected,
     SwitchedOnly,

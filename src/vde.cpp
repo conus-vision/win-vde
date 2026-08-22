@@ -9947,6 +9947,257 @@ static void ApplyAutoFix(){
     if(g_moveQueue.empty()) KillTimer(g_main,TIMER_MOVE_VERIFY);
 }
 
+struct PickerExactActivationProductContext {
+    uint64_t activationId=0;
+};
+
+static WindowIdentityRecapture PickerProductRecaptureExactIdentity(
+        void*,const WindowIdentityKey& identity) noexcept {
+    return RecaptureGenericWindowIdentity(identity);
+}
+
+static void PickerProductHideExactPopup(void*) noexcept {
+    HidePicker();
+}
+
+static HRESULT PickerProductSwitchExactDesktop(
+        void*,const GUID& destination,bool& invoked) noexcept {
+    return SwitchDesktopWithForegroundHandoff(destination,invoked);
+}
+
+static bool PickerProductReadExactCurrentDesktop(
+        void*,GUID& current) noexcept {
+    PickerTraceCurrentDesktopFacts facts;
+    current=CurrentDesktopGuid(&facts);
+    EmitPickerTraceCurrentDesktopFacts(0,0,facts);
+    return facts.validity==PickerReadValidity::Valid &&
+           !GuidIsZero(current);
+}
+
+static PickerExactActivationRouteValidation
+PickerProductValidateExactActivationRoute(
+        void*,const PickerExactActivationRequest& request) noexcept {
+    const HWND target=reinterpret_cast<HWND>(request.hwnd);
+    GUID rawDesktop{};
+    HRESULT rawResult=E_NOINTERFACE;
+    if(target && g_vdmDoc){
+        try {
+            rawResult=g_vdmDoc->GetWindowDesktopId(
+                target,&rawDesktop);
+        } catch(...) { rawResult=E_FAIL; }
+    }
+    EmitPickerTraceHResult(
+        PickerTraceApiKind::GetWindowDesktopIdTarget,
+        0,0,rawResult,target!=nullptr,target,GUID{},rawDesktop);
+
+    BOOL onCurrentDesktop=FALSE;
+    HRESULT membershipResult=E_NOINTERFACE;
+    if(target && g_vdmDoc){
+        try {
+            membershipResult=
+                g_vdmDoc->IsWindowOnCurrentVirtualDesktop(
+                    target,&onCurrentDesktop);
+        } catch(...) { membershipResult=E_FAIL; }
+    }
+
+    std::vector<DeskRec> desktops;
+    std::string desktopError;
+    bool desktopSnapshotReady=false;
+    try {
+        desktopSnapshotReady=CurrentDesktops(
+            desktops,&desktopError);
+    } catch(...) { desktopSnapshotReady=false; }
+    const bool rawDesktopExists=desktopSnapshotReady &&
+        ConcreteDesktopExists(rawDesktop,desktops,DeskGuid);
+    const TargetDesktopRoute freshRoute=DecideTargetDesktopRoute(
+        rawResult,!GuidIsZero(rawDesktop),rawDesktopExists,
+        membershipResult,onCurrentDesktop!=FALSE);
+
+    TargetMobilityDecision mobilityDecision;
+    bool pinServiceAvailableForPolicy=true;
+    if(PickerExactActivationUsesVisualRoute(request)){
+        IApplicationView* rawView=nullptr;
+        HRESULT viewResult=E_NOINTERFACE;
+        if(g_avc){
+            try {
+                viewResult=g_avc->GetViewForHwnd(
+                    target,&rawView);
+            } catch(...) { viewResult=E_FAIL; }
+        }
+        EmitPickerTraceHResult(
+            PickerTraceApiKind::GetViewForHwnd,
+            0,0,viewResult,g_avc!=nullptr,target);
+        ScopedComPtr<IApplicationView> view(rawView);
+        TargetMobilityProbeFacts mobilityFacts;
+        mobilityDecision=QueryTargetWindowMobility(
+            request.identity,freshRoute,
+            SUCCEEDED(viewResult)?view.get():nullptr,
+            mobilityFacts);
+        pinServiceAvailableForPolicy=
+            g_pinnedApps!=nullptr || !view;
+    }
+    return ValidatePickerExactActivationRoute(
+        request,SUCCEEDED(rawResult),rawDesktop,
+        rawDesktopExists,SUCCEEDED(membershipResult),
+        onCurrentDesktop!=FALSE,mobilityDecision.disposition,
+        pinServiceAvailableForPolicy);
+}
+
+static HWND PickerProductGetForegroundWindow(void*) noexcept {
+    return GetForegroundWindow();
+}
+
+static DWORD PickerProductGetWindowThread(
+        void*,HWND window) noexcept {
+    DWORD ignored=0;
+    return window
+        ?GetWindowThreadProcessId(window,&ignored):0;
+}
+
+static DWORD PickerProductGetCurrentThread(void*) noexcept {
+    return GetCurrentThreadId();
+}
+
+static BOOL PickerProductAttachExactInput(
+        void*,DWORD source,DWORD destination,BOOL attach) noexcept {
+    return AttachThreadInput(source,destination,attach);
+}
+
+static BOOL PickerProductIsExactTargetIconic(
+        void*,HWND target) noexcept {
+    return IsIconic(target);
+}
+
+static BOOL PickerProductRestoreExactTarget(
+        void*,HWND target,int command) noexcept {
+    return ShowWindow(target,command);
+}
+
+static BOOL PickerProductSetExactForeground(
+        void*,HWND target) noexcept {
+    return SetForegroundWindow(target);
+}
+
+static PickerTraceExactActivationResult MapPickerExactActivationResult(
+        PickerExactActivationCallOutcome outcome) noexcept {
+    switch(outcome){
+    case PickerExactActivationCallOutcome::RejectKeepPopup:
+        return PickerTraceExactActivationResult::RejectKeepPopup;
+    case PickerExactActivationCallOutcome::SwitchOnly:
+        return PickerTraceExactActivationResult::SwitchOnly;
+    case PickerExactActivationCallOutcome::IdentityLost:
+        return PickerTraceExactActivationResult::IdentityLost;
+    case PickerExactActivationCallOutcome::DesktopMismatch:
+        return PickerTraceExactActivationResult::DesktopMismatch;
+    case PickerExactActivationCallOutcome::GlobalMembershipLost:
+        return PickerTraceExactActivationResult::GlobalMembershipLost;
+    case PickerExactActivationCallOutcome::ForegroundRejected:
+        return PickerTraceExactActivationResult::ForegroundRejected;
+    case PickerExactActivationCallOutcome::ExactForeground:
+        return PickerTraceExactActivationResult::ExactForeground;
+    }
+    return PickerTraceExactActivationResult::RejectKeepPopup;
+}
+
+static int FindPickerTileByGuid(const GUID& guid) noexcept {
+    if(GuidIsZero(guid)) return -1;
+    for(size_t index=0;index<g_tiles.size();++index)
+        if(GuidEq(g_tiles[index].guid,guid))
+            return static_cast<int>(index);
+    return -1;
+}
+
+static void GoToDesktop(int idx) noexcept;
+
+static PickerTraceExactActivationResult ActivateExactPickerRow(
+        const PickerRowActionSnapshot& row) noexcept {
+    PickerExactActivationRequest request=
+        PickerExactActivationFromRow(row);
+    PickerTraceExactActivationEvent traceEvent;
+    traceEvent.activationId=g_pickerTrace.nextCorrelationId();
+    traceEvent.destination=request.displayedDesktop;
+    traceEvent.visualRoute=
+        PickerExactActivationUsesVisualRoute(request);
+    const int destinationIndex=
+        FindPickerTileByGuid(request.displayedDesktop);
+    traceEvent.tileIndex=destinationIndex;
+    bool destinationExists=false;
+    if(destinationIndex>=0){
+        try {
+            const ScopedComPtr<IVirtualDesktop> destination=
+                GetDesktopByGuid(request.displayedDesktop);
+            destinationExists=static_cast<bool>(destination);
+        } catch(...) { destinationExists=false; }
+    }
+    const bool presentationCurrent=PickerRowPresentationCurrent(
+        row,g_picker.modelGeneration,g_picker.rowLayoutEpoch);
+
+    bool identityUpgraded=false;
+    if(presentationCurrent &&
+       request.admission==PickerRowAdmission::Verified){
+        identityUpgraded=request.hwnd==request.identity.hwnd &&
+            SameIdentity(request.identity,request.identity) &&
+            RecaptureGenericWindowIdentity(request.identity)==
+                WindowIdentityRecapture::Match;
+    } else if(presentationCurrent && request.hwnd!=0){
+        const WindowIdentityKey upgraded=CapturePickerWindowIdentity(
+            reinterpret_cast<HWND>(request.hwnd));
+        if(SameIdentity(upgraded,upgraded) &&
+           upgraded.hwnd==request.hwnd){
+            request.identity=upgraded;
+            request.admission=PickerRowAdmission::Verified;
+            identityUpgraded=true;
+        }
+    }
+    const bool destinationIsCurrent=
+        !GuidIsZero(g_picker.currentDesktop) &&
+        GuidEq(g_picker.currentDesktop,request.displayedDesktop);
+    const PickerExactActivationDecision decision=
+        DecidePickerExactActivation(
+            destinationExists,presentationCurrent,
+            identityUpgraded,destinationIsCurrent);
+    traceEvent.decision=decision;
+    const auto finish=[&](PickerTraceExactActivationResult result) noexcept {
+        traceEvent.result=result;
+        g_pickerTrace.emit(traceEvent);
+        g_pickerTrace.flushBoundary();
+        return result;
+    };
+    if(decision==PickerExactActivationDecision::RejectKeepPopup)
+        return finish(
+            PickerTraceExactActivationResult::RejectKeepPopup);
+    if(decision==PickerExactActivationDecision::SwitchOnly){
+        const PickerTraceExactActivationResult result=
+            presentationCurrent &&
+            row.admission==PickerRowAdmission::Verified &&
+            !identityUpgraded
+            ?PickerTraceExactActivationResult::IdentityLost
+            :PickerTraceExactActivationResult::SwitchOnly;
+        GoToDesktop(destinationIndex);
+        return finish(result);
+    }
+
+    PickerExactActivationProductContext context;
+    context.activationId=traceEvent.activationId;
+    PickerExactActivationCallOps ops;
+    ops.context=&context;
+    ops.recaptureIdentity=PickerProductRecaptureExactIdentity;
+    ops.hidePopup=PickerProductHideExactPopup;
+    ops.switchDesktop=PickerProductSwitchExactDesktop;
+    ops.readCurrentDesktop=PickerProductReadExactCurrentDesktop;
+    ops.validateRoute=PickerProductValidateExactActivationRoute;
+    ops.getForegroundWindow=PickerProductGetForegroundWindow;
+    ops.getWindowThreadProcessId=PickerProductGetWindowThread;
+    ops.getCurrentThreadId=PickerProductGetCurrentThread;
+    ops.attachThreadInput=PickerProductAttachExactInput;
+    ops.isIconic=PickerProductIsExactTargetIconic;
+    ops.showWindow=PickerProductRestoreExactTarget;
+    ops.setForegroundWindow=PickerProductSetExactForeground;
+    const PickerExactActivationCallResult result=
+        ExecutePickerExactActivationCalls(decision,request,ops);
+    return finish(MapPickerExactActivationResult(result.outcome));
+}
+
 // Переключиться на десктоп. SwitchDesktop = слот 6 vtable (совпадает на 23H2/24H2).
 // Фокус-данс через Progman, как в референсе MScholtes: без него система может
 // «вернуть» исходный десктоп из-за активного окна -> переключение уходило не туда.
@@ -10571,12 +10822,14 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             resolution.action,false,resolution.dropTileIndex);
         switch(resolution.action){
         case PickerGestureAction::Click:
-            Activate(resolution.row.tileIndex,resolution.ctrlAtDown,
-                     PickerTraceActivationSource::Mouse);
+            if(resolution.ctrlAtDown)
+                Activate(resolution.row.tileIndex,true,
+                         PickerTraceActivationSource::Mouse);
+            else
+                (void)ActivateExactPickerRow(resolution.row);
             break;
         case PickerGestureAction::SwitchOnly:
-            Activate(resolution.row.tileIndex,false,
-                     PickerTraceActivationSource::Mouse);
+            (void)ActivateExactPickerRow(resolution.row);
             break;
         case PickerGestureAction::Drop:
             if(resolution.dropTileIndex>=0 &&
