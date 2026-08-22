@@ -104,6 +104,8 @@ restart, and moves each matched window to the desktop it was saved on.
   current desktop unchanged and the picker open. Verified Firefox, Chrome, and
   Edge moves update their supported saved assignment; moves for other
   applications affect the current live window but create no restore record.
+  During the drag, a translucent copy with the application icon and window title follows the pointer.
+  Drop it on another desktop to move or visually assign that window without switching desktops or closing the picker.
 - A globally visible, view-pinned, or application-pinned window is never sent
   through a physical move. The picker instead shows only the selected row under
   the destination tile until the popup session ends, then reconstructs the next

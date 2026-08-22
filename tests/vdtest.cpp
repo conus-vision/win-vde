@@ -15557,10 +15557,19 @@ static void test_message_pump_failure_uses_shared_teardown(){
 
 static void test_visible_branding_and_help_retention_are_exact(){
     const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string readme=ReadSourceFile(L"README.md");
     const std::string retention=
         "A closed Firefox, Chrome, or Edge window keeps its remembered virtual desktop for 30 days. If it reappears before expiry, VDE restores it before updating the saved layout.";
-    CHECK(!source.empty());
+    const std::string dragPreview=
+        "During the drag, a translucent copy with the application icon and window title follows the pointer.";
+    const std::string dragDrop=
+        "Drop it on another desktop to move or visually assign that window without switching desktops or closing the picker.";
+    CHECK(!source.empty() && !readme.empty());
     CHECK(source.find(retention)!=std::string::npos);
+    CHECK(source.find(dragPreview)!=std::string::npos);
+    CHECK(source.find(dragDrop)!=std::string::npos);
+    CHECK(readme.find(dragPreview)!=std::string::npos);
+    CHECK(readme.find(dragDrop)!=std::string::npos);
     CHECK(source.find("a few runs")==std::string::npos);
     CHECK(source.find("Virtual Desktop Extension")!=std::string::npos);
     CHECK(source.find("Virtual Desktops Extension")==std::string::npos);

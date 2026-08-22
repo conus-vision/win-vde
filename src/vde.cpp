@@ -10710,7 +10710,7 @@ static const wchar_t* HELP_TEXT =
 L"What this solves\r\n"
 L"Windows 11 does not remember which virtual desktop your app windows were on after a reboot, and browsers change their window handles when they restore a session - so nothing external can recognize the windows. win-vde fingerprints each browser window by the domains of its tabs, matches old windows to new ones after a restart, and moves each one back to the desktop it was saved on.\r\n\r\n"
 L"Picker  (hotkey Ctrl+Alt+D)\r\n"
-L"A grid of your virtual desktops. Click a desktop to switch to it; Ctrl+click to move the active window there. Type in the box to filter windows by name, scroll a tile with the mouse wheel, and hover a clipped name to see it in full.\r\n\r\n"
+L"A grid of your virtual desktops and their eligible application windows. Click a window row to switch to its displayed desktop and activate that exact window. Click a desktop title or empty tile area to switch without activating a listed window. Ctrl+click a desktop tile to move the captured active window there, follow it, and keep the picker open. During the drag, a translucent copy with the application icon and window title follows the pointer. Drop it on another desktop to move or visually assign that window without switching desktops or closing the picker. Globally visible and pinned windows are only visually assigned for the current popup session; their real Windows state is not changed. Type in the box to filter windows by name, scroll a tile with the mouse wheel, and hover a clipped name to see it in full.\r\n\r\n"
 L"Menu\r\n"
 L"- Save windows layout: save the current windows to a manual checkpoint file.\r\n"
 L"- Restore saved windows layout: put windows back from that manual checkpoint.\r\n"
