@@ -95,3 +95,42 @@ inline TargetMobilityDecision DecideTargetMobility(
     }
     return result;
 }
+
+template<class Desktops,class GuidOf>
+inline bool ConcreteDesktopExists(
+        const GUID& observed,const Desktops& desktops,
+        GuidOf&& guidOf) noexcept {
+    if(GuidIsZero(observed)) return false;
+    try {
+        for(const auto& desktop : desktops){
+            const GUID& candidate=guidOf(desktop);
+            if(!GuidIsZero(candidate) &&
+               GuidEq(candidate,observed))
+                return true;
+        }
+    } catch(...) {
+        return false;
+    }
+    return false;
+}
+
+template<class Issue>
+inline HRESULT ExecutePhysicalTargetMoveDecision(
+        WindowIdentityRecapture identity,TargetDesktopRoute route,
+        const TargetMobilityDecision& mobility,
+        bool sourceExists,bool destinationExists,bool sameSource,
+        bool& invoked,Issue&& issue) noexcept {
+    invoked=false;
+    if(identity!=WindowIdentityRecapture::Match ||
+       route!=TargetDesktopRoute::Exact ||
+       mobility.mobility!=TargetMobility::Movable ||
+       mobility.disposition!=TargetMoveDisposition::Physical ||
+       !sourceExists || !destinationExists || sameSource)
+        return E_ACCESSDENIED;
+    try {
+        invoked=true;
+        return issue();
+    } catch(...) {
+        return E_FAIL;
+    }
+}

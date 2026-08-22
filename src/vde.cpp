@@ -1143,6 +1143,10 @@ static bool LoadAutoLayout(){
     return true;
 }
 
+static const GUID& DeskGuid(const DeskRec& desktop) noexcept {
+    return desktop.guid;
+}
+
 static std::map<std::string,uint64_t> CurrentCausalGenerations(){
     std::map<std::string,uint64_t> generations;
     for(const auto& entry : g_recordByRuntime){
@@ -1969,11 +1973,12 @@ static bool SaveObservedApp(const std::string& app,
             BoundSaveObservation observed;
             observed.window=fast;
             observed.causalGeneration=snapshot.generation;
-            for(const DeskRec& desktop : desktops)
-                if(GuidEq(desktop.guid,fast.desktop)){
-                    observed.deskIndex=desktop.index;
-                    break;
-                }
+            if(ConcreteDesktopExists(fast.desktop,desktops,DeskGuid))
+                for(const DeskRec& desktop : desktops)
+                    if(GuidEq(desktop.guid,fast.desktop)){
+                        observed.deskIndex=desktop.index;
+                        break;
+                    }
             const std::string runtime=RuntimeKey(fast);
             auto binding=g_recordByRuntime.find(runtime);
             auto reservation=g_reservedAutoIdentities.find(runtime);
@@ -2471,33 +2476,194 @@ static void ObserveFastSnapshots(
     }
 }
 
-static HRESULT IssueWindowMove(const MoveRuntimeBinding& binding,
-                               WindowIdentityRecapture& identity){
-    identity=WindowIdentityRecapture::Match;
-    const HWND hwnd=binding.window.hwnd;
-    const GUID& destinationGuid=binding.destination;
-    if(GuidIsZero(destinationGuid) || !g_vdmi || !g_avc) return E_INVALIDARG;
-    ScopedComPtr<IVirtualDesktop> destination=GetDesktopByGuid(destinationGuid);
-    if(!destination) return E_INVALIDARG;
-    identity=RecaptureGenericWindowIdentity(IdentityOf(binding.window));
-    if(identity!=WindowIdentityRecapture::Match)
-        return identity==WindowIdentityRecapture::Lost ? E_ABORT : E_PENDING;
-    HRESULT issued=E_FAIL;
+struct TargetMoveIssueResult {
+    HRESULT result=E_FAIL;
+    bool invoked=false;
+    WindowIdentityRecapture identity=
+        WindowIdentityRecapture::Indeterminate;
+    TargetDesktopRoute desktopRoute=
+        TargetDesktopRoute::Indeterminate;
+    TargetMobilityDecision mobility;
+};
+
+static void EmitPickerTraceHResult(
+    PickerTraceApiKind api,uint64_t generation,uint64_t effectSerial,
+    HRESULT result,bool invoked,HWND hwnd=nullptr,
+    const GUID& requested=GUID{},const GUID& actual=GUID{}) noexcept;
+
+static TargetMoveIssueResult IssueGuardedTargetMove(
+        const WindowIdentityKey& expected,
+        TargetDesktopRoute observedRoute,
+        const GUID& destinationGuid,
+        PickerTraceDesktopLookupUse lookupUse,
+        uint64_t generation,uint64_t effectSerial) noexcept {
+    TargetMoveIssueResult issued;
+    issued.desktopRoute=observedRoute;
+    const HWND hwnd=reinterpret_cast<HWND>(expected.hwnd);
+    if(!hwnd || GuidIsZero(destinationGuid) || !g_vdmDoc ||
+       !g_avc || !g_vdmi){
+        issued.result=E_INVALIDARG;
+        return issued;
+    }
+
+    std::vector<DeskRec> desktops;
+    std::string desktopError;
+    if(!CurrentDesktops(desktops,&desktopError)){
+        issued.result=E_FAIL;
+        return issued;
+    }
+    const bool destinationExists=ConcreteDesktopExists(
+        destinationGuid,desktops,DeskGuid);
+    if(!destinationExists){
+        issued.result=E_INVALIDARG;
+        return issued;
+    }
+
+    issued.identity=RecaptureGenericWindowIdentity(expected);
+    if(issued.identity!=WindowIdentityRecapture::Match){
+        issued.result=issued.identity==WindowIdentityRecapture::Lost
+            ? E_ABORT : E_PENDING;
+        return issued;
+    }
+
+    GUID sourceDesktop{};
+    HRESULT sourceResult=E_FAIL;
     try {
-        issued=[&]()->HRESULT{
-            if(binding.window.pid==GetCurrentProcessId()){
-                if(!g_vdmDoc) return E_NOINTERFACE;
-                return g_vdmDoc->MoveWindowToDesktop(hwnd,destinationGuid);
-            }
-            IApplicationView* rawView=nullptr;
-            HRESULT result=g_avc->GetViewForHwnd(hwnd,&rawView);
-            ScopedComPtr<IApplicationView> view(rawView);
-            if(FAILED(result)) return result;
-            if(!view) return E_FAIL;
-            return g_vdmi->MoveViewToDesktop(view.get(),destination.get());
-        }();
-    } catch(...) { issued=E_FAIL; }
+        sourceResult=g_vdmDoc->GetWindowDesktopId(
+            hwnd,&sourceDesktop);
+    } catch(...) {
+        sourceResult=E_FAIL;
+    }
+    EmitPickerTraceHResult(
+        PickerTraceApiKind::GetWindowDesktopIdTarget,
+        generation,effectSerial,sourceResult,true,hwnd,
+        GUID{},sourceDesktop);
+    BOOL onCurrentDesktop=FALSE;
+    HRESULT membershipResult=E_FAIL;
+    try {
+        membershipResult=
+            g_vdmDoc->IsWindowOnCurrentVirtualDesktop(
+                hwnd,&onCurrentDesktop);
+    } catch(...) {
+        membershipResult=E_FAIL;
+    }
+    const bool sourceExists=ConcreteDesktopExists(
+        sourceDesktop,desktops,DeskGuid);
+    const TargetDesktopRoute freshRoute=DecideTargetDesktopRoute(
+        sourceResult,!GuidIsZero(sourceDesktop),sourceExists,
+        membershipResult,onCurrentDesktop!=FALSE);
+    issued.desktopRoute=
+        observedRoute==TargetDesktopRoute::GloballyVisible
+            ? TargetDesktopRoute::GloballyVisible : freshRoute;
+    const bool sameSource=sourceExists &&
+        GuidEq(sourceDesktop,destinationGuid);
+    if(!sourceExists || sameSource){
+        issued.result=E_ACCESSDENIED;
+        return issued;
+    }
+
+    IApplicationView* rawView=nullptr;
+    HRESULT viewResult=E_FAIL;
+    try {
+        viewResult=g_avc->GetViewForHwnd(hwnd,&rawView);
+    } catch(...) {
+        viewResult=E_FAIL;
+    }
+    EmitPickerTraceHResult(
+        PickerTraceApiKind::GetViewForHwnd,
+        generation,effectSerial,viewResult,true,hwnd);
+    ScopedComPtr<IApplicationView> view(rawView);
+    if(FAILED(viewResult) || !view){
+        issued.result=FAILED(viewResult) ? viewResult : E_FAIL;
+        return issued;
+    }
+
+    TargetMobilityProbeFacts probeFacts;
+    issued.mobility=QueryTargetWindowMobility(
+        expected,issued.desktopRoute,view.get(),probeFacts);
+    issued.identity=probeFacts.identity;
+    if(issued.identity!=WindowIdentityRecapture::Match){
+        issued.result=issued.identity==WindowIdentityRecapture::Lost
+            ? E_ABORT : E_PENDING;
+        return issued;
+    }
+
+    PickerTraceDesktopLookupContext lookupContext;
+    lookupContext.trace=&g_pickerTrace;
+    lookupContext.use=lookupUse;
+    lookupContext.generation=generation;
+    lookupContext.effectSerial=effectSerial;
+    lookupContext.requested=destinationGuid;
+    ScopedComPtr<IVirtualDesktop> destination=
+        GetDesktopByGuid(destinationGuid,&lookupContext);
+    if(!destination){
+        issued.result=E_INVALIDARG;
+        return issued;
+    }
+
+    issued.identity=RecaptureGenericWindowIdentity(expected);
+    const PickerTraceApiKind selectedApi=
+        expected.pid==GetCurrentProcessId()
+            ? PickerTraceApiKind::MoveWindowToDesktop
+            : PickerTraceApiKind::MoveViewToDesktop;
+    issued.result=ExecutePhysicalTargetMoveDecision(
+        issued.identity,issued.desktopRoute,issued.mobility,
+        sourceExists,destinationExists,sameSource,issued.invoked,
+        [&]()->HRESULT {
+            if(expected.pid==GetCurrentProcessId())
+                return g_vdmDoc->MoveWindowToDesktop(
+                    hwnd,destinationGuid);
+            return g_vdmi->MoveViewToDesktop(
+                view.get(),destination.get());
+        });
+    EmitPickerTraceHResult(
+        selectedApi,generation,effectSerial,issued.result,
+        issued.invoked,hwnd,destinationGuid);
     return issued;
+}
+
+static HRESULT IssuePickerPopupMove(
+        HWND popup,const GUID& destinationGuid,bool& invoked,
+        PickerTraceDesktopLookupUse lookupUse,
+        uint64_t generation,uint64_t effectSerial) noexcept {
+    invoked=false;
+    if(!popup || popup!=g_main || GuidIsZero(destinationGuid) ||
+       !g_vdmDoc)
+        return E_INVALIDARG;
+    PickerTraceDesktopLookupContext lookup;
+    lookup.trace=&g_pickerTrace;
+    lookup.use=lookupUse;
+    lookup.generation=generation;
+    lookup.effectSerial=effectSerial;
+    lookup.requested=destinationGuid;
+    if(GetDesktopIndexByGuid(destinationGuid,&lookup)<0)
+        return E_INVALIDARG;
+    HRESULT result=E_FAIL;
+    try {
+        invoked=true;
+        result=g_vdmDoc->MoveWindowToDesktop(
+            popup,destinationGuid);
+    } catch(...) {
+        result=E_FAIL;
+    }
+    EmitPickerTraceHResult(
+        PickerTraceApiKind::MoveWindowToDesktop,
+        generation,effectSerial,result,invoked,popup,
+        destinationGuid);
+    return result;
+}
+
+static HRESULT IssueWindowMove(
+        const MoveRuntimeBinding& binding,
+        WindowIdentityRecapture& identity){
+    TargetMoveIssueResult issued=IssueGuardedTargetMove(
+        IdentityOf(binding.window),
+        TargetDesktopRoute::Indeterminate,
+        binding.destination,
+        PickerTraceDesktopLookupUse::MoveEntryDestination,
+        0,0);
+    identity=issued.identity;
+    return issued.result;
 }
 
 static bool RetryableMoveHresult(HRESULT result){
@@ -3816,6 +3982,7 @@ static void HandleReconcileResult(std::unique_ptr<ReconcileResult> result){
 
 static std::vector<FinalAppObservation> BuildFinalObservations(
         const std::map<std::string,AppFastSnapshot>& snapshots,
+        const std::vector<DeskRec>& desktops,
         UnixSeconds nowUtc,
         std::map<std::string,std::string>& provisionalRecordByRuntime){
     std::vector<FinalAppObservation> observations;
@@ -3842,11 +4009,18 @@ static std::vector<FinalAppObservation> BuildFinalObservations(
             FinalWindowObservation window;
             window.observed.app=profile.id;
             window.observed.desktop=fast.desktop;
-            window.observed.deskIndex=SnapshotDesktopIndex(fast.desktop);
+            window.observed.deskIndex=-1;
+            window.desktopValid=
+                ConcreteDesktopExists(fast.desktop,desktops,DeskGuid);
+            if(window.desktopValid)
+                for(const DeskRec& desktop : desktops)
+                    if(GuidEq(desktop.guid,fast.desktop)){
+                        window.observed.deskIndex=desktop.index;
+                        break;
+                    }
             window.observed.activeTitle=W2U8(
                 StripReconcileTitleSuffix(
                     fast.title,profile.titleSuffixes));
-            window.desktopValid=!GuidIsZero(fast.desktop);
             window.fingerprintFresh=false;
             auto bound=g_recordByRuntime.find(runtime);
             if(bound!=g_recordByRuntime.end() &&
@@ -3886,6 +4060,9 @@ static std::vector<FinalAppObservation> BuildFinalObservations(
 static bool CommitFinalSnapshots(
         const std::map<std::string,AppFastSnapshot>& snapshots){
     const UnixSeconds nowUtc=UtcNowSeconds();
+    std::vector<DeskRec> desktops;
+    std::string desktopError;
+    if(!CurrentDesktops(desktops,&desktopError)) return false;
     const uint64_t checkpointGeneration=TakeNonzeroId(g_nextOperationId);
     std::vector<FinalAppObservation> observations;
     std::map<std::string,std::string> stagedProvisional;
@@ -3894,7 +4071,7 @@ static bool CommitFinalSnapshots(
             [&](std::map<std::string,std::string>& provisionals,
                 std::vector<FinalAppObservation>& stagedObservations){
                 stagedObservations=BuildFinalObservations(
-                    snapshots,nowUtc,provisionals);
+                    snapshots,desktops,nowUtc,provisionals);
                 return true;
             })) return false;
     FinalSnapshotResult finalResult;
@@ -4340,7 +4517,7 @@ static void FinishManualSave(uint64_t operationId){
             record.recordId=NewRecordId();
             GUID id{};
             std::string canonical;
-            if(GuidIsZero(record.desktop) ||
+            if(!ConcreteDesktopExists(record.desktop,currentDesktops,DeskGuid) ||
                !ParseNonzeroLayoutGuid(record.recordId,id,&canonical) ||
                !ids.insert(canonical).second){
                 fail(L"Manual layout could not allocate stable record identities.");
@@ -4911,6 +5088,7 @@ static void HandleManualRestoreSessionResult(const SessionRoute& route,
 
 static ReservedAutoIdentity ReservationForManualMove(
         const FastWin& fast,const MoveToken& token,const std::string& recordId,
+        const std::vector<DeskRec>& currentDesktops,
         bool& provisionalNeedsInsert,bool& reservationReady){
     provisionalNeedsInsert=false;
     reservationReady=false;
@@ -4919,13 +5097,16 @@ static ReservedAutoIdentity ReservationForManualMove(
     reservation.identity=IdentityOf(fast);
     reservation.app=fast.app;
     reservation.recordId=recordId;
-    reservation.originDesktop=fast.desktop;
+    const bool concreteOrigin=ConcreteDesktopExists(
+        fast.desktop,currentDesktops,DeskGuid);
+    reservation.originDesktop=concreteOrigin ? fast.desktop : GUID{};
     auto bound=g_recordByRuntime.find(RuntimeKey(fast));
     if(bound!=g_recordByRuntime.end() &&
        SameIdentity(bound->second.identity,IdentityOf(fast))){
         reservation.recordId=bound->second.recordId;
         reservationReady=true;
-    } else if(!fast.app.empty() && !GuidIsZero(fast.desktop)){
+    } else if(!fast.app.empty() &&
+              ConcreteDesktopExists(fast.desktop,currentDesktops,DeskGuid)){
         std::string id;
         auto existing=g_provisionalRecordByRuntime.find(RuntimeKey(fast));
         if(existing==g_provisionalRecordByRuntime.end()){
@@ -4975,6 +5156,7 @@ static bool QueueManualMove(ManualMoveOperation& operation,
     bool reservationReady=false;
     ReservedAutoIdentity reservation=
         ReservationForManualMove(fast,job.token,saved.recordId,
+                                 operation.currentDesktops,
                                  provisionalNeedsInsert,reservationReady);
     if(!reservationReady) return false;
     ReservationHandoff handoff;
@@ -5125,7 +5307,7 @@ static bool CliSaveCheckpoint(std::string& summary){
         record.recordId=NewRecordId();
         GUID id{};
         std::string canonical;
-        if(GuidIsZero(record.desktop) ||
+        if(!ConcreteDesktopExists(record.desktop,desktops,DeskGuid) ||
            !ParseNonzeroLayoutGuid(record.recordId,id,&canonical) ||
            !recordIds.insert(canonical).second){
             summary="Could not allocate valid record IDs; no file was changed.";
@@ -7143,9 +7325,9 @@ static PickerIdentityValidity PickerIdentityObservation(
 
 static void EmitPickerTraceHResult(
         PickerTraceApiKind api,uint64_t generation,uint64_t effectSerial,
-        HRESULT result,bool invoked,HWND hwnd=nullptr,
-        const GUID& requested=GUID{},
-        const GUID& actual=GUID{}) noexcept {
+        HRESULT result,bool invoked,HWND hwnd,
+        const GUID& requested,
+        const GUID& actual) noexcept {
     PickerTraceApiResultEvent event;
     event.api=api;
     event.resultKind=PickerTraceRawResultKind::HResult;
@@ -7157,109 +7339,6 @@ static void EmitPickerTraceHResult(
     event.hresult=result;
     event.invoked=invoked;
     g_pickerTrace.emit(event);
-}
-
-static HRESULT IssuePickerWindowMove(
-        const WindowIdentityKey& expected,const GUID& destinationGuid,
-        bool& invoked,WindowIdentityRecapture& identity,
-        PickerTraceDesktopLookupUse lookupUse,
-        uint64_t generation,uint64_t effectSerial) noexcept {
-    invoked=false;
-    identity=WindowIdentityRecapture::Indeterminate;
-    if(GuidIsZero(destinationGuid) || !g_vdmi) return E_INVALIDARG;
-    HWND hwnd=nullptr;
-    PickerTraceApiKind selectedApi=
-        PickerTraceApiKind::MoveViewToDesktop;
-    bool selectedApiKnown=false;
-    try {
-        PickerTraceDesktopLookupContext lookupContext;
-        lookupContext.trace=&g_pickerTrace;
-        lookupContext.use=lookupUse;
-        lookupContext.generation=generation;
-        lookupContext.effectSerial=effectSerial;
-        lookupContext.requested=destinationGuid;
-        ScopedComPtr<IVirtualDesktop> destination=
-            GetDesktopByGuid(destinationGuid,&lookupContext);
-        if(!destination) return E_INVALIDARG;
-        hwnd=reinterpret_cast<HWND>(expected.hwnd);
-        if(expected.pid==GetCurrentProcessId()){
-            selectedApi=PickerTraceApiKind::MoveWindowToDesktop;
-            selectedApiKnown=true;
-            if(!g_vdmDoc){
-                EmitPickerTraceHResult(
-                    selectedApi,generation,effectSerial,
-                    E_NOINTERFACE,false,hwnd,destinationGuid);
-                return E_NOINTERFACE;
-            }
-            identity=RecaptureGenericWindowIdentity(expected);
-            if(identity!=WindowIdentityRecapture::Match){
-                const HRESULT result=
-                    identity==WindowIdentityRecapture::Lost
-                        ? E_ABORT : E_PENDING;
-                EmitPickerTraceHResult(
-                    selectedApi,generation,effectSerial,
-                    result,false,hwnd,destinationGuid);
-                return result;
-            }
-            invoked=true;
-            const HRESULT result=
-                g_vdmDoc->MoveWindowToDesktop(hwnd,destinationGuid);
-            EmitPickerTraceHResult(
-                PickerTraceApiKind::MoveWindowToDesktop,
-                generation,effectSerial,result,true,hwnd,
-                destinationGuid);
-            return result;
-        }
-        selectedApi=PickerTraceApiKind::MoveViewToDesktop;
-        selectedApiKnown=true;
-        if(!g_avc){
-            EmitPickerTraceHResult(
-                PickerTraceApiKind::GetViewForHwnd,
-                generation,effectSerial,E_NOINTERFACE,false,hwnd);
-            EmitPickerTraceHResult(
-                selectedApi,generation,effectSerial,
-                E_NOINTERFACE,false,hwnd,destinationGuid);
-            return E_NOINTERFACE;
-        }
-        IApplicationView* rawView=nullptr;
-        const HRESULT viewResult=g_avc->GetViewForHwnd(hwnd,&rawView);
-        EmitPickerTraceHResult(
-            PickerTraceApiKind::GetViewForHwnd,
-            generation,effectSerial,viewResult,true,hwnd);
-        ScopedComPtr<IApplicationView> view(rawView);
-        if(FAILED(viewResult) || !view){
-            const HRESULT result=FAILED(viewResult)
-                ? viewResult : E_FAIL;
-            EmitPickerTraceHResult(
-                selectedApi,generation,effectSerial,
-                result,false,hwnd,destinationGuid);
-            return result;
-        }
-        identity=RecaptureGenericWindowIdentity(expected);
-        if(identity!=WindowIdentityRecapture::Match){
-            const HRESULT result=
-                identity==WindowIdentityRecapture::Lost
-                    ? E_ABORT : E_PENDING;
-            EmitPickerTraceHResult(
-                selectedApi,generation,effectSerial,
-                result,false,hwnd,destinationGuid);
-            return result;
-        }
-        invoked=true;
-        const HRESULT result=
-            g_vdmi->MoveViewToDesktop(view.get(),destination.get());
-        EmitPickerTraceHResult(
-            PickerTraceApiKind::MoveViewToDesktop,
-            generation,effectSerial,result,true,hwnd,
-            destinationGuid);
-        return result;
-    } catch(...) {
-        if(selectedApiKnown)
-            EmitPickerTraceHResult(
-                selectedApi,generation,effectSerial,
-                E_FAIL,invoked,hwnd,destinationGuid);
-        return E_FAIL;
-    }
 }
 
 struct PickerTraceWindowDesktopFacts {
@@ -7472,17 +7551,15 @@ static PickerObservation ExecutePickerEffect(
         switch(effect.kind){
         case PickerEffectKind::MoveTarget: {
             observation.event=PickerEvent::ApiCompleted;
-            WindowIdentityRecapture identity=
-                WindowIdentityRecapture::Indeterminate;
-            bool invoked=false;
-            const HRESULT result=IssuePickerWindowMove(
-                g_picker.transition.target,effect.desktop,
-                invoked,identity,
+            const TargetMoveIssueResult issued=IssueGuardedTargetMove(
+                g_picker.transition.target,
+                TargetDesktopRoute::Indeterminate,effect.desktop,
                 PickerTraceDesktopLookupUse::MoveTargetDestination,
                 effect.generation,effect.effectSerial);
-            observation.identity=PickerIdentityObservation(identity);
-            observation.apiInvoked=invoked;
-            observation.apiAccepted=SUCCEEDED(result);
+            observation.identity=
+                PickerIdentityObservation(issued.identity);
+            observation.apiInvoked=issued.invoked;
+            observation.apiAccepted=SUCCEEDED(issued.result);
             break;
         }
         case PickerEffectKind::ReadTarget: {
@@ -7512,12 +7589,9 @@ static PickerObservation ExecutePickerEffect(
             observation.event=PickerEvent::ApiCompleted;
             if(g_picker.transition.popupRoute!=PickerPopupRoute::Managed)
                 break;
-            WindowIdentityRecapture identity=
-                WindowIdentityRecapture::Indeterminate;
             bool invoked=false;
-            WindowIdentityKey popup=CapturePickerWindowIdentity(g_main);
-            const HRESULT result=IssuePickerWindowMove(
-                popup,effect.desktop,invoked,identity,
+            const HRESULT result=IssuePickerPopupMove(
+                g_main,effect.desktop,invoked,
                 PickerTraceDesktopLookupUse::MovePopupDestination,
                 effect.generation,effect.effectSerial);
             observation.apiInvoked=invoked;
@@ -8547,7 +8621,14 @@ static PickerTraceMoveBeginReason BeginVerifiedPickerMove(
             PickerTraceApiKind::GetWindowDesktopIdCapture,
             g_target,0,0,targetDesktopFacts);
         traceEvent.targetOrigin=fast.desktop;
-        if(GuidIsZero(fast.desktop))
+        std::vector<DeskRec> pickerDesktops;
+        std::string pickerDesktopError;
+        if(!CurrentDesktops(pickerDesktops,&pickerDesktopError))
+            return finish(
+                PickerTraceMoveBeginReason::TargetDesktopUnavailable);
+        const bool targetOriginConcrete=
+            ConcreteDesktopExists(fast.desktop,pickerDesktops,DeskGuid);
+        if(!targetOriginConcrete)
             return finish(
                 PickerTraceMoveBeginReason::TargetDesktopUnavailable);
         const WindowIdentityKey identity=IdentityOf(fast);
@@ -8697,7 +8778,7 @@ static PickerTraceMoveBeginReason BeginVerifiedPickerMove(
             } else {
                 source=SelectPopupReservationRecord(
                     tracked,persistenceReady,safeOriginRecord,
-                    !GuidIsZero(fast.desktop),
+                    targetOriginConcrete,
                     [&](std::string& selected){
                         return SelectPendingPopupRecordId(
                             identity,fast.app,g_pendingRecordByRuntime,
@@ -8735,7 +8816,7 @@ static PickerTraceMoveBeginReason BeginVerifiedPickerMove(
                !safeOriginRecord &&
                PickerMayReserveStableRecordId(
                    tracked,persistenceReady,
-                   !GuidIsZero(fast.desktop))){
+                   targetOriginConcrete)){
                 auto existing=g_provisionalRecordByRuntime.find(runtimeKey);
                 if(existing!=g_provisionalRecordByRuntime.end()){
                     recordId=existing->second;

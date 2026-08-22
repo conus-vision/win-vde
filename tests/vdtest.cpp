@@ -2852,6 +2852,90 @@ static void test_target_mobility_probe_adapters_are_fail_closed(){
     CHECK(global.disposition==TargetMoveDisposition::VisualOnly);
 }
 
+static void test_concrete_desktop_membership_rejects_sentinels(){
+    const GUID first=G(
+        L"{241A0000-0000-0000-0000-000000000001}");
+    const GUID sentinel=G(
+        L"{241A0000-0000-0000-0000-000000000099}");
+    std::vector<GUID> desktops{first};
+    const auto guidOf=[](const GUID& value)->const GUID& {
+        return value;
+    };
+    CHECK(ConcreteDesktopExists(first,desktops,guidOf));
+    CHECK(!ConcreteDesktopExists(GUID{},desktops,guidOf));
+    CHECK(!ConcreteDesktopExists(sentinel,desktops,guidOf));
+}
+
+static void test_physical_target_move_executor_is_fail_closed(){
+    TargetMobilityDecision physical;
+    physical.mobility=TargetMobility::Movable;
+    physical.disposition=TargetMoveDisposition::Physical;
+    TargetMobilityDecision viewPinned;
+    viewPinned.mobility=TargetMobility::ViewPinned;
+    viewPinned.disposition=TargetMoveDisposition::VisualOnly;
+    TargetMobilityDecision appPinned;
+    appPinned.mobility=TargetMobility::AppPinned;
+    appPinned.disposition=TargetMoveDisposition::VisualOnly;
+    TargetMobilityDecision immovable;
+    immovable.mobility=TargetMobility::Immovable;
+    immovable.disposition=TargetMoveDisposition::Reject;
+    TargetMobilityDecision indeterminate;
+
+    struct GuardCase {
+        WindowIdentityRecapture identity;
+        TargetDesktopRoute route;
+        TargetMobilityDecision mobility;
+        bool sourceExists;
+        bool destinationExists;
+        bool sameSource;
+    };
+    const GuardCase rejected[]={
+        {WindowIdentityRecapture::Match,
+         TargetDesktopRoute::GloballyVisible,physical,true,true,false},
+        {WindowIdentityRecapture::Match,
+         TargetDesktopRoute::Exact,viewPinned,true,true,false},
+        {WindowIdentityRecapture::Match,
+         TargetDesktopRoute::Exact,appPinned,true,true,false},
+        {WindowIdentityRecapture::Match,
+         TargetDesktopRoute::Exact,immovable,true,true,false},
+        {WindowIdentityRecapture::Match,
+         TargetDesktopRoute::Exact,indeterminate,true,true,false},
+        {WindowIdentityRecapture::Lost,
+         TargetDesktopRoute::Exact,physical,true,true,false},
+        {WindowIdentityRecapture::Indeterminate,
+         TargetDesktopRoute::Exact,physical,true,true,false},
+        {WindowIdentityRecapture::Match,
+         TargetDesktopRoute::Exact,physical,false,true,false},
+        {WindowIdentityRecapture::Match,
+         TargetDesktopRoute::Exact,physical,true,false,false},
+        {WindowIdentityRecapture::Match,
+         TargetDesktopRoute::Exact,physical,true,true,true}
+    };
+    for(const GuardCase& value : rejected){
+        bool invoked=false;
+        int calls=0;
+        const HRESULT result=ExecutePhysicalTargetMoveDecision(
+            value.identity,value.route,value.mobility,
+            value.sourceExists,value.destinationExists,
+            value.sameSource,invoked,[&](){
+                ++calls;
+                return S_OK;
+            });
+        CHECK(FAILED(result));
+        CHECK(!invoked && calls==0);
+    }
+
+    bool invoked=false;
+    int calls=0;
+    CHECK(ExecutePhysicalTargetMoveDecision(
+        WindowIdentityRecapture::Match,TargetDesktopRoute::Exact,
+        physical,true,true,false,invoked,[&](){
+            ++calls;
+            return S_OK;
+        })==S_OK);
+    CHECK(invoked && calls==1);
+}
+
 static void test_picker_async_search_joins_by_full_identity(){
     const WindowIdentityKey row=IK(0x1234,77,9001);
     CHECK(PickerSearchResultMatches(row,row));
@@ -23309,7 +23393,7 @@ static void test_picker_trace_activation_runtime_wiring_is_causal(){
           std::string::npos);
     CHECK(begin.find("event.activationId=activationId;")!=
           std::string::npos);
-    CHECK(CountSourceText(begin,"return finish(")==27);
+    CHECK(CountSourceText(begin,"return finish(")==28);
     CHECK(begin.find("return;")==std::string::npos);
     CHECK(CountSourceText(begin,"PickerTraceMoveBeginExceptionEvent")==1);
     const size_t acceptedEmit=begin.find(
@@ -24805,8 +24889,9 @@ static void test_picker_trace_task8_runtime_wiring_is_explicit(){
         source,"static void PumpPickerTransitionWork() noexcept {",
         "static void RequestPickerCancellation(");
     const std::string move=SourceSection(
-        source,"static HRESULT IssuePickerWindowMove(",
-        "struct PickerTraceWindowDesktopFacts");
+        source,"static TargetMoveIssueResult IssueGuardedTargetMove(\n"
+        "        const WindowIdentityKey& expected,",
+        "static HRESULT IssueWindowMove(");
     CHECK(begin.find("PickerTraceDesktopLookupUse::MoveEntryDestination")!=
           std::string::npos);
     CHECK(effects.find("PickerTraceDesktopLookupUse::MoveTargetDestination")!=
@@ -26416,7 +26501,7 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
         "static void PumpPickerTransitionWork() noexcept;");
     const std::string apiEmit=SourceSection(
         source,"static void EmitPickerTraceHResult(",
-        "static HRESULT IssuePickerWindowMove(");
+        "struct PickerTraceWindowDesktopFacts {");
     const std::string foregroundAdapter=SourceSection(
         source,"static void EmitPickerProductApiTrace(",
         "static PickerObservation ExecutePickerEffect(");
@@ -26516,7 +26601,8 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
         "observer.emit=EmitPickerProductApiTrace;")!=std::string::npos);
     CHECK(foregroundAdapter.find(
         "ops,g_pickerTrace.active()?&observer:nullptr")!=std::string::npos);
-    CHECK(effects.find("IssuePickerWindowMove(")!=std::string::npos);
+    CHECK(effects.find("IssueGuardedTargetMove(")!=std::string::npos);
+    CHECK(effects.find("IssuePickerPopupMove(")!=std::string::npos);
     CHECK(effects.find("EmitPickerTraceWindowDesktopFacts(")!=
           std::string::npos);
     CHECK(effects.find("EmitPickerTraceCurrentDesktopFacts(")!=
@@ -26885,6 +26971,155 @@ static void test_picker_pin_probe_is_optional_read_only_and_private(){
     CHECK(traceEvent.find("std::wstring")==std::string::npos);
 }
 
+static void test_target_move_guard_is_single_complete_boundary(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string guard=SourceSection(
+        source,
+        "static TargetMoveIssueResult IssueGuardedTargetMove(\n"
+        "        const WindowIdentityKey& expected,\n"
+        "        TargetDesktopRoute observedRoute,",
+        "static HRESULT IssuePickerPopupMove(\n"
+        "        HWND popup,");
+    const std::string popup=SourceSection(
+        source,"static HRESULT IssuePickerPopupMove(\n"
+        "        HWND popup,",
+        "static HRESULT IssueWindowMove(");
+    const std::string legacy=SourceSection(
+        source,"static HRESULT IssueWindowMove(",
+        "static bool RetryableMoveHresult(");
+    const std::string effects=SourceSection(
+        source,"static PickerObservation ExecutePickerEffect(",
+        "static void PumpPickerTransitionWork()");
+    const std::string binding=SourceSection(
+        source,"static PickerTraceMoveBeginReason BeginVerifiedPickerMove(",
+        "class PickerTraceCaptureEmitScope");
+    const std::string compactGuard=
+        NormalizeCppForPickerTraceAudit(guard);
+
+    CHECK(!guard.empty() && !popup.empty() && !legacy.empty());
+    CHECK(CountSourceText(source,
+        "g_vdmi->MoveViewToDesktop(")==1);
+    CHECK(CountSourceText(source,
+        "g_vdmDoc->MoveWindowToDesktop(")==3);
+    CHECK(source.find("IssuePickerWindowMove(")==std::string::npos);
+
+    const size_t currentDesktops=compactGuard.find("CurrentDesktops(");
+    const size_t destinationExists=compactGuard.find(
+        "ConcreteDesktopExists(destinationGuid,desktops,DeskGuid)",
+        currentDesktops);
+    const size_t firstIdentity=compactGuard.find(
+        "RecaptureGenericWindowIdentity(expected)",destinationExists);
+    const size_t sourceRead=compactGuard.find(
+        "g_vdmDoc->GetWindowDesktopId(hwnd,&sourceDesktop)",
+        firstIdentity);
+    const size_t membership=compactGuard.find(
+        "g_vdmDoc->IsWindowOnCurrentVirtualDesktop(",sourceRead);
+    const size_t sourceExists=compactGuard.find(
+        "ConcreteDesktopExists(sourceDesktop,desktops,DeskGuid)",
+        membership);
+    const size_t route=compactGuard.find(
+        "DecideTargetDesktopRoute(",sourceExists);
+    const size_t sameSource=compactGuard.find(
+        "GuidEq(sourceDesktop,destinationGuid)",sourceExists);
+    const size_t acquireView=compactGuard.find(
+        "g_avc->GetViewForHwnd(hwnd,&rawView)",sameSource);
+    const size_t probe=compactGuard.find(
+        "QueryTargetWindowMobility(",acquireView);
+    const size_t finalIdentity=compactGuard.find(
+        "RecaptureGenericWindowIdentity(expected)",probe);
+    const size_t execute=compactGuard.find(
+        "ExecutePhysicalTargetMoveDecision(",finalIdentity);
+    CHECK(currentDesktops!=std::string::npos);
+    CHECK(destinationExists!=std::string::npos);
+    CHECK(firstIdentity!=std::string::npos);
+    CHECK(sourceRead!=std::string::npos);
+    CHECK(membership!=std::string::npos);
+    CHECK(route!=std::string::npos);
+    CHECK(sourceExists!=std::string::npos);
+    CHECK(sameSource!=std::string::npos);
+    CHECK(acquireView!=std::string::npos);
+    CHECK(probe!=std::string::npos);
+    CHECK(finalIdentity!=std::string::npos);
+    CHECK(execute!=std::string::npos);
+    CHECK(currentDesktops<destinationExists &&
+          destinationExists<firstIdentity && firstIdentity<sourceRead &&
+          sourceRead<membership && membership<sourceExists &&
+          sourceExists<route && route<sameSource &&
+          sameSource<acquireView && acquireView<probe &&
+          probe<finalIdentity && finalIdentity<execute);
+
+    CHECK(guard.find("g_vdmi->MoveViewToDesktop(")!=
+          std::string::npos);
+    CHECK(guard.find("g_vdmDoc->MoveWindowToDesktop(")!=
+          std::string::npos);
+    CHECK(popup.find("popup!=g_main")!=std::string::npos);
+    CHECK(popup.find("GetDesktopIndexByGuid(")!=std::string::npos);
+    CHECK(popup.find("g_vdmDoc->MoveWindowToDesktop(")!=
+          std::string::npos);
+    CHECK(popup.find("g_vdmi->MoveViewToDesktop(")==
+          std::string::npos);
+    CHECK(legacy.find("IssueGuardedTargetMove(")!=
+          std::string::npos);
+    CHECK(legacy.find("MoveViewToDesktop(")==std::string::npos);
+    CHECK(legacy.find("MoveWindowToDesktop(")==std::string::npos);
+    CHECK(effects.find("case PickerEffectKind::MoveTarget:")!=
+          std::string::npos);
+    CHECK(effects.find("IssueGuardedTargetMove(")!=
+          std::string::npos);
+    CHECK(effects.find("case PickerEffectKind::MovePopup:")!=
+          std::string::npos);
+    CHECK(effects.find("IssuePickerPopupMove(")!=
+          std::string::npos);
+    CHECK(binding.find("g_vdmDoc->MoveWindowToDesktop(")!=
+          std::string::npos);
+}
+
+static void test_new_desktop_observations_require_concrete_membership(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string automatic=SourceSection(
+        source,"static bool SaveObservedApp(",
+        "static bool SessionPurposeForOwner(");
+    const std::string finalObservation=SourceSection(
+        source,"static std::vector<FinalAppObservation> BuildFinalObservations(",
+        "static bool CommitFinalSnapshots(");
+    const std::string manual=SourceSection(
+        source,"static void FinishManualSave(",
+        "static void CancelManualSaveOperation(");
+    const std::string cli=SourceSection(
+        source,"static bool CliSaveCheckpoint(",
+        "static bool WaitForCliVerify(");
+    const std::string reservation=SourceSection(
+        source,"static ReservedAutoIdentity ReservationForManualMove(",
+        "static bool QueueManualMove(");
+    const std::string picker=SourceSection(
+        source,"static PickerTraceMoveBeginReason BeginVerifiedPickerMove(",
+        "class PickerTraceCaptureEmitScope");
+    const std::string postMove=SourceSection(
+        source,"static PopupSaveResult SavePopupMovedWindow(",
+        "static bool SaveObservedApp(");
+
+    CHECK(automatic.find(
+        "ConcreteDesktopExists(fast.desktop,desktops,DeskGuid)")!=
+          std::string::npos);
+    CHECK(finalObservation.find(
+        "ConcreteDesktopExists(fast.desktop,desktops,DeskGuid)")!=
+          std::string::npos);
+    CHECK(manual.find(
+        "ConcreteDesktopExists(record.desktop,currentDesktops,DeskGuid)")!=
+          std::string::npos);
+    CHECK(cli.find(
+        "ConcreteDesktopExists(record.desktop,desktops,DeskGuid)")!=
+          std::string::npos);
+    CHECK(reservation.find(
+        "ConcreteDesktopExists(fast.desktop,currentDesktops,DeskGuid)")!=
+          std::string::npos);
+    CHECK(picker.find(
+        "ConcreteDesktopExists(fast.desktop,pickerDesktops,DeskGuid)")!=
+          std::string::npos);
+    CHECK(postMove.find("GetDesktopIndexByGuid(transition.destination)")!=
+          std::string::npos);
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
@@ -26947,6 +27182,8 @@ int main(){
     test_picker_trace_task10_runtime_anchors_and_privacy_are_locked();
     test_picker_evidence_fixes_have_guarded_product_wiring();
     test_picker_pin_probe_is_optional_read_only_and_private();
+    test_target_move_guard_is_single_complete_boundary();
+    test_new_desktop_observations_require_concrete_membership();
     test_picker_uses_self_contained_gdi_buffer();
     test_picker_icon_loading_is_bounded_and_outside_paint();
     test_picker_enum_publishes_display_only_rows_safely();
@@ -27035,6 +27272,8 @@ int main(){
     test_target_mobility_fails_closed_and_positive_signals_win();
     test_target_desktop_route_requires_concrete_snapshot_membership();
     test_target_mobility_probe_adapters_are_fail_closed();
+    test_concrete_desktop_membership_rejects_sentinels();
+    test_physical_target_move_executor_is_fail_closed();
     test_picker_async_search_joins_by_full_identity();
     test_picker_state_whole_object_swap_includes_generation_sentinel();
     test_picker_transition_policy_table_is_closed();
