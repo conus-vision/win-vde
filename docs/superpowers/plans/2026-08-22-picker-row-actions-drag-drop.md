@@ -2642,6 +2642,7 @@ git -c safe.directory=F:/_VDESKTOP_FF/win-vde commit --only -m "fix: finish pick
 
 **Files:**
 
+- Modify: build-test.bat
 - Modify: src/picker_state.hpp
 - Modify: src/vde.cpp
 - Modify: tests/vdtest.cpp
@@ -2714,6 +2715,17 @@ static void test_picker_row_hover_tracks_full_row_and_resets(){
   Expected: compilation fails because `PickerRowHoverUpdate`,
   `UpdatePickerRowHoverEvent`, `PickerRowHoverMatches`, and the row fields do
   not exist.
+
+- [ ] If the first GREEN compile reaches MSVC fatal error C1128 after the new
+  inline helpers are present, add `/bigobj` to only the test compiler command:
+
+~~~bat
+cl /nologo /utf-8 /EHsc /W3 /bigobj /std:c++14 /I src tests\vdtest.cpp src\picker_trace.cpp /Fe:build\vdtest.exe /Fo:build\ || exit /b 1
+~~~
+
+  Keep production `build.bat` unchanged. C1128 is the COFF section-count limit
+  of the monolithic test translation unit; `/bigobj` expands that object-file
+  capacity without changing application behavior.
 
 - [ ] Extend `PickerHoverEventState` and its pure helpers in
   src/picker_state.hpp:
@@ -2801,12 +2813,12 @@ if(hovered && !active){
 git -c safe.directory=F:/_VDESKTOP_FF/win-vde/.worktrees/picker-row-actions diff --check
 ~~~
 
-- [ ] Commit exactly the three task files:
+- [ ] Commit exactly the four task files:
 
 ~~~powershell
-git -c safe.directory=F:/_VDESKTOP_FF/win-vde/.worktrees/picker-row-actions add src/picker_state.hpp src/vde.cpp tests/vdtest.cpp
+git -c safe.directory=F:/_VDESKTOP_FF/win-vde/.worktrees/picker-row-actions add build-test.bat src/picker_state.hpp src/vde.cpp tests/vdtest.cpp
 git -c safe.directory=F:/_VDESKTOP_FF/win-vde/.worktrees/picker-row-actions diff --cached --check
-git -c safe.directory=F:/_VDESKTOP_FF/win-vde/.worktrees/picker-row-actions commit --only -m "feat: highlight hovered picker rows" -- src/picker_state.hpp src/vde.cpp tests/vdtest.cpp
+git -c safe.directory=F:/_VDESKTOP_FF/win-vde/.worktrees/picker-row-actions commit --only -m "feat: highlight hovered picker rows" -- build-test.bat src/picker_state.hpp src/vde.cpp tests/vdtest.cpp
 ~~~
 
 - [ ] Launch only the newly built worktree executable and verify its path:
