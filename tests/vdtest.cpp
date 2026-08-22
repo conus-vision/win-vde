@@ -27764,13 +27764,17 @@ static void test_picker_pin_probe_is_optional_read_only_and_private(){
         "InsertAfterWindow(HWND)","GetExtendedFramePosition(RECT*)",
         "GetAppUserModelId(PWSTR*)"
     };
-    size_t methodAt=interfaces.find("IApplicationView : IUnknown");
+    size_t methodAt=interfaces.find("IApplicationView : IInspectable");
     CHECK(methodAt!=std::string::npos);
-    for(const char* method : viewMethods){
-        const size_t next=interfaces.find(method,methodAt);
-        CHECK(next!=std::string::npos);
-        CHECK(next>=methodAt);
-        methodAt=next;
+    CHECK(interfaces.find("IApplicationView : IUnknown")==
+          std::string::npos);
+    if(methodAt!=std::string::npos){
+        for(const char* method : viewMethods){
+            const size_t next=interfaces.find(method,methodAt);
+            CHECK(next!=std::string::npos);
+            CHECK(next>=methodAt);
+            methodAt=next;
+        }
     }
 
     const char* pinSlots[]={

@@ -215,8 +215,10 @@ Instead, target-window mobility becomes Indeterminate, which disables physical
 target moves while leaving display, search, desktop switching, exact activation,
 and already-proven visual-only routes available.
 
-Application identity is obtained through the concrete IApplicationView ABI that
-matches the existing IApplicationViewCollection contract. Every HRESULT,
+Application identity is obtained through the concrete IApplicationView ABI,
+rooted at `IInspectable`, that matches the existing IApplicationViewCollection
+contract. The three IInspectable methods between IUnknown and the declared
+IApplicationView methods are part of the native vtable layout. Every HRESULT,
 returned pointer, and empty value is checked. Returned application-identity
 storage is released through its required COM allocator on every exit path.
 Failure to obtain a trustworthy identity makes the application-pin result

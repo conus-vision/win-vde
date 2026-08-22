@@ -33,6 +33,7 @@
 #include <objectarray.h>
 #include <servprov.h>
 #include <objbase.h>
+#include <inspectable.h>
 #include <stdio.h>
 #include <cstdint>
 #include <cmath>
@@ -310,7 +311,7 @@ static const GUID kIID_IVirtualDesktopPinnedApps=
 
 // ============================ Undocumented interfaces =========================
 struct __declspec(uuid("372E1D3B-38D3-42E4-A15B-8AB2B178F513"))
-IApplicationView : IUnknown {
+IApplicationView : IInspectable {
     virtual HRESULT STDMETHODCALLTYPE SetFocus()=0;
     virtual HRESULT STDMETHODCALLTYPE SwitchTo()=0;
     virtual HRESULT STDMETHODCALLTYPE TryInvokeBack(void*)=0;

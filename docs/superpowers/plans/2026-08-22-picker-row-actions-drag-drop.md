@@ -12,7 +12,14 @@
 
 **Approved design:** docs/superpowers/specs/2026-08-22-picker-row-actions-drag-drop-design.md
 
-**ABI reference:** Microsoft TypeAgent’s Windows virtual desktop service documents the IApplicationView method order, pinned-apps service CLSID/IID, and read-only IsViewPinned/IsAppIdPinned calls: https://github.com/microsoft/TypeAgent/blob/main/dotnet/autoShell/Services/WindowsVirtualDesktopService.cs
+**ABI references:** `IApplicationView` uses the Windows Runtime
+`IInspectable` base, whose three methods follow the `IUnknown` slots:
+https://learn.microsoft.com/windows/win32/api/inspectable/nn-inspectable-iinspectable.
+Microsoft TypeAgent remains a reference for the subsequent IApplicationView
+method order, pinned-apps service CLSID/IID, and read-only
+IsViewPinned/IsAppIdPinned calls, but its managed interface projection must not
+be copied as a native `IUnknown` base:
+https://github.com/microsoft/TypeAgent/blob/main/dotnet/autoShell/Services/WindowsVirtualDesktopService.cs
 
 ## Execution precondition
 
@@ -1651,12 +1658,15 @@ git -c safe.directory=F:/_VDESKTOP_FF/win-vde commit --only -m "feat: model pick
 .\build-test.bat
 ~~~
 
-- [ ] Expand the current empty IApplicationView definition through the
-  GetAppUserModelId vtable slot in this exact order:
+- [ ] Include `<inspectable.h>` and expand the current empty IApplicationView
+  definition through the GetAppUserModelId vtable slot in this exact order.
+  The `IInspectable` base is ABI-significant: using `IUnknown` shifts every
+  declared method three slots early and can turn GetAppUserModelId into an
+  incompatible SetPosition call:
 
 ~~~cpp
 struct __declspec(uuid("372E1D3B-38D3-42E4-A15B-8AB2B178F513"))
-IApplicationView : IUnknown {
+IApplicationView : IInspectable {
     virtual HRESULT STDMETHODCALLTYPE SetFocus()=0;
     virtual HRESULT STDMETHODCALLTYPE SwitchTo()=0;
     virtual HRESULT STDMETHODCALLTYPE TryInvokeBack(void*)=0;
