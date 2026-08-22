@@ -300,10 +300,40 @@ static const GUID kIID_IApplicationViewCollection =
     { 0x1841C6D7, 0x4F9D, 0x42C0, { 0xAF,0x41,0x87,0x47,0x53,0x8F,0x10,0xE5 } };
 static const GUID kIID_IVirtualDesktop =
     { 0x3F07F4BE, 0xB107, 0x441A, { 0xAF,0x0F,0x39,0xD8,0x25,0x29,0x07,0x2C } };
+static const GUID kCLSID_VirtualDesktopPinnedApps=
+    {0xB5A399E7,0x1C87,0x46B8,
+     {0x88,0xE9,0xFC,0x57,0x47,0xB1,0x71,0xBD}};
+static const GUID kIID_IVirtualDesktopPinnedApps=
+    {0x4CE81583,0x1E4C,0x4632,
+     {0xA6,0x21,0x07,0xA5,0x35,0x43,0x14,0x8F}};
 
 // ============================ Undocumented interfaces =========================
 struct __declspec(uuid("372E1D3B-38D3-42E4-A15B-8AB2B178F513"))
-IApplicationView : public IUnknown {};
+IApplicationView : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE SetFocus()=0;
+    virtual HRESULT STDMETHODCALLTYPE SwitchTo()=0;
+    virtual HRESULT STDMETHODCALLTYPE TryInvokeBack(void*)=0;
+    virtual HRESULT STDMETHODCALLTYPE GetThumbnailWindow(HWND*)=0;
+    virtual HRESULT STDMETHODCALLTYPE GetMonitor(void**)=0;
+    virtual HRESULT STDMETHODCALLTYPE GetVisibility(int*)=0;
+    virtual HRESULT STDMETHODCALLTYPE SetCloak(int,int)=0;
+    virtual HRESULT STDMETHODCALLTYPE GetPosition(REFIID,void**)=0;
+    virtual HRESULT STDMETHODCALLTYPE SetPosition(void*)=0;
+    virtual HRESULT STDMETHODCALLTYPE InsertAfterWindow(HWND)=0;
+    virtual HRESULT STDMETHODCALLTYPE GetExtendedFramePosition(RECT*)=0;
+    virtual HRESULT STDMETHODCALLTYPE GetAppUserModelId(PWSTR*)=0;
+};
+struct __declspec(uuid("4CE81583-1E4C-4632-A621-07A53543148F"))
+IVirtualDesktopPinnedApps : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE IsAppIdPinned(
+        PCWSTR,BOOL*)=0;
+    virtual HRESULT STDMETHODCALLTYPE PinAppID(PCWSTR)=0;
+    virtual HRESULT STDMETHODCALLTYPE UnpinAppID(PCWSTR)=0;
+    virtual HRESULT STDMETHODCALLTYPE IsViewPinned(
+        IApplicationView*,BOOL*)=0;
+    virtual HRESULT STDMETHODCALLTYPE PinView(IApplicationView*)=0;
+    virtual HRESULT STDMETHODCALLTYPE UnpinView(IApplicationView*)=0;
+};
 struct __declspec(uuid("3F07F4BE-B107-441A-AF0F-39D82529072C"))
 IVirtualDesktop : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE IsViewVisible(IApplicationView*, int*) = 0;
@@ -352,6 +382,32 @@ static IServiceProvider*               g_shell  = nullptr;
 static IVirtualDesktopManagerInternal* g_vdmi   = nullptr;
 static IApplicationViewCollection*     g_avc    = nullptr;
 static IVirtualDesktopManager*         g_vdmDoc = nullptr;
+static IVirtualDesktopPinnedApps*      g_pinnedApps=nullptr;
+
+static void TryInitializePinnedApps() noexcept {
+    if(!g_shell || g_pinnedApps) return;
+    IVirtualDesktopPinnedApps* candidate=nullptr;
+    HRESULT result=E_NOINTERFACE;
+    try {
+        result=g_shell->QueryService(
+            kCLSID_VirtualDesktopPinnedApps,
+            kIID_IVirtualDesktopPinnedApps,
+            reinterpret_cast<void**>(&candidate));
+    } catch(...) {
+        result=E_FAIL;
+    }
+    if(SUCCEEDED(result) && candidate)
+        g_pinnedApps=candidate;
+    else if(candidate)
+        candidate->Release();
+}
+
+static void ReleasePinnedApps() noexcept {
+    IVirtualDesktopPinnedApps* prior=g_pinnedApps;
+    g_pinnedApps=nullptr;
+    if(prior) prior->Release();
+}
+
 static void ReleaseServices();
 static bool InitServices(){
     HRESULT result=CoCreateInstance(
@@ -372,9 +428,11 @@ static bool InitServices(){
         ReleaseServices();
         return false;
     }
+    TryInitializePinnedApps();
     return true;
 }
 static void ReleaseServices(){
+    ReleasePinnedApps();
     if(g_vdmDoc){ g_vdmDoc->Release(); g_vdmDoc=nullptr; }
     if(g_avc){ g_avc->Release(); g_avc=nullptr; }
     if(g_vdmi){ g_vdmi->Release(); g_vdmi=nullptr; }
@@ -404,6 +462,29 @@ public:
     }
 private:
     T* value_=nullptr;
+};
+
+class ScopedCoTaskMemString {
+public:
+    ScopedCoTaskMemString() noexcept=default;
+    ~ScopedCoTaskMemString() noexcept {
+        if(value_) CoTaskMemFree(value_);
+    }
+    ScopedCoTaskMemString(const ScopedCoTaskMemString&)=delete;
+    ScopedCoTaskMemString& operator=(
+        const ScopedCoTaskMemString&)=delete;
+    ScopedCoTaskMemString(ScopedCoTaskMemString&&)=delete;
+    ScopedCoTaskMemString& operator=(
+        ScopedCoTaskMemString&&)=delete;
+
+    PWSTR* out() noexcept { return &value_; }
+    PCWSTR get() const noexcept { return value_; }
+    bool usable() const noexcept {
+        return value_ && value_[0]!=L'\0';
+    }
+
+private:
+    PWSTR value_=nullptr;
 };
 
 // After a Windows update the undocumented vtable/IIDs can shift: QueryService may
@@ -771,6 +852,111 @@ static WindowIdentityRecapture RecaptureGenericWindowIdentity(
         return WindowIdentityRecapture::Indeterminate;
     return started==expected.processStart
         ? WindowIdentityRecapture::Match : WindowIdentityRecapture::Lost;
+}
+
+struct TargetMobilityProbeFacts {
+    WindowIdentityRecapture identity=
+        WindowIdentityRecapture::Indeterminate;
+    TargetDesktopRoute route=TargetDesktopRoute::Indeterminate;
+    HRESULT viewPinnedResult=E_NOINTERFACE;
+    HRESULT appIdResult=E_NOINTERFACE;
+    HRESULT appPinnedResult=E_NOINTERFACE;
+    HRESULT canMoveResult=E_NOINTERFACE;
+    BOOL viewPinned=FALSE;
+    BOOL appPinned=FALSE;
+    int canMove=0;
+    bool viewPinnedInvoked=false;
+    bool appIdInvoked=false;
+    bool appPinnedInvoked=false;
+    bool canMoveInvoked=false;
+    TargetMobilityDecision decision;
+};
+
+static void EmitTargetMobilityProbeEvidence(
+        PickerTraceApiKind api,const WindowIdentityKey& expected,
+        HRESULT result,bool invoked,BOOL value=FALSE) noexcept {
+    PickerTraceApiResultEvent event;
+    event.api=api;
+    event.resultKind=PickerTraceRawResultKind::HResult;
+    event.hwnd=expected.hwnd;
+    event.hresult=result;
+    event.boolResult=value!=FALSE;
+    event.invoked=invoked;
+    g_pickerTrace.emit(event);
+}
+
+static TargetMobilityDecision QueryTargetWindowMobility(
+        const WindowIdentityKey& expected,
+        TargetDesktopRoute knownRoute,IApplicationView* view,
+        TargetMobilityProbeFacts& facts) noexcept {
+    facts=TargetMobilityProbeFacts{};
+    facts.route=knownRoute;
+    facts.identity=RecaptureGenericWindowIdentity(expected);
+    if(facts.identity!=WindowIdentityRecapture::Match || !view)
+        return facts.decision;
+
+    TargetMobilityEvidence evidence;
+    evidence.desktopRoute=knownRoute;
+    if(g_pinnedApps){
+        facts.viewPinnedInvoked=true;
+        try {
+            facts.viewPinnedResult=g_pinnedApps->IsViewPinned(
+                view,&facts.viewPinned);
+        } catch(...) {
+            facts.viewPinnedResult=E_FAIL;
+        }
+    }
+    EmitTargetMobilityProbeEvidence(
+        PickerTraceApiKind::IsViewPinned,expected,
+        facts.viewPinnedResult,facts.viewPinnedInvoked,
+        facts.viewPinned);
+    evidence.viewPinned=MobilityEvidenceFromBoolean(
+        facts.viewPinnedResult,facts.viewPinned);
+
+    ScopedCoTaskMemString appId;
+    facts.appIdInvoked=true;
+    try {
+        facts.appIdResult=view->GetAppUserModelId(appId.out());
+    } catch(...) {
+        facts.appIdResult=E_FAIL;
+    }
+    EmitTargetMobilityProbeEvidence(
+        PickerTraceApiKind::GetAppUserModelId,expected,
+        facts.appIdResult,facts.appIdInvoked);
+    if(SUCCEEDED(facts.appIdResult) && appId.usable() &&
+       g_pinnedApps){
+        facts.appPinnedInvoked=true;
+        try {
+            facts.appPinnedResult=g_pinnedApps->IsAppIdPinned(
+                appId.get(),&facts.appPinned);
+        } catch(...) {
+            facts.appPinnedResult=E_FAIL;
+        }
+    }
+    EmitTargetMobilityProbeEvidence(
+        PickerTraceApiKind::IsAppIdPinned,expected,
+        facts.appPinnedResult,facts.appPinnedInvoked,
+        facts.appPinned);
+    evidence.appPinned=MobilityEvidenceFromBoolean(
+        facts.appPinnedResult,facts.appPinned);
+
+    if(g_vdmi){
+        facts.canMoveInvoked=true;
+        try {
+            facts.canMoveResult=g_vdmi->CanViewMoveDesktops(
+                view,&facts.canMove);
+        } catch(...) {
+            facts.canMoveResult=E_FAIL;
+        }
+    }
+    EmitTargetMobilityProbeEvidence(
+        PickerTraceApiKind::CanViewMoveDesktops,expected,
+        facts.canMoveResult,facts.canMoveInvoked,
+        facts.canMove!=0 ? TRUE : FALSE);
+    evidence.canMove=MobilityEvidenceFromBoolean(
+        facts.canMoveResult,facts.canMove!=0);
+    facts.decision=DecideTargetMobility(evidence);
+    return facts.decision;
 }
 
 static bool CaptureGenericWindowIdentity(const WindowIdentityKey& expected,

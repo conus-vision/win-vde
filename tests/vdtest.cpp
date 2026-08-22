@@ -2820,6 +2820,38 @@ static void test_target_desktop_route_requires_concrete_snapshot_membership(){
         TargetDesktopRoute::Indeterminate);
 }
 
+static void test_target_mobility_probe_adapters_are_fail_closed(){
+    CHECK(MobilityEvidenceFromBoolean(S_OK,TRUE)==
+          MobilityEvidence::Positive);
+    CHECK(MobilityEvidenceFromBoolean(S_FALSE,FALSE)==
+          MobilityEvidence::Negative);
+    CHECK(MobilityEvidenceFromBoolean(E_NOINTERFACE,TRUE)==
+          MobilityEvidence::Unknown);
+    CHECK(MobilityEvidenceFromBoolean(E_FAIL,FALSE)==
+          MobilityEvidence::Unknown);
+
+    TargetMobilityEvidence optionalServiceAbsent;
+    optionalServiceAbsent.desktopRoute=TargetDesktopRoute::Exact;
+    optionalServiceAbsent.viewPinned=
+        MobilityEvidenceFromBoolean(E_NOINTERFACE,FALSE);
+    optionalServiceAbsent.appPinned=
+        MobilityEvidenceFromBoolean(E_NOINTERFACE,FALSE);
+    optionalServiceAbsent.canMove=
+        MobilityEvidenceFromBoolean(S_OK,TRUE);
+    const TargetMobilityDecision exact=DecideTargetMobility(
+        optionalServiceAbsent);
+    CHECK(exact.mobility==TargetMobility::Indeterminate);
+    CHECK(exact.disposition==TargetMoveDisposition::Reject);
+
+    optionalServiceAbsent.desktopRoute=
+        TargetDesktopRoute::GloballyVisible;
+    optionalServiceAbsent.canMove=MobilityEvidence::Unknown;
+    const TargetMobilityDecision global=DecideTargetMobility(
+        optionalServiceAbsent);
+    CHECK(global.mobility==TargetMobility::Indeterminate);
+    CHECK(global.disposition==TargetMoveDisposition::VisualOnly);
+}
+
 static void test_picker_async_search_joins_by_full_identity(){
     const WindowIdentityKey row=IK(0x1234,77,9001);
     CHECK(PickerSearchResultMatches(row,row));
@@ -23481,6 +23513,10 @@ static void test_picker_trace_task8_enums_have_complete_stable_names(){
     struct ApiCase { PickerTraceApiKind value; const char* name; };
     const ApiCase apis[]={
         {PickerTraceApiKind::GetViewForHwnd,"get_view_for_hwnd"},
+        {PickerTraceApiKind::GetAppUserModelId,"get_app_user_model_id"},
+        {PickerTraceApiKind::IsViewPinned,"is_view_pinned"},
+        {PickerTraceApiKind::IsAppIdPinned,"is_app_id_pinned"},
+        {PickerTraceApiKind::CanViewMoveDesktops,"can_view_move_desktops"},
         {PickerTraceApiKind::MoveViewToDesktop,"move_view_to_desktop"},
         {PickerTraceApiKind::MoveWindowToDesktop,"move_window_to_desktop"},
         {PickerTraceApiKind::GetWindowDesktopIdTarget,"get_window_desktop_id_target"},
@@ -26314,10 +26350,10 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
         PickerTraceEventAssignmentsForTest(source);
     const std::vector<std::string> moduleEventAssignments=
         PickerTraceEventAssignmentsForTest(traceSource);
-    CHECK(vdeEventAssignments.size()==161);
+    CHECK(vdeEventAssignments.size()==167);
     CHECK(moduleEventAssignments.size()==74);
     CHECK(PickerTraceAssignmentDigestForTest(vdeEventAssignments)==
-          "46f0c96ca1eed1ad52b9891431db4551570f08f997570d4960f99214acfe5aea");
+          "4a500c17df514965da708d738b780a8ea9f69c482de4d4d8b1b76159cdbf1505");
     CHECK(PickerTraceAssignmentDigestForTest(moduleEventAssignments)==
           "3cf0a4ba0d03558355119c432dd5c642014b7ac987858d2ade5c62a01a4cf493");
     CHECK(std::find(moduleEventAssignments.begin(),
@@ -26328,7 +26364,7 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
     const char* forbiddenAssignmentIdentifiers[]={
         "g_targetTitle","searchText","capturedTitle","diagnostic",
         "runtimeKey","pendingRecordId","sessionstore","sessionStore",
-        "ProcessSnapshot"
+        "ProcessSnapshot","appId","appUserModelId","applicationId"
     };
     for(const std::string& assignment:vdeEventAssignments)
         for(const char* forbidden:forbiddenAssignmentIdentifiers)
@@ -26552,14 +26588,14 @@ static void test_picker_trace_task10_runtime_anchors_and_privacy_are_locked(){
         "observer->context,emission.attempt",
         "observer->context,*terminal","startEvent,appVersion"
     };
-    CHECK(emitArguments.size()==25);
+    CHECK(emitArguments.size()==26);
     for(const std::string& argument:emitArguments){
         CHECK(allowedArguments.find(argument)!=allowedArguments.end());
         const char* forbidden[]={
             "g_targetTitle","searchText","capturedTitle","diagnostic",
             "runtimeKey","pendingRecordId","sessionstore","sessionStore",
             "ProcessSnapshot","process.image","process->second.image",
-            "snapshot.image"
+            "snapshot.image","appId","appUserModelId","applicationId"
         };
         for(const char* value:forbidden)
             CHECK(argument.find(value)==std::string::npos);
@@ -26726,6 +26762,129 @@ static void test_picker_evidence_fixes_have_guarded_product_wiring(){
           popupGuard<targetCapture && targetCapture<routePublish);
 }
 
+static void test_picker_pin_probe_is_optional_read_only_and_private(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string traceHeader=
+        ReadSourceFile(L"src\\picker_trace.hpp");
+    const std::string traceSource=
+        ReadSourceFile(L"src\\picker_trace.cpp");
+    const std::string interfaces=SourceSection(
+        source,"// ============================ Undocumented interfaces",
+        "// ================================ string utils");
+    const std::string init=SourceSection(
+        source,"static bool InitServices(){",
+        "static void ReleaseServices(){");
+    const std::string release=SourceSection(
+        source,"static void ReleaseServices(){",
+        "template<class T>");
+    const std::string facts=SourceSection(
+        source,"struct TargetMobilityProbeFacts {",
+        "static TargetMobilityDecision QueryTargetWindowMobility(");
+    const std::string probe=SourceSection(
+        source,"static TargetMobilityDecision QueryTargetWindowMobility(",
+        "static bool CaptureGenericWindowIdentity(");
+    const std::string traceEvent=SourceSection(
+        traceHeader,"struct PickerTraceApiResultEvent {",
+        "struct PickerTraceTerminalizationAttemptEvent {");
+
+    CHECK(source.find("0xB5A399E7,0x1C87,0x46B8")!=
+          std::string::npos);
+    CHECK(source.find("0x4CE81583,0x1E4C,0x4632")!=
+          std::string::npos);
+    CHECK(interfaces.find(
+        "uuid(\"4CE81583-1E4C-4632-A621-07A53543148F\")")!=
+          std::string::npos);
+
+    const char* viewMethods[]={
+        "SetFocus()","SwitchTo()","TryInvokeBack(void*)",
+        "GetThumbnailWindow(HWND*)","GetMonitor(void**)",
+        "GetVisibility(int*)","SetCloak(int,int)",
+        "GetPosition(REFIID,void**)","SetPosition(void*)",
+        "InsertAfterWindow(HWND)","GetExtendedFramePosition(RECT*)",
+        "GetAppUserModelId(PWSTR*)"
+    };
+    size_t methodAt=interfaces.find("IApplicationView : IUnknown");
+    CHECK(methodAt!=std::string::npos);
+    for(const char* method : viewMethods){
+        const size_t next=interfaces.find(method,methodAt);
+        CHECK(next!=std::string::npos);
+        CHECK(next>=methodAt);
+        methodAt=next;
+    }
+
+    const char* pinSlots[]={
+        "IsAppIdPinned(","PinAppID(","UnpinAppID(",
+        "IsViewPinned(","PinView(","UnpinView("
+    };
+    size_t pinAt=interfaces.find("IVirtualDesktopPinnedApps : IUnknown");
+    CHECK(pinAt!=std::string::npos);
+    for(const char* slot : pinSlots){
+        const size_t next=interfaces.find(slot,pinAt);
+        CHECK(next!=std::string::npos);
+        CHECK(next>=pinAt);
+        pinAt=next;
+    }
+
+    CHECK(!init.empty() && !release.empty());
+    const size_t mandatoryGuard=init.find("ReleaseServices();");
+    const size_t optionalInit=init.find("TryInitializePinnedApps();");
+    const size_t successReturn=init.find("return true;",optionalInit);
+    CHECK(mandatoryGuard!=std::string::npos);
+    CHECK(optionalInit!=std::string::npos);
+    CHECK(successReturn!=std::string::npos);
+    CHECK(mandatoryGuard<optionalInit && optionalInit<successReturn);
+    CHECK(init.find("g_pinnedApps!=nullptr")==std::string::npos);
+    CHECK(release.find("ReleasePinnedApps();")!=std::string::npos);
+    CHECK(source.find("candidate->Release();")!=std::string::npos);
+    CHECK(source.find("prior->Release();")!=std::string::npos);
+
+    CHECK(source.find("g_pinnedApps->IsViewPinned(")!=
+          std::string::npos);
+    CHECK(source.find("view->GetAppUserModelId(")!=
+          std::string::npos);
+    CHECK(source.find("g_pinnedApps->IsAppIdPinned(")!=
+          std::string::npos);
+    CHECK(source.find("g_vdmi->CanViewMoveDesktops(")!=
+          std::string::npos);
+    CHECK(source.find("g_pinnedApps->PinView(")==std::string::npos);
+    CHECK(source.find("g_pinnedApps->UnpinView(")==std::string::npos);
+    CHECK(source.find("g_pinnedApps->PinAppID(")==std::string::npos);
+    CHECK(source.find("g_pinnedApps->UnpinAppID(")==std::string::npos);
+
+    CHECK(source.find("if(value_) CoTaskMemFree(value_);")!=
+          std::string::npos);
+    CHECK(source.find("ScopedCoTaskMemString appId;")!=
+          std::string::npos);
+    CHECK(!facts.empty() && !probe.empty());
+    CHECK(facts.find("PWSTR")==std::string::npos);
+    CHECK(facts.find("PCWSTR")==std::string::npos);
+    CHECK(facts.find("std::string")==std::string::npos);
+    CHECK(facts.find("std::wstring")==std::string::npos);
+    CHECK(probe.find("facts.decision=DecideTargetMobility(evidence);")!=
+          std::string::npos);
+    CHECK(probe.find("appId.get()")!=std::string::npos);
+    CHECK(probe.find("return appId")==std::string::npos);
+
+    CHECK(traceSource.find(
+        "PickerTraceApiKind,GetAppUserModelId,\"get_app_user_model_id\"")!=
+          std::string::npos);
+    CHECK(traceSource.find(
+        "PickerTraceApiKind,IsViewPinned,\"is_view_pinned\"")!=
+          std::string::npos);
+    CHECK(traceSource.find(
+        "PickerTraceApiKind,IsAppIdPinned,\"is_app_id_pinned\"")!=
+          std::string::npos);
+    CHECK(traceSource.find(
+        "PickerTraceApiKind,CanViewMoveDesktops,\"can_view_move_desktops\"")!=
+          std::string::npos);
+    CHECK(!traceEvent.empty());
+    CHECK(traceEvent.find("appUserModelId")==std::string::npos);
+    CHECK(traceEvent.find("applicationId")==std::string::npos);
+    CHECK(traceEvent.find("PWSTR")==std::string::npos);
+    CHECK(traceEvent.find("PCWSTR")==std::string::npos);
+    CHECK(traceEvent.find("std::wstring")==std::string::npos);
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
@@ -26787,6 +26946,7 @@ int main(){
     test_picker_trace_task9_runtime_wiring_is_causal_and_private();
     test_picker_trace_task10_runtime_anchors_and_privacy_are_locked();
     test_picker_evidence_fixes_have_guarded_product_wiring();
+    test_picker_pin_probe_is_optional_read_only_and_private();
     test_picker_uses_self_contained_gdi_buffer();
     test_picker_icon_loading_is_bounded_and_outside_paint();
     test_picker_enum_publishes_display_only_rows_safely();
@@ -26874,6 +27034,7 @@ int main(){
     test_picker_evidence_routes_are_fail_closed();
     test_target_mobility_fails_closed_and_positive_signals_win();
     test_target_desktop_route_requires_concrete_snapshot_membership();
+    test_target_mobility_probe_adapters_are_fail_closed();
     test_picker_async_search_joins_by_full_identity();
     test_picker_state_whole_object_swap_includes_generation_sentinel();
     test_picker_transition_policy_table_is_closed();

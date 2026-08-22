@@ -335,6 +335,10 @@ const char* PickerTraceEffectStageName(PickerTraceEffectStage value) noexcept {
 const char* PickerTraceApiKindName(PickerTraceApiKind value) noexcept {
     switch(value){
     VDE_TRACE_NAME_CASE(PickerTraceApiKind,GetViewForHwnd,"get_view_for_hwnd");
+    VDE_TRACE_NAME_CASE(PickerTraceApiKind,GetAppUserModelId,"get_app_user_model_id");
+    VDE_TRACE_NAME_CASE(PickerTraceApiKind,IsViewPinned,"is_view_pinned");
+    VDE_TRACE_NAME_CASE(PickerTraceApiKind,IsAppIdPinned,"is_app_id_pinned");
+    VDE_TRACE_NAME_CASE(PickerTraceApiKind,CanViewMoveDesktops,"can_view_move_desktops");
     VDE_TRACE_NAME_CASE(PickerTraceApiKind,MoveViewToDesktop,"move_view_to_desktop");
     VDE_TRACE_NAME_CASE(PickerTraceApiKind,MoveWindowToDesktop,"move_window_to_desktop");
     VDE_TRACE_NAME_CASE(PickerTraceApiKind,GetWindowDesktopIdTarget,"get_window_desktop_id_target");

@@ -87,7 +87,9 @@ enum class PickerTraceEffectStage : uint8_t {
 };
 
 enum class PickerTraceApiKind : uint8_t {
-    GetViewForHwnd, MoveViewToDesktop, MoveWindowToDesktop,
+    GetViewForHwnd, GetAppUserModelId, IsViewPinned,
+    IsAppIdPinned, CanViewMoveDesktops,
+    MoveViewToDesktop, MoveWindowToDesktop,
     GetWindowDesktopIdTarget, GetWindowDesktopIdPopup,
     GetWindowDesktopIdCapture, GetDesktops, GetCount, GetAt, GetId,
     GetCurrentDesktop, AttachDesktopInput, AttachForegroundInput,
