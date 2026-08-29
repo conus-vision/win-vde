@@ -14,6 +14,8 @@
 #include "str_util.hpp"
 #include "layout.hpp"
 #include "layout_store.hpp"
+#include "tabsnap.hpp"
+#include "binding_store.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -8655,8 +8657,9 @@ static void test_dirty_flush_clock_ceiling_never_spins(){
     CHECK(saturatedWrites==1);
 }
 
-static void test_layout_serializes_v4_header(){
-    CHECK(SerializeLayout({}, {}).find("# VDE snapshot v4\n") == 0);
+static void test_layout_serializes_v5_header(){
+    // v5 = v4 records plus the optional U/P companion lines.
+    CHECK(SerializeLayout({}, {}).find("# VDE snapshot v5\n") == 0);
 }
 
 static void test_layout_roundtrip_v4(){
@@ -9146,7 +9149,7 @@ static void test_layout_provisional_marker_roundtrips_strict_v4(){
     int sourceVersion=0;
     CHECK(ParseLayout(serialized,desks,records,1800000000,&error,
                       &sourceVersion));
-    CHECK(error.empty() && sourceVersion==4);
+    CHECK(error.empty() && sourceVersion==5);
     CHECK(records.size()==1 && records[0].provisional);
     CHECK(records.size()==1 && records[0].recordId==provisional.recordId);
 }
@@ -10027,7 +10030,7 @@ static void test_layout_provisional_companions_do_not_consume_record_cap(){
     int sourceVersion=0;
     CHECK(ParseLayout(bytes,parsedDesks,parsedRecords,1800000000,&error,
                       &sourceVersion));
-    CHECK(error.empty() && sourceVersion==4);
+    CHECK(error.empty() && sourceVersion==5);
     CHECK(parsedRecords.size()==MAX_LAYOUT_RECORDS);
     CHECK(parsedRecords.size()==MAX_LAYOUT_RECORDS &&
           parsedRecords.front().provisional && parsedRecords.back().provisional);
@@ -10538,7 +10541,7 @@ static void test_reconcile_unique_generated_id_commits_strict_v4(){
     std::vector<LayoutWin> parsed;
     int version=0;
     CHECK(ParseLayout(snapshot,parsedDesks,parsed,now,&error,&version));
-    CHECK(error.empty() && version==4 && parsedDesks.empty());
+    CHECK(error.empty() && version==5 && parsedDesks.empty());
     CHECK(parsed.size()==1 && SameLayoutWinFields(parsed[0],committed[0]));
 }
 
@@ -11398,7 +11401,7 @@ static void test_checked_snapshot_enforces_combined_record_cap(){
     std::vector<LayoutWin> acceptedWins={StrictV4Record()};
     std::string output="sentinel", error="stale";
     CHECK(BuildCheckedLayoutSnapshot(acceptedDesks,acceptedWins,1700000000,output,&error));
-    CHECK(error.empty()); CHECK(output.find("# VDE snapshot v4\n")==0);
+    CHECK(error.empty()); CHECK(output.find("# VDE snapshot v5\n")==0);
     CHECK(acceptedWins[0].recordId=="{00000000-0000-0000-0000-000000000101}");
     CHECK(acceptedWins[0].lastSeenUtc==1700000000);
 
@@ -18343,7 +18346,7 @@ static void test_legacy_migration_never_overlays_recoverable_target(){
     }
 }
 
-static void test_legacy_migration_installs_checked_v4_then_retires_source(){
+static void test_legacy_migration_installs_checked_v5_then_retires_source(){
     LayoutTempDir temp;
     std::wstring legacy=temp.file(L"layout.txt");
     std::wstring automatic=temp.file(L"layout-auto.txt");
@@ -18357,20 +18360,20 @@ static void test_legacy_migration_installs_checked_v4_then_retires_source(){
     CHECK(result.status==LegacyLayoutMigrationStatus::Migrated);
     CHECK(result.error.empty());
     CHECK(result.target.status==LayoutLoadStatus::Valid);
-    CHECK(result.target.sourceVersion==4);
+    CHECK(result.target.sourceVersion==5);
     CHECK(result.target.revision.sourcePath==automatic);
     CHECK(result.target.revision.exists);
     CHECK(!FileExists(legacy));
     CHECK(ReadRawFile(legacy+L".migrated")==legacyBytes);
 
     std::string installed=ReadRawFile(automatic);
-    CHECK(installed.find("# VDE snapshot v4\n")==0);
+    CHECK(installed.find("# VDE snapshot v5\n")==0);
     std::vector<DeskRec> desks;
     std::vector<LayoutWin> wins;
     std::string error;
     int version=0;
     CHECK(ParseLayout(installed,desks,wins,1700000000,&error,&version));
-    CHECK(version==4 && desks.size()==1 && wins.size()==1);
+    CHECK(version==5 && desks.size()==1 && wins.size()==1);
     CHECK(!wins[0].recordId.empty());
     CHECK(wins[0].lastSeenUtc==1700000000 && wins[0].missingSinceUtc==0);
 }
@@ -28997,6 +29000,942 @@ static void test_picker_final_feature_regressions_are_locked(){
           std::string::npos);
 }
 
+// ---------------------- session snapshots (tabsnap.hpp) ----------------------
+static SnapTab snapTab(const std::string& url,const std::string& title){
+    SnapTab tab; tab.url=url; tab.title=title; return tab;
+}
+
+static SessionSnapshot sampleSnapshot(){
+    SessionSnapshot snapshot;
+    snapshot.kind=SnapKind::Exit;
+    snapshot.capturedUtc=1756000000;
+    DeskRec desk; desk.index=0; desk.guid=G(L"{11111111-1111-1111-1111-111111111111}");
+    desk.name=L"Work \x2014 main";
+    snapshot.desks.push_back(desk);
+    SnapWindow window;
+    window.app="firefox";
+    window.recordId=W2U8(GuidToString(G(L"{22222222-2222-2222-2222-222222222222}")));
+    window.desktop=desk.guid;
+    window.deskIndex=0;
+    window.activeTab=1;
+    window.activeTitle="Inbox \xE2\x80\x94 tab";
+    window.tabs.push_back(snapTab("https://example.com/a?x=1","First"));
+    window.tabs.push_back(snapTab("https://docs.python.org/3","Python\tdocs"));
+    snapshot.windows.push_back(window);
+    SnapWindow second;
+    second.app="chrome";
+    second.desktop=G(L"{33333333-3333-3333-3333-333333333333}");
+    second.deskIndex=1;
+    second.activeTab=-1;
+    second.tabs.push_back(snapTab("https://github.com/x","GitHub"));
+    snapshot.windows.push_back(second);
+    return snapshot;
+}
+
+static void test_session_snapshot_roundtrip(){
+    const SessionSnapshot original=sampleSnapshot();
+    CHECK(ValidSnapshot(original));
+    SessionSnapshot parsed;
+    std::string error="sentinel";
+    CHECK(ParseSessionSnapshot(SerializeSessionSnapshot(original),parsed,&error));
+    CHECK(error.empty());
+    CHECK(parsed.kind==SnapKind::Exit);
+    CHECK(parsed.capturedUtc==original.capturedUtc);
+    CHECK(parsed.desks.size()==1 && parsed.desks[0].name==L"Work \x2014 main");
+    CHECK(parsed.windows.size()==2);
+    CHECK(parsed.windows[0].app=="firefox");
+    CHECK(parsed.windows[0].recordId==original.windows[0].recordId);
+    CHECK(GuidEq(parsed.windows[0].desktop,original.windows[0].desktop));
+    CHECK(parsed.windows[0].activeTab==1);
+    CHECK(parsed.windows[0].activeTitle==original.windows[0].activeTitle);
+    CHECK(parsed.windows[0].tabs.size()==2);
+    CHECK(parsed.windows[0].tabs[1].title=="Python\tdocs");   // tabs survive delimiters
+    CHECK(parsed.windows[1].app=="chrome" && parsed.windows[1].recordId.empty());
+    CHECK(parsed.windows[1].activeTab==-1);
+    CHECK(SnapshotTabCount(parsed)==3);
+    CHECK(SnapshotApps(parsed).count("firefox") && SnapshotApps(parsed).count("chrome"));
+    CHECK(SnapshotWindowCountForApp(parsed,"firefox")==1);
+    // Re-serializing a parsed snapshot reproduces the same bytes.
+    CHECK(SerializeSessionSnapshot(parsed)==SerializeSessionSnapshot(original));
+}
+
+static void test_session_snapshot_rejects_malformed_input(){
+    SessionSnapshot parsed;
+    CHECK(!ParseSessionSnapshot("",parsed));
+    CHECK(!ParseSessionSnapshot("# VDE session snapshot v2\nM\tsaved\t1\n",parsed));
+    CHECK(!ParseSessionSnapshot("M\tsaved\t1\n",parsed));                    // no header
+    CHECK(!ParseSessionSnapshot("# VDE session snapshot v1\nW\tfirefox\t-\t0\t"
+        "{11111111-1111-1111-1111-111111111111}\t-1\t\n",parsed));           // no meta
+    CHECK(!ParseSessionSnapshot("# VDE session snapshot v1\nM\tsaved\t0\n",parsed));
+    CHECK(!ParseSessionSnapshot("# VDE session snapshot v1\nM\tbogus\t1\n",parsed));
+    CHECK(!ParseSessionSnapshot("# VDE session snapshot v1\nM\tsaved\t1\n"
+        "T\taHR0cHM6Ly9leGFtcGxlLmNvbQ==\t\n",parsed));                      // tab before window
+    CHECK(!ParseSessionSnapshot("# VDE session snapshot v1\nM\tsaved\t1\n"
+        "W\topera\t-\t0\t{11111111-1111-1111-1111-111111111111}\t-1\t\n",parsed));
+    // An active tab index beyond the tab list must not survive parsing.
+    CHECK(!ParseSessionSnapshot("# VDE session snapshot v1\nM\tsaved\t1\n"
+        "W\tfirefox\t-\t0\t{11111111-1111-1111-1111-111111111111}\t3\t\n",parsed));
+    // A zero desktop GUID is not a place a window can be put back on.
+    CHECK(!ParseSessionSnapshot("# VDE session snapshot v1\nM\tsaved\t1\n"
+        "W\tfirefox\t-\t0\t{00000000-0000-0000-0000-000000000000}\t-1\t\n",parsed));
+}
+
+static void test_reopen_url_sanitation(){
+    std::string sanitized="sentinel";
+    CHECK(SanitizeReopenUrl("https://example.com/a?b=c#d",sanitized) &&
+          sanitized=="https://example.com/a?b=c#d");
+    CHECK(SanitizeReopenUrl("HTTP://Example.com/",sanitized));
+    CHECK(SanitizeReopenUrl("file:///C:/tmp/page.html",sanitized));
+    // Scriptable and inert schemes are never replayed onto a command line.
+    CHECK(!SanitizeReopenUrl("javascript:alert(1)",sanitized) && sanitized.empty());
+    CHECK(!SanitizeReopenUrl("data:text/html,<script>",sanitized));
+    CHECK(!SanitizeReopenUrl("about:newtab",sanitized));
+    CHECK(!SanitizeReopenUrl("chrome://settings",sanitized));
+    // Anything that could split or extend the argument list is dropped.
+    CHECK(!SanitizeReopenUrl("https://example.com/a b",sanitized));
+    CHECK(!SanitizeReopenUrl("https://example.com/\" --disable-x",sanitized));
+    CHECK(!SanitizeReopenUrl("https://example.com/\\x",sanitized));
+    CHECK(!SanitizeReopenUrl("https://example.com/\nx",sanitized));
+    CHECK(!SanitizeReopenUrl("-new-window",sanitized));
+    CHECK(!SanitizeReopenUrl("",sanitized));
+    CHECK(!SanitizeReopenUrl("https://"+std::string(MAX_SNAPSHOT_URL_BYTES,'a'),sanitized));
+}
+
+static void test_reopen_launch_chunking(){
+    std::vector<std::string> urls;
+    for(int i=0;i<4;++i) urls.push_back("https://example.com/"+std::to_string(i));
+    // Chromium takes every URL of a window in one --new-window invocation.
+    std::vector<ReopenLaunch> chromium=BuildReopenLaunches("chrome",urls,40);
+    CHECK(chromium.size()==1 && chromium[0].newWindow && chromium[0].urls.size()==4);
+    // Firefox only understands one URL after -new-window; the rest follow as
+    // tab invocations against the window that first launch created.
+    std::vector<ReopenLaunch> firefox=BuildReopenLaunches("firefox",urls,40);
+    CHECK(firefox.size()==2);
+    CHECK(firefox[0].newWindow && firefox[0].urls.size()==1 &&
+          firefox[0].urls[0]=="https://example.com/0");
+    CHECK(!firefox[1].newWindow && firefox[1].urls.size()==3);
+    // A command-line budget splits long tab lists instead of truncating them.
+    std::vector<ReopenLaunch> tight=BuildReopenLaunches("chrome",urls,40,80);
+    size_t carried=0;
+    for(size_t i=0;i<tight.size();++i) carried+=tight[i].urls.size();
+    CHECK(tight.size()>1 && carried==urls.size() && tight[0].newWindow);
+    for(size_t i=1;i<tight.size();++i) CHECK(!tight[i].urls.empty());
+    // One URL that alone exceeds the budget still gets its own invocation.
+    std::vector<std::string> single(1,"https://example.com/"+std::string(200,'a'));
+    std::vector<ReopenLaunch> oversized=BuildReopenLaunches("chrome",single,40,80);
+    CHECK(oversized.size()==1 && oversized[0].urls.size()==1);
+    CHECK(BuildReopenLaunches("chrome",std::vector<std::string>(),40).empty());
+}
+
+static void test_reopen_plan_selects_apps_and_drops_unreplayable_tabs(){
+    SessionSnapshot snapshot=sampleSnapshot();
+    snapshot.windows[0].tabs.push_back(snapTab("javascript:alert(1)","bad"));
+    SnapWindow inert;
+    inert.app="msedge";
+    inert.desktop=G(L"{44444444-4444-4444-4444-444444444444}");
+    inert.deskIndex=2;
+    inert.tabs.push_back(snapTab("about:blank",""));
+    snapshot.windows.push_back(inert);
+
+    std::set<std::string> apps;
+    apps.insert("firefox");
+    ReopenPlan plan;
+    CHECK(BuildReopenPlan(snapshot,apps,64,plan));
+    CHECK(plan.jobs.size()==1);                       // chrome/edge were not asked for
+    CHECK(plan.jobs[0].app=="firefox" && plan.jobs[0].urls.size()==2);
+    CHECK(plan.skippedTabs==1 && plan.skippedWindows==0);
+    CHECK(GuidEq(plan.jobs[0].desktop,snapshot.windows[0].desktop));
+    CHECK(plan.jobs[0].recordId==snapshot.windows[0].recordId);
+
+    apps.insert("msedge");
+    ReopenPlan withEdge;
+    CHECK(BuildReopenPlan(snapshot,apps,64,withEdge));
+    CHECK(withEdge.jobs.size()==1);                   // the edge window had no usable tab
+    CHECK(withEdge.skippedWindows==1 && withEdge.skippedTabs==2);
+}
+
+static void test_reopen_command_line_shape(){
+    ReopenLaunch launch;
+    launch.newWindow=true;
+    launch.urls.push_back("https://example.com/a");
+    launch.urls.push_back("https://example.com/b");
+    CHECK(BuildReopenCommandLine("chrome",L"C:\\Apps\\chrome.exe",launch)==
+          L"\"C:\\Apps\\chrome.exe\" --new-window \"https://example.com/a\" \"https://example.com/b\"");
+    ReopenLaunch tabs;
+    tabs.urls.push_back("https://example.com/c");
+    CHECK(BuildReopenCommandLine("firefox",L"C:\\Apps\\firefox.exe",tabs)==
+          L"\"C:\\Apps\\firefox.exe\" \"https://example.com/c\"");
+    ReopenLaunch first;
+    first.newWindow=true;
+    first.urls.push_back("https://example.com/d");
+    CHECK(BuildReopenCommandLine("firefox",L"C:\\Apps\\firefox.exe",first)==
+          L"\"C:\\Apps\\firefox.exe\" -new-window \"https://example.com/d\"");
+}
+
+static void test_snapshot_slot_naming_and_rotation(){
+    CHECK(SnapshotSlotFileName(0)==L"session-saved.txt");
+    CHECK(SnapshotSlotFileName(1)==L"session-exit-1.txt");
+    CHECK(SnapshotSlotFileName(4)==L"session-exit-4.txt");
+    // Oldest first, so a failed rename can never overwrite a newer snapshot.
+    const std::vector<std::pair<size_t,size_t> > steps=SnapshotRotationSteps();
+    CHECK(steps.size()==3);
+    CHECK(steps[0].first==3 && steps[0].second==4);
+    CHECK(steps[1].first==2 && steps[1].second==3);
+    CHECK(steps[2].first==1 && steps[2].second==2);
+    SnapshotSlot described=DescribeSnapshotSlot(2,sampleSnapshot());
+    CHECK(described.index==2 && described.present && described.windows==2 &&
+          described.tabs==3 && described.kind==SnapKind::Exit);
+}
+
+// ---------- structured tab capture and SNSS close-command replay -------------
+static void test_snss_captures_ordered_tabs(){
+    std::vector<WinFp> windows;
+    CHECK(ParseChromiumSNSS(makeSnss(),windows));
+    int mainIndex=-1;
+    for(size_t i=0;i<windows.size();++i)
+        if(windows[i].counts.count("github.com")) mainIndex=(int)i;
+    CHECK(mainIndex>=0);
+    const WinFp& window=windows[(size_t)mainIndex];
+    CHECK(window.tabs.size()==2);
+    CHECK(window.tabs[0].url=="https://github.com/x" && window.tabs[0].title=="GitHub");
+    CHECK(window.tabs[1].url=="https://docs.python.org/3");
+    CHECK(window.activeTab==1);                       // window 10 selects index 1
+    CHECK(window.tabs[(size_t)window.activeTab].title==window.activeTitle);
+}
+
+static void test_snss_replays_closed_tabs_and_windows(){
+    // A tab and a window that the user closed must not come back: SNSS only
+    // appends "closed" commands, it never rewrites the earlier ones.
+    std::string file=makeSnss();
+    std::string closedTab; wInt(closedTab,2); wInt(closedTab,0); wInt(closedTab,0);
+    snssFrame(file,16,closedTab);
+    std::vector<WinFp> windows;
+    CHECK(ParseChromiumSNSS(file,windows));
+    CHECK(windows.size()==2);
+    int remaining=-1;
+    for(size_t i=0;i<windows.size();++i)
+        if(windows[i].counts.count("github.com")) remaining=(int)i;
+    CHECK(remaining>=0);
+    CHECK(windows[(size_t)remaining].tabCount==1);
+    CHECK(windows[(size_t)remaining].counts.count("python.org")==0);
+    CHECK(windows[(size_t)remaining].tabs.size()==1);
+
+    std::string closedWindow; wInt(closedWindow,10); wInt(closedWindow,0); wInt(closedWindow,0);
+    snssFrame(file,17,closedWindow);
+    std::vector<WinFp> survivors;
+    CHECK(ParseChromiumSNSS(file,survivors));
+    CHECK(survivors.size()==1);
+    CHECK(survivors[0].counts.count("example.com")==1);
+
+    // A truncated close command is still a malformed file.
+    std::string truncated=makeSnss();
+    snssFrame(truncated,16,std::string(2,'\0'));
+    std::vector<WinFp> rejected(1);
+    CHECK(!ParseChromiumSNSS(truncated,rejected));
+    CHECK(rejected.empty());
+}
+
+static void test_firefox_captures_ordered_tabs(){
+    std::vector<WinFp> windows;
+    CHECK(ParseFirefoxSessionJson(
+        "{\"windows\":[{\"selected\":2,\"tabs\":["
+        "{\"index\":1,\"entries\":[{\"url\":\"https://example.com/a\",\"title\":\"A\"}]},"
+        "{\"index\":1,\"entries\":[{\"url\":\"https://example.com/b\",\"title\":\"B\"}]}"
+        "]}]}",windows));
+    CHECK(windows.size()==1);
+    CHECK(windows[0].tabs.size()==2);
+    CHECK(windows[0].tabs[0].url=="https://example.com/a");
+    CHECK(windows[0].tabs[1].title=="B");
+    CHECK(windows[0].activeTab==1 && windows[0].activeTitle=="B");
+    // Tabs with no navigation entry are skipped without shifting the active tab.
+    std::vector<WinFp> sparse;
+    CHECK(ParseFirefoxSessionJson(
+        "{\"windows\":[{\"selected\":3,\"tabs\":["
+        "{\"entries\":[]},"
+        "{\"index\":1,\"entries\":[{\"url\":\"https://example.com/a\",\"title\":\"A\"}]},"
+        "{\"index\":1,\"entries\":[{\"url\":\"https://example.com/c\",\"title\":\"C\"}]}"
+        "]}]}",sparse));
+    CHECK(sparse.size()==1 && sparse[0].tabs.size()==2);
+    CHECK(sparse[0].activeTab==1 && sparse[0].tabs[1].title=="C");
+}
+
+static void test_session_payload_estimate_counts_tabs(){
+    std::vector<WinFp> windows(1);
+    const size_t bare=EstimateSessionPayloadBytes(windows);
+    windows[0].tabs.push_back(SessionTab());
+    windows[0].tabs[0].url=std::string(512,'u');
+    windows[0].tabs[0].title=std::string(256,'t');
+    CHECK(EstimateSessionPayloadBytes(windows)>=bare+768);
+}
+
+// ------------------ persisted bindings + restore gate ------------------------
+static PersistedBinding testBinding(const std::string& app,const std::string& id,
+                                    uint64_t hwnd,uint64_t pid,uint64_t started){
+    PersistedBinding binding;
+    binding.app=app;
+    binding.recordId=id;
+    binding.hwnd=hwnd;
+    binding.pid=pid;
+    binding.processStart=started;
+    return binding;
+}
+
+static void test_binding_store_roundtrip(){
+    std::vector<PersistedBinding> bindings;
+    bindings.push_back(testBinding(
+        "firefox","{5D5676BD-A590-415F-AB4B-520D6049F8DD}",
+        0x1234,4321,132000000000000000ULL));
+    bindings.push_back(testBinding(
+        "chrome","{FEF40324-4778-4FA9-B4B4-C97B5E901059}",
+        0x5678,8765,132000000000000001ULL));
+    std::vector<PersistedBinding> parsed;
+    std::string error="sentinel";
+    CHECK(ParseBindings(SerializeBindings(bindings),parsed,&error));
+    CHECK(error.empty());
+    CHECK(parsed.size()==2);
+    CHECK(parsed[0].app=="firefox" && parsed[0].hwnd==0x1234 &&
+          parsed[0].pid==4321 && parsed[0].processStart==132000000000000000ULL);
+    CHECK(parsed[1].recordId==bindings[1].recordId);
+    CHECK(SerializeBindings(parsed)==SerializeBindings(bindings));
+}
+
+static void test_binding_store_rejects_malformed(){
+    std::vector<PersistedBinding> parsed;
+    CHECK(!ParseBindings("",parsed));
+    CHECK(!ParseBindings("# VDE bindings v2\n",parsed));
+    CHECK(!ParseBindings("B\tfirefox\t{5D5676BD-A590-415F-AB4B-520D6049F8DD}\t1\t2\t3\n",
+                         parsed));                       // no header
+    const std::string header="# VDE bindings v1\n";
+    CHECK(!ParseBindings(header+"B\topera\t{5D5676BD-A590-415F-AB4B-520D6049F8DD}\t1\t2\t3\n",parsed));
+    CHECK(!ParseBindings(header+"B\tfirefox\tnot-a-guid\t1\t2\t3\n",parsed));
+    // A zero handle, pid or start time cannot identify a window.
+    CHECK(!ParseBindings(header+"B\tfirefox\t{5D5676BD-A590-415F-AB4B-520D6049F8DD}\t0\t2\t3\n",parsed));
+    CHECK(!ParseBindings(header+"B\tfirefox\t{5D5676BD-A590-415F-AB4B-520D6049F8DD}\t1\t0\t3\n",parsed));
+    CHECK(!ParseBindings(header+"B\tfirefox\t{5D5676BD-A590-415F-AB4B-520D6049F8DD}\t1\t2\t0\n",parsed));
+    CHECK(!ParseBindings(header+"B\tfirefox\t{5D5676BD-A590-415F-AB4B-520D6049F8DD}\t1\t2\n",parsed));
+    CHECK(!ParseBindings(header+"X\tfirefox\n",parsed));
+    // An empty but well-formed file is valid and simply binds nothing.
+    CHECK(ParseBindings(header,parsed) && parsed.empty());
+}
+
+static void test_binding_signature_detects_every_field(){
+    std::vector<PersistedBinding> base;
+    base.push_back(testBinding("firefox","{5D5676BD-A590-415F-AB4B-520D6049F8DD}",
+                               10,20,30));
+    const uint64_t signature=BindingsSignature(base);
+    std::vector<PersistedBinding> changed=base;
+    changed[0].hwnd=11;
+    CHECK(BindingsSignature(changed)!=signature);
+    changed=base; changed[0].pid=21;
+    CHECK(BindingsSignature(changed)!=signature);
+    changed=base; changed[0].processStart=31;
+    CHECK(BindingsSignature(changed)!=signature);
+    changed=base; changed[0].app="chrome";
+    CHECK(BindingsSignature(changed)!=signature);
+    changed=base; changed[0].recordId="{FEF40324-4778-4FA9-B4B4-C97B5E901059}";
+    CHECK(BindingsSignature(changed)!=signature);
+    changed=base; changed.push_back(base[0]);
+    CHECK(BindingsSignature(changed)!=signature);
+    CHECK(BindingsSignature(base)==signature);            // stable
+    CHECK(BindingsSignature(std::vector<PersistedBinding>())!=signature);
+}
+
+static void test_restore_gate_cold_until_a_window_is_bound(){
+    RestoreGate gate;
+    // Nothing bound yet: this is the restart case, moves are allowed.
+    CHECK(GateDisposition(gate,1000)==RestoreDisposition::Restore);
+    ObserveRestoreGate(gate,false,1000);
+    CHECK(GateDisposition(gate,1000)==RestoreDisposition::Restore);
+
+    // The first binding starts the grace window for windows the browser
+    // restores late.
+    ObserveRestoreGate(gate,true,2000);
+    CHECK(gate.warmSinceMs==2000);
+    CHECK(GateDisposition(gate,2000)==RestoreDisposition::Restore);
+    CHECK(GateDisposition(gate,2000+RESTORE_GRACE_MS-1)==RestoreDisposition::Restore);
+    CHECK(GateDisposition(gate,2000+RESTORE_GRACE_MS)==RestoreDisposition::RecordOnly);
+
+    // Staying warm does not restart the grace.
+    ObserveRestoreGate(gate,true,2000+RESTORE_GRACE_MS+5000);
+    CHECK(gate.warmSinceMs==2000);
+    CHECK(GateDisposition(gate,2000+RESTORE_GRACE_MS+5000)==
+          RestoreDisposition::RecordOnly);
+
+    // The browser dies: every binding goes away, so the app is cold again and
+    // the next appearance is a restart.
+    ObserveRestoreGate(gate,false,100000);
+    CHECK(gate.warmSinceMs==0);
+    CHECK(GateDisposition(gate,100000)==RestoreDisposition::Restore);
+    ObserveRestoreGate(gate,true,101000);
+    CHECK(GateDisposition(gate,101000+RESTORE_GRACE_MS-1)==RestoreDisposition::Restore);
+}
+
+static void test_restore_gate_survives_a_clock_rollback(){
+    RestoreGate gate;
+    ObserveRestoreGate(gate,true,50000);
+    CHECK(gate.warmSinceMs==50000);
+    // A tick timestamp that moved backwards must not leave the app warm
+    // forever (nowMs - warmSinceMs would underflow into a huge value).
+    ObserveRestoreGate(gate,true,10000);
+    CHECK(gate.warmSinceMs==10000);
+    CHECK(GateDisposition(gate,10000)==RestoreDisposition::Restore);
+    ObserveRestoreGate(gate,true,0);
+    CHECK(gate.warmSinceMs==0 || gate.warmSinceMs==1);
+}
+
+static void test_valid_persisted_binding_requires_every_part(){
+    PersistedBinding binding=testBinding(
+        "firefox","{5D5676BD-A590-415F-AB4B-520D6049F8DD}",1,2,3);
+    CHECK(ValidPersistedBinding(binding));
+    PersistedBinding broken=binding; broken.app="opera";
+    CHECK(!ValidPersistedBinding(broken));
+    broken=binding; broken.recordId="{00000000-0000-0000-0000-000000000000}";
+    CHECK(!ValidPersistedBinding(broken));
+    broken=binding; broken.hwnd=0; CHECK(!ValidPersistedBinding(broken));
+    broken=binding; broken.pid=0; CHECK(!ValidPersistedBinding(broken));
+    broken=binding; broken.processStart=0; CHECK(!ValidPersistedBinding(broken));
+    // A binding that cannot be written back must not be serialized either.
+    std::vector<PersistedBinding> mixed;
+    mixed.push_back(binding);
+    mixed.push_back(broken);
+    std::vector<PersistedBinding> parsed;
+    CHECK(ParseBindings(SerializeBindings(mixed),parsed) && parsed.size()==1);
+}
+
+// ---------------- title normalization, URL signatures, destinations ---------
+static void test_unread_counter_is_stripped_before_matching(){
+    CHECK(StripTitleUnreadCounter("(3) Inbox")=="Inbox");
+    CHECK(StripTitleUnreadCounter("(12)  Inbox - mail")=="Inbox - mail");
+    CHECK(StripTitleUnreadCounter("  (1) Inbox")=="Inbox");
+    // Not a counter: keep the title untouched.
+    CHECK(StripTitleUnreadCounter("(beta) Inbox")=="(beta) Inbox");
+    CHECK(StripTitleUnreadCounter("(3)")=="(3)");
+    CHECK(StripTitleUnreadCounter("()")=="()");
+    CHECK(StripTitleUnreadCounter("Inbox (3)")=="Inbox (3)");
+    CHECK(StripTitleUnreadCounter("")=="");
+    // The counter moves the moment the page changes it while the session file
+    // still holds the previous value, so both sides must normalize to the same.
+    CHECK(NormalizeProvisionalAdoptionTitle("(4) Inbox — Gmail")==
+          NormalizeProvisionalAdoptionTitle("(3) Inbox — Gmail"));
+    CHECK(NormalizeProvisionalAdoptionTitle("(4) Inbox")==
+          NormalizeProvisionalAdoptionTitle("inbox"));
+}
+
+static void test_url_signature_is_order_independent_and_discriminating(){
+    WinFp first;
+    first.tabs.push_back(SessionTab());
+    first.tabs.back().url="https://example.com/a";
+    first.tabs.push_back(SessionTab());
+    first.tabs.back().url="https://example.org/b";
+    WinFp reordered;
+    reordered.tabs.push_back(SessionTab());
+    reordered.tabs.back().url="https://example.org/b";
+    reordered.tabs.push_back(SessionTab());
+    reordered.tabs.back().url="https://example.com/a";
+    CHECK(SessionUrlSignature(first)!=0);
+    CHECK(SessionUrlSignature(first)==SessionUrlSignature(reordered));
+
+    WinFp different=first;
+    different.tabs[1].url="https://example.org/c";
+    CHECK(SessionUrlSignature(different)!=SessionUrlSignature(first));
+
+    WinFp shorter;
+    shorter.tabs.push_back(first.tabs[0]);
+    CHECK(SessionUrlSignature(shorter)!=SessionUrlSignature(first));
+
+    WinFp empty;
+    CHECK(SessionUrlSignature(empty)==0);          // unknown, never "equal"
+    WinFp blank;
+    blank.tabs.push_back(SessionTab());
+    CHECK(SessionUrlSignature(blank)==0);
+}
+
+static void test_identical_pages_score_as_the_same_window(){
+    LayoutWin saved=StrictV4Record();
+    saved.counts.clear();
+    saved.counts["a.test"]=1;
+    saved.activeTitle="one";
+    saved.tabCount=1;
+    saved.urlSignature=12345;
+    LayoutWin live=saved;
+    live.recordId.clear();
+    live.activeTitle="something else entirely";
+    live.counts.clear();
+    live.counts["b.test"]=9;
+    live.tabCount=17;
+    // Different title, different domains, different tab count - but the same
+    // set of pages, so it is the same window.
+    CHECK(LayoutScore(saved,live)==1.0);
+    live.urlSignature=999;
+    CHECK(LayoutScore(saved,live)<1.0);
+    // An unknown signature (0) never counts as a match.
+    LayoutWin unknown=saved;
+    unknown.urlSignature=0;
+    LayoutWin alsoUnknown=live;
+    alsoUnknown.urlSignature=0;
+    CHECK(LayoutScore(unknown,alsoUnknown)<1.0);
+}
+
+static void test_restore_destination_falls_back_to_the_saved_position(){
+    DeskRec first{}; first.index=0; first.guid=G(L"{7F000000-0000-0000-0000-000000000001}");
+    DeskRec second{}; second.index=1; second.guid=G(L"{7F000000-0000-0000-0000-000000000002}");
+    std::vector<DeskRec> desktops={first,second};
+
+    LayoutWin record=StrictV4Record();
+    record.desktop=second.guid;
+    record.deskIndex=1;
+    GUID destination={0};
+    CHECK(ResolveRestoreDestination(record,desktops,destination));
+    CHECK(GuidEq(destination,second.guid));
+
+    // The desktop was deleted: its GUID can never come back, so fall back to
+    // whatever now sits at the remembered position.
+    record.desktop=G(L"{7F000000-0000-0000-0000-0000000000FF}");
+    destination=GUID{};
+    CHECK(ResolveRestoreDestination(record,desktops,destination));
+    CHECK(GuidEq(destination,second.guid));
+
+    // Position gone too: nothing to restore onto.
+    record.deskIndex=7;
+    destination=GUID{};
+    CHECK(!ResolveRestoreDestination(record,desktops,destination));
+
+    record.desktop=GUID{};
+    CHECK(!ResolveRestoreDestination(record,desktops,destination));
+}
+
+static void test_equivalent_windows_are_assigned_without_moving_them(){
+    DeskRec first{}; first.index=0; first.guid=G(L"{7E000000-0000-0000-0000-000000000001}");
+    DeskRec second{}; second.index=1; second.guid=G(L"{7E000000-0000-0000-0000-000000000002}");
+
+    LayoutWin savedFirst=StrictV4Record();
+    savedFirst.recordId="{00000000-0000-0000-0000-0000000000A1}";
+    savedFirst.counts.clear();
+    savedFirst.counts["same.test"]=1;
+    savedFirst.tabCount=1;
+    savedFirst.activeTitle="same";
+    savedFirst.desktop=first.guid;
+    savedFirst.deskIndex=0;
+    LayoutWin savedSecond=savedFirst;
+    savedSecond.recordId="{00000000-0000-0000-0000-0000000000A2}";
+    savedSecond.desktop=second.guid;
+    savedSecond.deskIndex=1;
+
+    // Two live windows indistinguishable from each other and from both
+    // records: any pairing scores the same, so the one that moves nothing wins.
+    LayoutWin liveFirst=savedFirst;
+    liveFirst.recordId.clear();
+    LayoutWin liveSecond=savedSecond;
+    liveSecond.recordId.clear();
+
+    bool tooComplex=true;
+    std::vector<LayoutMatch> matches=MatchOneToOne(
+        {savedFirst,savedSecond},{liveSecond,liveFirst},0.55,&tooComplex);
+    CHECK(!tooComplex && matches.size()==2);
+    const std::vector<LayoutWin> saved={savedFirst,savedSecond};
+    const std::vector<LayoutWin> live={liveSecond,liveFirst};
+    for(size_t i=0;i<matches.size();++i){
+        CHECK(matches[i].savedIndex<saved.size() && matches[i].liveIndex<live.size());
+        CHECK(GuidEq(saved[matches[i].savedIndex].desktop,
+                     live[matches[i].liveIndex].desktop));
+    }
+}
+
+// ------------------- evidence-based session association ---------------------
+static ReconcileRequest DuplicateTitleRequest(){
+    DeskRec desktop{}; desktop.index=3;
+    desktop.guid=G(L"{7D000000-0000-0000-0000-000000000001}");
+    ReconcileRequest request;
+    request.app="firefox";
+    request.buildLiveFromInputs=true;
+    request.desktops={desktop};
+    request.titleSuffixes={L" - Browser"};
+    request.fastWindows={
+        SnapshotWindow(0x7101,7101,17101,L"Docs - Browser",desktop.guid),
+        SnapshotWindow(0x7102,7102,17102,L"Docs - Browser",desktop.guid)
+    };
+    std::shared_ptr<std::vector<WinFp> > session(new std::vector<WinFp>());
+    WinFp left;
+    left.activeTitle="Docs";
+    left.activeDomain="left.test";
+    left.tabCount=2;
+    left.counts["left.test"]=2;
+    left.tabs.push_back(SessionTab());
+    left.tabs.back().url="https://left.test/1";
+    left.tabs.push_back(SessionTab());
+    left.tabs.back().url="https://left.test/2";
+    WinFp right;
+    right.activeTitle="Docs";
+    right.activeDomain="right.test";
+    right.tabCount=1;
+    right.counts["right.test"]=1;
+    right.tabs.push_back(SessionTab());
+    right.tabs.back().url="https://right.test/1";
+    session->push_back(left);
+    session->push_back(right);
+    request.sessionWindows=session;
+    return request;
+}
+
+static void test_duplicate_titles_are_left_unassociated(){
+    ReconcileRequest request=DuplicateTitleRequest();
+    PreparedReconcileLive prepared;
+    CHECK(BuildReconcileLivePreparation(request,prepared));
+    CHECK(prepared.sessionIndexByFast.size()==2);
+    // Guessing would give one window the other's tabs; refusing is honest.
+    CHECK(prepared.sessionIndexByFast[0]==-1 && prepared.sessionIndexByFast[1]==-1);
+    CHECK(prepared.live.size()==2);
+    CHECK(prepared.live[0].counts.empty() && prepared.live[0].urlSignature==0);
+    CHECK(prepared.live[0].activeTitle=="Docs");        // title-only fingerprint
+}
+
+static void test_bound_record_pages_resolve_a_duplicate_title(){
+    ReconcileRequest request=DuplicateTitleRequest();
+    // The second window already owns a record holding right.test's page.
+    std::vector<BoundLiveFingerprint> bound(2);
+    bound[1].known=true;
+    bound[1].urlSignature=SessionUrlSignature(request.sessionWindows->at(1));
+    request.boundFingerprints=bound;
+
+    PreparedReconcileLive prepared;
+    CHECK(BuildReconcileLivePreparation(request,prepared));
+    CHECK(prepared.sessionIndexByFast[1]==1);
+    CHECK(prepared.live[1].activeDomain=="right.test" &&
+          prepared.live[1].tabCount==1);
+    CHECK(prepared.live[1].urlSignature==bound[1].urlSignature);
+    // With one session window claimed, the remaining title is unique on both
+    // sides, so the first window can be associated too.
+    CHECK(prepared.sessionIndexByFast[0]==0);
+    CHECK(prepared.live[0].activeDomain=="left.test");
+}
+
+static void test_bound_record_counts_resolve_when_no_signature_is_known(){
+    ReconcileRequest request=DuplicateTitleRequest();
+    std::vector<BoundLiveFingerprint> bound(2);
+    bound[0].known=true;                       // v4 record: no signature yet
+    bound[0].tabCount=1;
+    bound[0].counts["right.test"]=1;
+    request.boundFingerprints=bound;
+
+    PreparedReconcileLive prepared;
+    CHECK(BuildReconcileLivePreparation(request,prepared));
+    CHECK(prepared.sessionIndexByFast[0]==1);
+    CHECK(prepared.live[0].activeDomain=="right.test");
+    CHECK(prepared.sessionIndexByFast[1]==0);
+}
+
+static void test_association_survives_a_moving_unread_counter(){
+    DeskRec desktop{}; desktop.index=1;
+    desktop.guid=G(L"{7C000000-0000-0000-0000-000000000001}");
+    ReconcileRequest request;
+    request.app="firefox";
+    request.buildLiveFromInputs=true;
+    request.desktops={desktop};
+    request.titleSuffixes={L" - Browser"};
+    request.fastWindows={
+        SnapshotWindow(0x7201,7201,17201,L"(4) Inbox - Browser",desktop.guid)
+    };
+    std::shared_ptr<std::vector<WinFp> > session(new std::vector<WinFp>());
+    WinFp inbox;
+    inbox.activeTitle="(3) Inbox";              // the session file lags behind
+    inbox.activeDomain="mail.test";
+    inbox.tabCount=1;
+    inbox.counts["mail.test"]=1;
+    session->push_back(inbox);
+    request.sessionWindows=session;
+
+    PreparedReconcileLive prepared;
+    CHECK(BuildReconcileLivePreparation(request,prepared));
+    CHECK(prepared.sessionIndexByFast.size()==1 && prepared.sessionIndexByFast[0]==0);
+    CHECK(prepared.live[0].activeDomain=="mail.test");
+    CHECK(prepared.live[0].activeTitle=="(3) Inbox");   // stored title stays raw
+}
+
+static void test_live_preparation_rejects_mismatched_fingerprint_input(){
+    ReconcileRequest request=DuplicateTitleRequest();
+    request.boundFingerprints.resize(1);        // must be empty or per-window
+    PreparedReconcileLive untouched;
+    untouched.live.push_back(LayoutWin());
+    CHECK(!BuildReconcileLivePreparation(request,untouched));
+    CHECK(untouched.live.size()==1);
+}
+
+// ------------------------- layout v5 companions -----------------------------
+static void test_layout_v5_carries_the_url_signature(){
+    std::vector<LayoutWin> records(1,StrictV4Record());
+    records[0].urlSignature=987654321ULL;
+    records[0].provisional=true;
+    const std::string serialized=SerializeLayout({},records);
+    CHECK(serialized.find("\nU\t")!=std::string::npos);
+    CHECK(serialized.find("\nP\t")!=std::string::npos);
+
+    std::vector<DeskRec> desks;
+    std::vector<LayoutWin> parsed;
+    std::string error="stale";
+    int version=0;
+    CHECK(ParseLayout(serialized,desks,parsed,1800000000,&error,&version));
+    CHECK(error.empty() && version==5 && parsed.size()==1);
+    CHECK(parsed[0].urlSignature==987654321ULL && parsed[0].provisional);
+    CHECK(SerializeLayout({},parsed)==serialized);
+
+    // A v4 file still loads; its records simply have no signature yet.
+    std::string v4=serialized;
+    v4.replace(0,std::string("# VDE snapshot v5").size(),"# VDE snapshot v4");
+    std::vector<LayoutWin> legacy;
+    CHECK(!ParseLayout(v4,desks,legacy,1800000000,&error,&version));  // U needs v5
+    std::string v4NoSignature;
+    size_t position=0;
+    while(position<v4.size()){
+        const size_t newline=v4.find('\n',position);
+        const std::string line=v4.substr(position,
+            (newline==std::string::npos?v4.size():newline)-position);
+        position=newline==std::string::npos?v4.size():newline+1;
+        if(line.size()>1 && line[0]=='U' && line[1]=='\t') continue;
+        v4NoSignature+=line;
+        v4NoSignature+='\n';
+    }
+    CHECK(ParseLayout(v4NoSignature,desks,legacy,1800000000,&error,&version));
+    CHECK(error.empty() && version==4 && legacy.size()==1);
+    CHECK(legacy[0].urlSignature==0 && legacy[0].provisional);
+}
+
+// A real signature is a 64-bit hash: half of all possible values do not fit in
+// a signed 64-bit integer, and reading them through the signed parser rejected
+// the file - which the loader then treated as corrupt and started empty.
+static void test_layout_v5_accepts_signatures_above_int64_max(){
+    std::vector<LayoutWin> records(1,StrictV4Record());
+    records[0].urlSignature=14898234550704159766ULL;   // seen in a real layout
+    const std::string serialized=SerializeLayout({},records);
+    std::vector<DeskRec> desks;
+    std::vector<LayoutWin> parsed;
+    std::string error="stale";
+    int version=0;
+    CHECK(ParseLayout(serialized,desks,parsed,1800000000,&error,&version));
+    CHECK(error.empty() && parsed.size()==1);
+    CHECK(parsed[0].urlSignature==14898234550704159766ULL);
+
+    records[0].urlSignature=18446744073709551615ULL;   // the very top
+    const std::string top=SerializeLayout({},records);
+    CHECK(ParseLayout(top,desks,parsed,1800000000,&error));
+    CHECK(parsed.size()==1 && parsed[0].urlSignature==18446744073709551615ULL);
+
+    unsigned long long value=7;
+    CHECK(ParseU64Strict("18446744073709551615",value) &&
+          value==18446744073709551615ULL);
+    CHECK(!ParseU64Strict("18446744073709551616",value));   // overflow
+    CHECK(!ParseU64Strict("",value) && !ParseU64Strict("07",value));
+    CHECK(!ParseU64Strict("-1",value) && !ParseU64Strict("1x",value));
+    CHECK(ParseU64Strict("0",value) && value==0);
+}
+
+static void test_binding_store_accepts_large_handles(){
+    std::vector<PersistedBinding> bindings;
+    bindings.push_back(testBinding(
+        "firefox","{5D5676BD-A590-415F-AB4B-520D6049F8DD}",
+        0xFFFFFFFFFFFF0000ULL,4321,13300000000000000000ULL));
+    std::vector<PersistedBinding> parsed;
+    CHECK(ParseBindings(SerializeBindings(bindings),parsed));
+    CHECK(parsed.size()==1 && parsed[0].hwnd==0xFFFFFFFFFFFF0000ULL &&
+          parsed[0].processStart==13300000000000000000ULL);
+}
+
+static void test_layout_v5_rejects_malformed_companions(){
+    std::vector<DeskRec> desks;
+    std::vector<LayoutWin> parsed;
+    std::vector<LayoutWin> records(1,StrictV4Record());
+    records[0].urlSignature=42;
+    const std::string good=SerializeLayout({},records);
+    const std::string id=records[0].recordId;
+
+    std::string duplicated=good;
+    duplicated+="U\t"+id+"\t43\n";
+    CHECK(!ParseLayout(duplicated,desks,parsed,1800000000));
+
+    std::string orphan="# VDE snapshot v5\nU\t"+id+"\t42\n";
+    CHECK(!ParseLayout(orphan,desks,parsed,1800000000));
+
+    std::string zero=good;
+    const size_t marker=zero.find("\nU\t");
+    zero.replace(marker,zero.find('\n',marker+1)-marker,"\nU\t"+id+"\t0");
+    CHECK(!ParseLayout(zero,desks,parsed,1800000000));
+
+    std::string shortFields="# VDE snapshot v5\nU\t"+id+"\n";
+    CHECK(!ParseLayout(shortFields,desks,parsed,1800000000));
+}
+
+// ------------------- multi-profile session sources (G2) ---------------------
+static void test_firefox_ini_lists_every_profile_default_first(){
+    const std::wstring base=L"C:\\Base";
+    const std::string ini=
+        "[Install123]\nDefault=Profiles/work.default\n\n"
+        "[Profile0]\nName=default\nIsRelative=1\nPath=Profiles/home.default\n\n"
+        "[Profile1]\nName=work\nIsRelative=1\nPath=Profiles/work.default\nDefault=1\n\n"
+        "[Profile2]\nName=absolute\nIsRelative=0\nPath=D:\\Other\\ff\n";
+    const std::vector<std::wstring> directories=
+        ResolveFirefoxProfileDirectoriesFromIni(base,ini);
+    CHECK(directories.size()==3);
+    CHECK(directories[0]==L"C:\\Base\\Profiles\\work.default");   // the default
+    CHECK(directories[1]==L"C:\\Base\\Profiles\\home.default");
+    CHECK(directories[2]==L"D:\\Other\\ff");                      // IsRelative=0
+    // No duplicates even though the default also appears as a [Profile] section.
+    for(size_t i=0;i<directories.size();++i)
+        for(size_t j=i+1;j<directories.size();++j)
+            CHECK(directories[i]!=directories[j]);
+    CHECK(ResolveFirefoxProfileDirectoriesFromIni(base,"").empty());
+}
+
+static SessionProfileCandidate ProfileCandidate(const wchar_t* path,bool isDefault,
+                                                bool active){
+    SessionProfileCandidate candidate;
+    candidate.sessionPath=path;
+    candidate.isDefault=isDefault;
+    candidate.active=active;
+    return candidate;
+}
+
+static void test_only_profiles_the_browser_has_open_are_read(){
+    // Default running plus a second running profile: both are read, default
+    // first, because the first path is the one the worker verifies end to end.
+    std::vector<SessionProfileCandidate> candidates={
+        ProfileCandidate(L"P1",false,true),
+        ProfileCandidate(L"D",true,true),
+        ProfileCandidate(L"P2",false,false)      // installed, not running
+    };
+    std::vector<std::wstring> ordered=OrderSessionProfileCandidates(candidates);
+    CHECK(ordered.size()==2 && ordered[0]==L"D" && ordered[1]==L"P1");
+
+    // Only a non-default profile is running: it becomes the primary source.
+    candidates={ProfileCandidate(L"D",true,false),ProfileCandidate(L"P1",false,true)};
+    ordered=OrderSessionProfileCandidates(candidates);
+    CHECK(ordered.size()==1 && ordered[0]==L"P1");
+
+    // Nothing running: fall back to the default profile, exactly as before.
+    candidates={ProfileCandidate(L"P1",false,false),ProfileCandidate(L"D",true,false)};
+    ordered=OrderSessionProfileCandidates(candidates);
+    CHECK(ordered.size()==1 && ordered[0]==L"D");
+
+    // A profile with no session file at all is never offered.
+    candidates={ProfileCandidate(L"",true,true),ProfileCandidate(L"P1",false,true)};
+    ordered=OrderSessionProfileCandidates(candidates);
+    CHECK(ordered.size()==1 && ordered[0]==L"P1");
+
+    CHECK(OrderSessionProfileCandidates({}).empty());
+
+    // The cap is honoured.
+    std::vector<SessionProfileCandidate> many;
+    for(int i=0;i<12;++i) many.push_back(ProfileCandidate(L"P",false,true));
+    CHECK(OrderSessionProfileCandidates(many).size()==MAX_SESSION_PROFILES);
+    CHECK(OrderSessionProfileCandidates(many,3).size()==3);
+}
+
+// ----------------------- split and merge (G11) ------------------------------
+static void test_counts_containment_helpers(){
+    std::map<std::string,int> whole; whole["a"]=2; whole["b"]=1;
+    std::map<std::string,int> part; part["a"]=1;
+    CHECK(CountsContainedIn(part,whole));
+    part["b"]=1;
+    CHECK(CountsContainedIn(part,whole));
+    part["a"]=3;
+    CHECK(!CountsContainedIn(part,whole));       // more tabs than the whole
+    part.clear(); part["c"]=1;
+    CHECK(!CountsContainedIn(part,whole));
+    CHECK(!CountsContainedIn(std::map<std::string,int>(),whole));   // empty is not a part
+    CHECK(CountsIntersect(whole,part)==false);
+    part["a"]=1;
+    CHECK(CountsIntersect(whole,part));
+}
+
+static void test_split_window_is_recorded_but_never_moved(){
+    const UnixSeconds now=2000000000;
+    const GUID savedDesktop=G(L"{231A0000-0000-0000-0000-000000000031}");
+    const GUID liveDesktop=G(L"{231A0000-0000-0000-0000-000000000032}");
+    LayoutWin parent=Identified(
+        "{00000000-0000-0000-0000-000000000501}","firefox",0,
+        {{"a.com",1},{"b.com",1},{"c.com",1}},"Parent");
+    parent.desktop=savedDesktop;
+    parent.tabCount=3;
+
+    // The user dragged one tab out: the record's pages now live in two windows.
+    LayoutWin remainder=Identified(
+        "{00000000-0000-0000-0000-000000000502}","firefox",0,
+        {{"a.com",1},{"b.com",1}},"Parent");
+    remainder.desktop=liveDesktop;
+    remainder.tabCount=2;
+    LayoutWin derived=Identified(
+        "{00000000-0000-0000-0000-000000000503}","firefox",0,
+        {{"c.com",1}},"Derived");
+    derived.desktop=liveDesktop;
+    derived.tabCount=1;
+
+    CHECK(LooksLikeWindowSplit(parent,remainder,{remainder,derived},0));
+    CHECK(!LooksLikeWindowSplit(parent,remainder,{remainder},0));  // no sibling
+
+    const ReconcilePlan plan=PlanAppReconcile(
+        {parent},{remainder,derived},"firefox",now);
+    CHECK(!plan.deferred);
+    CHECK(plan.matches.size()==1 && plan.matches[0].liveIndex==0);
+    // The record follows whichever window kept most of it; neither window is
+    // dragged to the remembered desktop on the strength of half a fingerprint.
+    CHECK(plan.restores.empty());
+    CHECK(plan.newRecords.size()==1 && plan.newRecords[0].liveIndex==1);
+}
+
+static void test_merged_window_is_recorded_but_never_moved(){
+    const UnixSeconds now=2000000000;
+    const GUID first=G(L"{231A0000-0000-0000-0000-000000000041}");
+    const GUID second=G(L"{231A0000-0000-0000-0000-000000000042}");
+    const GUID liveDesktop=G(L"{231A0000-0000-0000-0000-000000000043}");
+    LayoutWin left=Identified(
+        "{00000000-0000-0000-0000-000000000511}","firefox",0,
+        {{"a.com",1},{"b.com",1}},"Left");
+    left.desktop=first;
+    left.tabCount=2;
+    LayoutWin right=Identified(
+        "{00000000-0000-0000-0000-000000000512}","firefox",0,
+        {{"c.com",1}},"Right");
+    right.desktop=second;
+    right.tabCount=1;
+
+    LayoutWin merged=Identified(
+        "{00000000-0000-0000-0000-000000000513}","firefox",0,
+        {{"a.com",1},{"b.com",1},{"c.com",1}},"Left");
+    merged.desktop=liveDesktop;
+    merged.tabCount=3;
+
+    CHECK(LooksLikeWindowMerge(left,merged,{left,right},0,now));
+    CHECK(!LooksLikeWindowMerge(left,merged,{left},0,now));   // nothing absorbed
+
+    const ReconcilePlan plan=PlanAppReconcile(
+        {left,right},{merged},"firefox",now);
+    CHECK(!plan.deferred);
+    CHECK(plan.matches.size()==1);
+    CHECK(plan.restores.empty());
+}
+
+static void test_ordinary_tab_loss_still_restores(){
+    const UnixSeconds now=2000000000;
+    const GUID savedDesktop=G(L"{231A0000-0000-0000-0000-000000000051}");
+    const GUID liveDesktop=G(L"{231A0000-0000-0000-0000-000000000052}");
+    LayoutWin saved=Identified(
+        "{00000000-0000-0000-0000-000000000521}","firefox",0,
+        {{"a.com",2},{"b.com",1}},"Window");
+    saved.desktop=savedDesktop;
+    saved.tabCount=3;
+    // Same window, two tabs closed while VDE was not running: a subset, but
+    // nothing else holds the record's pages, so it is still restored.
+    LayoutWin live=Identified(
+        "{00000000-0000-0000-0000-000000000522}","firefox",0,
+        {{"a.com",1}},"Window");
+    live.desktop=liveDesktop;
+    live.tabCount=1;
+
+    CHECK(!LooksLikeWindowSplit(saved,live,{live},0));
+    const ReconcilePlan plan=PlanAppReconcile({saved},{live},"firefox",now);
+    CHECK(!plan.deferred && plan.matches.size()==1);
+    CHECK(plan.restores.size()==1 &&
+          GuidEq(plan.restores[0].destination,savedDesktop));
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
@@ -29453,7 +30392,7 @@ int main(){
     test_session_cache_lookup_fault_preserves_output_and_lru();
     test_session_cache_runtime_fault_is_transactional();
     test_post_message_exception_deletes_heap_result();
-    test_layout_serializes_v4_header();
+    test_layout_serializes_v5_header();
     test_layout_roundtrip_v4();
     test_layout_provisional_marker_roundtrips_strict_v4();
     test_layout_noncanonical_record_id_is_published_canonically();
@@ -29655,7 +30594,7 @@ int main(){
     test_legacy_migration_failure_preserves_source_and_publishes_nothing();
     test_legacy_migration_parses_before_publishing();
     test_legacy_migration_never_overlays_recoverable_target();
-    test_legacy_migration_installs_checked_v4_then_retires_source();
+    test_legacy_migration_installs_checked_v5_then_retires_source();
     test_same_revision_compares_every_field();
     test_missing_primary_corrupt_recovery_revision_allows_empty_publish();
     test_recovered_conflict_preserves_valid_backup_before_publish();
@@ -29664,6 +30603,43 @@ int main(){
     test_layout_mutex_zero_timeout_and_acquisition_after_release();
     test_layout_mutex_treats_abandoned_as_acquired();
     test_layout_fixture_removes_only_its_unique_tree();
+    test_session_snapshot_roundtrip();
+    test_session_snapshot_rejects_malformed_input();
+    test_reopen_url_sanitation();
+    test_reopen_launch_chunking();
+    test_reopen_plan_selects_apps_and_drops_unreplayable_tabs();
+    test_reopen_command_line_shape();
+    test_snapshot_slot_naming_and_rotation();
+    test_snss_captures_ordered_tabs();
+    test_snss_replays_closed_tabs_and_windows();
+    test_firefox_captures_ordered_tabs();
+    test_session_payload_estimate_counts_tabs();
+    test_binding_store_roundtrip();
+    test_binding_store_rejects_malformed();
+    test_binding_signature_detects_every_field();
+    test_restore_gate_cold_until_a_window_is_bound();
+    test_restore_gate_survives_a_clock_rollback();
+    test_valid_persisted_binding_requires_every_part();
+    test_unread_counter_is_stripped_before_matching();
+    test_url_signature_is_order_independent_and_discriminating();
+    test_identical_pages_score_as_the_same_window();
+    test_restore_destination_falls_back_to_the_saved_position();
+    test_equivalent_windows_are_assigned_without_moving_them();
+    test_duplicate_titles_are_left_unassociated();
+    test_bound_record_pages_resolve_a_duplicate_title();
+    test_bound_record_counts_resolve_when_no_signature_is_known();
+    test_association_survives_a_moving_unread_counter();
+    test_live_preparation_rejects_mismatched_fingerprint_input();
+    test_layout_v5_carries_the_url_signature();
+    test_layout_v5_accepts_signatures_above_int64_max();
+    test_binding_store_accepts_large_handles();
+    test_layout_v5_rejects_malformed_companions();
+    test_firefox_ini_lists_every_profile_default_first();
+    test_only_profiles_the_browser_has_open_are_read();
+    test_counts_containment_helpers();
+    test_split_window_is_recorded_but_never_moved();
+    test_merged_window_is_recorded_but_never_moved();
+    test_ordinary_tab_loss_still_restores();
     printf("%d/%d passed\n", g_total - g_fail, g_total);
     return g_fail ? 1 : 0;
 }

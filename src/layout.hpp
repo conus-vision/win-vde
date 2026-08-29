@@ -35,7 +35,39 @@ struct LayoutWin {
     std::map<std::string,int> counts;
     UnixSeconds lastSeenUtc=0, missingSinceUtc=0;
     bool provisional=false;
+    // Hash of the window's full tab URLs (order-independent).  Two windows
+    // holding exactly the same pages are interchangeable as far as desktop
+    // placement goes, and this is what recognizes that case exactly instead of
+    // guessing from domain counts.  0 = unknown (v4 records, no session data).
+    uint64_t urlSignature=0;
 };
+
+// Order-independent so reordering tabs does not invalidate the signature, and
+// commutative-safe: each URL is hashed on its own and the hashes are combined
+// with addition plus a mix, so two different URL sets are very unlikely to
+// collide.
+inline uint64_t HashTabUrl(const std::string& url){
+    uint64_t hash=1469598103934665603ULL;
+    for(size_t i=0;i<url.size();++i){
+        hash^=static_cast<unsigned char>(url[i]);
+        hash*=1099511628211ULL;
+    }
+    return hash;
+}
+
+// Accumulation must stay commutative, otherwise reordering tabs would change
+// the signature; the avalanche happens once, when the sum is finalized.
+inline uint64_t CombineTabUrlHashes(uint64_t accumulated,uint64_t urlHash){
+    return accumulated+urlHash;
+}
+
+inline uint64_t FinalizeTabUrlSignature(uint64_t accumulated){
+    uint64_t mixed=accumulated;
+    mixed^=mixed>>33;
+    mixed*=0xff51afd7ed558ccdULL;
+    mixed^=mixed>>33;
+    return mixed==0 ? 1 : mixed;   // 0 is reserved for "unknown"
+}
 
 inline int ResolveSavedDesktop(const LayoutWin& saved,
                                const std::vector<DeskRec>& currentDesktops){
@@ -52,11 +84,42 @@ inline bool SavedRestoreDestinationAvailable(
         ResolveSavedDesktop(saved,preparedDesktops)>=0;
 }
 
+// A deleted virtual desktop leaves every record that pointed at it
+// unrestorable forever, because the GUID can never come back.  Fall back to
+// the desktop that now sits at the saved position, which is where the user
+// would look for the window.
+inline bool ResolveRestoreDestination(const LayoutWin& saved,
+                                      const std::vector<DeskRec>& desktops,
+                                      GUID& destination){
+    if(GuidIsZero(saved.desktop)) return false;
+    for(size_t i=0;i<desktops.size();++i)
+        if(GuidEq(desktops[i].guid,saved.desktop)){
+            destination=saved.desktop;
+            return true;
+        }
+    if(saved.deskIndex<0) return false;
+    for(size_t i=0;i<desktops.size();++i)
+        if(desktops[i].index==saved.deskIndex && !GuidIsZero(desktops[i].guid)){
+            destination=desktops[i].guid;
+            return true;
+        }
+    return false;
+}
+
 struct LayoutMatch {
     size_t savedIndex=0;
     size_t liveIndex=0;
     double score=0;
+    // The window already sits on the record's desktop.  Equivalent windows
+    // (same pages, same score) are interchangeable, so among equal-scoring
+    // assignments the one that moves nothing wins.
+    bool inPlace=false;
 };
+
+// Larger than any achievable sum of candidate orderings (candidates are capped
+// at MAX_MATCH_CANDIDATES), so a move-free assignment always outranks a
+// move-heavy one of the same score, and ordering only breaks remaining ties.
+static const long long MATCH_IN_PLACE_TIE_WEIGHT=1000000000LL;
 
 inline bool IsExpired(const LayoutWin& window, UnixSeconds nowUtc){
     return window.missingSinceUtc>0 && nowUtc>=window.missingSinceUtc &&
@@ -146,8 +209,30 @@ inline bool CanBindFinalProvisional(
     return true;
 }
 
+// Browsers put an unread counter in front of the page title ("(3) Inbox"), and
+// it is the page that changes it, so the window title moves the moment the
+// counter does while the browser's session file still holds the previous value.
+// Comparing the raw titles then fails for a window that is plainly the same
+// one, which breaks both the session association and the title half of the
+// match score.  Drop a leading "(digits)" run before comparing.
+inline std::string StripTitleUnreadCounter(const std::string& title){
+    size_t position=0;
+    while(position<title.size() &&
+          (title[position]==' ' || title[position]=='\t')) ++position;
+    if(position>=title.size() || title[position]!='(') return title;
+    size_t digits=position+1;
+    while(digits<title.size() && title[digits]>='0' && title[digits]<='9') ++digits;
+    if(digits==position+1 || digits>=title.size() || title[digits]!=')')
+        return title;
+    size_t rest=digits+1;
+    while(rest<title.size() && (title[rest]==' ' || title[rest]=='\t')) ++rest;
+    if(rest>=title.size()) return title;      // "(3)" alone is the whole title
+    return title.substr(rest);
+}
+
 inline std::string NormalizeProvisionalAdoptionTitle(
-        const std::string& title){
+        const std::string& rawTitle){
+    const std::string title=StripTitleUnreadCounter(rawTitle);
     std::string normalized;
     normalized.reserve(title.size());
     bool pendingSpace=false;
@@ -170,9 +255,67 @@ inline std::string NormalizeProvisionalAdoptionTitle(
     return normalized;
 }
 
+// Every domain of `part` is present in `whole` with at least as many tabs.
+inline bool CountsContainedIn(const std::map<std::string,int>& part,
+                              const std::map<std::string,int>& whole){
+    if(part.empty()) return false;
+    for(std::map<std::string,int>::const_iterator it=part.begin();it!=part.end();++it){
+        std::map<std::string,int>::const_iterator found=whole.find(it->first);
+        if(found==whole.end() || found->second<it->second) return false;
+    }
+    return true;
+}
+
+inline bool CountsIntersect(const std::map<std::string,int>& left,
+                            const std::map<std::string,int>& right){
+    for(std::map<std::string,int>::const_iterator it=left.begin();it!=left.end();++it)
+        if(right.find(it->first)!=right.end()) return true;
+    return false;
+}
+
+// Dragging a tab out of a window, or merging two windows, changes both sides at
+// once: the record's pages end up spread over two live windows, or two records'
+// pages end up inside one.  Whichever window then wins the match, moving it
+// would be a guess about which half "is" the remembered window - so the match
+// is kept (the record follows the window) and the move is dropped.
+inline bool LooksLikeWindowSplit(const LayoutWin& saved,const LayoutWin& live,
+                                 const std::vector<LayoutWin>& allLive,
+                                 size_t matchedLiveIndex){
+    if(!CountsContainedIn(live.counts,saved.counts)) return false;
+    if(live.tabCount>=saved.tabCount) return false;
+    for(size_t index=0;index<allLive.size();++index){
+        if(index==matchedLiveIndex) continue;
+        const LayoutWin& other=allLive[index];
+        if(other.app!=saved.app || other.counts.empty()) continue;
+        if(CountsContainedIn(other.counts,saved.counts) &&
+           CountsIntersect(other.counts,saved.counts))
+            return true;
+    }
+    return false;
+}
+
+inline bool LooksLikeWindowMerge(const LayoutWin& saved,const LayoutWin& live,
+                                 const std::vector<LayoutWin>& allSaved,
+                                 size_t matchedSavedIndex,UnixSeconds nowUtc){
+    if(!CountsContainedIn(saved.counts,live.counts)) return false;
+    if(live.tabCount<=saved.tabCount) return false;
+    for(size_t index=0;index<allSaved.size();++index){
+        if(index==matchedSavedIndex) continue;
+        const LayoutWin& other=allSaved[index];
+        if(other.app!=saved.app || other.counts.empty()) continue;
+        if(IsExpired(other,nowUtc)) continue;
+        if(CountsContainedIn(other.counts,live.counts) &&
+           CountsIntersect(other.counts,live.counts))
+            return true;
+    }
+    return false;
+}
+
 inline double LayoutScore(const LayoutWin& saved, const LayoutWin& live){
     if(saved.app!=live.app) return 0;
     if(saved.provisional && saved.counts.empty()) return 0;
+    // Same set of pages open: this is the window, whatever its title says.
+    if(saved.urlSignature!=0 && saved.urlSignature==live.urlSignature) return 1.0;
     if(saved.counts.empty() || live.counts.empty())
         return !saved.activeTitle.empty() && saved.activeTitle==live.activeTitle ? 1.0 : 0.0;
 
@@ -487,6 +630,7 @@ inline std::vector<LayoutMatch> AssignOneToOne(size_t savedCount, size_t liveCou
     if(savedCount==0 || liveCount==0 || inputCandidates.empty()) return std::vector<LayoutMatch>();
 
     std::map<std::pair<size_t,size_t>,double> bestScores;
+    std::map<std::pair<size_t,size_t>,bool> inPlaceByPair;
     for(const auto& candidate : inputCandidates){
         if(candidate.savedIndex>=savedCount || candidate.liveIndex>=liveCount ||
                 !std::isfinite(candidate.score) || candidate.score<0) continue;
@@ -494,10 +638,12 @@ inline std::vector<LayoutMatch> AssignOneToOne(size_t savedCount, size_t liveCou
         auto existing=bestScores.find(key);
         if(existing!=bestScores.end()){
             if(candidate.score>existing->second) existing->second=candidate.score;
+            if(candidate.inPlace) inPlaceByPair[key]=true;
             continue;
         }
         if(bestScores.size()>=MAX_MATCH_CANDIDATES) return fail();
         bestScores.insert(std::make_pair(key,candidate.score));
+        inPlaceByPair.insert(std::make_pair(key,candidate.inPlace));
     }
     if(bestScores.empty()) return std::vector<LayoutMatch>();
 
@@ -520,10 +666,15 @@ inline std::vector<LayoutMatch> AssignOneToOne(size_t savedCount, size_t liveCou
         candidate.match.savedIndex=item.first.first;
         candidate.match.liveIndex=item.first.second;
         candidate.match.score=item.second;
+        const std::map<std::pair<size_t,size_t>,bool>::const_iterator inPlace=
+            inPlaceByPair.find(item.first);
+        candidate.match.inPlace=inPlace!=inPlaceByPair.end() && inPlace->second;
         if(!layout_detail::ScaleMatchScore(item.second,candidate.scoreUnits)) return fail();
         candidate.savedNode=static_cast<size_t>(std::lower_bound(savedNodes.begin(),savedNodes.end(),item.first.first)-savedNodes.begin());
         candidate.liveNode=static_cast<size_t>(std::lower_bound(liveNodes.begin(),liveNodes.end(),item.first.second)-liveNodes.begin());
-        candidate.tieOrder=static_cast<long long>(++candidateOrder);
+        candidate.tieOrder=(candidate.match.inPlace
+            ? 0 : MATCH_IN_PLACE_TIE_WEIGHT)+
+            static_cast<long long>(++candidateOrder);
         candidates.push_back(candidate);
     }
 
@@ -617,6 +768,8 @@ inline std::vector<LayoutMatch> MatchOneToOne(const std::vector<LayoutWin>& save
             if(candidates.size()>=MAX_MATCH_CANDIDATES) return fail();
             LayoutMatch candidate;
             candidate.savedIndex=savedIndex; candidate.liveIndex=liveIndex; candidate.score=score;
+            candidate.inPlace=!GuidIsZero(saved[savedIndex].desktop) &&
+                GuidEq(saved[savedIndex].desktop,live[liveIndex].desktop);
             candidates.push_back(candidate);
         }
     }
@@ -662,12 +815,12 @@ inline bool AreLayoutCountsSerializable(const std::map<std::string,int>& counts)
 }
 
 inline std::string SerializeLayout(const std::vector<DeskRec>& desks, const std::vector<LayoutWin>& wins){
-    // v4's finalized schema permits one optional P companion immediately
-    // after its W record.  The W row remains the same 11-field record, so
-    // snapshots without provisional state are byte-compatible.  P was added
-    // before v4 shipped; downgrade to earlier development-only v4 readers is
-    // intentionally unsupported rather than silently losing provisional IDs.
-    std::string out = "# VDE snapshot v4\n";
+    // v5 keeps v4's 11-field W record and adds two optional companion lines
+    // that may follow it: U carries the tab-URL signature, P marks the record
+    // provisional.  A v4 file therefore still parses unchanged; downgrading a
+    // v5 file to a v4-only reader is intentionally unsupported rather than
+    // silently losing companion state.
+    std::string out = "# VDE snapshot v5\n";
     for(const auto& d : desks){
         out += "D\t"; out += std::to_string(d.index); out += "\t";
         out += W2U8(GuidToString(d.guid)); out += "\t"; out += b64enc(W2U8(d.name)); out += "\n";
@@ -679,6 +832,10 @@ inline std::string SerializeLayout(const std::vector<DeskRec>& desks, const std:
         out += w.activeDomain; out += "\t"; out += std::to_string(w.tabCount); out += "\t";
         out += CountsToStr(w.counts); out += "\t"; out += std::to_string(w.lastSeenUtc); out += "\t";
         out += std::to_string(w.missingSinceUtc); out += "\n";
+        if(w.urlSignature!=0){
+            out += "U\t"; out += w.recordId; out += "\t";
+            out += std::to_string(w.urlSignature); out += "\n";
+        }
         if(w.provisional){
             out += "P\t"; out += w.recordId; out += "\n";
         }
@@ -724,8 +881,8 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
     std::set<std::string> recordIds;
     int version = 0;
     bool headerSeen = false, recordsSeen = false;
-    bool provisionalMarkerAllowed = false;
-    std::string provisionalMarkerRecordId;
+    bool companionMarkerAllowed = false;
+    std::string companionMarkerRecordId;
     size_t recordCount = 0, lineNumber = 0, pos = 0;
 
     auto fail = [&](const std::string& message)->bool {
@@ -772,6 +929,7 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
             if(line=="# VDE snapshot v2") version=2;
             else if(line=="# VDE snapshot v3") version=3;
             else if(line=="# VDE snapshot v4") version=4;
+            else if(line=="# VDE snapshot v5") version=5;
             else return failLine("unknown or empty snapshot header");
             if(version<4 && migrationNow<=0) return failLine("legacy snapshot requires a positive migration time");
             headerSeen = true;
@@ -783,23 +941,44 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
         std::vector<std::string> col = splitTabs(line);
         if(col.empty()) return failLine("empty record");
 
+        if(col[0]=="U"){
+            if(version<5) return failLine("URL signature marker requires v5");
+            if(col.size()!=3)
+                return failLine("URL signature marker must have exactly 3 fields");
+            GUID id{};
+            std::string canonicalId;
+            if(!ParseNonzeroLayoutGuid(col[1],id,&canonicalId))
+                return failLine("invalid URL signature record ID");
+            if(!companionMarkerAllowed || wins.empty() ||
+               canonicalId!=companionMarkerRecordId)
+                return failLine("URL signature marker must follow its window record");
+            if(wins.back().urlSignature!=0)
+                return failLine("duplicate URL signature marker");
+            unsigned long long signature=0;
+            if(!ParseU64Strict(col[2],signature) || signature==0)
+                return failLine("invalid URL signature");
+            wins.back().urlSignature=(uint64_t)signature;
+            continue;
+        }
+
         if(col[0]=="P"){
-            if(version!=4) return failLine("provisional marker requires v4");
+            if(version<4) return failLine("provisional marker requires v4");
             if(col.size()!=2)
                 return failLine("provisional marker must have exactly 2 fields");
             GUID id{};
             std::string canonicalId;
             if(!ParseNonzeroLayoutGuid(col[1],id,&canonicalId))
                 return failLine("invalid provisional record ID");
-            if(!provisionalMarkerAllowed || wins.empty() ||
-               canonicalId!=provisionalMarkerRecordId)
+            if(!companionMarkerAllowed || wins.empty() ||
+               canonicalId!=companionMarkerRecordId)
                 return failLine("provisional marker must immediately follow its window record");
+            if(wins.back().provisional)
+                return failLine("duplicate provisional marker");
             wins.back().provisional=true;
-            provisionalMarkerAllowed=false;
             continue;
         }
 
-        provisionalMarkerAllowed=false;
+        companionMarkerAllowed=false;
         if(++recordCount > MAX_LAYOUT_RECORDS)
             return failLine("snapshot record limit exceeded");
 
@@ -819,7 +998,7 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
         LayoutWin w;
         std::string title;
         std::string parsedRecordId;
-        if(version==4){
+        if(version>=4){
             if(col.size()!=11) return failLine("v4 window record must have exactly 11 fields");
             w.app = col[1];
             if(!IsSupportedLayoutApp(w.app)) return failLine("unsupported window app");
@@ -877,9 +1056,9 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
             w.lastSeenUtc = migrationNow;
         }
         wins.push_back(w);
-        if(version==4){
-            provisionalMarkerAllowed=true;
-            provisionalMarkerRecordId=parsedRecordId;
+        if(version>=4){
+            companionMarkerAllowed=true;
+            companionMarkerRecordId=parsedRecordId;
         }
     }
 

@@ -1802,6 +1802,7 @@ inline bool CommitBoundRecordRefresh(
             desired.activeDomain=live.activeDomain;
             desired.tabCount=live.tabCount;
             desired.counts=live.counts;
+            desired.urlSignature=live.urlSignature;
             desired.provisional=false;
         }
         MarkSeen(desired,nowUtc);
@@ -1961,7 +1962,11 @@ inline ReconcilePlan PlanAppReconcile(
         plan.matches.push_back(match);
         matchedSaved[match.savedIndex]=true;
         matchedLive[match.liveIndex]=true;
-        if(!GuidEq(existing[match.savedIndex].desktop,live[match.liveIndex].desktop)){
+        if(!GuidEq(existing[match.savedIndex].desktop,live[match.liveIndex].desktop) &&
+           !LooksLikeWindowSplit(existing[match.savedIndex],live[match.liveIndex],
+                                 live,match.liveIndex) &&
+           !LooksLikeWindowMerge(existing[match.savedIndex],live[match.liveIndex],
+                                 existing,match.savedIndex,nowUtc)){
             RestoreRequest restore;
             restore.savedIndex=match.savedIndex;
             restore.liveIndex=match.liveIndex;
@@ -2344,7 +2349,8 @@ inline bool SameRecord(const LayoutWin& left,const LayoutWin& right){
         left.deskIndex==right.deskIndex && GuidEq(left.desktop,right.desktop) &&
         left.activeTitle==right.activeTitle &&
         left.activeDomain==right.activeDomain && left.tabCount==right.tabCount &&
-        left.counts==right.counts && left.lastSeenUtc==right.lastSeenUtc &&
+        left.counts==right.counts && left.urlSignature==right.urlSignature &&
+        left.lastSeenUtc==right.lastSeenUtc &&
         left.missingSinceUtc==right.missingSinceUtc &&
         left.provisional==right.provisional;
 }
@@ -2368,6 +2374,7 @@ inline void CopyFingerprint(LayoutWin& target,const LayoutWin& source){
     target.activeDomain=source.activeDomain;
     target.tabCount=source.tabCount;
     target.counts=source.counts;
+    target.urlSignature=source.urlSignature;
 }
 
 inline void BuildIndex(const std::vector<LayoutWin>& records,

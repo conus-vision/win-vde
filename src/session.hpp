@@ -21,12 +21,21 @@
 #include <utility>
 #include <vector>
 
+// One decoded tab of a browser window: exactly what the address bar shows plus
+// the tab title.  Kept ordered so a snapshot can reopen the window later.
+struct SessionTab {
+    std::string url;
+    std::string title;
+};
+
 struct WinFp {
     std::string activeTitle;
     std::string activeDomain;
     std::map<std::string,int> counts;
     int tabCount=0;
     std::string tabsBlob;
+    std::vector<SessionTab> tabs;   // tab order as the browser stores it
+    int activeTab=-1;               // index into tabs, -1 when unknown
 };
 
 static const unsigned MAX_JSON_DEPTH=128;
@@ -356,6 +365,12 @@ inline bool ExtractFirefoxWindows(const JValue& root,std::vector<WinFp>& output)
                 fingerprint.tabsBlob.push_back(' ');
                 fingerprint.tabsBlob+=url;
                 fingerprint.tabsBlob.push_back(' ');
+                if(FirefoxSelectedTabMatches(selected,ti))
+                    fingerprint.activeTab=(int)fingerprint.tabs.size();
+                SessionTab decoded;
+                decoded.url=url;
+                decoded.title=title;
+                fingerprint.tabs.push_back(std::move(decoded));
                 if(FirefoxSelectedTabMatches(selected,ti)){ fingerprint.activeTitle=title; fingerprint.activeDomain=domain; }
             }
             parsed.push_back(std::move(fingerprint));
@@ -470,6 +485,32 @@ inline bool ParseChromiumSNSS(const std::string& data,std::vector<WinFp>& output
             if(tabs.size()>=limits.maxTabs) return false;
             tabs.insert(id); return true;
         };
+        // SNSS is an append-only command log: closing a tab or a window only
+        // appends a "closed" command, so a reader that ignores commands 16/17
+        // resurrects windows the user already closed.  Replay them instead.
+        auto forgetTab=[&](int32_t tab){
+            std::map<int32_t,std::map<int32_t,Navigation> >::iterator found=
+                tabNavigations.find(tab);
+            if(found!=tabNavigations.end()){
+                for(std::map<int32_t,Navigation>::const_iterator nav=found->second.begin();
+                    nav!=found->second.end();++nav){
+                    const size_t bytes=nav->second.first.size()+nav->second.second.size();
+                    retainedText=bytes<=retainedText?retainedText-bytes:0;
+                    if(navigationCount>0) --navigationCount;
+                }
+                tabNavigations.erase(found);
+            }
+            tabWindow.erase(tab); tabIndex.erase(tab); tabSelectedNavigation.erase(tab);
+            tabs.erase(tab);
+        };
+        auto forgetWindow=[&](int32_t window){
+            std::vector<int32_t> owned;
+            for(std::map<int32_t,int32_t>::const_iterator it=tabWindow.begin();
+                it!=tabWindow.end();++it)
+                if(it->second==window) owned.push_back(it->first);
+            for(size_t i=0;i<owned.size();++i) forgetTab(owned[i]);
+            windows.erase(window); windowSelected.erase(window);
+        };
         size_t position=8;
         while(position<size){
             if(commandCount>=limits.maxCommands || size-position<2) return false;
@@ -505,6 +546,20 @@ inline bool ParseChromiumSNSS(const std::string& data,std::vector<WinFp>& output
                 retainedText=withoutOld+newBytes;
                 tabNavigations[tab][navigation]=Navigation(std::move(url),std::move(title));
             }
+            else if(id==16){
+                // kCommandTabClosed — payload starts with the tab id.
+                if(commandLength<4) return false;
+                const int32_t closed=ReadSnssI32(command);
+                if(closed<0) return false;
+                forgetTab(closed);
+            }
+            else if(id==17){
+                // kCommandWindowClosed — payload starts with the window id.
+                if(commandLength<4) return false;
+                const int32_t closed=ReadSnssI32(command);
+                if(closed<0) return false;
+                forgetWindow(closed);
+            }
         }
         std::map<int32_t,std::vector<int32_t> > windowTabs;
         for(std::map<int32_t,int32_t>::const_iterator it=tabWindow.begin();it!=tabWindow.end();++it) windowTabs[it->second].push_back(it->first);
@@ -522,8 +577,20 @@ inline bool ParseChromiumSNSS(const std::string& data,std::vector<WinFp>& output
             WinFp fingerprint; int32_t selectedIndex=-1,activeTab=-1;
             std::map<int32_t,int32_t>::const_iterator selected=windowSelected.find(it->first);
             if(selected!=windowSelected.end()) selectedIndex=selected->second;
-            for(size_t ti=0;ti<it->second.size();++ti){
-                int32_t tab=it->second[ti]; const Navigation* navigation=currentNavigation(tab); const std::string empty;
+            // Present tabs in the order the browser shows them, not in tab-id
+            // order: a reopened window should keep its left-to-right layout.
+            std::vector<int32_t> ordered=it->second;
+            std::stable_sort(ordered.begin(),ordered.end(),
+                [&](int32_t left,int32_t right){
+                    std::map<int32_t,int32_t>::const_iterator leftIndex=tabIndex.find(left);
+                    std::map<int32_t,int32_t>::const_iterator rightIndex=tabIndex.find(right);
+                    const int32_t leftValue=leftIndex!=tabIndex.end()?leftIndex->second:INT32_MAX;
+                    const int32_t rightValue=rightIndex!=tabIndex.end()?rightIndex->second:INT32_MAX;
+                    if(leftValue!=rightValue) return leftValue<rightValue;
+                    return left<right;
+                });
+            for(size_t ti=0;ti<ordered.size();++ti){
+                int32_t tab=ordered[ti]; const Navigation* navigation=currentNavigation(tab); const std::string empty;
                 const std::string& url=navigation?navigation->first:empty; const std::string& title=navigation?navigation->second:empty;
                 std::string domain=etld1(hostOf(url)); if(!domain.empty()) ++fingerprint.counts[domain];
                 if(url.size()>(std::numeric_limits<size_t>::max)()-title.size()-2) return false;
@@ -532,9 +599,16 @@ inline bool ParseChromiumSNSS(const std::string& data,std::vector<WinFp>& output
                 fingerprint.tabsBlob+=title; fingerprint.tabsBlob.push_back(' '); fingerprint.tabsBlob+=url; fingerprint.tabsBlob.push_back(' ');
                 ++fingerprint.tabCount;
                 std::map<int32_t,int32_t>::const_iterator index=tabIndex.find(tab);
-                if(index!=tabIndex.end()&&index->second==selectedIndex) activeTab=tab;
+                if(index!=tabIndex.end()&&index->second==selectedIndex){
+                    activeTab=tab;
+                    fingerprint.activeTab=(int)fingerprint.tabs.size();
+                }
+                SessionTab decoded;
+                decoded.url=url;
+                decoded.title=title;
+                fingerprint.tabs.push_back(std::move(decoded));
             }
-            if(activeTab<0&&!it->second.empty()) activeTab=it->second.front();
+            if(activeTab<0&&!ordered.empty()) activeTab=ordered.front();
             const Navigation* active=currentNavigation(activeTab);
             if(active){ fingerprint.activeTitle=active->second; fingerprint.activeDomain=etld1(hostOf(active->first)); }
             if(fingerprint.tabCount>0) parsed.push_back(std::move(fingerprint));

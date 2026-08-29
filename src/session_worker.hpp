@@ -27,6 +27,8 @@
 
 static const UINT WM_SESSION_RESULT=WM_APP+12;
 static const size_t MAX_SESSION_CACHE_ENTRIES=16;
+static const size_t MAX_SESSION_PROFILES=8;
+static const size_t MAX_MERGED_SESSION_WINDOWS=10000;
 static const size_t MAX_SESSION_CACHE_BYTES=256ULL*1024ULL*1024ULL;
 
 enum class SessionDataStatus { Fresh, CachedStale, Unavailable, Superseded };
@@ -114,6 +116,12 @@ inline size_t EstimateSessionPayloadBytes(const std::vector<WinFp>& windows){
         total=SessionSaturatingAdd(total,window.activeTitle.capacity());
         total=SessionSaturatingAdd(total,window.activeDomain.capacity());
         total=SessionSaturatingAdd(total,window.tabsBlob.capacity());
+        total=SessionSaturatingAdd(
+            total,window.tabs.capacity()*sizeof(SessionTab));
+        for(size_t t=0;t<window.tabs.size();++t){
+            total=SessionSaturatingAdd(total,window.tabs[t].url.capacity());
+            total=SessionSaturatingAdd(total,window.tabs[t].title.capacity());
+        }
         for(std::map<std::string,int>::const_iterator it=window.counts.begin();it!=window.counts.end();++it){
             size_t node=sizeof(std::pair<const std::string,int>)+3*sizeof(void*);
             node=SessionSaturatingAdd(node,it->first.capacity());
@@ -392,6 +400,59 @@ inline std::wstring ResolveFirefoxProfileDirectoryFromIni(const std::wstring& ba
       catch(const std::length_error&) { return std::wstring(); }
 }
 
+// Every profile listed in profiles.ini, the default one first.  Reading only
+// the default profile leaves the windows of a second (-P) profile without any
+// tab fingerprint for as long as they exist.
+inline std::vector<std::wstring> ResolveFirefoxProfileDirectoriesFromIni(
+        const std::wstring& base,const std::string& ini){
+    std::vector<std::wstring> directories;
+    try {
+        const std::wstring preferred=ResolveFirefoxProfileDirectoryFromIni(base,ini);
+        if(!preferred.empty()) directories.push_back(preferred);
+        size_t position=0;
+        std::string section;
+        std::string path;
+        bool relative=true;
+        auto flush=[&](){
+            if(section.find("Profile")!=0 || path.empty()) return;
+            std::string normalized=path;
+            for(size_t i=0;i<normalized.size();++i)
+                if(normalized[i]=='/') normalized[i]='\\';
+            std::wstring resolved=relative
+                ? base+L"\\"+U82W(normalized) : U82W(normalized);
+            for(size_t i=0;i<directories.size();++i)
+                if(directories[i]==resolved) return;
+            directories.push_back(resolved);
+        };
+        while(position<ini.size()){
+            const size_t newline=ini.find('\n',position);
+            std::string line=ini.substr(position,
+                (newline==std::string::npos?ini.size():newline)-position);
+            position=newline==std::string::npos?ini.size():newline+1;
+            while(!line.empty()&&(line.back()=='\r'||line.back()==' ')) line.pop_back();
+            size_t first=0;
+            while(first<line.size()&&line[first]==' ') ++first;
+            if(first) line.erase(0,first);
+            if(line.empty()||line[0]==';'||line[0]=='#') continue;
+            if(line.size()>=2&&line[0]=='['&&line.back()==']'){
+                flush();
+                section=line.substr(1,line.size()-2);
+                path.clear();
+                relative=true;
+                continue;
+            }
+            const size_t equals=line.find('=');
+            if(equals==std::string::npos) continue;
+            const std::string key=line.substr(0,equals);
+            const std::string value=line.substr(equals+1);
+            if(key=="Path") path=value;
+            else if(key=="IsRelative") relative=value!="0";
+        }
+        flush();
+    } catch(...) { directories.clear(); }
+    return directories;
+}
+
 inline std::wstring FindFirefoxProfileDirectoryForSession(){
     wchar_t appData[MAX_PATH]={0};
     if(!GetEnvironmentVariableW(L"APPDATA",appData,MAX_PATH)) return std::wstring();
@@ -401,42 +462,158 @@ inline std::wstring FindFirefoxProfileDirectoryForSession(){
     return ResolveFirefoxProfileDirectoryFromIni(base,read.bytes);
 }
 
-inline std::wstring ResolveBrowserSessionPath(const AppProfile& profile){
-    if(profile.session==AppProfile::FIREFOX){
-        std::wstring directory=FindFirefoxProfileDirectoryForSession();
-        if(directory.empty()) return std::wstring();
-        const wchar_t* candidates[]={L"\\sessionstore-backups\\recovery.jsonlz4",L"\\sessionstore-backups\\recovery.baklz4",L"\\sessionstore.jsonlz4",L"\\sessionstore-backups\\previous.jsonlz4"};
-        for(size_t i=0;i<sizeof(candidates)/sizeof(candidates[0]);++i){
-            std::wstring path=directory+candidates[i]; SessionStamp stamp;
-            if(GetSessionStamp(path,stamp)) return path;
-        }
-        return std::wstring();
+// A browser holds an exclusive lock on one file per open profile, so a failed
+// exclusive open is a precise "this profile is running right now" signal - much
+// better than guessing from file age, and it keeps the session data of profiles
+// that are merely installed out of the matching input.
+inline bool ProfileLockedByBrowser(const std::wstring& lockPath){
+    HANDLE probe=CreateFileW(lockPath.c_str(),GENERIC_READ,0,nullptr,
+                             OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(probe!=INVALID_HANDLE_VALUE){
+        CloseHandle(probe);
+        return false;
     }
-    if(profile.session!=AppProfile::CHROMIUM || profile.userDataDir.empty()) return std::wstring();
-    std::wstring pattern=profile.userDataDir+L"\\Default\\Sessions\\Session_*";
-    WIN32_FIND_DATAW found{}; HANDLE search=FindFirstFileW(pattern.c_str(),&found);
+    return GetLastError()==ERROR_SHARING_VIOLATION;
+}
+
+struct SessionProfileCandidate {
+    std::wstring sessionPath;
+    bool isDefault=false;
+    bool active=false;
+};
+
+// The primary source comes first: the default profile when it is running, then
+// any other running profile, and - when nothing looks running - the default
+// anyway, so a browser that is closed behaves exactly as it did before.
+inline std::vector<std::wstring> OrderSessionProfileCandidates(
+        const std::vector<SessionProfileCandidate>& candidates,
+        size_t maxProfiles=MAX_SESSION_PROFILES){
+    std::vector<std::wstring> ordered;
+    for(size_t i=0;i<candidates.size();++i)
+        if(candidates[i].active && candidates[i].isDefault &&
+           !candidates[i].sessionPath.empty())
+            ordered.push_back(candidates[i].sessionPath);
+    for(size_t i=0;i<candidates.size();++i)
+        if(candidates[i].active && !candidates[i].isDefault &&
+           !candidates[i].sessionPath.empty())
+            ordered.push_back(candidates[i].sessionPath);
+    if(ordered.empty())
+        for(size_t i=0;i<candidates.size();++i)
+            if(candidates[i].isDefault && !candidates[i].sessionPath.empty()){
+                ordered.push_back(candidates[i].sessionPath);
+                break;
+            }
+    if(ordered.size()>maxProfiles) ordered.resize(maxProfiles);
+    return ordered;
+}
+
+inline std::wstring FirefoxSessionFileInDirectory(const std::wstring& directory){
+    if(directory.empty()) return std::wstring();
+    const wchar_t* candidates[]={L"\\sessionstore-backups\\recovery.jsonlz4",
+                                 L"\\sessionstore-backups\\recovery.baklz4",
+                                 L"\\sessionstore.jsonlz4",
+                                 L"\\sessionstore-backups\\previous.jsonlz4"};
+    for(size_t i=0;i<sizeof(candidates)/sizeof(candidates[0]);++i){
+        const std::wstring path=directory+candidates[i];
+        SessionStamp stamp;
+        if(GetSessionStamp(path,stamp)) return path;
+    }
+    return std::wstring();
+}
+
+inline std::wstring ChromiumSessionFileInDirectory(const std::wstring& directory){
+    if(directory.empty()) return std::wstring();
+    const std::wstring pattern=directory+L"\\Sessions\\Session_*";
+    WIN32_FIND_DATAW found{};
+    HANDLE search=FindFirstFileW(pattern.c_str(),&found);
     if(search==INVALID_HANDLE_VALUE) return std::wstring();
-    std::wstring bestName; ULARGE_INTEGER newest{};
+    std::wstring bestName;
+    ULARGE_INTEGER newest{};
     try {
         do {
             if(found.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) continue;
-            ULARGE_INTEGER size{}; size.LowPart=found.nFileSizeLow; size.HighPart=found.nFileSizeHigh;
+            ULARGE_INTEGER size{};
+            size.LowPart=found.nFileSizeLow; size.HighPart=found.nFileSizeHigh;
             if(size.QuadPart==0||size.QuadPart>MAX_BROWSER_SESSION_BYTES) continue;
-            ULARGE_INTEGER modified{}; modified.LowPart=found.ftLastWriteTime.dwLowDateTime; modified.HighPart=found.ftLastWriteTime.dwHighDateTime;
+            ULARGE_INTEGER modified{};
+            modified.LowPart=found.ftLastWriteTime.dwLowDateTime;
+            modified.HighPart=found.ftLastWriteTime.dwHighDateTime;
             std::wstring candidate=found.cFileName;
             if(bestName.empty()||modified.QuadPart>newest.QuadPart||
                (modified.QuadPart==newest.QuadPart&&candidate>bestName)){
-                newest=modified; bestName=std::move(candidate);
+                newest=modified;
+                bestName=std::move(candidate);
             }
         } while(FindNextFileW(search,&found));
-    } catch(const std::bad_alloc&) { FindClose(search); return std::wstring(); }
-      catch(const std::length_error&) { FindClose(search); return std::wstring(); }
+    } catch(...) { FindClose(search); return std::wstring(); }
     FindClose(search);
-    return bestName.empty()?std::wstring():profile.userDataDir+L"\\Default\\Sessions\\"+bestName;
+    return bestName.empty()?std::wstring():directory+L"\\Sessions\\"+bestName;
 }
 
-inline bool ParseBrowserSessionData(const AppProfile& profile,const std::string& bytes,
-                                    std::vector<WinFp>& output){
+// Session files of every profile the browser currently has open.
+inline std::vector<std::wstring> ResolveBrowserSessionPaths(
+        const AppProfile& profile){
+    std::vector<SessionProfileCandidate> candidates;
+    try {
+        if(profile.session==AppProfile::FIREFOX){
+            wchar_t appData[MAX_PATH]={0};
+            if(!GetEnvironmentVariableW(L"APPDATA",appData,MAX_PATH))
+                return std::vector<std::wstring>();
+            const std::wstring base=std::wstring(appData)+L"\\Mozilla\\Firefox";
+            FileReadResult read=ReadFileBytesBounded(
+                base+L"\\profiles.ini",4ULL*1024ULL*1024ULL);
+            if(read.status!=FileReadStatus::Ok)
+                return std::vector<std::wstring>();
+            const std::vector<std::wstring> directories=
+                ResolveFirefoxProfileDirectoriesFromIni(base,read.bytes);
+            for(size_t i=0;i<directories.size();++i){
+                SessionProfileCandidate candidate;
+                candidate.isDefault=i==0;
+                candidate.active=ProfileLockedByBrowser(
+                    directories[i]+L"\\parent.lock");
+                candidate.sessionPath=FirefoxSessionFileInDirectory(directories[i]);
+                candidates.push_back(std::move(candidate));
+            }
+        } else if(profile.session==AppProfile::CHROMIUM){
+            if(profile.userDataDir.empty()) return std::vector<std::wstring>();
+            std::vector<std::wstring> directories;
+            directories.push_back(L"Default");
+            WIN32_FIND_DATAW found{};
+            HANDLE search=FindFirstFileW(
+                (profile.userDataDir+L"\\Profile*").c_str(),&found);
+            if(search!=INVALID_HANDLE_VALUE){
+                do {
+                    if(!(found.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)) continue;
+                    const std::wstring name=found.cFileName;
+                    if(name==L"."||name==L"..") continue;
+                    if(directories.size()>=MAX_SESSION_PROFILES) break;
+                    directories.push_back(name);
+                } while(FindNextFileW(search,&found));
+                FindClose(search);
+            }
+            for(size_t i=0;i<directories.size();++i){
+                const std::wstring directory=
+                    profile.userDataDir+L"\\"+directories[i];
+                SessionProfileCandidate candidate;
+                candidate.isDefault=directories[i]==L"Default";
+                candidate.active=ProfileLockedByBrowser(
+                    directory+L"\\Local Storage\\leveldb\\LOCK");
+                candidate.sessionPath=ChromiumSessionFileInDirectory(directory);
+                candidates.push_back(std::move(candidate));
+            }
+        }
+    } catch(...) { return std::vector<std::wstring>(); }
+    return OrderSessionProfileCandidates(candidates);
+}
+
+inline std::wstring ResolveBrowserSessionPath(const AppProfile& profile){
+    const std::vector<std::wstring> paths=ResolveBrowserSessionPaths(profile);
+    return paths.empty() ? std::wstring() : paths.front();
+}
+
+inline bool ParseOneBrowserSessionFile(const AppProfile& profile,
+                                       const std::string& bytes,
+                                       std::vector<WinFp>& output){
     output.clear();
     if(profile.session==AppProfile::CHROMIUM) return ParseChromiumSNSS(bytes,output);
     if(profile.session==AppProfile::FIREFOX){
@@ -445,6 +622,31 @@ inline bool ParseBrowserSessionData(const AppProfile& profile,const std::string&
         return ParseFirefoxSessionJson(json,output);
     }
     return false;
+}
+
+// The worker verifies one file end to end (stamp, read, stamp again); the other
+// open profiles are appended best effort on top of that verified read, so a
+// second profile's windows get real fingerprints instead of falling back to
+// their titles.  A profile that fails to read is skipped, never fatal.
+inline bool ParseBrowserSessionData(const AppProfile& profile,const std::string& bytes,
+                                    std::vector<WinFp>& output){
+    if(!ParseOneBrowserSessionFile(profile,bytes,output)) return false;
+    std::vector<std::wstring> paths;
+    try { paths=ResolveBrowserSessionPaths(profile); } catch(...) { return true; }
+    if(paths.size()<2) return true;
+    for(size_t i=1;i<paths.size();++i){
+        SessionFileReadResult read=
+            ReadBrowserSessionFileBounded(paths[i],MAX_BROWSER_SESSION_BYTES);
+        if(read.status!=FileReadStatus::Ok) continue;
+        std::vector<WinFp> extra;
+        if(!ParseOneBrowserSessionFile(profile,read.bytes,extra)) continue;
+        try {
+            if(output.size()+extra.size()>MAX_MERGED_SESSION_WINDOWS) break;
+            for(size_t w=0;w<extra.size();++w)
+                output.push_back(std::move(extra[w]));
+        } catch(...) { return true; }
+    }
+    return true;
 }
 
 struct SessionWorkerOps {

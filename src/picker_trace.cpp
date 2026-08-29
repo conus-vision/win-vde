@@ -11,7 +11,7 @@
 static bool PickerTraceIsCliCommand(const std::wstring& command) noexcept {
     return command==L"save" || command==L"restore" ||
         command==L"restore-auto" || command==L"status" ||
-        command==L"list" || command==L"-h" ||
+        command==L"list" || command==L"checkpoints" || command==L"-h" ||
         command==L"--help" || command==L"/?";
 }
 

@@ -60,6 +60,8 @@
 #include "session.hpp"    // bounded browser-session decoding primitives
 #include "appprofile.hpp" // AppProfile, BuiltinProfiles
 #include "session_worker.hpp"
+#include "tabsnap.hpp"  // session snapshots (checkpoints) + reopen planning
+#include "binding_store.hpp"  // persisted window identities + restore gate
 #include <dwmapi.h>
 #pragma comment(lib, "dwmapi.lib")
 
@@ -91,10 +93,12 @@ static bool g_appFirefox = true, g_appChrome = true, g_appEdge = true;  // ка�
 #define TIMER_PICKER_TRANSITION 6
 #define TIMER_PICKER_SEARCH_RETRY 7
 #define TIMER_PICKER_ICON_PRELOAD 8
+#define TIMER_REOPEN 9
 #define WM_PICKER_TRANSITION (WM_APP + 16)
 #define WM_PICKER_SEARCH_RETRY (WM_APP + 17)
 #define WM_MOVE_CANCEL_RETRY (WM_APP + 14)
 #define WM_AUTO_TIMER_RETRY (WM_APP + 15)
+#define WM_FOREGROUND_KICK (WM_APP + 18)
 #define MONITOR_INTERVAL_MS 5000
 #define MOVE_VERIFY_INTERVAL_MS 150
 #define PICKER_IDLE_REFRESH_MS 1000
@@ -111,6 +115,15 @@ static bool g_appFirefox = true, g_appChrome = true, g_appEdge = true;  // ка�
 #define IDC_LINK_REPO 1102
 #define IDC_ABOUT_COPY 1103
 #define IDC_HELP_TEXT 1104
+#define IDC_SNAP_LIST 1201
+#define IDC_SNAP_APP_FF 1202
+#define IDC_SNAP_APP_CR 1203
+#define IDC_SNAP_APP_ED 1204
+#define IDC_SNAP_INFO 1205
+#define IDC_SNAP_REOPEN 1206
+#define REOPEN_STEP_INTERVAL_MS 400
+#define REOPEN_WINDOW_TIMEOUT_MS 45000
+#define REOPEN_TAB_SETTLE_MS 900
 static const wchar_t* APP_VERSION = L"1.1.0";
 
 static HWND g_main=nullptr;
@@ -733,6 +746,11 @@ static BOOL CALLBACK EnumFastWindow(HWND hwnd,LPARAM parameter){
     FastEnumContext& context=*reinterpret_cast<FastEnumContext*>(parameter);
     try {
         if(!(GetWindowLongPtrW(hwnd,GWL_STYLE)&WS_VISIBLE)) return TRUE;
+        // Picture-in-picture and other browser tool windows share the browser's
+        // window class and executable but are not browsing windows: they carry
+        // no session entry and only compete for matches.  The same rule already
+        // decides picker eligibility.
+        if(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&WS_EX_TOOLWINDOW) return TRUE;
         wchar_t className[64]={0};
         const int classLength=GetClassNameW(hwnd,className,64);
         if(!AcceptFastClassNameRead(
@@ -820,6 +838,60 @@ static std::map<std::string,AppFastSnapshot> CollectFastSnapshots(
 
 static std::map<std::string,AppFastSnapshot> CollectFastSnapshots(){
     return CollectFastSnapshots(ActiveProfiles());
+}
+
+// Polling every 5 s is the safety net, but it also means a window can be opened
+// and moved by the user before VDE ever sees it.  Rather than hooking window
+// creation - which fires for every menu, tooltip and control on the desktop -
+// VDE listens to EVENT_SYSTEM_FOREGROUND alone: it fires a handful of times a
+// minute, a new browser window always takes focus, and closing one hands focus
+// to something else.  The callback does two integer tests and one class-name
+// read, then posts at most one wake per second; everything else stays on the
+// existing tick.
+static uint64_t MonotonicNowMs();
+static HWINEVENTHOOK g_foregroundHook=nullptr;
+static uint64_t g_lastForegroundKickMs=0;
+static const uint64_t FOREGROUND_KICK_MIN_INTERVAL_MS=1000;
+
+static bool TrackedFastWindowClass(const wchar_t* className) noexcept {
+    if(!className) return false;
+    try {
+        const std::vector<AppProfile> profiles=ActiveProfiles();
+        for(size_t i=0;i<profiles.size();++i)
+            for(size_t c=0;c<profiles[i].classNames.size();++c)
+                if(profiles[i].classNames[c]==className) return true;
+    } catch(...) { return false; }
+    return false;
+}
+
+static void CALLBACK ForegroundEventProc(HWINEVENTHOOK,DWORD event,HWND hwnd,
+                                         LONG idObject,LONG idChild,
+                                         DWORD,DWORD) {
+    if(event!=EVENT_SYSTEM_FOREGROUND || idObject!=OBJID_WINDOW ||
+       idChild!=CHILDID_SELF || !hwnd) return;
+    if(!g_main || !g_autoFix || g_degraded) return;
+    const uint64_t now=MonotonicNowMs();
+    if(g_lastForegroundKickMs!=0 && now>=g_lastForegroundKickMs &&
+       now-g_lastForegroundKickMs<FOREGROUND_KICK_MIN_INTERVAL_MS) return;
+    wchar_t className[64]={0};
+    if(GetClassNameW(hwnd,className,64)<=0) return;
+    if(!TrackedFastWindowClass(className)) return;
+    g_lastForegroundKickMs=now!=0 ? now : 1;
+    PostMessageW(g_main,WM_FOREGROUND_KICK,0,0);
+}
+
+static void InstallForegroundHook() noexcept {
+    if(g_foregroundHook) return;
+    g_foregroundHook=SetWinEventHook(
+        EVENT_SYSTEM_FOREGROUND,EVENT_SYSTEM_FOREGROUND,nullptr,
+        ForegroundEventProc,0,0,
+        WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
+}
+
+static void RemoveForegroundHook() noexcept {
+    if(!g_foregroundHook) return;
+    UnhookWinEvent(g_foregroundHook);
+    g_foregroundHook=nullptr;
 }
 
 struct PickerProcessStartTraceFacts {
@@ -1047,7 +1119,7 @@ static bool MigrateLegacyLayout(){
         ReportStorageError(L"Legacy layout migration could not be completed; the original file was preserved and startup will retry.");
     return migration.succeeded();
 }
-static bool CurrentDesktops(std::vector<DeskRec>& desksOut, std::string* errorOut=nullptr){
+static bool CurrentDesktopsOnce(std::vector<DeskRec>& desksOut, std::string* errorOut){
     auto fail=[&](const std::string& message)->bool{ if(errorOut)*errorOut=message; return false; };
     if(!g_vdmi)return fail("virtual desktop manager is unavailable");
     DesktopCollectionComOps ops;
@@ -1068,6 +1140,40 @@ static bool CurrentDesktops(std::vector<DeskRec>& desksOut, std::string* errorOu
         } catch(...) { return fail("out of memory collecting virtual desktops"); }
     }
     desksOut.swap(desks); if(errorOut)errorOut->clear(); return true;
+}
+
+// explorer.exe can restart (or crash) at any time.  The ImmersiveShell proxies
+// VDE holds then become disconnected and *every* desktop call fails silently
+// until VDE itself is restarted.  Re-acquire them, at most once per interval,
+// whenever the desktop enumeration - the call every other path goes through -
+// stops working.
+static const uint64_t SERVICE_REPAIR_INTERVAL_MS=30ULL*1000ULL;
+static uint64_t g_lastServiceRepairMs=0;
+
+static bool RepairDesktopServices() noexcept {
+    if(g_degraded) return false;
+    const uint64_t now=MonotonicNowMs();
+    if(g_lastServiceRepairMs!=0 && now>=g_lastServiceRepairMs &&
+       now-g_lastServiceRepairMs<SERVICE_REPAIR_INTERVAL_MS) return false;
+    g_lastServiceRepairMs=now!=0 ? now : 1;
+    try {
+        if(SanityCheckServices()) return false;   // services are fine
+        ReleaseServices();
+        if(!InitServices()) return false;
+        if(!SanityCheckServices()){
+            ReleaseServices();
+            return false;
+        }
+    } catch(...) { return false; }
+    Balloon(L"Reconnected to the Windows virtual-desktop services after a shell restart.");
+    return true;
+}
+
+static bool CurrentDesktops(std::vector<DeskRec>& desksOut,
+                            std::string* errorOut=nullptr){
+    if(CurrentDesktopsOnce(desksOut,errorOut)) return true;
+    if(!RepairDesktopServices()) return false;
+    return CurrentDesktopsOnce(desksOut,errorOut);
 }
 
 static void ReportStorageError(const std::wstring& message){
@@ -1470,6 +1576,34 @@ static uint64_t SessionSourceSignature(const SessionResult& result){
 
 // CLI commands have no message loop; they may run the same bounded preparation
 // synchronously. GUI paths always queue it through ReconcileWorker.
+// What each window's own record already knows about its pages.  Passing it
+// into the live build is what lets the association prefer evidence over an
+// identical window title.
+static std::vector<BoundLiveFingerprint> BoundFingerprintsFor(
+        const std::string& app,const AppFastSnapshot& snapshot) noexcept {
+    std::vector<BoundLiveFingerprint> fingerprints;
+    try {
+        fingerprints.resize(snapshot.windows.size());
+        for(size_t index=0;index<snapshot.windows.size();++index){
+            const FastWin& window=snapshot.windows[index];
+            std::map<std::string,RuntimeRecordBinding>::const_iterator binding=
+                g_recordByRuntime.find(RuntimeKey(window));
+            if(binding==g_recordByRuntime.end() || binding->second.app!=app ||
+               !SameIdentity(binding->second.identity,IdentityOf(window)))
+                continue;
+            const LayoutWin* record=FindAutoRecord(binding->second.recordId);
+            if(!record || record->app!=app) continue;
+            BoundLiveFingerprint bound;
+            bound.known=true;
+            bound.urlSignature=record->urlSignature;
+            bound.tabCount=record->tabCount;
+            bound.counts=record->counts;
+            fingerprints[index]=std::move(bound);
+        }
+    } catch(...) { fingerprints.clear(); }
+    return fingerprints;
+}
+
 static ReconcileRequest MakeCliLiveRequest(
         const AppProfile& profile,const AppFastSnapshot& snapshot,
         const std::shared_ptr<const std::vector<WinFp> >& sessionWindows,
@@ -1478,6 +1612,7 @@ static ReconcileRequest MakeCliLiveRequest(
     request.app=profile.id;
     request.buildLiveFromInputs=true;
     request.fastWindows=snapshot.windows;
+    request.boundFingerprints=BoundFingerprintsFor(profile.id,snapshot);
     request.sessionWindows=sessionWindows;
     request.desktops=desktops;
     request.titleSuffixes=profile.titleSuffixes;
@@ -1492,6 +1627,7 @@ static void ConfigureWorkerLiveBuild(
     request.workMode=mode;
     request.buildLiveFromInputs=true;
     request.fastWindows=snapshot.windows;
+    request.boundFingerprints=BoundFingerprintsFor(profile.id,snapshot);
     request.sessionWindows=sessionWindows;
     request.desktops=desktops;
     request.titleSuffixes=profile.titleSuffixes;
@@ -1502,7 +1638,7 @@ static bool SameRecordSemantic(const LayoutWin& left,const LayoutWin& right){
         left.deskIndex==right.deskIndex && GuidEq(left.desktop,right.desktop) &&
         left.activeTitle==right.activeTitle &&
         left.activeDomain==right.activeDomain && left.tabCount==right.tabCount &&
-        left.counts==right.counts &&
+        left.counts==right.counts && left.urlSignature==right.urlSignature &&
         left.missingSinceUtc==right.missingSinceUtc &&
         left.provisional==right.provisional;
 }
@@ -1551,6 +1687,489 @@ static bool EraseAutoRecord(const LayoutWin& previous,RecordDeltaKind kind,
         return true;
     }
     return false;
+}
+
+// ==================== browser session snapshots (checkpoints) ================
+// The rolling layout remembers where a window belongs; a session snapshot also
+// remembers what it contained, so a browsing layout can be reopened after the
+// browser itself forgot it.  Tabs are captured from the reconcile results that
+// already decode the browser session files — no extra reads, no extra threads.
+struct LiveTabCapture {
+    std::string app;
+    std::string activeTitle;
+    int activeTab=-1;
+    std::vector<SnapTab> tabs;
+    UnixSeconds capturedUtc=0;
+};
+static std::map<std::string,LiveTabCapture> g_tabsByRecord;
+static uint64_t g_lastSavedSnapshotMs=0;
+// One shutdown must consume exactly one history slot: Windows delivers
+// WM_QUERYENDSESSION and then WM_ENDSESSION, and both checkpoint.
+static bool g_exitSnapshotWritten=false;
+
+static std::wstring SnapshotDir(){
+    std::wstring dir=DataDir()+L"\\sessions";
+    CreateDirectoryW(dir.c_str(),nullptr);
+    return dir;
+}
+
+static std::wstring SnapshotPath(size_t slot){
+    return SnapshotDir()+L"\\"+SnapshotSlotFileName(slot);
+}
+
+// Session snapshots and runtime bindings are convenience caches, not the
+// authoritative layout, so they use a plain write-temp-then-replace instead of
+// the layout store's transactional machinery.  A torn write costs at most one
+// checkpoint, never the layout.
+static bool WriteReplaceFileAtomic(const std::wstring& path,
+                                   const std::string& data) noexcept {
+    if(data.size()>MAX_SNAPSHOT_FILE_BYTES) return false;
+    const std::wstring temp=path+L".tmp";
+    HANDLE file=CreateFileW(temp.c_str(),GENERIC_WRITE,0,nullptr,
+                            CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(file==INVALID_HANDLE_VALUE) return false;
+    bool written=true;
+    size_t offset=0;
+    while(offset<data.size()){
+        const DWORD chunk=(DWORD)(std::min)((size_t)(1u<<20),data.size()-offset);
+        DWORD produced=0;
+        if(!WriteFile(file,data.data()+offset,chunk,&produced,nullptr) ||
+           produced==0){ written=false; break; }
+        offset+=produced;
+    }
+    if(written) written=FlushFileBuffers(file)!=FALSE;
+    CloseHandle(file);
+    if(!written){ DeleteFileW(temp.c_str()); return false; }
+    if(!MoveFileExW(temp.c_str(),path.c_str(),
+                    MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)){
+        DeleteFileW(temp.c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool ReadSnapshotSlot(size_t slot,SessionSnapshot& output) noexcept {
+    try {
+        FileReadResult read=ReadFileBytesBounded(
+            SnapshotPath(slot),MAX_SNAPSHOT_FILE_BYTES);
+        if(read.status!=FileReadStatus::Ok) return false;
+        SessionSnapshot parsed;
+        if(!ParseSessionSnapshot(read.bytes,parsed,nullptr)) return false;
+        if(!ValidSnapshot(parsed)) return false;
+        output=std::move(parsed);
+        return true;
+    } catch(...) { return false; }
+}
+
+static std::vector<SnapshotSlot> DescribeSnapshotSlots() noexcept {
+    std::vector<SnapshotSlot> slots;
+    try {
+        for(size_t index=0;index<=MAX_SNAPSHOT_EXIT_SLOTS;++index){
+            SessionSnapshot snapshot;
+            if(!ReadSnapshotSlot(index,snapshot)){
+                SnapshotSlot empty;
+                empty.index=index;
+                slots.push_back(empty);
+                continue;
+            }
+            slots.push_back(DescribeSnapshotSlot(index,snapshot));
+        }
+    } catch(...) { slots.clear(); }
+    return slots;
+}
+
+static void RotateExitSnapshots() noexcept {
+    const std::vector<std::pair<size_t,size_t> > steps=SnapshotRotationSteps();
+    for(size_t i=0;i<steps.size();++i){
+        const std::wstring from=SnapshotPath(steps[i].first);
+        const std::wstring to=SnapshotPath(steps[i].second);
+        if(!FileExists(from)){ DeleteFileW(to.c_str()); continue; }
+        MoveFileExW(from.c_str(),to.c_str(),
+                    MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH);
+    }
+}
+
+// Keeps the tab cache aligned with the records that still exist.
+static void PruneTabCaptures() noexcept {
+    try {
+        std::set<std::string> known;
+        for(size_t i=0;i<g_autoRecords.size();++i)
+            known.insert(g_autoRecords[i].recordId);
+        for(std::map<std::string,LiveTabCapture>::iterator it=g_tabsByRecord.begin();
+            it!=g_tabsByRecord.end();){
+            if(known.count(it->first)) ++it;
+            else it=g_tabsByRecord.erase(it);
+        }
+    } catch(...) {}
+}
+
+static void RememberSessionTabsFromAssociation(
+        const std::string& app,const std::vector<FastWin>& fastWindows,
+        const std::vector<int>& sessionIndexByFast,
+        const std::vector<WinFp>& sessionWindows) noexcept {
+    try {
+        if(app.empty() || fastWindows.size()!=sessionIndexByFast.size()) return;
+        const UnixSeconds nowUtc=UtcNowSeconds();
+        if(nowUtc<=0) return;
+        for(size_t index=0;index<fastWindows.size();++index){
+            const int sessionIndex=sessionIndexByFast[index];
+            if(sessionIndex<0 ||
+               (size_t)sessionIndex>=sessionWindows.size()) continue;
+            const WinFp* session=&sessionWindows[(size_t)sessionIndex];
+            if(session->tabs.empty()) continue;
+            const FastWin& fast=fastWindows[index];
+            std::map<std::string,RuntimeRecordBinding>::const_iterator binding=
+                g_recordByRuntime.find(RuntimeKey(fast));
+            if(binding==g_recordByRuntime.end() ||
+               binding->second.app!=app ||
+               binding->second.recordId.empty() ||
+               !SameIdentity(binding->second.identity,IdentityOf(fast))) continue;
+            LiveTabCapture capture;
+            capture.app=app;
+            capture.activeTitle=session->activeTitle;
+            capture.activeTab=session->activeTab;
+            const size_t limit=(std::min)(session->tabs.size(),
+                                          MAX_SNAPSHOT_TABS_PER_WINDOW);
+            capture.tabs.reserve(limit);
+            for(size_t tab=0;tab<limit;++tab){
+                if(session->tabs[tab].url.size()>MAX_SNAPSHOT_URL_BYTES) continue;
+                SnapTab converted;
+                converted.url=session->tabs[tab].url;
+                converted.title=session->tabs[tab].title.size()>MAX_SNAPSHOT_TITLE_BYTES
+                    ? std::string() : session->tabs[tab].title;
+                capture.tabs.push_back(std::move(converted));
+            }
+            if(capture.tabs.empty()) continue;
+            if(capture.activeTab>=0 &&
+               (size_t)capture.activeTab>=capture.tabs.size())
+                capture.activeTab=-1;
+            capture.capturedUtc=nowUtc;
+            g_tabsByRecord[binding->second.recordId]=std::move(capture);
+        }
+        PruneTabCaptures();
+    } catch(...) {}
+}
+
+static void RememberSessionTabs(const ReconcileResult& result) noexcept {
+    if(!result.sessionWindows) return;
+    RememberSessionTabsFromAssociation(
+        result.app,result.fastWindows,result.sessionIndexByFast,
+        *result.sessionWindows);
+}
+
+// A snapshot describes the windows that are open right now: every layout record
+// that is bound to a live window and whose tabs we have decoded.
+static bool BuildCurrentSessionSnapshot(SnapKind kind,
+                                        SessionSnapshot& output) noexcept {
+    try {
+        SessionSnapshot snapshot;
+        snapshot.kind=kind;
+        snapshot.capturedUtc=UtcNowSeconds();
+        if(snapshot.capturedUtc<=0) return false;
+        std::vector<DeskRec> desktops;
+        if(CurrentDesktops(desktops)) snapshot.desks=desktops;
+        std::set<std::string> liveRecordIds;
+        for(std::map<std::string,RuntimeRecordBinding>::const_iterator it=
+                g_recordByRuntime.begin();it!=g_recordByRuntime.end();++it)
+            if(!it->second.recordId.empty())
+                liveRecordIds.insert(it->second.recordId);
+        size_t tabTotal=0;
+        for(size_t i=0;i<g_autoRecords.size();++i){
+            const LayoutWin& record=g_autoRecords[i];
+            if(!liveRecordIds.count(record.recordId)) continue;
+            std::map<std::string,LiveTabCapture>::const_iterator tabs=
+                g_tabsByRecord.find(record.recordId);
+            if(tabs==g_tabsByRecord.end() || tabs->second.tabs.empty()) continue;
+            if(snapshot.windows.size()>=MAX_SNAPSHOT_WINDOWS) break;
+            if(tabTotal>=MAX_SNAPSHOT_TABS_TOTAL) break;
+            SnapWindow window;
+            window.app=record.app;
+            window.recordId=record.recordId;
+            window.desktop=record.desktop;
+            window.deskIndex=record.deskIndex;
+            window.activeTitle=tabs->second.activeTitle.empty()
+                ? record.activeTitle : tabs->second.activeTitle;
+            if(window.activeTitle.size()>MAX_SNAPSHOT_TITLE_BYTES)
+                window.activeTitle.resize(MAX_SNAPSHOT_TITLE_BYTES);
+            const size_t room=MAX_SNAPSHOT_TABS_TOTAL-tabTotal;
+            const size_t limit=(std::min)(tabs->second.tabs.size(),room);
+            window.tabs.assign(tabs->second.tabs.begin(),
+                               tabs->second.tabs.begin()+limit);
+            window.activeTab=tabs->second.activeTab;
+            if(window.activeTab>=0 &&
+               (size_t)window.activeTab>=window.tabs.size())
+                window.activeTab=-1;
+            if(!ValidSnapshotWindow(window)) continue;
+            tabTotal+=window.tabs.size();
+            snapshot.windows.push_back(std::move(window));
+        }
+        if(!ValidSnapshot(snapshot)) return false;
+        output=std::move(snapshot);
+        return true;
+    } catch(...) { return false; }
+}
+
+static bool CaptureSessionSnapshot(SnapKind kind) noexcept {
+    try {
+        SessionSnapshot snapshot;
+        if(!BuildCurrentSessionSnapshot(kind,snapshot)) return false;
+        // An empty snapshot would silently discard a useful history slot.
+        if(snapshot.windows.empty()) return false;
+        const std::string data=SerializeSessionSnapshot(snapshot);
+        if(kind==SnapKind::Exit){
+            if(!g_exitSnapshotWritten) RotateExitSnapshots();
+            if(!WriteReplaceFileAtomic(SnapshotPath(1),data)) return false;
+            g_exitSnapshotWritten=true;
+            return true;
+        }
+        g_lastSavedSnapshotMs=MonotonicNowMs();
+        return WriteReplaceFileAtomic(SnapshotPath(0),data);
+    } catch(...) { return false; }
+}
+
+// The "saved" slot is refreshed on demand and, in the background, at most once
+// every few minutes so an abrupt power loss still leaves a recent checkpoint.
+static const uint64_t SAVED_SNAPSHOT_MIN_INTERVAL_MS=5ULL*60ULL*1000ULL;
+
+static void MaintainSavedSnapshot() noexcept {
+    if(!g_autoLoaded || g_degraded) return;
+    const uint64_t now=MonotonicNowMs();
+    if(g_lastSavedSnapshotMs!=0 && now>=g_lastSavedSnapshotMs &&
+       now-g_lastSavedSnapshotMs<SAVED_SNAPSHOT_MIN_INTERVAL_MS) return;
+    // No decoded tabs yet is normal right after startup; retry on the next
+    // tick instead of spending the interval on an empty snapshot.
+    if(g_tabsByRecord.empty()) return;
+    CaptureSessionSnapshot(SnapKind::Saved);
+    g_lastSavedSnapshotMs=now;
+}
+
+// ==================== persisted bindings + restore gate ======================
+// A window is identified exactly by (HWND, PID, process start time) while VDE
+// runs.  Persisting those identities is what lets VDE tell "the browser
+// restarted" (identities gone -> search by tabs and restore) apart from "VDE
+// restarted" or "the user opened one more window" (identities still match ->
+// only record).
+static std::map<std::string,RestoreGate> g_restoreGates;
+static std::map<std::string,uint64_t> g_unboundSinceMs;
+static uint64_t g_bindingsSignature=0;
+static bool g_bindingsSignatureKnown=false;
+
+// A window that stays unbound this long while its app is warm is the user's
+// doing, so record it where it is instead of waiting for a reconcile pass to
+// accept it (which can take minutes, or until the final checkpoint).
+static const uint64_t WARM_RECORD_DELAY_MS=10ULL*1000ULL;
+
+static std::wstring BindingsPath(){ return DataDir()+L"\\bindings.txt"; }
+
+static std::vector<PersistedBinding> CurrentPersistedBindings() noexcept {
+    std::vector<PersistedBinding> bindings;
+    try {
+        for(std::map<std::string,RuntimeRecordBinding>::const_iterator it=
+                g_recordByRuntime.begin();it!=g_recordByRuntime.end();++it){
+            if(it->second.recordId.empty()) continue;
+            if(!FindAutoRecord(it->second.recordId)) continue;
+            PersistedBinding binding;
+            binding.app=it->second.app;
+            binding.recordId=it->second.recordId;
+            binding.hwnd=static_cast<uint64_t>(it->second.identity.hwnd);
+            binding.pid=static_cast<uint64_t>(it->second.identity.pid);
+            binding.processStart=it->second.identity.processStart;
+            if(!ValidPersistedBinding(binding)) continue;
+            if(bindings.size()>=MAX_PERSISTED_BINDINGS) break;
+            bindings.push_back(std::move(binding));
+        }
+    } catch(...) { bindings.clear(); }
+    return bindings;
+}
+
+static void WriteBindingsIfChanged() noexcept {
+    if(!g_autoLoaded || !g_autoWritesAllowed || g_degraded) return;
+    try {
+        const std::vector<PersistedBinding> bindings=CurrentPersistedBindings();
+        const uint64_t signature=BindingsSignature(bindings);
+        if(g_bindingsSignatureKnown && signature==g_bindingsSignature) return;
+        if(!WriteReplaceFileAtomic(BindingsPath(),SerializeBindings(bindings)))
+            return;
+        g_bindingsSignature=signature;
+        g_bindingsSignatureKnown=true;
+    } catch(...) {}
+}
+
+// Startup: silently re-adopt every window whose identity survived.  Those
+// windows are the same physical windows VDE saw before, so they must never be
+// re-placed from their fingerprint.
+static size_t RebindPersistedIdentities(
+        const std::map<std::string,AppFastSnapshot>& snapshots) noexcept {
+    size_t adopted=0;
+    try {
+        FileReadResult read=ReadFileBytesBounded(
+            BindingsPath(),MAX_BINDING_FILE_BYTES);
+        if(read.status!=FileReadStatus::Ok) return 0;
+        std::vector<PersistedBinding> persisted;
+        if(!ParseBindings(read.bytes,persisted,nullptr)) return 0;
+        std::map<std::string,const FastWin*> liveByKey;
+        std::map<std::string,uint64_t> generationByApp;
+        for(std::map<std::string,AppFastSnapshot>::const_iterator app=
+                snapshots.begin();app!=snapshots.end();++app){
+            if(!FastSnapshotCanObserve(app->second)) continue;
+            generationByApp[app->first]=app->second.generation;
+            for(size_t i=0;i<app->second.windows.size();++i)
+                liveByKey[RuntimeKey(app->second.windows[i])]=
+                    &app->second.windows[i];
+        }
+        for(size_t i=0;i<persisted.size();++i){
+            const PersistedBinding& entry=persisted[i];
+            WindowIdentityKey identity;
+            identity.hwnd=static_cast<uintptr_t>(entry.hwnd);
+            identity.pid=static_cast<DWORD>(entry.pid);
+            identity.processStart=entry.processStart;
+            const std::string runtimeKey=RuntimeKey(identity);
+            std::map<std::string,const FastWin*>::const_iterator live=
+                liveByKey.find(runtimeKey);
+            if(live==liveByKey.end() || live->second->app!=entry.app) continue;
+            const LayoutWin* record=FindAutoRecord(entry.recordId);
+            if(!record || record->app!=entry.app) continue;
+            if(g_recordByRuntime.count(runtimeKey)) continue;
+            RuntimeRecordBinding binding;
+            binding.app=entry.app;
+            binding.recordId=entry.recordId;
+            binding.identity=identity;
+            binding.causalGeneration=generationByApp[entry.app];
+            g_recordByRuntime[runtimeKey]=binding;
+            ++adopted;
+        }
+    } catch(...) { return adopted; }
+    return adopted;
+}
+
+static bool AppHasLiveBindings(const std::string& app) noexcept {
+    for(std::map<std::string,RuntimeRecordBinding>::const_iterator it=
+            g_recordByRuntime.begin();it!=g_recordByRuntime.end();++it)
+        if(it->second.app==app) return true;
+    return false;
+}
+
+static RestoreDisposition AppRestoreDisposition(const std::string& app,
+                                                uint64_t nowMs) noexcept {
+    std::map<std::string,RestoreGate>::const_iterator found=
+        g_restoreGates.find(app);
+    if(found==g_restoreGates.end()) return RestoreDisposition::Restore;
+    return GateDisposition(found->second,nowMs);
+}
+
+static void ObserveRestoreGates(
+        const std::map<std::string,AppFastSnapshot>& snapshots,
+        uint64_t nowMs) noexcept {
+    try {
+        for(std::map<std::string,AppFastSnapshot>::const_iterator app=
+                snapshots.begin();app!=snapshots.end();++app){
+            if(!FastSnapshotCanObserve(app->second)) continue;
+            ObserveRestoreGate(g_restoreGates[app->first],
+                               AppHasLiveBindings(app->first),nowMs);
+        }
+    } catch(...) {}
+}
+
+// Records a window exactly where it is, with a title-only fingerprint.  The
+// next observation that carries decoded session data upgrades the record in
+// place (CommitBoundRecordRefresh clears `provisional`).
+static bool RecordWindowInPlace(const AppProfile& profile,
+                                const FastWin& window) noexcept {
+    if(!g_autoLoaded || !g_autoWritesAllowed || !g_autoFix || g_degraded)
+        return false;
+    if(GuidIsZero(window.desktop)) return false;
+    const UnixSeconds nowUtc=UtcNowSeconds();
+    if(nowUtc<=0) return false;
+    try {
+        std::vector<DeskRec> desktops;
+        if(!CurrentDesktops(desktops)) return false;
+        int deskIndex=-1;
+        for(size_t i=0;i<desktops.size();++i)
+            if(GuidEq(desktops[i].guid,window.desktop)){
+                deskIndex=desktops[i].index;
+                break;
+            }
+        if(deskIndex<0) return false;
+        const std::string generated=NewRecordId();
+        GUID parsedId{};
+        std::string recordId;
+        if(!ParseNonzeroLayoutGuid(generated,parsedId,&recordId)) return false;
+        LayoutWin record;
+        record.recordId=recordId;
+        record.app=profile.id;
+        record.desktop=window.desktop;
+        record.deskIndex=deskIndex;
+        record.activeTitle=W2U8(StripReconcileTitleSuffix(
+            window.title,profile.titleSuffixes));
+        record.tabCount=0;
+        record.provisional=true;
+        MarkSeen(record,nowUtc);
+        std::vector<LayoutWin> validated(1,record);
+        if(!ValidateV4Records(validated)) return false;
+        const uint64_t generation=TakeNonzeroId(g_nextOperationId);
+        if(!UpsertAutoRecord(record,RecordDeltaKind::ValidatedRuntimeUpsert,
+                             nowUtc,generation)) return false;
+        const std::string runtimeKey=RuntimeKey(window);
+        RuntimeRecordBinding binding;
+        binding.app=profile.id;
+        binding.recordId=recordId;
+        binding.identity=IdentityOf(window);
+        binding.causalGeneration=generation;
+        g_recordByRuntime[runtimeKey]=binding;
+        g_provisionalRecordByRuntime[runtimeKey]=recordId;
+        MarkAutoDirty();
+        return true;
+    } catch(...) { return false; }
+}
+
+// While an app is warm, a window that has stayed unbound for a moment is one
+// the user just opened.  Record it in place rather than leaving it unknown.
+static void RecordLingeringUnboundWindows(
+        const std::map<std::string,AppFastSnapshot>& snapshots,
+        uint64_t nowMs) noexcept {
+    try {
+        std::vector<AppProfile> profiles=ActiveProfiles();
+        std::set<std::string> seen;
+        for(size_t p=0;p<profiles.size();++p){
+            const AppProfile& profile=profiles[p];
+            std::map<std::string,AppFastSnapshot>::const_iterator app=
+                snapshots.find(profile.id);
+            if(app==snapshots.end() ||
+               !FastSnapshotCanPersistAll(app->second)) continue;
+            const bool warm=AppRestoreDisposition(profile.id,nowMs)==
+                RestoreDisposition::RecordOnly;
+            for(size_t i=0;i<app->second.windows.size();++i){
+                const FastWin& window=app->second.windows[i];
+                const std::string runtimeKey=RuntimeKey(window);
+                seen.insert(runtimeKey);
+                std::map<std::string,RuntimeRecordBinding>::const_iterator bound=
+                    g_recordByRuntime.find(runtimeKey);
+                if(bound!=g_recordByRuntime.end() &&
+                   SameIdentity(bound->second.identity,IdentityOf(window))){
+                    g_unboundSinceMs.erase(runtimeKey);
+                    continue;
+                }
+                if(g_reservedAutoIdentities.count(runtimeKey) ||
+                   g_pendingRecordByRuntime.count(runtimeKey) ||
+                   g_provisionalRecordByRuntime.count(runtimeKey)) continue;
+                std::map<std::string,uint64_t>::iterator since=
+                    g_unboundSinceMs.find(runtimeKey);
+                if(since==g_unboundSinceMs.end()){
+                    g_unboundSinceMs[runtimeKey]=nowMs;
+                    continue;
+                }
+                if(nowMs<since->second){ since->second=nowMs; continue; }
+                if(!warm || nowMs-since->second<WARM_RECORD_DELAY_MS) continue;
+                if(RecordWindowInPlace(profile,window))
+                    g_unboundSinceMs.erase(runtimeKey);
+            }
+        }
+        for(std::map<std::string,uint64_t>::iterator it=g_unboundSinceMs.begin();
+            it!=g_unboundSinceMs.end();){
+            if(seen.count(it->first)) ++it;
+            else it=g_unboundSinceMs.erase(it);
+        }
+    } catch(...) {}
 }
 
 static void MarkPickerOperationClaimsPublished(
@@ -2473,6 +3092,10 @@ static void ObserveFastSnapshots(
     const UnixSeconds nowUtc=UtcNowSeconds();
     CancelExpiredSessionRoutes(nowMs);
     PruneStaleRuntimeState(snapshots);
+    // Pruning first: a browser that just died leaves no live binding, which is
+    // exactly what makes its app cold again.
+    ObserveRestoreGates(snapshots,nowMs);
+    RecordLingeringUnboundWindows(snapshots,nowMs);
     std::vector<AppProfile> profiles=ActiveProfiles();
     for(const AppProfile& profile : profiles){
         auto found=snapshots.find(profile.id);
@@ -2505,6 +3128,7 @@ static void ObserveFastSnapshots(
            !state.saveInFlight)
             BeginMetadataProbe(profile,snapshot);
     }
+    WriteBindingsIfChanged();
 }
 
 struct TargetMoveIssueResult {
@@ -2697,6 +3321,37 @@ static HRESULT IssueWindowMove(
     return issued.result;
 }
 
+// A window owned by a process at a higher integrity level cannot be moved by an
+// unelevated VDE, and the COM call just fails.  OpenProcessToken is the cheap
+// discriminator: querying a limited handle works across integrity levels, but
+// opening the token does not.
+static bool ProcessLikelyElevatedAboveUs(DWORD pid) noexcept {
+    if(pid==0) return false;
+    HANDLE process=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);
+    if(!process) return false;
+    HANDLE token=nullptr;
+    const BOOL opened=OpenProcessToken(process,TOKEN_QUERY,&token);
+    const DWORD error=GetLastError();
+    if(opened && token) CloseHandle(token);
+    CloseHandle(process);
+    return !opened && error==ERROR_ACCESS_DENIED;
+}
+
+static std::set<DWORD> g_elevationReportedPids;
+
+static void ReportElevatedMoveTarget(const std::string& app,DWORD pid) noexcept {
+    try {
+        if(!ProcessLikelyElevatedAboveUs(pid)) return;
+        if(!g_elevationReportedPids.insert(pid).second) return;
+        std::wstring name=L"That browser";
+        if(app=="firefox") name=L"Firefox";
+        else if(app=="chrome") name=L"Chrome";
+        else if(app=="msedge") name=L"Edge";
+        Balloon(name+L" is running as administrator, so its windows cannot be "
+                L"moved between desktops unless VDE runs elevated too.");
+    } catch(...) {}
+}
+
 static bool RetryableMoveHresult(HRESULT result){
     return result==E_FAIL || result==E_PENDING || result==RPC_E_CALL_REJECTED ||
            result==HRESULT_FROM_WIN32(ERROR_BUSY) ||
@@ -2850,6 +3505,9 @@ static void AdvanceMoveQueue(){
                     : (RetryableMoveHresult(issued)
                         ? MoveAttemptOutcome::TransientFailure
                         : MoveAttemptOutcome::PermanentFailure);
+                if(outcome==MoveAttemptOutcome::PermanentFailure)
+                    ReportElevatedMoveTarget(
+                        runtime->second.window.app,runtime->second.window.pid);
                 result=g_moveQueue.onIssued(outcome);
             }
         }
@@ -3519,6 +4177,26 @@ static void HandleManualSaveSessionResult(const SessionRoute& route,
                                           const SessionResult& result);
 static void HandleManualRestoreSessionResult(const SessionRoute& route,
                                               const SessionResult& result);
+static void RememberProbedSessionTabs(
+        const std::string& app,const AppFastSnapshot& snapshot,
+        const std::shared_ptr<const std::vector<WinFp> >& sessionWindows)
+        noexcept {
+    if(!sessionWindows || snapshot.windows.empty()) return;
+    try {
+        std::vector<AppProfile> profiles=ActiveProfiles();
+        const AppProfile* profile=FindActiveProfile(app,profiles);
+        if(!profile) return;
+        std::vector<DeskRec> desktops;
+        if(!CurrentDesktops(desktops)) return;
+        const ReconcileRequest request=MakeCliLiveRequest(
+            *profile,snapshot,sessionWindows,desktops);
+        PreparedReconcileLive prepared;
+        if(!BuildReconcileLivePreparation(request,prepared)) return;
+        RememberSessionTabsFromAssociation(
+            app,snapshot.windows,prepared.sessionIndexByFast,*sessionWindows);
+    } catch(...) {}
+}
+
 static void HandleMetadataProbeSessionResult(const SessionRoute& route,
                                              const SessionResult& result){
     auto operation=g_metadataProbeOperations.find(route.operationId);
@@ -3538,6 +4216,10 @@ static void HandleMetadataProbeSessionResult(const SessionRoute& route,
     const uint64_t sourceSignature=SessionSourceSignature(result);
     if(g_lastFreshSessionSignature[route.app]!=sourceSignature)
         g_lastFreshSessionSignature[route.app]=sourceSignature;
+    // The probe is the routine moment fresh session data and stable bindings
+    // exist at the same time — the reconcile path only runs while a restore is
+    // armed, which is far too rare to keep a checkpoint current.
+    RememberProbedSessionTabs(route.app,current->second,result.windows);
 }
 
 static void HandleSessionResult(std::unique_ptr<SessionResult> result){
@@ -3889,6 +4571,7 @@ static void HandleReconcileResult(std::unique_ptr<ReconcileResult> result){
         RememberAcceptedFreshRuntimeRecords(*result);
         std::set<std::string> reserved=UpdateBoundRecords(
             result->app,prepared,*result,result->nowUtc);
+        RememberSessionTabs(*result);
         for(const auto& entry : g_reservedAutoIdentities)
             if(entry.second.app==result->app && !entry.second.recordId.empty())
                 reserved.insert(entry.second.recordId);
@@ -3982,15 +4665,43 @@ static void HandleReconcileResult(std::unique_ptr<ReconcileResult> result){
     }
     operation->second.reconcile=std::move(result);
     ReconcileResult& accepted=*operation->second.reconcile;
-    for(const RestoreRequest& restore : accepted.plan.restores){
+    // A warm app is one VDE still holds live bindings for: its windows were
+    // never lost, so a window appearing now was opened by the user and is only
+    // recorded.  Moves belong to the cold case - the browser restarted - plus a
+    // short grace for windows the browser restores late.
+    const bool restoreAllowed=
+        AppRestoreDisposition(accepted.app,MonotonicNowMs())==
+        RestoreDisposition::Restore;
+    for(const RestoreRequest& plannedRestore : accepted.plan.restores){
+        if(!restoreAllowed) break;
+        RestoreRequest restore=plannedRestore;
         if(restore.savedIndex>=accepted.saved.size() ||
-           restore.liveIndex>=operation->second.reconcileFast.size() ||
-           !SavedRestoreDestinationAvailable(
-               accepted.saved[restore.savedIndex],restore.destination,
-               operation->second.currentDesktops)){
+           restore.liveIndex>=operation->second.reconcileFast.size()){
             operation->second.hadFailure=true;
             continue;
         }
+        const LayoutWin& savedRecord=accepted.saved[restore.savedIndex];
+        // A deleted desktop leaves a GUID that can never come back; fall back
+        // to whatever desktop now sits at the remembered position.
+        if(!SavedRestoreDestinationAvailable(
+               savedRecord,restore.destination,
+               operation->second.currentDesktops)){
+            GUID fallback={0};
+            if(!GuidEq(savedRecord.desktop,restore.destination) ||
+               !ResolveRestoreDestination(
+                   savedRecord,operation->second.currentDesktops,fallback)){
+                operation->second.hadFailure=true;
+                continue;
+            }
+            restore.destination=fallback;
+        }
+        // A window whose pages VDE could not read cannot claim a record that
+        // does know its pages: record the window where it is instead of moving
+        // it on a title alone.
+        if(restore.liveIndex<accepted.live.size() &&
+           accepted.live[restore.liveIndex].counts.empty() &&
+           !savedRecord.counts.empty())
+            continue;
         const FastWin& fast=operation->second.reconcileFast[restore.liveIndex];
         auto pickerReservation=g_reservedAutoIdentities.find(
             RuntimeKey(fast));
@@ -4183,12 +4894,20 @@ static bool CommitFinalSnapshots(
     return true;
 }
 
-static bool ExecuteCheckpoint(CheckpointReason){
+static bool ExecuteCheckpoint(CheckpointReason reason){
     if(!g_autoFix || g_degraded || !g_autoLoaded || !g_autoWritesAllowed)
         return !g_autoFix || g_degraded;
     std::map<std::string,AppFastSnapshot> snapshots=CollectFastSnapshots();
     if(!CommitFinalSnapshots(snapshots)) return false;
-    return FlushAutoLayout(true);
+    const bool flushed=FlushAutoLayout(true);
+    WriteBindingsIfChanged();
+    // A shutdown checkpoint also rotates the session-snapshot history so the
+    // last four shutdowns stay reopenable.  A snapshot failure never fails the
+    // layout checkpoint: the layout is authoritative, the snapshot is a cache.
+    if(reason==CheckpointReason::Finalize ||
+       reason==CheckpointReason::QueryEndSession)
+        CaptureSessionSnapshot(SnapKind::Exit);
+    return flushed;
 }
 
 static bool CheckpointAutoLayout(CheckpointReason reason){
@@ -4245,6 +4964,11 @@ static bool TryLoadAutoLayoutAndInitialize(){
                     mutation.provisionalRecordByRuntime);
                 g_lifecycleByApp.swap(prepared.states);
                 g_lastFreshSessionSignature.swap(prepared.signatures);
+                // Windows whose identity survived are the same physical
+                // windows: adopt them silently so this start cannot be
+                // mistaken for a browser restart.
+                RebindPersistedIdentities(snapshots);
+                ObserveRestoreGates(snapshots,MonotonicNowMs());
                 if(changed) MarkAutoDirty(false);
                 return true;
             } catch(...) { return false; }
@@ -4589,6 +5313,9 @@ static void FinishManualSave(uint64_t operationId){
         fail(L"Manual layout write failed; the previous checkpoint was kept.");
         return;
     }
+    // The manual checkpoint is also the natural moment to refresh the "last
+    // saved" session snapshot the reopen dialog offers.
+    CaptureSessionSnapshot(SnapKind::Saved);
     wchar_t message[160]={0};
     swprintf_s(message,L"Saved manual layout: %u window(s).",
                static_cast<unsigned>(records.size()));
@@ -5644,7 +6371,31 @@ static int CliRun(const std::wstring& cmd){
         printf("\n%s\n",summary.c_str());
         return ok?0:1;
     }
-    printf("Usage: vde <save|restore|restore-auto|status|list>\n");
+    if(cmd==L"checkpoints"){
+        const std::vector<SnapshotSlot> slots=DescribeSnapshotSlots();
+        printf("Session checkpoints in %s\n",
+               W2U8(SnapshotDir()).c_str());
+        for(size_t i=0;i<slots.size();++i){
+            const SnapshotSlot& slot=slots[i];
+            const char* label=slot.index==0?"saved  ":"exit   ";
+            if(!slot.present){
+                printf("  [%u] %s (empty)\n",(unsigned)slot.index,label);
+                continue;
+            }
+            std::string apps;
+            for(std::set<std::string>::const_iterator app=slot.apps.begin();
+                app!=slot.apps.end();++app){
+                if(!apps.empty()) apps+=",";
+                apps+=*app;
+            }
+            printf("  [%u] %s utc=%lld windows=%u tabs=%u apps=%s\n",
+                   (unsigned)slot.index,label,(long long)slot.capturedUtc,
+                   (unsigned)slot.windows,(unsigned)slot.tabs,apps.c_str());
+        }
+        return 0;
+    }
+    printf("Usage: vde <save|restore|restore-auto|status|list|checkpoints>\n");
+    printf("  checkpoints   list the saved browser-session checkpoints\n");
     printf("  save          save current window layout to layout-manual.txt\n");
     printf("  restore       restore from layout-manual.txt\n");
     printf("  restore-auto  restore from the last auto-saved layout\n");
@@ -5732,6 +6483,8 @@ static bool QuiesceRuntime(HWND messageWindow) noexcept {
         KillTimer(messageWindow,TIMER_AUTO_FLUSH);
         KillTimer(messageWindow,TIMER_PICKER_TRANSITION);
         KillTimer(messageWindow,TIMER_PICKER_SEARCH_RETRY);
+        KillTimer(messageWindow,TIMER_REOPEN);
+        RemoveForegroundHook();
         CancelPickerIconPreload(messageWindow);
         g_flushTimerArmed=false;
         g_flushTimerDueMs=0;
@@ -10714,13 +11467,14 @@ L"A grid of your virtual desktops and their eligible application windows. Click 
 L"Menu\r\n"
 L"- Save windows layout: save the current windows to a manual checkpoint file.\r\n"
 L"- Restore saved windows layout: put windows back from that manual checkpoint.\r\n"
-L"- Restore last auto saved layout: put windows back from the rolling automatic layout.\r\n\r\n"
+L"- Restore last auto saved layout: put windows back from the rolling automatic layout.\r\n"
+L"- Reopen browser windows...: pick one of five session checkpoints - the last saved state plus the last four shutdowns, each with its date and time - choose which browsers to bring back, and VDE relaunches them with the saved tabs and moves every window to the desktop it was on. Existing windows are left alone, so a checkpoint that is still open will be duplicated.\r\n\r\n"
 L"Settings\r\n"
-L"- Auto-save & auto-restore layout: the utility watches your browsers and restores the layout automatically at startup and about 20 seconds after a browser launches. A closed Firefox, Chrome, or Edge window keeps its remembered virtual desktop for 30 days. If it reappears before expiry, VDE restores it before updating the saved layout.\r\n"
+L"- Auto-save & auto-restore layout: the utility watches your browsers and restores the layout after a reboot, a browser restart or a browser crash - about 20 seconds after the windows appear. Restarting VDE itself moves nothing: windows that survived are recognized by their handle, process ID and process start time and are simply re-adopted. A window you open while the browser is already running is never relocated; VDE only records where you put it. A closed Firefox, Chrome, or Edge window keeps its remembered virtual desktop for 30 days. If it reappears before expiry, VDE restores it before updating the saved layout.\r\n"
 L"- Track these apps: choose which of Firefox, Chrome and Edge to manage.\r\n"
 L"- Start with Windows: launch the utility at sign-in.\r\n\r\n"
 L"Notes\r\n"
-L"Only the virtual desktop of each window is restored; on-screen size and position are left to the browser. Moving other apps' windows between desktops relies on undocumented Windows interfaces, so a Windows update can temporarily break it - the app will tell you if that happens.";
+L"Only the virtual desktop of each window is restored; on-screen size and position are left to the browser. Reopened windows carry their tab URLs and order, but not tab history, pinned tabs, tab groups, form data or private windows - the browser session files hold none of that for VDE to replay. Moving other apps' windows between desktops relies on undocumented Windows interfaces, so a Windows update can temporarily break it - the app will tell you if that happens.";
 static HWND g_help=nullptr;
 static LRESULT CALLBACK HelpProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     switch(msg){
@@ -10773,6 +11527,666 @@ static bool OpenPickerFooterLink(
         },[](){
             Balloon(L"The selected project link could not be opened.");
         });
+}
+
+// ===================== reopen a session snapshot (checkpoint) ================
+// Restoring a *layout* only moves windows that still exist.  Reopening a
+// snapshot goes further: it launches the browser again with the tabs the
+// snapshot recorded, then puts each recreated window on its saved desktop.
+// The work is inherently slow and asynchronous (a browser needs seconds to
+// materialize a window), so it runs as a small timer-driven state machine on
+// the UI thread instead of blocking it.
+static HWND g_snapshotDialog=nullptr;
+
+static bool ReadRegistryStringValue(HKEY root,const wchar_t* subkey,
+                                    REGSAM view,std::wstring& output) noexcept {
+    HKEY key=nullptr;
+    if(RegOpenKeyExW(root,subkey,0,KEY_QUERY_VALUE|view,&key)!=ERROR_SUCCESS)
+        return false;
+    wchar_t buffer[MAX_PATH*2]={0};
+    DWORD bytes=sizeof(buffer)-sizeof(wchar_t);
+    DWORD type=0;
+    const LSTATUS status=RegQueryValueExW(key,nullptr,nullptr,&type,
+        reinterpret_cast<LPBYTE>(buffer),&bytes);
+    RegCloseKey(key);
+    if(status!=ERROR_SUCCESS || (type!=REG_SZ && type!=REG_EXPAND_SZ))
+        return false;
+    try { output.assign(buffer); } catch(...) { return false; }
+    if(output.empty()) return false;
+    if(type==REG_EXPAND_SZ){
+        wchar_t expanded[MAX_PATH*2]={0};
+        const DWORD produced=ExpandEnvironmentStringsW(
+            output.c_str(),expanded,MAX_PATH*2);
+        if(produced>0 && produced<=MAX_PATH*2){
+            try { output.assign(expanded); } catch(...) { return false; }
+        }
+    }
+    return true;
+}
+
+// Prefer the executable a live window actually runs from — that is the exact
+// install (and channel) the snapshot came from.  Fall back to the documented
+// App Paths registration, then to the usual install locations.
+static std::wstring ResolveBrowserExecutable(
+        const std::string& app,
+        const std::map<std::string,AppFastSnapshot>& live) noexcept {
+    try {
+        std::vector<AppProfile> profiles=BuiltinProfiles(true,true,true);
+        const AppProfile* profile=nullptr;
+        for(size_t i=0;i<profiles.size();++i)
+            if(profiles[i].id==app){ profile=&profiles[i]; break; }
+        if(!profile) return std::wstring();
+
+        std::map<std::string,AppFastSnapshot>::const_iterator running=
+            live.find(app);
+        if(running!=live.end())
+            for(size_t i=0;i<running->second.windows.size();++i){
+                const ProcessSnapshot process=ReadProcessSnapshot(
+                    running->second.windows[i].pid);
+                if(!process.image.empty() && FileExists(process.image))
+                    return process.image;
+            }
+
+        const std::wstring appPaths=
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\"+
+            profile->exeName;
+        // Machine-wide first: a per-user App Paths entry for chrome.exe can
+        // belong to a Chromium fork rather than to Chrome itself.
+        const HKEY roots[]={HKEY_LOCAL_MACHINE,HKEY_CURRENT_USER};
+        const REGSAM views[]={0,KEY_WOW64_64KEY,KEY_WOW64_32KEY};
+        for(size_t r=0;r<sizeof(roots)/sizeof(roots[0]);++r)
+            for(size_t v=0;v<sizeof(views)/sizeof(views[0]);++v){
+                std::wstring path;
+                if(ReadRegistryStringValue(roots[r],appPaths.c_str(),views[v],path) &&
+                   FileExists(path))
+                    return path;
+            }
+
+        std::vector<std::wstring> roots64;
+        wchar_t buffer[MAX_PATH]={0};
+        if(GetEnvironmentVariableW(L"ProgramFiles",buffer,MAX_PATH))
+            roots64.push_back(buffer);
+        if(GetEnvironmentVariableW(L"ProgramFiles(x86)",buffer,MAX_PATH))
+            roots64.push_back(buffer);
+        if(GetEnvironmentVariableW(L"LOCALAPPDATA",buffer,MAX_PATH))
+            roots64.push_back(buffer);
+        std::vector<std::wstring> suffixes;
+        if(app=="firefox") suffixes.push_back(L"\\Mozilla Firefox\\firefox.exe");
+        else if(app=="chrome"){
+            suffixes.push_back(L"\\Google\\Chrome\\Application\\chrome.exe");
+        } else if(app=="msedge"){
+            suffixes.push_back(L"\\Microsoft\\Edge\\Application\\msedge.exe");
+        }
+        for(size_t r=0;r<roots64.size();++r)
+            for(size_t s=0;s<suffixes.size();++s){
+                const std::wstring candidate=roots64[r]+suffixes[s];
+                if(FileExists(candidate)) return candidate;
+            }
+    } catch(...) {}
+    return std::wstring();
+}
+
+static bool LaunchReopenCommand(const std::wstring& exePath,
+                                const std::wstring& commandLine) noexcept {
+    std::vector<wchar_t> mutableCommand;
+    try {
+        mutableCommand.assign(commandLine.begin(),commandLine.end());
+        mutableCommand.push_back(L'\0');
+    } catch(...) { return false; }
+    STARTUPINFOW startup={0};
+    startup.cb=sizeof(startup);
+    startup.dwFlags=STARTF_USESHOWWINDOW;
+    startup.wShowWindow=SW_SHOWNORMAL;
+    PROCESS_INFORMATION process={0};
+    if(!CreateProcessW(exePath.c_str(),mutableCommand.data(),nullptr,nullptr,
+                       FALSE,0,nullptr,nullptr,&startup,&process))
+        return false;
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return true;
+}
+
+enum class ReopenPhase { Idle, Launch, AwaitWindow, Tabs, Move };
+
+struct ReopenRuntime {
+    bool active=false;
+    std::vector<ReopenWindowJob> jobs;
+    std::map<std::string,std::wstring> exeByApp;
+    size_t jobIndex=0;
+    size_t launchIndex=0;
+    ReopenPhase phase=ReopenPhase::Idle;
+    uint64_t phaseSinceMs=0;
+    uint64_t nextStepMs=0;
+    std::set<std::string> beforeKeys;
+    WindowIdentityKey target;
+    bool haveTarget=false;
+    size_t opened=0;
+    size_t launchFailed=0;
+    size_t windowTimedOut=0;
+    size_t moved=0;
+    size_t moveFailed=0;
+    size_t skippedTabs=0;
+};
+
+static ReopenRuntime g_reopen;
+
+static bool ReopenInProgress() noexcept { return g_reopen.active; }
+
+static std::map<std::string,AppFastSnapshot> ReopenLiveSnapshots() noexcept {
+    try { return CollectFastSnapshots(BuiltinProfiles(true,true,true)); }
+    catch(...) { return std::map<std::string,AppFastSnapshot>(); }
+}
+
+static std::set<std::string> ReopenRuntimeKeysFor(
+        const std::map<std::string,AppFastSnapshot>& snapshots,
+        const std::string& app) noexcept {
+    std::set<std::string> keys;
+    try {
+        std::map<std::string,AppFastSnapshot>::const_iterator found=
+            snapshots.find(app);
+        if(found==snapshots.end()) return keys;
+        for(size_t i=0;i<found->second.windows.size();++i)
+            keys.insert(RuntimeKey(found->second.windows[i]));
+    } catch(...) { keys.clear(); }
+    return keys;
+}
+
+static void FinishReopen() noexcept {
+    if(g_main) KillTimer(g_main,TIMER_REOPEN);
+    const size_t opened=g_reopen.opened;
+    const size_t moved=g_reopen.moved;
+    const size_t failed=g_reopen.launchFailed+g_reopen.windowTimedOut;
+    const size_t moveFailed=g_reopen.moveFailed;
+    const size_t skippedTabs=g_reopen.skippedTabs;
+    g_reopen=ReopenRuntime();
+    wchar_t message[240]={0};
+    swprintf_s(message,
+        L"Reopen finished: %u window(s) opened, %u placed on their desktop."
+        L"%s%u not opened, %u could not be moved, %u tab(s) skipped.",
+        (unsigned)opened,(unsigned)moved,L"\r\n",(unsigned)failed,
+        (unsigned)moveFailed,(unsigned)skippedTabs);
+    Balloon(message);
+}
+
+static void ReopenScheduleNextJob(uint64_t nowMs) noexcept {
+    ++g_reopen.jobIndex;
+    g_reopen.launchIndex=0;
+    g_reopen.haveTarget=false;
+    g_reopen.phase=ReopenPhase::Launch;
+    g_reopen.phaseSinceMs=nowMs;
+    g_reopen.nextStepMs=nowMs+REOPEN_STEP_INTERVAL_MS;
+}
+
+// Resolves the desktop a reopened window should land on: the exact saved
+// desktop when it still exists, otherwise the desktop that now sits at the
+// saved position, otherwise nothing (the window simply stays where it opened).
+static bool ResolveReopenDestination(const ReopenWindowJob& job,
+                                     GUID& destination) noexcept {
+    try {
+        std::vector<DeskRec> desktops;
+        if(!CurrentDesktops(desktops)) return false;
+        for(size_t i=0;i<desktops.size();++i)
+            if(GuidEq(desktops[i].guid,job.desktop)){
+                destination=job.desktop;
+                return true;
+            }
+        for(size_t i=0;i<desktops.size();++i)
+            if(job.deskIndex>=0 && desktops[i].index==job.deskIndex){
+                destination=desktops[i].guid;
+                return true;
+            }
+    } catch(...) {}
+    return false;
+}
+
+// A window that was just reopened is known better than any observation can
+// tell: its tabs come from the checkpoint and its desktop is the one it was
+// just moved to.  Writing the record here means the reopened layout survives
+// the next restart even if the reconcile pass has not accepted the new window
+// yet (an unbound window is only planned once its session data is decoded,
+// which can take minutes after a launch).
+static bool RecordReopenedWindow(const ReopenWindowJob& job,
+                                 const WindowIdentityKey& identity,
+                                 const GUID& destination) noexcept {
+    if(!g_autoLoaded || !g_autoWritesAllowed || !g_autoFix || g_degraded)
+        return false;
+    if(GuidIsZero(destination) || job.urls.empty()) return false;
+    const UnixSeconds nowUtc=UtcNowSeconds();
+    const int deskIndex=GetDesktopIndexByGuid(destination);
+    if(nowUtc<=0 || deskIndex<0) return false;
+    try {
+        std::string recordId;
+        GUID parsedId{};
+        if(job.recordId.empty() ||
+           !ParseNonzeroLayoutGuid(job.recordId,parsedId,&recordId)){
+            const std::string generated=NewRecordId();
+            if(!ParseNonzeroLayoutGuid(generated,parsedId,&recordId)) return false;
+        }
+        for(const LayoutWin& current : g_autoRecords)
+            if(current.recordId==recordId && current.app!=job.app) return false;
+        LayoutWin record;
+        record.recordId=recordId;
+        record.app=job.app;
+        record.desktop=destination;
+        record.deskIndex=deskIndex;
+        record.activeTitle=job.activeTitle;
+        record.tabCount=static_cast<int>(job.urls.size());
+        for(size_t i=0;i<job.urls.size();++i){
+            const std::string domain=etld1(hostOf(job.urls[i]));
+            if(!domain.empty()) ++record.counts[domain];
+        }
+        record.activeDomain=etld1(hostOf(job.urls[0]));
+        record.provisional=false;
+        MarkSeen(record,nowUtc);
+        std::vector<LayoutWin> validated(1,record);
+        if(!ValidateV4Records(validated)) return false;
+        const uint64_t generation=TakeNonzeroId(g_nextOperationId);
+        if(!UpsertAutoRecord(record,RecordDeltaKind::ValidatedRuntimeUpsert,
+                             nowUtc,generation)) return false;
+        RuntimeRecordBinding binding;
+        binding.app=job.app;
+        binding.recordId=recordId;
+        binding.identity=identity;
+        binding.causalGeneration=generation;
+        g_recordByRuntime[RuntimeKey(identity)]=binding;
+        MarkAutoDirty();
+        return true;
+    } catch(...) { return false; }
+}
+
+static void AdvanceReopen() noexcept {
+    if(!g_reopen.active) return;
+    const uint64_t nowMs=MonotonicNowMs();
+    if(nowMs<g_reopen.nextStepMs) return;
+    if(g_reopen.jobIndex>=g_reopen.jobs.size()){ FinishReopen(); return; }
+    const ReopenWindowJob& job=g_reopen.jobs[g_reopen.jobIndex];
+
+    if(g_reopen.phase==ReopenPhase::Launch){
+        std::map<std::string,std::wstring>::const_iterator exe=
+            g_reopen.exeByApp.find(job.app);
+        if(exe==g_reopen.exeByApp.end() || exe->second.empty() ||
+           job.launches.empty()){
+            ++g_reopen.launchFailed;
+            ReopenScheduleNextJob(nowMs);
+            return;
+        }
+        g_reopen.beforeKeys=ReopenRuntimeKeysFor(ReopenLiveSnapshots(),job.app);
+        if(!LaunchReopenCommand(exe->second,
+                BuildReopenCommandLine(job.app,exe->second,job.launches[0]))){
+            ++g_reopen.launchFailed;
+            ReopenScheduleNextJob(nowMs);
+            return;
+        }
+        g_reopen.launchIndex=1;
+        g_reopen.phase=ReopenPhase::AwaitWindow;
+        g_reopen.phaseSinceMs=nowMs;
+        g_reopen.nextStepMs=nowMs+REOPEN_STEP_INTERVAL_MS;
+        return;
+    }
+
+    if(g_reopen.phase==ReopenPhase::AwaitWindow){
+        const std::map<std::string,AppFastSnapshot> live=ReopenLiveSnapshots();
+        std::map<std::string,AppFastSnapshot>::const_iterator found=
+            live.find(job.app);
+        if(found!=live.end())
+            for(size_t i=0;i<found->second.windows.size();++i){
+                const FastWin& window=found->second.windows[i];
+                if(g_reopen.beforeKeys.count(RuntimeKey(window))) continue;
+                g_reopen.target=IdentityOf(window);
+                g_reopen.haveTarget=true;
+                ++g_reopen.opened;
+                break;
+            }
+        if(g_reopen.haveTarget){
+            g_reopen.phase=g_reopen.launchIndex<job.launches.size()
+                ? ReopenPhase::Tabs : ReopenPhase::Move;
+            g_reopen.phaseSinceMs=nowMs;
+            g_reopen.nextStepMs=nowMs+REOPEN_TAB_SETTLE_MS;
+            return;
+        }
+        if(nowMs>=g_reopen.phaseSinceMs &&
+           nowMs-g_reopen.phaseSinceMs>=REOPEN_WINDOW_TIMEOUT_MS){
+            ++g_reopen.windowTimedOut;
+            ReopenScheduleNextJob(nowMs);
+            return;
+        }
+        g_reopen.nextStepMs=nowMs+REOPEN_STEP_INTERVAL_MS;
+        return;
+    }
+
+    if(g_reopen.phase==ReopenPhase::Tabs){
+        std::map<std::string,std::wstring>::const_iterator exe=
+            g_reopen.exeByApp.find(job.app);
+        if(exe==g_reopen.exeByApp.end() ||
+           g_reopen.launchIndex>=job.launches.size()){
+            g_reopen.phase=ReopenPhase::Move;
+            g_reopen.nextStepMs=nowMs;
+            return;
+        }
+        LaunchReopenCommand(exe->second,
+            BuildReopenCommandLine(job.app,exe->second,
+                                   job.launches[g_reopen.launchIndex]));
+        ++g_reopen.launchIndex;
+        if(g_reopen.launchIndex>=job.launches.size())
+            g_reopen.phase=ReopenPhase::Move;
+        g_reopen.nextStepMs=nowMs+REOPEN_TAB_SETTLE_MS;
+        return;
+    }
+
+    // ReopenPhase::Move — the window exists and holds its tabs; put it home.
+    if(g_reopen.haveTarget){
+        GUID destination={0};
+        if(ResolveReopenDestination(job,destination)){
+            WindowIdentityRecapture identity=WindowIdentityRecapture::Lost;
+            GUID current={0};
+            bool alreadyHome=false;
+            if(g_vdmDoc &&
+               SUCCEEDED(g_vdmDoc->GetWindowDesktopId(
+                   reinterpret_cast<HWND>(g_reopen.target.hwnd),&current)))
+                alreadyHome=GuidEq(current,destination);
+            bool placed=false;
+            if(alreadyHome){ ++g_reopen.moved; placed=true; }
+            else {
+                TargetMoveIssueResult issued=IssueGuardedTargetMove(
+                    g_reopen.target,TargetDesktopRoute::Indeterminate,
+                    destination,
+                    PickerTraceDesktopLookupUse::MoveEntryDestination,0,0);
+                identity=issued.identity;
+                if(SUCCEEDED(issued.result) && issued.invoked){
+                    ++g_reopen.moved;
+                    placed=true;
+                } else ++g_reopen.moveFailed;
+            }
+            if(placed)
+                RecordReopenedWindow(job,g_reopen.target,destination);
+        } else ++g_reopen.moveFailed;
+    }
+    ReopenScheduleNextJob(nowMs);
+}
+
+static bool StartReopen(const SessionSnapshot& snapshot,
+                        const std::set<std::string>& apps,
+                        std::wstring& errorOut) noexcept {
+    errorOut.clear();
+    if(g_reopen.active){
+        errorOut=L"A reopen is already running.";
+        return false;
+    }
+    if(!g_main){
+        errorOut=L"VDE is not ready yet.";
+        return false;
+    }
+    ReopenPlan plan;
+    if(!BuildReopenPlan(snapshot,apps,64,plan)){
+        errorOut=L"The checkpoint could not be turned into a reopen plan.";
+        return false;
+    }
+    if(plan.jobs.empty()){
+        errorOut=L"This checkpoint holds no reopenable window for the selected browsers.";
+        return false;
+    }
+    ReopenRuntime runtime;
+    try {
+        const std::map<std::string,AppFastSnapshot> live=ReopenLiveSnapshots();
+        for(std::set<std::string>::const_iterator it=apps.begin();it!=apps.end();++it){
+            const std::wstring exe=ResolveBrowserExecutable(*it,live);
+            if(!exe.empty()) runtime.exeByApp[*it]=exe;
+        }
+        bool anyLaunchable=false;
+        for(size_t i=0;i<plan.jobs.size();++i)
+            if(runtime.exeByApp.count(plan.jobs[i].app)){ anyLaunchable=true; break; }
+        if(!anyLaunchable){
+            errorOut=L"No installed browser was found for the selected checkpoint.";
+            return false;
+        }
+        runtime.jobs=plan.jobs;
+        runtime.skippedTabs=plan.skippedTabs;
+    } catch(...) {
+        errorOut=L"Out of memory preparing the reopen.";
+        return false;
+    }
+    runtime.active=true;
+    runtime.phase=ReopenPhase::Launch;
+    runtime.phaseSinceMs=MonotonicNowMs();
+    runtime.nextStepMs=runtime.phaseSinceMs;
+    g_reopen=std::move(runtime);
+    if(!SetTimer(g_main,TIMER_REOPEN,REOPEN_STEP_INTERVAL_MS,nullptr)){
+        g_reopen=ReopenRuntime();
+        errorOut=L"The reopen timer could not be started.";
+        return false;
+    }
+    return true;
+}
+
+// ------------------------------- checkpoint dialog ---------------------------
+static std::wstring FormatSnapshotTime(UnixSeconds seconds){
+    if(seconds<=0) return L"unknown time";
+    ULARGE_INTEGER ticks{};
+    ticks.QuadPart=(ULONGLONG)seconds*10000000ULL+116444736000000000ULL;
+    FILETIME utc{};
+    utc.dwLowDateTime=ticks.LowPart;
+    utc.dwHighDateTime=ticks.HighPart;
+    FILETIME local{};
+    SYSTEMTIME system{};
+    if(!FileTimeToLocalFileTime(&utc,&local) ||
+       !FileTimeToSystemTime(&local,&system)) return L"unknown time";
+    wchar_t date[64]={0},time[64]={0};
+    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT,DATE_SHORTDATE,&system,nullptr,
+                    date,64,nullptr);
+    GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT,TIME_NOSECONDS,&system,nullptr,
+                    time,64);
+    return std::wstring(date)+L" "+time;
+}
+
+static std::wstring SnapshotAppsText(const std::set<std::string>& apps){
+    std::wstring text;
+    const char* order[]={"firefox","chrome","msedge"};
+    const wchar_t* labels[]={L"Firefox",L"Chrome",L"Edge"};
+    for(size_t i=0;i<3;++i){
+        if(!apps.count(order[i])) continue;
+        if(!text.empty()) text+=L", ";
+        text+=labels[i];
+    }
+    return text.empty()?std::wstring(L"none"):text;
+}
+
+static std::wstring DescribeSnapshotSlotRow(const SnapshotSlot& slot){
+    std::wstring label=slot.index==0
+        ? std::wstring(L"Last saved")
+        : L"Shutdown "+std::to_wstring(slot.index);
+    if(!slot.present) return label+L"  \x2014  (empty)";
+    wchar_t counts[96]={0};
+    swprintf_s(counts,L"%u window(s), %u tab(s)",
+               (unsigned)slot.windows,(unsigned)slot.tabs);
+    return label+L"  \x2014  "+FormatSnapshotTime(slot.capturedUtc)+
+        L"  \x2014  "+counts+L"  \x2014  "+SnapshotAppsText(slot.apps);
+}
+
+static std::vector<SnapshotSlot> g_snapshotSlots;
+
+static void UpdateSnapshotDialogState(HWND hwnd){
+    const int selection=(int)SendMessageW(
+        GetDlgItem(hwnd,IDC_SNAP_LIST),LB_GETCURSEL,0,0);
+    const bool valid=selection>=0 &&
+        (size_t)selection<g_snapshotSlots.size() &&
+        g_snapshotSlots[(size_t)selection].present;
+    const int boxes[]={IDC_SNAP_APP_FF,IDC_SNAP_APP_CR,IDC_SNAP_APP_ED};
+    const char* apps[]={"firefox","chrome","msedge"};
+    for(size_t i=0;i<3;++i){
+        const bool available=valid &&
+            g_snapshotSlots[(size_t)selection].apps.count(apps[i])!=0;
+        EnableWindow(GetDlgItem(hwnd,boxes[i]),available?TRUE:FALSE);
+        SendMessageW(GetDlgItem(hwnd,boxes[i]),BM_SETCHECK,
+                     available?BST_CHECKED:BST_UNCHECKED,0);
+    }
+    EnableWindow(GetDlgItem(hwnd,IDC_SNAP_REOPEN),
+                 valid && !ReopenInProgress() ? TRUE : FALSE);
+}
+
+static LRESULT CALLBACK SnapshotProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
+    switch(msg){
+    case WM_CREATE:{
+        CreateWindowW(L"STATIC",
+            L"Reopen browser windows from a checkpoint. VDE relaunches the "
+            L"browser with the saved tabs and moves each window to the desktop "
+            L"it was on. Existing windows are kept, so a checkpoint that is "
+            L"already open will be duplicated.",
+            WS_CHILD|WS_VISIBLE,S(16),S(12),S(516),S(52),hwnd,nullptr,g_inst,nullptr);
+        CreateWindowW(L"STATIC",L"Checkpoint:",WS_CHILD|WS_VISIBLE,
+            S(16),S(70),S(120),S(18),hwnd,nullptr,g_inst,nullptr);
+        CreateWindowW(L"LISTBOX",L"",
+            WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_BORDER|WS_VSCROLL|LBS_NOTIFY,
+            S(16),S(92),S(516),S(110),hwnd,(HMENU)IDC_SNAP_LIST,g_inst,nullptr);
+        CreateWindowW(L"STATIC",L"Reopen these browsers:",WS_CHILD|WS_VISIBLE,
+            S(16),S(212),S(200),S(18),hwnd,nullptr,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Firefox",
+            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,
+            S(16),S(234),S(100),S(22),hwnd,(HMENU)IDC_SNAP_APP_FF,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Chrome",
+            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,
+            S(124),S(234),S(100),S(22),hwnd,(HMENU)IDC_SNAP_APP_CR,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Edge",
+            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,
+            S(232),S(234),S(100),S(22),hwnd,(HMENU)IDC_SNAP_APP_ED,g_inst,nullptr);
+        CreateWindowW(L"STATIC",
+            L"Reopening runs in the background and takes a few seconds per "
+            L"window; automatic layout tracking pauses until it finishes.",
+            WS_CHILD|WS_VISIBLE,S(16),S(262),S(516),S(34),hwnd,
+            (HMENU)IDC_SNAP_INFO,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Reopen",
+            WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON|WS_TABSTOP,
+            S(348),S(302),S(90),S(28),hwnd,(HMENU)IDC_SNAP_REOPEN,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Close",WS_CHILD|WS_VISIBLE|WS_TABSTOP,
+            S(444),S(302),S(88),S(28),hwnd,(HMENU)IDCANCEL,g_inst,nullptr);
+        SetChildFont(hwnd);
+        g_snapshotSlots=DescribeSnapshotSlots();
+        HWND list=GetDlgItem(hwnd,IDC_SNAP_LIST);
+        int firstPresent=-1;
+        for(size_t i=0;i<g_snapshotSlots.size();++i){
+            SendMessageW(list,LB_ADDSTRING,0,
+                (LPARAM)DescribeSnapshotSlotRow(g_snapshotSlots[i]).c_str());
+            if(firstPresent<0 && g_snapshotSlots[i].present)
+                firstPresent=(int)i;
+        }
+        SendMessageW(list,LB_SETCURSEL,firstPresent<0?0:firstPresent,0);
+        UpdateSnapshotDialogState(hwnd);
+        return 0;
+    }
+    case WM_COMMAND:
+        if(LOWORD(wp)==IDC_SNAP_LIST && HIWORD(wp)==LBN_SELCHANGE){
+            UpdateSnapshotDialogState(hwnd);
+            return 0;
+        }
+        if(LOWORD(wp)==IDC_SNAP_REOPEN){
+            const int selection=(int)SendMessageW(
+                GetDlgItem(hwnd,IDC_SNAP_LIST),LB_GETCURSEL,0,0);
+            if(selection<0 || (size_t)selection>=g_snapshotSlots.size() ||
+               !g_snapshotSlots[(size_t)selection].present) return 0;
+            SessionSnapshot snapshot;
+            if(!ReadSnapshotSlot(g_snapshotSlots[(size_t)selection].index,snapshot)){
+                MessageBoxW(hwnd,L"That checkpoint could not be read.",APP_NAME,
+                            MB_ICONWARNING);
+                return 0;
+            }
+            std::set<std::string> apps;
+            if(IsDlgButtonChecked(hwnd,IDC_SNAP_APP_FF)==BST_CHECKED) apps.insert("firefox");
+            if(IsDlgButtonChecked(hwnd,IDC_SNAP_APP_CR)==BST_CHECKED) apps.insert("chrome");
+            if(IsDlgButtonChecked(hwnd,IDC_SNAP_APP_ED)==BST_CHECKED) apps.insert("msedge");
+            if(apps.empty()){
+                MessageBoxW(hwnd,L"Select at least one browser to reopen.",APP_NAME,
+                            MB_ICONINFORMATION);
+                return 0;
+            }
+            size_t windows=0,tabs=0;
+            for(size_t i=0;i<snapshot.windows.size();++i){
+                if(!apps.count(snapshot.windows[i].app)) continue;
+                ++windows;
+                tabs+=snapshot.windows[i].tabs.size();
+            }
+            wchar_t question[320]={0};
+            swprintf_s(question,
+                L"Reopen %u browser window(s) with %u tab(s) from the checkpoint "
+                L"of %s?\r\n\r\nWindows that are already open are not closed or "
+                L"reused, so matching windows will appear twice.",
+                (unsigned)windows,(unsigned)tabs,
+                FormatSnapshotTime(snapshot.capturedUtc).c_str());
+            if(MessageBoxW(hwnd,question,APP_NAME,
+                           MB_ICONQUESTION|MB_OKCANCEL)!=IDOK) return 0;
+            std::wstring error;
+            if(!StartReopen(snapshot,apps,error)){
+                MessageBoxW(hwnd,error.c_str(),APP_NAME,MB_ICONWARNING);
+                return 0;
+            }
+            Balloon(L"Reopening browser windows from the checkpoint...");
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if(LOWORD(wp)==IDCANCEL){ DestroyWindow(hwnd); return 0; }
+        return 0;
+    case WM_CTLCOLORSTATIC:{
+        HDC dc=(HDC)wp;
+        SetBkMode(dc,TRANSPARENT);
+        return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+    }
+    case WM_CLOSE: DestroyWindow(hwnd); return 0;
+    case WM_DESTROY: g_snapshotDialog=nullptr; return 0;
+    }
+    return DefWindowProcW(hwnd,msg,wp,lp);
+}
+
+static void OpenSessionRestore(){
+    if(g_snapshotDialog){ SetForegroundWindow(g_snapshotDialog); return; }
+    static bool registered=false;
+    if(!registered){
+        WNDCLASSW wc={0};
+        wc.lpfnWndProc=SnapshotProc;
+        wc.hInstance=g_inst;
+        wc.lpszClassName=L"VdeSnapshots";
+        wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
+        wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
+        wc.hIcon=LoadAppIcon(GetSystemMetrics(SM_CXICON),GetSystemMetrics(SM_CYICON));
+        RegisterClassW(&wc);
+        registered=true;
+    }
+    int W=S(548),H=S(348);
+    RECT wr={0,0,W,H};
+    AdjustWindowRect(&wr,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,FALSE);
+    const int ww=wr.right-wr.left,wh=wr.bottom-wr.top;
+    const int sx=(GetSystemMetrics(SM_CXSCREEN)-ww)/2;
+    const int sy=(GetSystemMetrics(SM_CYSCREEN)-wh)/2;
+    g_snapshotDialog=CreateWindowExW(0,L"VdeSnapshots",
+        L"Reopen browser windows - Virtual Desktop Extension",
+        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,sx,sy,ww,wh,nullptr,nullptr,g_inst,nullptr);
+    if(g_snapshotDialog){
+        ShowWindow(g_snapshotDialog,SW_SHOW);
+        SetForegroundWindow(g_snapshotDialog);
+    }
+}
+
+// The observation pass, shared by the 5 s timer and the foreground wake-up.
+static void RunMonitorTick(HWND hwnd){
+    RunMessageRouteNoThrow([&](){
+        const uint64_t nowMs=MonotonicNowMs();
+        CancelExpiredSessionRoutes(nowMs);
+        CancelExpiredReconcileOperations(nowMs);
+        if(!g_autoFix || g_degraded){
+            if(g_sessionRoutes.empty() && g_reconcileDeadlines.empty())
+                KillTimer(hwnd,TIMER_MONITOR);
+            return;
+        }
+        if(!g_autoLoadRetry.loaded){
+            if(!g_autoLoadRetry.monitorStarted ||
+               g_autoLoadRetry.due(nowMs))
+                TryLoadAutoLayoutAndInitialize();
+            return;
+        }
+        // A reopen drives browser launches of its own; observing (and
+        // restoring) half-built windows would fight it.
+        if(ReopenInProgress()) return;
+        ObserveFastSnapshots(CollectFastSnapshots());
+        MaintainSavedSnapshot();
+        CancelExpiredSessionRoutes(MonotonicNowMs());
+    },[](){},[](){ MaintainAutoFlushTimer(); });
 }
 
 static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
@@ -11206,6 +12620,10 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             g_moveCancellationRetry.clear();
         }
         return 0;
+    case WM_FOREGROUND_KICK:
+        if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
+        RunMonitorTick(hwnd);
+        return 0;
     case WM_AUTO_TIMER_RETRY:
         if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
         RunMessageRouteNoThrow([](){
@@ -11292,26 +12710,12 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             },[](){});
             return 0;
         }
-        if(wp==TIMER_MONITOR){
-            RunMessageRouteNoThrow([&](){
-                const uint64_t nowMs=MonotonicNowMs();
-                CancelExpiredSessionRoutes(nowMs);
-                CancelExpiredReconcileOperations(nowMs);
-                if(!g_autoFix || g_degraded){
-                    if(g_sessionRoutes.empty() && g_reconcileDeadlines.empty())
-                        KillTimer(hwnd,TIMER_MONITOR);
-                    return;
-                }
-                if(!g_autoLoadRetry.loaded){
-                    if(!g_autoLoadRetry.monitorStarted ||
-                       g_autoLoadRetry.due(nowMs))
-                        TryLoadAutoLayoutAndInitialize();
-                    return;
-                }
-                ObserveFastSnapshots(CollectFastSnapshots());
-                CancelExpiredSessionRoutes(MonotonicNowMs());
-            },[](){},[](){ MaintainAutoFlushTimer(); });
+        if(wp==TIMER_REOPEN){
+            RunMessageRouteNoThrow([&](){ AdvanceReopen(); },
+                                   [](){ FinishReopen(); },[](){});
+            return 0;
         }
+        if(wp==TIMER_MONITOR) RunMonitorTick(hwnd);
         return 0;
     case WM_ACTIVATE:
         if(LOWORD(wp)==WA_INACTIVE &&
@@ -11354,6 +12758,7 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             AppendMenuW(m,MF_STRING,201,L"Save windows layout");
             AppendMenuW(m,MF_STRING,202,L"Restore saved windows layout");
             AppendMenuW(m,MF_STRING,204,L"Restore last auto saved layout");
+            AppendMenuW(m,MF_STRING,207,L"Reopen browser windows...");
             AppendMenuW(m,MF_SEPARATOR,0,nullptr);
             AppendMenuW(m,MF_STRING,203,L"Settings...");
             AppendMenuW(m,MF_STRING,206,L"Help...");
@@ -11366,6 +12771,7 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             else if(cmd==201)StartManualSave();
             else if(cmd==202)StartManualRestore(true);
             else if(cmd==204)StartManualRestore(false);
+            else if(cmd==207)OpenSessionRestore();
             else if(cmd==203)OpenSettings();
             else if(cmd==206)OpenHelp();
             else if(cmd==205)OpenAbout();
@@ -11463,6 +12869,7 @@ static bool DestroyUiWindow(HWND& window) noexcept {
 
 static bool DestroyAllUiWindows() noexcept {
     bool destroyed=true;
+    if(!DestroyUiWindow(g_snapshotDialog)) destroyed=false;
     if(!DestroyUiWindow(g_settings)) destroyed=false;
     if(!DestroyUiWindow(g_about)) destroyed=false;
     if(!DestroyUiWindow(g_help)) destroyed=false;
@@ -11484,6 +12891,7 @@ static bool UnregisterUiClass(const wchar_t* name) noexcept {
 
 static bool UnregisterUiClasses() noexcept {
     bool unregistered=true;
+    if(!UnregisterUiClass(L"VdeSnapshots")) unregistered=false;
     if(!UnregisterUiClass(L"VdeSettings")) unregistered=false;
     if(!UnregisterUiClass(L"VdeAbout")) unregistered=false;
     if(!UnregisterUiClass(L"VdeCompat")) unregistered=false;
@@ -11547,6 +12955,7 @@ static int RunGui(HINSTANCE hInst){
                                L"Another app may be using it. Change it in Settings,\n"
                                L"or open the picker via double-click on the tray icon.",APP_NAME,MB_ICONWARNING);
     ApplyAutoFix();   // start the lifecycle monitor timer if enabled
+    InstallForegroundHook();
     std::wstring hkStr=HotkeyString(), tip;
     if(g_degraded)     tip=L"Running in limited mode (compatibility issue). See About for details.";
     else if(g_autoFix) tip=L"Running. Auto-restore is on. Press "+hkStr+L" to open the desktop picker.";
@@ -11581,6 +12990,7 @@ static int RunGui(HINSTANCE hInst){
         if(g_about && IsDialogMessageW(g_about,&msg)) continue;
         if(g_compat && IsDialogMessageW(g_compat,&msg)) continue;
         if(g_help && IsDialogMessageW(g_help,&msg)) continue;
+        if(g_snapshotDialog && IsDialogMessageW(g_snapshotDialog,&msg)) continue;
         TranslateMessage(&msg); DispatchMessageW(&msg);
     }
     return runResult;

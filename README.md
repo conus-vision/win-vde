@@ -39,24 +39,38 @@ Three things Windows and the browser don't solve on their own:
 3. There is **no public Windows API** for moving another process's window
    between virtual desktops. It requires undocumented COM interfaces.
 
-win-vde builds a stable *fingerprint* of each window from its content (the set
-of tab domains + the active tab), matches old windows to new ones after a
-restart, and moves each matched window to the desktop it was saved on.
+win-vde bridges that gap from the window's *content*: it remembers the pages a
+window holds, matches the old windows to the new ones after a restart, and moves
+each of them to the desktop it was saved on. While it runs, a window needs no
+fingerprint at all — it is identified exactly by its handle, process ID and
+process start time, and those identities are kept on disk, so restarting win-vde
+itself is never mistaken for a browser restart and moves nothing.
 
 ## Features
 
 - **Multi-browser** — Firefox (via its session store), Chrome and Edge (via
-  their SNSS session files); each can be toggled in Settings. Windows are
-  re-identified after a restart by their tab domains, falling back to the window
-  title.
-- **Automatic restore** — on utility start (if a browser is already open) and
-  when a browser launches (after a ~20 s stabilization), windows are returned to
-  their saved desktops.
+  their SNSS session files); each can be toggled in Settings. After a restart a
+  window is re-identified by its pages: an exact match of the whole tab-URL set
+  first, then tab domains, then the window title. Windows holding exactly the
+  same pages are treated as interchangeable, and among equally good placements
+  win-vde picks the one that moves the fewest windows.
+- **Automatic restore, only when it is warranted** — windows are put back when
+  their identity is actually gone, i.e. after a reboot, a browser restart, or a
+  browser crash (with a ~20 s stabilization first). Restarting win-vde itself
+  moves nothing: surviving windows are recognized by handle, process ID and
+  process start time and simply re-adopted. A window you open while the browser
+  is already running is never relocated — it is recorded where you opened it.
 - **30-day closed-window memory** — a closed Firefox, Chrome, or Edge window
   keeps its remembered virtual desktop for 30 days. If it reappears before
   expiry, VDE restores it before updating the saved layout.
 - **Two layouts** — a rolling *auto* layout plus a manual checkpoint you save on
   demand.
+- **Reopen a whole browsing session** — VDE also remembers *what* each window
+  contained. Pick one of five checkpoints — the last saved state plus the last
+  four shutdowns, each shown with its date and time — choose the browsers, and
+  VDE relaunches them with the saved tabs and puts every window back on its
+  desktop. Useful when the browser itself lost the session, not just its window
+  placement.
 - **All-window desktop picker** — the global hotkey (default `Ctrl+Alt+D`)
   opens a grid of desktops on the primary monitor, containing eligible ordinary
   application windows, not only tracked browsers. Rows show application icons,
@@ -112,7 +126,7 @@ restart, and moves each matched window to the desktop it was saved on.
   popup from actual Windows state.
 - The footer links to [Virtual Desktop Extension](https://github.com/conus-vision/win-vde)
   and [Conus Vision](https://conus.vision).
-- Layout v4 is migrated automatically from v2/v3. The legacy
+- Layout v5 is migrated automatically from v2/v3/v4. The legacy
   `%LOCALAPPDATA%\VirtualDesktopsExtention` directory and matching registry key
   keep their historical spelling for compatibility.
 
@@ -143,6 +157,7 @@ icon for:
 | **Save windows layout** | Save current windows to a manual checkpoint file |
 | **Restore saved windows layout** | Restore from that manual checkpoint |
 | **Restore last auto saved layout** | Restore from the rolling auto layout |
+| **Reopen browser windows…** | Relaunch the browsers with the tabs of a saved session checkpoint |
 | **Settings…** | Hotkey, auto-save/restore, start-with-Windows |
 | **About…** | Version, author, contact, project link |
 | **Exit** | Quit after saving the current automatic layout |
@@ -162,6 +177,7 @@ vde.exe status        desktops + live browser windows and their fingerprints
 vde.exe save          save current layout to layout-manual.txt
 vde.exe restore       restore from layout-manual.txt
 vde.exe restore-auto  restore from the last auto-saved layout
+vde.exe checkpoints   list the saved browser-session checkpoints
 ```
 
 ### Picker diagnostics
@@ -187,6 +203,14 @@ Stored under `%LOCALAPPDATA%\VirtualDesktopsExtention\`:
 - `layout-auto.txt` — the rolling auto layout with 30-day closed-window
   retention.
 - `layout-manual.txt` — your manual checkpoint (full snapshot).
+- `sessions\session-saved.txt` — the last saved browser session (windows,
+  their desktops, and every tab URL/title).
+- `sessions\session-exit-1..4.txt` — the same for the last four shutdowns,
+  newest first.
+- `bindings.txt` — which live window (handle, process ID, process start time)
+  currently owns which layout record. It is what lets win-vde tell a browser
+  restart from its own restart; a stale or missing file only costs one extra
+  restore pass.
 
 A legacy `layout.txt` from earlier builds is migrated to `layout-auto.txt` on
 first run.
@@ -211,14 +235,33 @@ restore work unattended.
   other applications, but it does not create restore records for them.
 - Globally visible or pinned windows are protected from physical moves. Their
   session-only visual placement in the picker disappears when the popup closes.
+- If a saved virtual desktop has been deleted, the window is restored to the
+  desktop that now occupies that position rather than staying put forever.
+- If the Windows shell (`explorer.exe`) restarts, win-vde reconnects to the
+  virtual-desktop services by itself instead of silently failing every move.
+- Dragging a tab out of a window, or merging two windows, is recognized as such:
+  the layout follows the windows instead of dragging one half to the desktop the
+  original was remembered on.
+- If a browser runs as administrator, win-vde says so once instead of reporting a
+  generic failure — an unelevated app cannot move an elevated window.
 - Private Firefox windows aren't in the session store, so they're matched by
-  title only.
+  title only, and they are not part of a session checkpoint.
+- Reopening a checkpoint **adds** windows; it never closes or reuses the ones
+  already open, so a checkpoint that is still open will appear twice. Tab
+  history, pinned tabs, tab groups, form data and scroll position are not
+  reopened — only the tab URLs, their order, and the window's desktop.
+- Every browser profile that is currently open is read, not just the default
+  one: win-vde detects an open profile from the lock the browser holds on it.
+  A profile that is merely installed is ignored, so its old windows can never
+  confuse the matching.
 
 ## Roadmap
 
 - Persistent restore profiles for generic (user-defined) multi-window apps
   beyond the three built-in browsers.
 - Optional restore of on-screen geometry (size/position), not just the desktop.
+- Telling a browser's PWA / app windows apart from ordinary browsing windows
+  (Windows exposes no signal for it today).
 
 ## License
 

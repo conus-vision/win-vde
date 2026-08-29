@@ -123,7 +123,8 @@ inline bool SameRecordForDelta(const LayoutWin& left,const LayoutWin& right){
         left.deskIndex==right.deskIndex && GuidEq(left.desktop,right.desktop) &&
         left.activeTitle==right.activeTitle &&
         left.activeDomain==right.activeDomain && left.tabCount==right.tabCount &&
-        left.counts==right.counts && left.lastSeenUtc==right.lastSeenUtc &&
+        left.counts==right.counts &&
+        left.urlSignature==right.urlSignature && left.lastSeenUtc==right.lastSeenUtc &&
         left.missingSinceUtc==right.missingSinceUtc &&
         left.provisional==right.provisional;
 }
@@ -2666,18 +2667,18 @@ inline LegacyLayoutMigrationResult MigrateLegacyLayoutLocked(
         result.error=error.empty() ? "legacy layout is invalid" : error;
         return result;
     }
-    std::string checkedV4;
-    if(!BuildCheckedLayoutSnapshot(desks,wins,nowUtc,checkedV4,&error)){
-        result.error=error.empty() ? "legacy layout cannot be represented as v4" : error;
+    std::string checkedCurrent;
+    if(!BuildCheckedLayoutSnapshot(desks,wins,nowUtc,checkedCurrent,&error)){
+        result.error=error.empty() ? "legacy layout cannot be represented as v5" : error;
         return result;
     }
-    if(!AtomicWriteText(targetPath,checkedV4,&error,false,ops)){
+    if(!AtomicWriteText(targetPath,checkedCurrent,&error,false,ops)){
         result.error=error.empty() ? "automatic layout atomic write failed" : error;
         return result;
     }
 
     result.target=LoadLayoutWithBackupLocked(targetPath,nowUtc,ops);
-    if(result.target.status!=LayoutLoadStatus::Valid || result.target.sourceVersion!=4 ||
+    if(result.target.status!=LayoutLoadStatus::Valid || result.target.sourceVersion!=5 ||
        !result.target.revision.exists || result.target.revision.sourcePath!=targetPath){
         result.error=result.target.error.empty() ?
             "installed automatic layout could not be verified" : result.target.error;

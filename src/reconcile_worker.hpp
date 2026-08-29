@@ -32,6 +32,13 @@ static const size_t MAX_RECONCILE_COPIED_TEXT_BYTES=32ULL*1024ULL*1024ULL;
 
 enum class ReconcileWorkMode { Plan, PrepareLiveOnly };
 
+struct BoundLiveFingerprint {
+    bool known=false;
+    uint64_t urlSignature=0;
+    int tabCount=0;
+    std::map<std::string,int> counts;
+};
+
 struct ReconcileRequest {
     uint64_t operationId=0;
     std::string app;
@@ -47,6 +54,10 @@ struct ReconcileRequest {
     std::vector<LayoutWin> live;
     std::set<std::string> reservedRecordIds;
     std::vector<FastWin> fastWindows;
+    // For a window that already owns a record, that record's fingerprint: the
+    // strongest evidence for deciding which decoded session window belongs to
+    // it.  Empty, or exactly one entry per fast window.
+    std::vector<BoundLiveFingerprint> boundFingerprints;
     std::shared_ptr<const std::vector<WinFp> > sessionWindows;
     std::vector<DeskRec> desktops;
     std::vector<std::wstring> titleSuffixes;
@@ -95,6 +106,10 @@ inline bool ReconcileRequestTextWithinBudget(
     for(const DeskRec& desktop : request.desktops)
         if(!AddReconcileTextUnits(
                 desktop.name.size(),sizeof(wchar_t),maxBytes,totalBytes)) return false;
+    for(const BoundLiveFingerprint& bound : request.boundFingerprints)
+        for(const auto& count : bound.counts)
+            if(!AddReconcileTextUnits(
+                    count.first.size(),sizeof(char),maxBytes,totalBytes)) return false;
     size_t suffixChars=0;
     for(const std::wstring& suffix : request.titleSuffixes){
         if(suffix.size()>MAX_RECONCILE_TITLE_SUFFIX_CHARS-suffixChars ||
@@ -229,6 +244,31 @@ inline std::wstring StripReconcileTitleSuffix(
     return title;
 }
 
+// The set of pages a decoded session window holds, independent of tab order.
+inline uint64_t SessionUrlSignature(const WinFp& window){
+    uint64_t accumulated=0;
+    size_t counted=0;
+    for(size_t i=0;i<window.tabs.size();++i){
+        if(window.tabs[i].url.empty()) continue;
+        accumulated=CombineTabUrlHashes(
+            accumulated,HashTabUrl(window.tabs[i].url));
+        ++counted;
+    }
+    if(counted==0) return 0;              // no pages known
+    return FinalizeTabUrlSignature(accumulated);
+}
+
+// Joining a decoded session window to a live HWND used to be done on the exact
+// active-tab title, first come first served.  Two windows showing the same
+// title then swapped tab sets and both fingerprints were wrong - and a title
+// carrying an unread counter ("(3) Inbox") mismatches its own session entry for
+// as long as the browser has not flushed the session file.
+//
+// Evidence order now: a window that already owns a record is joined to the
+// session window whose pages match that record; the rest are joined only where
+// the normalized title is unique on *both* sides.  Anything still ambiguous is
+// left unassociated, which downgrades that window to a title-only fingerprint -
+// honest, unlike a confidently wrong tab set.
 inline bool BuildReconcileLivePreparation(
         const ReconcileRequest& request,PreparedReconcileLive& output){
     if(!request.buildLiveFromInputs || !request.sessionWindows ||
@@ -238,18 +278,79 @@ inline bool BuildReconcileLivePreparation(
        request.titleSuffixes.size()>MAX_RECONCILE_TITLE_SUFFIXES ||
        !ReconcileRequestTextWithinBudget(request))
         return false;
+    if(!request.boundFingerprints.empty() &&
+       request.boundFingerprints.size()!=request.fastWindows.size())
+        return false;
     try {
+        const std::vector<WinFp>& sessions=*request.sessionWindows;
+        const size_t liveCount=request.fastWindows.size();
         PreparedReconcileLive built;
-        built.live.reserve(request.fastWindows.size());
-        built.sessionIndexByFast.assign(request.fastWindows.size(),-1);
+        built.live.reserve(liveCount);
+        built.sessionIndexByFast.assign(liveCount,-1);
 
-        std::map<std::string,std::deque<size_t> > sessionsByTitle;
-        for(size_t index=0;index<request.sessionWindows->size();++index)
-            sessionsByTitle[request.sessionWindows->at(index).activeTitle]
-                .push_back(index);
+        std::vector<std::string> liveTitles(liveCount);
+        std::vector<std::string> matchTitles(liveCount);
+        for(size_t i=0;i<liveCount;++i){
+            liveTitles[i]=W2U8(StripReconcileTitleSuffix(
+                request.fastWindows[i].title,request.titleSuffixes));
+            matchTitles[i]=NormalizeProvisionalAdoptionTitle(liveTitles[i]);
+        }
+        std::vector<std::string> sessionTitles(sessions.size());
+        std::vector<uint64_t> sessionSignatures(sessions.size(),0);
+        for(size_t j=0;j<sessions.size();++j){
+            sessionTitles[j]=NormalizeProvisionalAdoptionTitle(
+                sessions[j].activeTitle);
+            sessionSignatures[j]=SessionUrlSignature(sessions[j]);
+        }
+        std::vector<char> taken(sessions.size(),0);
 
-        for(size_t fastIndex=0;fastIndex<request.fastWindows.size();++fastIndex){
-            const FastWin& fast=request.fastWindows[fastIndex];
+        for(size_t i=0;i<liveCount && !request.boundFingerprints.empty();++i){
+            const BoundLiveFingerprint& bound=request.boundFingerprints[i];
+            if(!bound.known) continue;
+            size_t matches=0;
+            size_t chosen=0;
+            if(bound.urlSignature!=0){
+                for(size_t j=0;j<sessions.size();++j){
+                    if(taken[j] || sessionSignatures[j]!=bound.urlSignature) continue;
+                    ++matches;
+                    chosen=j;
+                }
+            }
+            if(matches!=1 && !bound.counts.empty()){
+                matches=0;
+                for(size_t j=0;j<sessions.size();++j){
+                    if(taken[j] || sessions[j].counts!=bound.counts ||
+                       sessions[j].tabCount!=bound.tabCount) continue;
+                    ++matches;
+                    chosen=j;
+                }
+            }
+            if(matches!=1) continue;
+            built.sessionIndexByFast[i]=static_cast<int>(chosen);
+            taken[chosen]=1;
+        }
+
+        std::map<std::string,size_t> liveTitleCounts,sessionTitleCounts,sessionByTitle;
+        for(size_t i=0;i<liveCount;++i)
+            if(built.sessionIndexByFast[i]<0 && !matchTitles[i].empty())
+                ++liveTitleCounts[matchTitles[i]];
+        for(size_t j=0;j<sessions.size();++j){
+            if(taken[j] || sessionTitles[j].empty()) continue;
+            ++sessionTitleCounts[sessionTitles[j]];
+            sessionByTitle[sessionTitles[j]]=j;
+        }
+        for(size_t i=0;i<liveCount;++i){
+            if(built.sessionIndexByFast[i]>=0 || matchTitles[i].empty()) continue;
+            if(liveTitleCounts[matchTitles[i]]!=1 ||
+               sessionTitleCounts[matchTitles[i]]!=1) continue;
+            const size_t j=sessionByTitle[matchTitles[i]];
+            if(taken[j]) continue;
+            built.sessionIndexByFast[i]=static_cast<int>(j);
+            taken[j]=1;
+        }
+
+        for(size_t i=0;i<liveCount;++i){
+            const FastWin& fast=request.fastWindows[i];
             LayoutWin live;
             live.app=request.app;
             live.desktop=fast.desktop;
@@ -260,19 +361,17 @@ inline bool BuildReconcileLivePreparation(
                     break;
                 }
             }
-            live.activeTitle=W2U8(StripReconcileTitleSuffix(
-                fast.title,request.titleSuffixes));
-            auto matching=sessionsByTitle.find(live.activeTitle);
-            if(matching!=sessionsByTitle.end() && !matching->second.empty()){
-                const size_t sessionIndex=matching->second.front();
-                matching->second.pop_front();
-                const WinFp& fingerprint=request.sessionWindows->at(sessionIndex);
-                built.sessionIndexByFast[fastIndex]=static_cast<int>(sessionIndex);
+            live.activeTitle=liveTitles[i];
+            const int sessionIndex=built.sessionIndexByFast[i];
+            if(sessionIndex>=0){
+                const WinFp& fingerprint=sessions[static_cast<size_t>(sessionIndex)];
                 if(!fingerprint.activeTitle.empty())
                     live.activeTitle=fingerprint.activeTitle;
                 live.activeDomain=fingerprint.activeDomain;
                 live.tabCount=fingerprint.tabCount;
                 live.counts=fingerprint.counts;
+                live.urlSignature=
+                    sessionSignatures[static_cast<size_t>(sessionIndex)];
             }
             built.live.push_back(std::move(live));
         }

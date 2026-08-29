@@ -86,6 +86,24 @@ inline bool ParseI64Strict(const std::string& s, long long& out) {
     out = value;
     return true;
 }
+// Values that legitimately use the whole 64-bit range (hashes, signatures)
+// must not be read through the signed parser: anything above 2^63-1 would be
+// rejected as invalid.
+inline bool ParseU64Strict(const std::string& s, unsigned long long& out) {
+    if (s.empty() || s.size() > 20) return false;
+    unsigned long long value = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        const char digit = s[i];
+        if (digit < '0' || digit > '9') return false;
+        const unsigned long long next = (unsigned long long)(digit - '0');
+        if (value > (0xffffffffffffffffULL - next) / 10ULL) return false;
+        value = value * 10ULL + next;
+    }
+    if (s.size() > 1 && s[0] == '0') return false;
+    out = value;
+    return true;
+}
+
 inline bool ParseIntStrict(const std::string& s, int& out) {
     long long value = 0;
     if (!ParseI64Strict(s, value) || value < INT_MIN || value > INT_MAX) return false;
