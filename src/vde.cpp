@@ -124,7 +124,7 @@ static bool g_appFirefox = true, g_appChrome = true, g_appEdge = true;  // ка�
 #define REOPEN_STEP_INTERVAL_MS 400
 #define REOPEN_WINDOW_TIMEOUT_MS 45000
 #define REOPEN_TAB_SETTLE_MS 900
-static const wchar_t* APP_VERSION = L"1.1.0";
+static const wchar_t* APP_VERSION = L"1.2.0";
 
 static HWND g_main=nullptr;
 static void Balloon(const std::wstring& text);
