@@ -1,10 +1,22 @@
 # win-vde — Virtual Desktop Extension for Windows 11
 
-A small tray utility that remembers which **virtual desktop** each browser
-window belongs to and puts them back automatically after a reboot or a browser
-restart. It also adds a fast searchable picker for moving the active
-window between desktops, activating an exact listed window, and dragging window
-rows between desktop tiles.
+A small tray utility for people who work in many browser windows spread over
+Windows 11 **virtual desktops**. It does three things:
+
+1. **Keeps your desktop layout.** It remembers which virtual desktop every
+   browser window belongs to and puts the windows back after a reboot, a
+   browser restart or a crash — and only then; it never moves a window you
+   opened yourself.
+2. **Brings back lost browsing sessions.** It also remembers *what* each window
+   held. Five checkpoints — the last saved state plus the last four shutdowns,
+   each with date and time — let you reopen any desktop, any window or any
+   single tab, in its original window, on its original desktop, skipping
+   whatever is already open. Lost a session to a browser update, a crash, an
+   accidental "close all windows", or a profile reset? Pick what you need and
+   get it back in seconds.
+3. **Gives you a fast desktop picker.** A hotkey opens a searchable grid of all
+   your desktops and their windows: switch, activate an exact window, or drag a
+   window row onto another desktop.
 
 - **Author:** Volodymyr Moskvin — <info@conus.vision>
 - **Repository:** https://github.com/conus-vision/win-vde
@@ -12,9 +24,24 @@ rows between desktop tiles.
 
 **➡ [Download the latest `vde.exe`](https://github.com/conus-vision/win-vde/releases/latest)** — a single file, no installer. Or build it from source (see [Quick start](#quick-start)).
 
-> Automatic layout memory supports **Firefox, Chrome, and Edge** today. The
-> picker also lists eligible ordinary windows from other applications, with app
-> icons, active-window highlighting, search, scrolling, and full-name tooltips.
+> Layout memory and session checkpoints support **Firefox, Chrome, and Edge**.
+> The picker also lists eligible ordinary windows from other applications, with
+> app icons, active-window highlighting, search, scrolling, and full-name
+> tooltips.
+
+## Who it is for
+
+- **Anyone with more than a handful of browser windows** — a research desktop,
+  a work desktop, a shopping desktop. After a reboot Windows dumps them all on
+  desktop 1; win-vde puts each one back where it lived.
+- **Anyone who has lost a browser session** — the browser updated and forgot,
+  a crash swallowed the windows, "Restore previous session" restored the wrong
+  thing, or one careless click closed forty tabs. win-vde keeps its own
+  checkpoints, outside the browser, and lets you restore exactly the desktop,
+  window or tab you miss.
+- **Anyone who wants to rebuild a working context on demand** — bring back the
+  three windows of last Tuesday's project onto their desktop without touching
+  what is open now.
 
 <p align="center"><img src="docs/overview.svg" alt="How win-vde works: Windows scatters browser windows across virtual desktops after a reboot; win-vde remembers the layout and restores it; plus a fast searchable desktop picker" width="840"></p>
 
@@ -48,6 +75,29 @@ itself is never mistaken for a browser restart and moves nothing.
 
 ## Features
 
+### Session checkpoints — restore what was lost
+
+- **Five checkpoints, always up to date** — the current state is saved every
+  few minutes and on demand; the last four shutdowns are kept as well. Each is
+  shown with its date and time.
+- **Reopen exactly the tabs you pick** — three cascading columns, **desktops →
+  browser windows → browser tabs**, each with check boxes, a select-all box in
+  the column header, a "Hide open" switch and a text filter; a browser filter on
+  top. Checking a desktop selects its windows and their tabs; uncheck whatever
+  you do not want.
+- **Never a duplicate** — tabs that are open in the browser right now are
+  greyed out and left unchecked; windows and desktops that are fully open are
+  greyed too. If a browser's open tabs cannot be read, its windows start
+  unchecked and the status line says so.
+- **Back where it was** — selected tabs return grouped into their original
+  windows, each on its original desktop; a desktop that no longer exists is
+  marked and its windows go to desktop 1. About a second per window, with a
+  progress bar and Cancel.
+- **Built for big sessions** — the window resizes and maximizes; the lists are
+  virtual, so a checkpoint with hundreds of tabs stays instant.
+
+### Layout memory — keep windows on their desktops
+
 - **Multi-browser** — Firefox (via its session store), Chrome and Edge (via
   their SNSS session files); each can be toggled in Settings. After a restart a
   window is re-identified by its pages: an exact match of the whole tab-URL set
@@ -65,23 +115,8 @@ itself is never mistaken for a browser restart and moves nothing.
   expiry, VDE restores it before updating the saved layout.
 - **Two layouts** — a rolling *auto* layout plus a manual checkpoint you save on
   demand.
-- **Reopen exactly the tabs you pick** — VDE also remembers *what* each window
-  contained. The reopen window shows five checkpoints as tabs (the last saved
-  state plus the last four shutdowns, each with its date and time) and three
-  cascading columns: **desktops → browser windows → browser tabs**, each with
-  check boxes, a select-all box in the column header, a **Hide open** switch,
-  and a text filter underneath, plus a browser filter. Checking a desktop
-  selects its windows and their tabs; uncheck whatever you do not want; type to
-  narrow a column or hide what is already open (both only change what is
-  shown, never what is selected). Tabs that are open in the browser right now
-  are greyed out and left unchecked, so a reopen never duplicates them; a window
-  whose every tab is open, or a desktop whose every window is, is greyed too.
-  If a browser's open tabs cannot be read, its windows start unchecked and the
-  status line says so. A desktop that no longer exists is marked; its windows
-  reopen on desktop 1. The window is resizable and maximizes, and the lists are
-  virtual, so a checkpoint with hundreds of tabs stays instant. The selected
-  tabs come back grouped into their original windows, each on the desktop it
-  was on, with a progress bar and a Cancel button while it runs.
+### Desktop picker — get around fast
+
 - **All-window desktop picker** — the global hotkey (default `Ctrl+Alt+D`)
   opens a grid of desktops on the primary monitor, containing eligible ordinary
   application windows, not only tracked browsers. Rows show application icons,

@@ -150,7 +150,7 @@ static bool g_appFirefox = true, g_appChrome = true, g_appEdge = true;  // ка�
 #define IDC_RO_HIDE_DESK 1323
 #define IDC_RO_HIDE_WIN 1324
 #define IDC_RO_HIDE_TAB 1325
-static const wchar_t* APP_VERSION = L"1.2.0";
+static const wchar_t* APP_VERSION = L"1.3.0";
 
 static HWND g_main=nullptr;
 static void Balloon(const std::wstring& text);
@@ -11392,7 +11392,7 @@ static LRESULT CALLBACK AboutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         int y=S(16);
         std::wstring title=std::wstring(L"Virtual Desktop Extension for Windows 11  \x2014  v")+APP_VERSION;
         CreateWindowW(L"STATIC",title.c_str(),WS_CHILD|WS_VISIBLE,S(16),y,S(352),S(20),hwnd,nullptr,g_inst,nullptr); y+=S(26);
-        CreateWindowW(L"STATIC",L"Saves and restores browser windows across Windows 11 virtual desktops.",WS_CHILD|WS_VISIBLE,S(16),y,S(352),S(34),hwnd,nullptr,g_inst,nullptr); y+=S(40);
+        CreateWindowW(L"STATIC",L"Keeps browser windows on their virtual desktops, and brings back lost browsing sessions - any desktop, window or tab.",WS_CHILD|WS_VISIBLE,S(16),y,S(352),S(34),hwnd,nullptr,g_inst,nullptr); y+=S(40);
         CreateWindowW(L"STATIC",L"Author:  Volodymyr Moskvin",WS_CHILD|WS_VISIBLE,S(16),y,S(352),S(20),hwnd,nullptr,g_inst,nullptr); y+=S(24);
         CreateWindowW(L"SysLink",L"Email:  <a href=\"mailto:info@conus.vision\">info@conus.vision</a>",WS_CHILD|WS_VISIBLE|WS_TABSTOP,S(16),y,S(352),S(20),hwnd,(HMENU)IDC_LINK_MAIL,g_inst,nullptr); y+=S(24);
         CreateWindowW(L"SysLink",L"GitHub:  <a href=\"https://github.com/conus-vision/win-vde\">github.com/conus-vision/win-vde</a>",WS_CHILD|WS_VISIBLE|WS_TABSTOP,S(16),y,S(352),S(20),hwnd,(HMENU)IDC_LINK_REPO,g_inst,nullptr); y+=S(28);
@@ -11487,7 +11487,7 @@ static void ShowCompatIssue(bool buildChanged){
 // --------------------------- Help window -------------------------------------
 static const wchar_t* HELP_TEXT =
 L"What this solves\r\n"
-L"Windows 11 does not remember which virtual desktop your app windows were on after a reboot, and browsers change their window handles when they restore a session - so nothing external can recognize the windows. win-vde fingerprints each browser window by the domains of its tabs, matches old windows to new ones after a restart, and moves each one back to the desktop it was saved on.\r\n\r\n"
+L"Windows 11 does not remember which virtual desktop your app windows were on after a reboot, and browsers change their window handles when they restore a session - so nothing external can recognize the windows. win-vde identifies each browser window by its pages, matches old windows to new ones after a restart, and moves each one back to the desktop it was saved on. It also keeps its own session checkpoints, outside the browser: when a session is lost to a crash, an update or a careless click, any desktop, window or single tab can be brought back from one of them.\r\n\r\n"
 L"Picker  (hotkey Ctrl+Alt+D)\r\n"
 L"A grid of your virtual desktops and their eligible application windows. Click a window row to switch to its displayed desktop and activate that exact window. Click a desktop title or empty tile area to switch without activating a listed window. Ctrl+click a desktop tile to move the captured active window there, follow it, and keep the picker open. During the drag, a translucent copy with the application icon and window title follows the pointer. Drop it on another desktop to move or visually assign that window without switching desktops or closing the picker. Globally visible and pinned windows are only visually assigned for the current popup session; their real Windows state is not changed. Type in the box to filter windows by name, scroll a tile with the mouse wheel, and hover a clipped name to see it in full.\r\n\r\n"
 L"Menu\r\n"
