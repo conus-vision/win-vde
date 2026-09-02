@@ -62,6 +62,7 @@
 #include "session_worker.hpp"
 #include "tabsnap.hpp"  // session snapshots (checkpoints) + reopen planning
 #include "binding_store.hpp"  // persisted window identities + restore gate
+#include "reopen_model.hpp"   // checkpoint selection model for the reopen dialog
 #include <dwmapi.h>
 #pragma comment(lib, "dwmapi.lib")
 
@@ -121,9 +122,34 @@ static bool g_appFirefox = true, g_appChrome = true, g_appEdge = true;  // ка�
 #define IDC_SNAP_APP_ED 1204
 #define IDC_SNAP_INFO 1205
 #define IDC_SNAP_REOPEN 1206
-#define REOPEN_STEP_INTERVAL_MS 400
+#define REOPEN_STEP_INTERVAL_MS 150
 #define REOPEN_WINDOW_TIMEOUT_MS 45000
-#define REOPEN_TAB_SETTLE_MS 900
+#define REOPEN_TAB_SETTLE_MS 500
+#define IDC_RO_TABS 1301
+#define IDC_RO_APP_FF 1302
+#define IDC_RO_APP_CR 1303
+#define IDC_RO_APP_ED 1304
+#define IDC_RO_ALL_DESK 1305
+#define IDC_RO_ALL_WIN 1306
+#define IDC_RO_ALL_TAB 1307
+#define IDC_RO_LIST_DESK 1308
+#define IDC_RO_LIST_WIN 1309
+#define IDC_RO_LIST_TAB 1310
+#define IDC_RO_HINT_WIN 1311
+#define IDC_RO_HINT_TAB 1312
+#define IDC_RO_STATUS 1313
+#define IDC_RO_PROGRESS 1314
+#define IDC_RO_REOPEN 1315
+#define IDC_RO_HINT_DESK 1316
+#define IDC_RO_LABEL_DESK 1317
+#define IDC_RO_LABEL_WIN 1318
+#define IDC_RO_LABEL_TAB 1319
+#define IDC_RO_FILTER_DESK 1320
+#define IDC_RO_FILTER_WIN 1321
+#define IDC_RO_FILTER_TAB 1322
+#define IDC_RO_HIDE_DESK 1323
+#define IDC_RO_HIDE_WIN 1324
+#define IDC_RO_HIDE_TAB 1325
 static const wchar_t* APP_VERSION = L"1.2.0";
 
 static HWND g_main=nullptr;
@@ -11468,7 +11494,7 @@ L"Menu\r\n"
 L"- Save windows layout: save the current windows to a manual checkpoint file.\r\n"
 L"- Restore saved windows layout: put windows back from that manual checkpoint.\r\n"
 L"- Restore last auto saved layout: put windows back from the rolling automatic layout.\r\n"
-L"- Reopen browser windows...: pick one of five session checkpoints - the last saved state plus the last four shutdowns, each with its date and time - choose which browsers to bring back, and VDE relaunches them with the saved tabs and moves every window to the desktop it was on. Existing windows are left alone, so a checkpoint that is still open will be duplicated.\r\n\r\n"
+L"- Reopen browser windows...: five session checkpoints as tabs (the last saved state plus the last four shutdowns, with date and time) and three cascading columns - desktops, browser windows, browser tabs - each with check boxes, a select-all box in the column header, a Hide open switch and a text filter underneath, plus a browser filter. Checking a desktop selects its windows and tabs; uncheck what you do not want; filters and Hide open narrow what is shown, not what is selected. Tabs that are open right now are greyed out and skipped; if a browser's open tabs cannot be read, its windows start unchecked and the status line says so. A desktop that no longer exists is marked and its windows reopen on desktop 1. The selected tabs come back in their original windows on their original desktops, with a progress bar and Cancel.\r\n\r\n"
 L"Settings\r\n"
 L"- Auto-save & auto-restore layout: the utility watches your browsers and restores the layout after a reboot, a browser restart or a browser crash - about 20 seconds after the windows appear. Restarting VDE itself moves nothing: windows that survived are recognized by their handle, process ID and process start time and are simply re-adopted. A window you open while the browser is already running is never relocated; VDE only records where you put it. A closed Firefox, Chrome, or Edge window keeps its remembered virtual desktop for 30 days. If it reappears before expiry, VDE restores it before updating the saved layout.\r\n"
 L"- Track these apps: choose which of Firefox, Chrome and Edge to manage.\r\n"
@@ -11650,6 +11676,7 @@ enum class ReopenPhase { Idle, Launch, AwaitWindow, Tabs, Move };
 
 struct ReopenRuntime {
     bool active=false;
+    bool cancelRequested=false;
     std::vector<ReopenWindowJob> jobs;
     std::map<std::string,std::wstring> exeByApp;
     size_t jobIndex=0;
@@ -11669,6 +11696,12 @@ struct ReopenRuntime {
 };
 
 static ReopenRuntime g_reopen;
+
+// The dialog, when open, mirrors the engine's progress; the engine itself
+// never depends on it.
+static void NotifyReopenProgress() noexcept;
+static void NotifyReopenFinished(const std::wstring& summary,
+                                 const std::vector<ReopenWindowJob>& jobs) noexcept;
 
 static bool ReopenInProgress() noexcept { return g_reopen.active; }
 
@@ -11698,14 +11731,23 @@ static void FinishReopen() noexcept {
     const size_t failed=g_reopen.launchFailed+g_reopen.windowTimedOut;
     const size_t moveFailed=g_reopen.moveFailed;
     const size_t skippedTabs=g_reopen.skippedTabs;
+    const size_t total=g_reopen.jobs.size();
+    const bool cancelled=g_reopen.cancelRequested && g_reopen.jobIndex<total;
+    std::vector<ReopenWindowJob> done;
+    try {
+        done.assign(g_reopen.jobs.begin(),
+                    g_reopen.jobs.begin()+
+                    (std::min)(g_reopen.jobIndex,g_reopen.jobs.size()));
+    } catch(...) { done.clear(); }
     g_reopen=ReopenRuntime();
     wchar_t message[240]={0};
     swprintf_s(message,
-        L"Reopen finished: %u window(s) opened, %u placed on their desktop."
-        L"%s%u not opened, %u could not be moved, %u tab(s) skipped.",
-        (unsigned)opened,(unsigned)moved,L"\r\n",(unsigned)failed,
+        L"%s%u of %u window(s) opened, %u placed on their desktop, "
+        L"%u not opened, %u could not be moved, %u tab(s) skipped.",
+        cancelled?L"Cancelled: ":L"Done: ",
+        (unsigned)opened,(unsigned)total,(unsigned)moved,(unsigned)failed,
         (unsigned)moveFailed,(unsigned)skippedTabs);
-    Balloon(message);
+    NotifyReopenFinished(message,done);
 }
 
 static void ReopenScheduleNextJob(uint64_t nowMs) noexcept {
@@ -11714,27 +11756,30 @@ static void ReopenScheduleNextJob(uint64_t nowMs) noexcept {
     g_reopen.haveTarget=false;
     g_reopen.phase=ReopenPhase::Launch;
     g_reopen.phaseSinceMs=nowMs;
-    g_reopen.nextStepMs=nowMs+REOPEN_STEP_INTERVAL_MS;
+    g_reopen.nextStepMs=nowMs;      // the next launch may go out immediately
+    NotifyReopenProgress();
 }
 
 // Resolves the desktop a reopened window should land on: the exact saved
-// desktop when it still exists, otherwise the desktop that now sits at the
-// saved position, otherwise nothing (the window simply stays where it opened).
+// desktop when it still exists, otherwise the first desktop - a window from a
+// desktop that no longer exists has no better home, and the first desktop is
+// where the user will look.
 static bool ResolveReopenDestination(const ReopenWindowJob& job,
                                      GUID& destination) noexcept {
     try {
         std::vector<DeskRec> desktops;
-        if(!CurrentDesktops(desktops)) return false;
+        if(!CurrentDesktops(desktops) || desktops.empty()) return false;
         for(size_t i=0;i<desktops.size();++i)
             if(GuidEq(desktops[i].guid,job.desktop)){
                 destination=job.desktop;
                 return true;
             }
-        for(size_t i=0;i<desktops.size();++i)
-            if(job.deskIndex>=0 && desktops[i].index==job.deskIndex){
-                destination=desktops[i].guid;
-                return true;
-            }
+        size_t first=0;
+        for(size_t i=1;i<desktops.size();++i)
+            if(desktops[i].index<desktops[first].index) first=i;
+        if(GuidIsZero(desktops[first].guid)) return false;
+        destination=desktops[first].guid;
+        return true;
     } catch(...) {}
     return false;
 }
@@ -11743,8 +11788,7 @@ static bool ResolveReopenDestination(const ReopenWindowJob& job,
 // tell: its tabs come from the checkpoint and its desktop is the one it was
 // just moved to.  Writing the record here means the reopened layout survives
 // the next restart even if the reconcile pass has not accepted the new window
-// yet (an unbound window is only planned once its session data is decoded,
-// which can take minutes after a launch).
+// yet.
 static bool RecordReopenedWindow(const ReopenWindowJob& job,
                                  const WindowIdentityKey& identity,
                                  const GUID& destination) noexcept {
@@ -11771,10 +11815,13 @@ static bool RecordReopenedWindow(const ReopenWindowJob& job,
         record.deskIndex=deskIndex;
         record.activeTitle=job.activeTitle;
         record.tabCount=static_cast<int>(job.urls.size());
+        uint64_t signature=0;
         for(size_t i=0;i<job.urls.size();++i){
             const std::string domain=etld1(hostOf(job.urls[i]));
             if(!domain.empty()) ++record.counts[domain];
+            signature=CombineTabUrlHashes(signature,HashTabUrl(job.urls[i]));
         }
+        record.urlSignature=FinalizeTabUrlSignature(signature);
         record.activeDomain=etld1(hostOf(job.urls[0]));
         record.provisional=false;
         MarkSeen(record,nowUtc);
@@ -11794,11 +11841,19 @@ static bool RecordReopenedWindow(const ReopenWindowJob& job,
     } catch(...) { return false; }
 }
 
+// One window at a time: the new window is recognized as the difference in the
+// browser's window set, and Firefox routes extra tabs to its most recent
+// window, so launches cannot overlap.  Speed comes from tight polling and no
+// idle gaps, not from parallelism.
 static void AdvanceReopen() noexcept {
     if(!g_reopen.active) return;
     const uint64_t nowMs=MonotonicNowMs();
     if(nowMs<g_reopen.nextStepMs) return;
-    if(g_reopen.jobIndex>=g_reopen.jobs.size()){ FinishReopen(); return; }
+    if(g_reopen.jobIndex>=g_reopen.jobs.size() ||
+       (g_reopen.cancelRequested && g_reopen.phase==ReopenPhase::Launch)){
+        FinishReopen();
+        return;
+    }
     const ReopenWindowJob& job=g_reopen.jobs[g_reopen.jobIndex];
 
     if(g_reopen.phase==ReopenPhase::Launch){
@@ -11841,7 +11896,10 @@ static void AdvanceReopen() noexcept {
             g_reopen.phase=g_reopen.launchIndex<job.launches.size()
                 ? ReopenPhase::Tabs : ReopenPhase::Move;
             g_reopen.phaseSinceMs=nowMs;
-            g_reopen.nextStepMs=nowMs+REOPEN_TAB_SETTLE_MS;
+            // A window that exists can take tabs right away; only Firefox's
+            // "most recent window" bookkeeping needs a moment to catch up.
+            g_reopen.nextStepMs=nowMs+(g_reopen.phase==ReopenPhase::Tabs
+                ? REOPEN_TAB_SETTLE_MS : 0);
             return;
         }
         if(nowMs>=g_reopen.phaseSinceMs &&
@@ -11877,7 +11935,6 @@ static void AdvanceReopen() noexcept {
     if(g_reopen.haveTarget){
         GUID destination={0};
         if(ResolveReopenDestination(job,destination)){
-            WindowIdentityRecapture identity=WindowIdentityRecapture::Lost;
             GUID current={0};
             bool alreadyHome=false;
             if(g_vdmDoc &&
@@ -11891,7 +11948,6 @@ static void AdvanceReopen() noexcept {
                     g_reopen.target,TargetDesktopRoute::Indeterminate,
                     destination,
                     PickerTraceDesktopLookupUse::MoveEntryDestination,0,0);
-                identity=issued.identity;
                 if(SUCCEEDED(issued.result) && issued.invoked){
                     ++g_reopen.moved;
                     placed=true;
@@ -11904,9 +11960,8 @@ static void AdvanceReopen() noexcept {
     ReopenScheduleNextJob(nowMs);
 }
 
-static bool StartReopen(const SessionSnapshot& snapshot,
-                        const std::set<std::string>& apps,
-                        std::wstring& errorOut) noexcept {
+static bool StartReopenJobs(std::vector<ReopenWindowJob> jobs,
+                            size_t skippedTabs,std::wstring& errorOut) noexcept {
     errorOut.clear();
     if(g_reopen.active){
         errorOut=L"A reopen is already running.";
@@ -11916,31 +11971,28 @@ static bool StartReopen(const SessionSnapshot& snapshot,
         errorOut=L"VDE is not ready yet.";
         return false;
     }
-    ReopenPlan plan;
-    if(!BuildReopenPlan(snapshot,apps,64,plan)){
-        errorOut=L"The checkpoint could not be turned into a reopen plan.";
-        return false;
-    }
-    if(plan.jobs.empty()){
-        errorOut=L"This checkpoint holds no reopenable window for the selected browsers.";
+    if(jobs.empty()){
+        errorOut=L"Nothing is selected.";
         return false;
     }
     ReopenRuntime runtime;
     try {
+        std::set<std::string> apps;
+        for(size_t i=0;i<jobs.size();++i) apps.insert(jobs[i].app);
         const std::map<std::string,AppFastSnapshot> live=ReopenLiveSnapshots();
         for(std::set<std::string>::const_iterator it=apps.begin();it!=apps.end();++it){
             const std::wstring exe=ResolveBrowserExecutable(*it,live);
             if(!exe.empty()) runtime.exeByApp[*it]=exe;
         }
         bool anyLaunchable=false;
-        for(size_t i=0;i<plan.jobs.size();++i)
-            if(runtime.exeByApp.count(plan.jobs[i].app)){ anyLaunchable=true; break; }
+        for(size_t i=0;i<jobs.size();++i)
+            if(runtime.exeByApp.count(jobs[i].app)){ anyLaunchable=true; break; }
         if(!anyLaunchable){
-            errorOut=L"No installed browser was found for the selected checkpoint.";
+            errorOut=L"No installed browser was found for the selected windows.";
             return false;
         }
-        runtime.jobs=plan.jobs;
-        runtime.skippedTabs=plan.skippedTabs;
+        runtime.jobs.swap(jobs);
+        runtime.skippedTabs=skippedTabs;
     } catch(...) {
         errorOut=L"Out of memory preparing the reopen.";
         return false;
@@ -11955,7 +12007,12 @@ static bool StartReopen(const SessionSnapshot& snapshot,
         errorOut=L"The reopen timer could not be started.";
         return false;
     }
+    NotifyReopenProgress();
     return true;
+}
+
+static void CancelReopen() noexcept {
+    if(g_reopen.active) g_reopen.cancelRequested=true;
 }
 
 // ------------------------------- checkpoint dialog ---------------------------
@@ -11978,158 +12035,844 @@ static std::wstring FormatSnapshotTime(UnixSeconds seconds){
     return std::wstring(date)+L" "+time;
 }
 
-static std::wstring SnapshotAppsText(const std::set<std::string>& apps){
-    std::wstring text;
-    const char* order[]={"firefox","chrome","msedge"};
-    const wchar_t* labels[]={L"Firefox",L"Chrome",L"Edge"};
-    for(size_t i=0;i<3;++i){
-        if(!apps.count(order[i])) continue;
-        if(!text.empty()) text+=L", ";
-        text+=labels[i];
-    }
-    return text.empty()?std::wstring(L"none"):text;
+static const wchar_t* BrowserDisplayName(const std::string& app){
+    if(app=="firefox") return L"Firefox";
+    if(app=="chrome") return L"Chrome";
+    if(app=="msedge") return L"Edge";
+    return L"Browser";
 }
 
-static std::wstring DescribeSnapshotSlotRow(const SnapshotSlot& slot){
-    std::wstring label=slot.index==0
-        ? std::wstring(L"Last saved")
-        : L"Shutdown "+std::to_wstring(slot.index);
-    if(!slot.present) return label+L"  \x2014  (empty)";
-    wchar_t counts[96]={0};
-    swprintf_s(counts,L"%u window(s), %u tab(s)",
-               (unsigned)slot.windows,(unsigned)slot.tabs);
-    return label+L"  \x2014  "+FormatSnapshotTime(slot.capturedUtc)+
-        L"  \x2014  "+counts+L"  \x2014  "+SnapshotAppsText(slot.apps);
+// The URLs open in every running browser right now, so the dialog can grey
+// out what a reopen would only duplicate.  The session read is verified
+// against the file stamp before and after, so it fails whenever the browser
+// happens to be writing the file - Firefox does that every 15 s - hence the
+// retries.  A browser whose session still cannot be read while it has live
+// windows is reported in `unknownApps`: duplicates cannot be detected for it.
+static OpenUrlsByApp CollectOpenTabUrls(std::set<std::string>& unknownApps) noexcept {
+    OpenUrlsByApp open;
+    unknownApps.clear();
+    try {
+        const std::vector<AppProfile> profiles=BuiltinProfiles(true,true,true);
+        const std::map<std::string,AppFastSnapshot> live=ReopenLiveSnapshots();
+        for(size_t p=0;p<profiles.size();++p){
+            const std::map<std::string,AppFastSnapshot>::const_iterator windows=
+                live.find(profiles[p].id);
+            const bool running=windows!=live.end() && !windows->second.windows.empty();
+            std::shared_ptr<const std::vector<WinFp> > session;
+            bool acquired=false;
+            for(int attempt=0;attempt<4 && !acquired;++attempt){
+                if(attempt>0) Sleep(250);
+                acquired=AcquireCliSession(profiles[p],session) && session;
+            }
+            if(!acquired){
+                if(running) unknownApps.insert(profiles[p].id);
+                continue;
+            }
+            std::set<std::string>& urls=open[profiles[p].id];
+            for(size_t w=0;w<session->size();++w)
+                for(size_t t=0;t<session->at(w).tabs.size();++t)
+                    urls.insert(session->at(w).tabs[t].url);
+        }
+    } catch(...) { open.clear(); }
+    return open;
 }
 
-static std::vector<SnapshotSlot> g_snapshotSlots;
+// What a virtual list row shows.  The lists own no data: the control asks for
+// text and check state row by row while painting, so refreshing a column is a
+// vector rebuild and an invalidate - never hundreds of inserts.
+struct RoRow {
+    std::wstring cells[4];
+    bool checked=false;
+    bool grey=false;
+};
 
-static void UpdateSnapshotDialogState(HWND hwnd){
-    const int selection=(int)SendMessageW(
-        GetDlgItem(hwnd,IDC_SNAP_LIST),LB_GETCURSEL,0,0);
-    const bool valid=selection>=0 &&
-        (size_t)selection<g_snapshotSlots.size() &&
-        g_snapshotSlots[(size_t)selection].present;
-    const int boxes[]={IDC_SNAP_APP_FF,IDC_SNAP_APP_CR,IDC_SNAP_APP_ED};
-    const char* apps[]={"firefox","chrome","msedge"};
-    for(size_t i=0;i<3;++i){
-        const bool available=valid &&
-            g_snapshotSlots[(size_t)selection].apps.count(apps[i])!=0;
-        EnableWindow(GetDlgItem(hwnd,boxes[i]),available?TRUE:FALSE);
-        SendMessageW(GetDlgItem(hwnd,boxes[i]),BM_SETCHECK,
-                     available?BST_CHECKED:BST_UNCHECKED,0);
+struct ReopenDialogState {
+    std::vector<size_t> slots;                    // present slots, tab order
+    std::map<size_t,SessionSnapshot> snapshots;   // loaded on demand
+    size_t currentSlot=0;
+    ReopenModel model;
+    bool modelValid=false;
+    OpenUrlsByApp openUrls;
+    bool suppress=false;                          // ignore list notifications
+    bool busy=false;                              // a reopen is running
+    std::vector<size_t> desktopRows;
+    std::vector<size_t> windowRows;
+    std::vector<std::pair<size_t,size_t> > tabRows;
+    std::vector<RoRow> desktopCells;
+    std::vector<RoRow> windowCells;
+    std::vector<RoRow> tabCells;
+    std::vector<DeskRec> currentDesktops;
+    std::vector<ReopenWindowJob> runningJobs;
+    HFONT tabFontBold=nullptr;                    // the selected checkpoint tab
+    std::set<std::string> openUnknownApps;        // running, but session unreadable
+};
+
+static ReopenDialogState g_reopenUi;
+
+static const int RO_W=980,RO_H=640,RO_MIN_W=760,RO_MIN_H=460;
+static const int RO_MARGIN=12,RO_GAP=10;
+static const int RO_COL1_W=250;
+static const int RO_TABS_Y=10,RO_TABS_H=30,RO_FILTER_Y=50,RO_HEADER_Y=84,RO_LIST_Y=104;
+static const int RO_BOTTOM_H=156;   // filter row + two-line status + progress + buttons
+static const int RO_FILTER_H=24;
+
+static HWND RoCtl(HWND hwnd,int id){ return GetDlgItem(hwnd,id); }
+
+static void RoSetText(HWND hwnd,int id,const std::wstring& text){
+    SetWindowTextW(RoCtl(hwnd,id),text.c_str());
+}
+
+static void RoSetCheck(HWND hwnd,int id,bool checked){
+    SendMessageW(RoCtl(hwnd,id),BM_SETCHECK,checked?BST_CHECKED:BST_UNCHECKED,0);
+}
+
+static bool RoIsChecked(HWND hwnd,int id){
+    return IsDlgButtonChecked(hwnd,id)==BST_CHECKED;
+}
+
+static void RoAddColumn(HWND list,int index,const wchar_t* title,int width){
+    LVCOLUMNW column={0};
+    column.mask=LVCF_TEXT|LVCF_WIDTH|LVCF_SUBITEM;
+    column.pszText=const_cast<wchar_t*>(title);
+    column.cx=width;
+    column.iSubItem=index;
+    ListView_InsertColumn(list,index,&column);
+}
+
+static int RoInsertRow(HWND list,int row,const std::wstring& text){
+    LVITEMW item={0};
+    item.mask=LVIF_TEXT;
+    item.iItem=row;
+    item.pszText=const_cast<wchar_t*>(text.c_str());
+    return ListView_InsertItem(list,&item);
+}
+
+static void RoSetCell(HWND list,int row,int column,const std::wstring& text){
+    ListView_SetItemText(list,row,column,const_cast<wchar_t*>(text.c_str()));
+}
+
+// The "select all" box lives in the list header, on the first column, the way
+// every file manager and mail client does it.  The header only reports the
+// click; the state is ours to set.
+static void RoEnableHeaderCheck(HWND list){
+    HWND header=ListView_GetHeader(list);
+    if(!header) return;
+    const LONG_PTR style=GetWindowLongPtrW(header,GWL_STYLE);
+    SetWindowLongPtrW(header,GWL_STYLE,style|HDS_CHECKBOXES);
+    HDITEMW item={0};
+    item.mask=HDI_FORMAT;
+    if(!Header_GetItem(header,0,&item)) return;
+    item.fmt|=HDF_CHECKBOX;
+    Header_SetItem(header,0,&item);
+}
+
+static void RoSetHeaderCheck(HWND list,bool checked){
+    HWND header=ListView_GetHeader(list);
+    if(!header) return;
+    HDITEMW item={0};
+    item.mask=HDI_FORMAT;
+    if(!Header_GetItem(header,0,&item)) return;
+    item.fmt|=HDF_CHECKBOX;
+    if(checked) item.fmt|=HDF_CHECKED;
+    else item.fmt&=~HDF_CHECKED;
+    Header_SetItem(header,0,&item);
+}
+
+static bool RoHeaderChecked(HWND list){
+    HWND header=ListView_GetHeader(list);
+    if(!header) return false;
+    HDITEMW item={0};
+    item.mask=HDI_FORMAT;
+    if(!Header_GetItem(header,0,&item)) return false;
+    return (item.fmt&HDF_CHECKED)!=0;
+}
+
+// Empty lists explain themselves instead of looking broken.
+static void RoShowHint(HWND hwnd,int listId,int hintId,bool showHint,
+                       const wchar_t* text){
+    if(showHint) SetWindowTextW(RoCtl(hwnd,hintId),text);
+    ShowWindow(RoCtl(hwnd,listId),showHint?SW_HIDE:SW_SHOW);
+    ShowWindow(RoCtl(hwnd,hintId),showHint?SW_SHOW:SW_HIDE);
+}
+
+// Everything is placed from the client size, so the window can be resized and
+// maximized: the first column keeps its width, the other two share the rest.
+static void RoLayout(HWND hwnd){
+    RECT client;
+    GetClientRect(hwnd,&client);
+    const int cx=client.right,cy=client.bottom;
+    const int margin=S(RO_MARGIN),gap=S(RO_GAP);
+    const int col1X=margin,col1W=S(RO_COL1_W);
+    const int rest=cx-2*margin-col1W-2*gap;
+    const int col2W=(std::max)(S(240),rest*42/100);
+    const int col2X=col1X+col1W+gap;
+    const int col3X=col2X+col2W+gap;
+    const int col3W=(std::max)(S(240),cx-margin-col3X);
+    const int listY=S(RO_LIST_Y);
+    const int listH=(std::max)(S(120),cy-listY-S(RO_BOTTOM_H));
+    const int statusY=listY+listH+S(6)+S(RO_FILTER_H)+S(10);
+    const int progressY=statusY+S(40);
+    const int buttonY=cy-S(40);
+
+    MoveWindow(RoCtl(hwnd,IDC_RO_TABS),margin,S(RO_TABS_Y),cx-2*margin,S(RO_TABS_H),TRUE);
+    struct Column { int x; int w; int labelId; int listId; int hintId; int filterId; int hideId; };
+    const Column columns[]={
+        {col1X,col1W,IDC_RO_LABEL_DESK,IDC_RO_LIST_DESK,IDC_RO_HINT_DESK,IDC_RO_FILTER_DESK,IDC_RO_HIDE_DESK},
+        {col2X,col2W,IDC_RO_LABEL_WIN,IDC_RO_LIST_WIN,IDC_RO_HINT_WIN,IDC_RO_FILTER_WIN,IDC_RO_HIDE_WIN},
+        {col3X,col3W,IDC_RO_LABEL_TAB,IDC_RO_LIST_TAB,IDC_RO_HINT_TAB,IDC_RO_FILTER_TAB,IDC_RO_HIDE_TAB},
+    };
+    for(size_t c=0;c<3;++c){
+        MoveWindow(RoCtl(hwnd,columns[c].labelId),columns[c].x,S(RO_HEADER_Y),columns[c].w-S(104),S(18),TRUE);
+        MoveWindow(RoCtl(hwnd,columns[c].hideId),columns[c].x+columns[c].w-S(98),S(RO_HEADER_Y-3),S(96),S(22),TRUE);
+        MoveWindow(RoCtl(hwnd,columns[c].listId),columns[c].x,listY,columns[c].w,listH,TRUE);
+        MoveWindow(RoCtl(hwnd,columns[c].hintId),columns[c].x,listY+S(40),columns[c].w,S(40),TRUE);
+        MoveWindow(RoCtl(hwnd,columns[c].filterId),columns[c].x,listY+listH+S(6),columns[c].w,S(RO_FILTER_H),TRUE);
     }
-    EnableWindow(GetDlgItem(hwnd,IDC_SNAP_REOPEN),
-                 valid && !ReopenInProgress() ? TRUE : FALSE);
+    // Last column of every list fills what is left of its list.
+    const int scroll=GetSystemMetrics(SM_CXVSCROLL)+S(4);
+    HWND deskList=RoCtl(hwnd,IDC_RO_LIST_DESK);
+    ListView_SetColumnWidth(deskList,1,S(64));
+    ListView_SetColumnWidth(deskList,0,(std::max)(S(100),col1W-S(64)-scroll));
+    HWND winList=RoCtl(hwnd,IDC_RO_LIST_WIN);
+    ListView_SetColumnWidth(winList,0,(std::max)(S(120),
+        col2W-ListView_GetColumnWidth(winList,1)-ListView_GetColumnWidth(winList,2)-
+        ListView_GetColumnWidth(winList,3)-scroll));
+    HWND tabList=RoCtl(hwnd,IDC_RO_LIST_TAB);
+    const int titleW=(std::max)(S(160),(col3W-S(66)-scroll)*45/100);
+    ListView_SetColumnWidth(tabList,0,titleW);
+    ListView_SetColumnWidth(tabList,2,(std::max)(S(120),col3W-titleW-S(66)-scroll));
+
+    MoveWindow(RoCtl(hwnd,IDC_RO_STATUS),margin,statusY,cx-2*margin,S(36),TRUE);
+    MoveWindow(RoCtl(hwnd,IDC_RO_PROGRESS),margin,progressY,cx-2*margin-S(210),S(16),TRUE);
+    MoveWindow(RoCtl(hwnd,IDC_RO_REOPEN),cx-margin-S(90)-S(96),buttonY,S(90),S(28),TRUE);
+    MoveWindow(RoCtl(hwnd,IDCANCEL),cx-margin-S(88),buttonY,S(88),S(28),TRUE);
+    InvalidateRect(hwnd,nullptr,TRUE);
+}
+
+static void RoRefreshStatus(HWND hwnd){
+    if(g_reopenUi.busy) return;
+    if(!g_reopenUi.modelValid){
+        RoSetText(hwnd,IDC_RO_STATUS,L"No checkpoint is loaded.");
+        EnableWindow(RoCtl(hwnd,IDC_RO_REOPEN),FALSE);
+        return;
+    }
+    const ReopenSelectionSummary summary=ReopenSummarize(g_reopenUi.model);
+    size_t openTabs=0,totalTabs=0;
+    for(size_t w=0;w<g_reopenUi.model.windows.size();++w){
+        if(!ReopenWindowPassesFilter(g_reopenUi.model,w)) continue;
+        for(size_t t=0;t<g_reopenUi.model.windows[w].tabs.size();++t){
+            ++totalTabs;
+            if(g_reopenUi.model.windows[w].tabs[t].open) ++openTabs;
+        }
+    }
+    wchar_t text[320]={0};
+    if(summary.tabs==0 && openTabs>0 && openTabs==totalTabs)
+        swprintf_s(text,L"Nothing to reopen: all %u tab(s) of this checkpoint are open right now.",
+                   (unsigned)totalTabs);
+    else
+        swprintf_s(text,L"Selected: %u window(s), %u tab(s).  %u of %u tab(s) are open now and were left unchecked.",
+                   (unsigned)summary.windows,(unsigned)summary.tabs,
+                   (unsigned)openTabs,(unsigned)totalTabs);
+    std::wstring status=text;
+    if(!g_reopenUi.openUnknownApps.empty()){
+        std::wstring names;
+        for(std::set<std::string>::const_iterator it=g_reopenUi.openUnknownApps.begin();
+            it!=g_reopenUi.openUnknownApps.end();++it){
+            if(!names.empty()) names+=L", ";
+            names+=BrowserDisplayName(*it);
+        }
+        status+=L"  Could not read the open tabs of "+names+
+            L" - duplicates cannot be detected, so its windows start unchecked.";
+    }
+    RoSetText(hwnd,IDC_RO_STATUS,status);
+    EnableWindow(RoCtl(hwnd,IDC_RO_REOPEN),
+                 summary.tabs>0 && !ReopenInProgress() ? TRUE : FALSE);
+    RoSetHeaderCheck(RoCtl(hwnd,IDC_RO_LIST_DESK),ReopenAllDesktopsChecked(g_reopenUi.model));
+    RoSetHeaderCheck(RoCtl(hwnd,IDC_RO_LIST_WIN),ReopenAllWindowsChecked(g_reopenUi.model));
+    RoSetHeaderCheck(RoCtl(hwnd,IDC_RO_LIST_TAB),ReopenAllTabsChecked(g_reopenUi.model));
+}
+
+static std::wstring RoWindowTabsText(size_t window){
+    const ReopenModel& model=g_reopenUi.model;
+    wchar_t text[64]={0};
+    swprintf_s(text,L"%u / %u",
+               (unsigned)ReopenCheckedTabCount(model,window),
+               (unsigned)model.windows[window].tabs.size());
+    return text;
+}
+
+static void RoRefreshWindows(HWND hwnd);
+static void RoRefreshWindowRowTexts(HWND hwnd){ RoRefreshWindows(hwnd); }
+
+static void RoPublishRows(HWND list,size_t count){
+    g_reopenUi.suppress=true;
+    ListView_SetItemCountEx(list,(int)count,LVSICF_NOSCROLL);
+    g_reopenUi.suppress=false;
+    InvalidateRect(list,nullptr,TRUE);
+}
+
+static void RoRefreshDesktops(HWND hwnd){
+    g_reopenUi.desktopRows.clear();
+    g_reopenUi.desktopCells.clear();
+    if(g_reopenUi.modelValid){
+        const ReopenModel& model=g_reopenUi.model;
+        const std::vector<size_t> visible=ReopenVisibleDesktops(model);
+        for(size_t i=0;i<visible.size();++i){
+            const ReopenDesktopItem& desktop=model.desktops[visible[i]];
+            size_t windows=0;
+            for(size_t w=0;w<desktop.windows.size();++w)
+                if(ReopenWindowPassesFilter(model,desktop.windows[w])) ++windows;
+            RoRow row;
+            row.cells[0]=std::to_wstring(desktop.index+1)+L"  "+desktop.name;
+            if(desktop.missing) row.cells[0]+=L"  (gone -> desktop 1)";
+            row.cells[1]=std::to_wstring(windows);
+            row.checked=desktop.checked;
+            row.grey=desktop.missing;
+            g_reopenUi.desktopCells.push_back(row);
+            g_reopenUi.desktopRows.push_back(visible[i]);
+        }
+    }
+    RoPublishRows(RoCtl(hwnd,IDC_RO_LIST_DESK),g_reopenUi.desktopRows.size());
+    RoShowHint(hwnd,IDC_RO_LIST_DESK,IDC_RO_HINT_DESK,g_reopenUi.desktopRows.empty(),
+               g_reopenUi.modelValid && (!g_reopenUi.model.desktopFilter.empty() ||
+                                        g_reopenUi.model.hideOpenDesktops)
+                   ? L"No desktop matches the filter."
+                   : L"This checkpoint holds no window for the selected browsers.");
+}
+
+static void RoRefreshWindows(HWND hwnd){
+    g_reopenUi.windowRows.clear();
+    g_reopenUi.windowCells.clear();
+    if(g_reopenUi.modelValid){
+        const ReopenModel& model=g_reopenUi.model;
+        const std::vector<size_t> visible=ReopenVisibleWindows(model);
+        for(size_t i=0;i<visible.size();++i){
+            const size_t index=visible[i];
+            const SnapWindow& window=model.snapshot.windows[index];
+            RoRow row;
+            row.cells[0]=U82W(window.activeTitle);
+            if(row.cells[0].empty()) row.cells[0]=L"(untitled window)";
+            row.cells[1]=RoWindowTabsText(index);
+            row.cells[2]=BrowserDisplayName(window.app);
+            row.cells[3]=std::to_wstring(
+                model.desktops[model.windows[index].desktop].index+1);
+            row.checked=model.windows[index].checked;
+            row.grey=ReopenWindowFullyOpen(model,index);
+            g_reopenUi.windowCells.push_back(row);
+            g_reopenUi.windowRows.push_back(index);
+        }
+    }
+    RoPublishRows(RoCtl(hwnd,IDC_RO_LIST_WIN),g_reopenUi.windowRows.size());
+    RoShowHint(hwnd,IDC_RO_LIST_WIN,IDC_RO_HINT_WIN,g_reopenUi.windowRows.empty(),
+               g_reopenUi.modelValid && (!g_reopenUi.model.windowFilter.empty() ||
+                                        g_reopenUi.model.hideOpenWindows)
+                   ? L"No window matches the filter."
+                   : L"Select a desktop on the left to list its windows.");
+}
+
+static void RoRefreshTabs(HWND hwnd){
+    g_reopenUi.tabRows.clear();
+    g_reopenUi.tabCells.clear();
+    if(g_reopenUi.modelValid){
+        const ReopenModel& model=g_reopenUi.model;
+        const std::vector<std::pair<size_t,size_t> > visible=ReopenVisibleTabs(model);
+        for(size_t i=0;i<visible.size();++i){
+            const SnapTab& tab=model.snapshot.windows[visible[i].first].tabs[visible[i].second];
+            const ReopenTabItem& item=model.windows[visible[i].first].tabs[visible[i].second];
+            RoRow row;
+            row.cells[0]=U82W(tab.title);
+            if(row.cells[0].empty()) row.cells[0]=U82W(tab.url);
+            row.cells[1]=item.open?L"open now":L"";
+            row.cells[2]=U82W(tab.url);
+            row.checked=item.checked;
+            row.grey=item.open;
+            g_reopenUi.tabCells.push_back(row);
+            g_reopenUi.tabRows.push_back(visible[i]);
+        }
+    }
+    RoPublishRows(RoCtl(hwnd,IDC_RO_LIST_TAB),g_reopenUi.tabRows.size());
+    RoShowHint(hwnd,IDC_RO_LIST_TAB,IDC_RO_HINT_TAB,g_reopenUi.tabRows.empty(),
+               g_reopenUi.modelValid && (!g_reopenUi.model.tabFilter.empty() ||
+                                        g_reopenUi.model.hideOpenTabs)
+                   ? L"No tab matches the filter."
+                   : L"Select a window to list its tabs.");
+}
+
+static void RoRefreshAll(HWND hwnd){
+    RoRefreshDesktops(hwnd);
+    RoRefreshWindows(hwnd);
+    RoRefreshTabs(hwnd);
+    RoRefreshStatus(hwnd);
+}
+
+static void RoApplyBrowserFilter(HWND hwnd){
+    if(!g_reopenUi.modelValid) return;
+    std::set<std::string> apps;
+    if(RoIsChecked(hwnd,IDC_RO_APP_FF)) apps.insert("firefox");
+    if(RoIsChecked(hwnd,IDC_RO_APP_CR)) apps.insert("chrome");
+    if(RoIsChecked(hwnd,IDC_RO_APP_ED)) apps.insert("msedge");
+    g_reopenUi.model.apps=apps;
+    RoRefreshAll(hwnd);
+}
+
+static std::wstring RoEditText(HWND hwnd,int id){
+    wchar_t buffer[256]={0};
+    GetWindowTextW(RoCtl(hwnd,id),buffer,256);
+    return buffer;
+}
+
+static void RoApplyTextFilters(HWND hwnd){
+    if(!g_reopenUi.modelValid) return;
+    g_reopenUi.model.desktopFilter=RoEditText(hwnd,IDC_RO_FILTER_DESK);
+    g_reopenUi.model.windowFilter=RoEditText(hwnd,IDC_RO_FILTER_WIN);
+    g_reopenUi.model.tabFilter=RoEditText(hwnd,IDC_RO_FILTER_TAB);
+    g_reopenUi.model.hideOpenDesktops=RoIsChecked(hwnd,IDC_RO_HIDE_DESK);
+    g_reopenUi.model.hideOpenWindows=RoIsChecked(hwnd,IDC_RO_HIDE_WIN);
+    g_reopenUi.model.hideOpenTabs=RoIsChecked(hwnd,IDC_RO_HIDE_TAB);
+}
+
+static void RoLoadSlot(HWND hwnd,size_t slot){
+    g_reopenUi.currentSlot=slot;
+    g_reopenUi.modelValid=false;
+    std::map<size_t,SessionSnapshot>::iterator cached=g_reopenUi.snapshots.find(slot);
+    if(cached==g_reopenUi.snapshots.end()){
+        SessionSnapshot snapshot;
+        if(ReadSnapshotSlot(slot,snapshot))
+            cached=g_reopenUi.snapshots.insert(std::make_pair(slot,snapshot)).first;
+    }
+    if(cached!=g_reopenUi.snapshots.end() &&
+       BuildReopenModel(cached->second,g_reopenUi.openUrls,
+                        g_reopenUi.currentDesktops,g_reopenUi.model)){
+        g_reopenUi.modelValid=true;
+        for(size_t w=0;w<g_reopenUi.model.windows.size();++w)
+            if(g_reopenUi.openUnknownApps.count(
+                   g_reopenUi.model.snapshot.windows[w].app))
+                ReopenSetWindowChecked(g_reopenUi.model,w,false);
+    }
+    // The browser filter offers only what the checkpoint holds, all on.
+    const std::set<std::string> apps=g_reopenUi.modelValid
+        ? SnapshotApps(g_reopenUi.model.snapshot) : std::set<std::string>();
+    const int boxes[]={IDC_RO_APP_FF,IDC_RO_APP_CR,IDC_RO_APP_ED};
+    const char* ids[]={"firefox","chrome","msedge"};
+    for(size_t i=0;i<3;++i){
+        const bool present=apps.count(ids[i])!=0;
+        EnableWindow(RoCtl(hwnd,boxes[i]),present?TRUE:FALSE);
+        RoSetCheck(hwnd,boxes[i],present);
+    }
+    RoApplyTextFilters(hwnd);
+    RoRefreshAll(hwnd);
+    InvalidateRect(RoCtl(hwnd,IDC_RO_TABS),nullptr,TRUE);
+}
+
+static void RoSetBusy(HWND hwnd,bool busy){
+    g_reopenUi.busy=busy;
+    const int controls[]={IDC_RO_TABS,IDC_RO_APP_FF,IDC_RO_APP_CR,IDC_RO_APP_ED,
+                          IDC_RO_LIST_DESK,IDC_RO_LIST_WIN,IDC_RO_LIST_TAB,
+                          IDC_RO_FILTER_DESK,IDC_RO_FILTER_WIN,IDC_RO_FILTER_TAB,
+                          IDC_RO_HIDE_DESK,IDC_RO_HIDE_WIN,IDC_RO_HIDE_TAB};
+    for(size_t i=0;i<sizeof(controls)/sizeof(controls[0]);++i)
+        EnableWindow(RoCtl(hwnd,controls[i]),busy?FALSE:TRUE);
+    ShowWindow(RoCtl(hwnd,IDC_RO_PROGRESS),busy?SW_SHOW:SW_HIDE);
+    RoSetText(hwnd,IDC_RO_REOPEN,busy?L"Cancel":L"Reopen");
+    EnableWindow(RoCtl(hwnd,IDC_RO_REOPEN),TRUE);
+    if(!busy && g_reopenUi.modelValid){
+        // Browser boxes come back only for browsers the checkpoint holds; the
+        // model itself is kept, so the marks a reopen just made survive.
+        const std::set<std::string> apps=SnapshotApps(g_reopenUi.model.snapshot);
+        const int boxes[]={IDC_RO_APP_FF,IDC_RO_APP_CR,IDC_RO_APP_ED};
+        const char* ids[]={"firefox","chrome","msedge"};
+        for(size_t i=0;i<3;++i)
+            EnableWindow(RoCtl(hwnd,boxes[i]),apps.count(ids[i])?TRUE:FALSE);
+    }
+}
+
+static void NotifyReopenProgress() noexcept {
+    if(!g_snapshotDialog || !g_reopenUi.busy) return;
+    try {
+        const size_t total=g_reopen.jobs.size();
+        const size_t done=(std::min)(g_reopen.jobIndex,total);
+        HWND progress=RoCtl(g_snapshotDialog,IDC_RO_PROGRESS);
+        SendMessageW(progress,PBM_SETRANGE32,0,(LPARAM)(total==0?1:total));
+        SendMessageW(progress,PBM_SETPOS,(WPARAM)done,0);
+        std::wstring current;
+        if(done<total){
+            current=U82W(g_reopen.jobs[done].activeTitle);
+            if(current.size()>70) current=current.substr(0,70)+L"\x2026";
+        }
+        wchar_t text[200]={0};
+        if(g_reopen.cancelRequested)
+            swprintf_s(text,L"Cancelling after the current window (%u of %u done)...",
+                       (unsigned)done,(unsigned)total);
+        else
+            swprintf_s(text,L"Opening window %u of %u: %s",
+                       (unsigned)(std::min)(done+1,total),(unsigned)total,current.c_str());
+        RoSetText(g_snapshotDialog,IDC_RO_STATUS,text);
+    } catch(...) {}
+}
+
+static void NotifyReopenFinished(const std::wstring& summary,
+                                 const std::vector<ReopenWindowJob>& jobs) noexcept {
+    if(!g_snapshotDialog){
+        Balloon(summary);
+        return;
+    }
+    try {
+        // The launched tabs are open now: grey them out here and remember
+        // them for the other checkpoint pages too.
+        for(size_t j=0;j<jobs.size();++j)
+            for(size_t u=0;u<jobs[j].urls.size();++u)
+                g_reopenUi.openUrls[jobs[j].app].insert(jobs[j].urls[u]);
+        if(g_reopenUi.modelValid) ReopenMarkJobsOpen(g_reopenUi.model,jobs);
+        RoSetBusy(g_snapshotDialog,false);
+        RoRefreshAll(g_snapshotDialog);
+        RoSetText(g_snapshotDialog,IDC_RO_STATUS,summary);
+    } catch(...) {}
+}
+
+static void RoHandleListCheck(HWND hwnd,int listId,int row,bool checked){
+    if(!g_reopenUi.modelValid || row<0) return;
+    ReopenModel& model=g_reopenUi.model;
+    if(listId==IDC_RO_LIST_DESK){
+        if((size_t)row>=g_reopenUi.desktopRows.size()) return;
+        ReopenSetDesktopChecked(model,g_reopenUi.desktopRows[(size_t)row],checked);
+        RoRefreshWindows(hwnd);
+        RoRefreshTabs(hwnd);
+    } else if(listId==IDC_RO_LIST_WIN){
+        if((size_t)row>=g_reopenUi.windowRows.size()) return;
+        ReopenSetWindowChecked(model,g_reopenUi.windowRows[(size_t)row],checked);
+        RoRefreshWindowRowTexts(hwnd);
+        RoRefreshTabs(hwnd);
+    } else if(listId==IDC_RO_LIST_TAB){
+        if((size_t)row>=g_reopenUi.tabRows.size()) return;
+        const std::pair<size_t,size_t> tab=g_reopenUi.tabRows[(size_t)row];
+        ReopenSetTabChecked(model,tab.first,tab.second,checked);
+        if((size_t)row<g_reopenUi.tabCells.size()){
+            g_reopenUi.tabCells[(size_t)row].checked=checked;
+            ListView_RedrawItems(RoCtl(hwnd,IDC_RO_LIST_TAB),row,row);
+        }
+        RoRefreshWindowRowTexts(hwnd);
+    }
+    if(listId==IDC_RO_LIST_DESK || listId==IDC_RO_LIST_WIN) RoRefreshDesktops(hwnd);
+    RoRefreshStatus(hwnd);
+}
+
+// A click on the header box: flip everything visible in that column.
+static void RoHandleHeaderCheck(HWND hwnd,HWND header){
+    if(!g_reopenUi.modelValid || g_reopenUi.busy) return;
+    const int lists[]={IDC_RO_LIST_DESK,IDC_RO_LIST_WIN,IDC_RO_LIST_TAB};
+    for(size_t i=0;i<3;++i){
+        HWND list=RoCtl(hwnd,lists[i]);
+        if(ListView_GetHeader(list)!=header) continue;
+        const bool checked=!RoHeaderChecked(list);
+        if(lists[i]==IDC_RO_LIST_DESK){
+            ReopenSetAllDesktopsChecked(g_reopenUi.model,checked);
+            RoRefreshAll(hwnd);
+        } else if(lists[i]==IDC_RO_LIST_WIN){
+            ReopenSetAllWindowsChecked(g_reopenUi.model,checked);
+            RoRefreshWindows(hwnd);
+            RoRefreshTabs(hwnd);
+            RoRefreshStatus(hwnd);
+        } else {
+            ReopenSetAllTabsChecked(g_reopenUi.model,checked);
+            RoRefreshTabs(hwnd);
+            RoRefreshWindowRowTexts(hwnd);
+            RoRefreshStatus(hwnd);
+        }
+        return;
+    }
+}
+
+static void RoStartReopen(HWND hwnd){
+    if(!g_reopenUi.modelValid) return;
+    std::vector<ReopenWindowJob> jobs;
+    size_t skipped=0;
+    if(!BuildReopenJobsFromSelection(g_reopenUi.model,64,jobs,skipped) || jobs.empty()){
+        MessageBoxW(hwnd,L"Nothing is selected to reopen.",APP_NAME,MB_ICONINFORMATION);
+        return;
+    }
+    std::wstring error;
+    g_reopenUi.runningJobs=jobs;
+    RoSetBusy(hwnd,true);
+    if(!StartReopenJobs(jobs,skipped,error)){
+        RoSetBusy(hwnd,false);
+        MessageBoxW(hwnd,error.c_str(),APP_NAME,MB_ICONWARNING);
+    }
+}
+
+// The checkpoint tabs are owner-drawn so the selected one is unmistakable:
+// highlight colour, bold text - the built-in look only lifts it by a pixel.
+static void RoDrawTab(const DRAWITEMSTRUCT* draw){
+    wchar_t label[128]={0};
+    TCITEMW item={0};
+    item.mask=TCIF_TEXT;
+    item.pszText=label;
+    item.cchTextMax=128;
+    TabCtrl_GetItem(draw->hwndItem,(int)draw->itemID,&item);
+    const bool selected=TabCtrl_GetCurSel(draw->hwndItem)==(int)draw->itemID;
+    RECT rc=draw->rcItem;
+    HBRUSH brush=CreateSolidBrush(GetSysColor(selected?COLOR_HIGHLIGHT:COLOR_BTNFACE));
+    FillRect(draw->hDC,&rc,brush);
+    DeleteObject(brush);
+    SetBkMode(draw->hDC,TRANSPARENT);
+    SetTextColor(draw->hDC,GetSysColor(selected?COLOR_HIGHLIGHTTEXT:COLOR_BTNTEXT));
+    HFONT previous=(HFONT)SelectObject(draw->hDC,
+        selected && g_reopenUi.tabFontBold ? g_reopenUi.tabFontBold : g_uiFont);
+    DrawTextW(draw->hDC,label,-1,&rc,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+    SelectObject(draw->hDC,previous);
 }
 
 static LRESULT CALLBACK SnapshotProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     switch(msg){
     case WM_CREATE:{
-        CreateWindowW(L"STATIC",
-            L"Reopen browser windows from a checkpoint. VDE relaunches the "
-            L"browser with the saved tabs and moves each window to the desktop "
-            L"it was on. Existing windows are kept, so a checkpoint that is "
-            L"already open will be duplicated.",
-            WS_CHILD|WS_VISIBLE,S(16),S(12),S(516),S(52),hwnd,nullptr,g_inst,nullptr);
-        CreateWindowW(L"STATIC",L"Checkpoint:",WS_CHILD|WS_VISIBLE,
-            S(16),S(70),S(120),S(18),hwnd,nullptr,g_inst,nullptr);
-        CreateWindowW(L"LISTBOX",L"",
-            WS_CHILD|WS_VISIBLE|WS_TABSTOP|WS_BORDER|WS_VSCROLL|LBS_NOTIFY,
-            S(16),S(92),S(516),S(110),hwnd,(HMENU)IDC_SNAP_LIST,g_inst,nullptr);
-        CreateWindowW(L"STATIC",L"Reopen these browsers:",WS_CHILD|WS_VISIBLE,
-            S(16),S(212),S(200),S(18),hwnd,nullptr,g_inst,nullptr);
-        CreateWindowW(L"BUTTON",L"Firefox",
-            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,
-            S(16),S(234),S(100),S(22),hwnd,(HMENU)IDC_SNAP_APP_FF,g_inst,nullptr);
-        CreateWindowW(L"BUTTON",L"Chrome",
-            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,
-            S(124),S(234),S(100),S(22),hwnd,(HMENU)IDC_SNAP_APP_CR,g_inst,nullptr);
-        CreateWindowW(L"BUTTON",L"Edge",
-            WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,
-            S(232),S(234),S(100),S(22),hwnd,(HMENU)IDC_SNAP_APP_ED,g_inst,nullptr);
-        CreateWindowW(L"STATIC",
-            L"Reopening runs in the background and takes a few seconds per "
-            L"window; automatic layout tracking pauses until it finishes.",
-            WS_CHILD|WS_VISIBLE,S(16),S(262),S(516),S(34),hwnd,
-            (HMENU)IDC_SNAP_INFO,g_inst,nullptr);
-        CreateWindowW(L"BUTTON",L"Reopen",
-            WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON|WS_TABSTOP,
-            S(348),S(302),S(90),S(28),hwnd,(HMENU)IDC_SNAP_REOPEN,g_inst,nullptr);
-        CreateWindowW(L"BUTTON",L"Close",WS_CHILD|WS_VISIBLE|WS_TABSTOP,
-            S(444),S(302),S(88),S(28),hwnd,(HMENU)IDCANCEL,g_inst,nullptr);
-        SetChildFont(hwnd);
-        g_snapshotSlots=DescribeSnapshotSlots();
-        HWND list=GetDlgItem(hwnd,IDC_SNAP_LIST);
-        int firstPresent=-1;
-        for(size_t i=0;i<g_snapshotSlots.size();++i){
-            SendMessageW(list,LB_ADDSTRING,0,
-                (LPARAM)DescribeSnapshotSlotRow(g_snapshotSlots[i]).c_str());
-            if(firstPresent<0 && g_snapshotSlots[i].present)
-                firstPresent=(int)i;
+        HWND tabs=CreateWindowExW(0,WC_TABCONTROLW,L"",
+            WS_CHILD|WS_VISIBLE|WS_TABSTOP|TCS_TABS|TCS_FOCUSNEVER|TCS_OWNERDRAWFIXED|TCS_FIXEDWIDTH,
+            0,0,10,10,hwnd,(HMENU)IDC_RO_TABS,g_inst,nullptr);
+        CreateWindowW(L"STATIC",L"Browsers:",WS_CHILD|WS_VISIBLE,
+            S(RO_MARGIN),S(RO_FILTER_Y+2),S(70),S(20),hwnd,nullptr,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Firefox",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,
+            S(86),S(RO_FILTER_Y),S(84),S(22),hwnd,(HMENU)IDC_RO_APP_FF,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Chrome",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,
+            S(176),S(RO_FILTER_Y),S(84),S(22),hwnd,(HMENU)IDC_RO_APP_CR,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Edge",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,
+            S(266),S(RO_FILTER_Y),S(84),S(22),hwnd,(HMENU)IDC_RO_APP_ED,g_inst,nullptr);
+
+        struct Column { const wchar_t* title; int labelId; int listId; int hintId; int filterId; const wchar_t* cue; int hideId; };
+        const Column columns[]={
+            {L"Desktops",IDC_RO_LABEL_DESK,IDC_RO_LIST_DESK,IDC_RO_HINT_DESK,IDC_RO_FILTER_DESK,L"Filter desktops",IDC_RO_HIDE_DESK},
+            {L"Browser windows",IDC_RO_LABEL_WIN,IDC_RO_LIST_WIN,IDC_RO_HINT_WIN,IDC_RO_FILTER_WIN,L"Filter windows by title",IDC_RO_HIDE_WIN},
+            {L"Browser tabs",IDC_RO_LABEL_TAB,IDC_RO_LIST_TAB,IDC_RO_HINT_TAB,IDC_RO_FILTER_TAB,L"Filter tabs by title or URL",IDC_RO_HIDE_TAB},
+        };
+        for(size_t c=0;c<3;++c){
+            const Column& column=columns[c];
+            CreateWindowW(L"STATIC",column.title,WS_CHILD|WS_VISIBLE,
+                0,0,10,10,hwnd,(HMENU)(INT_PTR)column.labelId,g_inst,nullptr);
+            HWND list=CreateWindowExW(WS_EX_CLIENTEDGE,WC_LISTVIEWW,L"",
+                WS_CHILD|WS_VISIBLE|WS_TABSTOP|LVS_REPORT|LVS_SINGLESEL|
+                LVS_OWNERDATA|LVS_SHOWSELALWAYS,
+                0,0,10,10,hwnd,(HMENU)(INT_PTR)column.listId,g_inst,nullptr);
+            ListView_SetExtendedListViewStyle(list,
+                LVS_EX_CHECKBOXES|LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER);
+            // Check marks come from the row cache, not from the control.
+            ListView_SetCallbackMask(list,LVIS_STATEIMAGEMASK);
+            CreateWindowW(L"BUTTON",L"Hide open",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX|WS_TABSTOP,
+                0,0,10,10,hwnd,(HMENU)(INT_PTR)column.hideId,g_inst,nullptr);
+            CreateWindowW(L"STATIC",L"",WS_CHILD|SS_CENTER,
+                0,0,10,10,hwnd,(HMENU)(INT_PTR)column.hintId,g_inst,nullptr);
+            HWND filter=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",
+                WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,
+                0,0,10,10,hwnd,(HMENU)(INT_PTR)column.filterId,g_inst,nullptr);
+            SendMessageW(filter,EM_SETCUEBANNER,TRUE,(LPARAM)column.cue);
         }
-        SendMessageW(list,LB_SETCURSEL,firstPresent<0?0:firstPresent,0);
-        UpdateSnapshotDialogState(hwnd);
+        HWND deskList=RoCtl(hwnd,IDC_RO_LIST_DESK);
+        RoAddColumn(deskList,0,L"Desktop",S(120));
+        RoAddColumn(deskList,1,L"Windows",S(68));
+        HWND winList=RoCtl(hwnd,IDC_RO_LIST_WIN);
+        RoAddColumn(winList,0,L"Window",S(160));
+        RoAddColumn(winList,1,L"Tabs",S(60));
+        RoAddColumn(winList,2,L"Browser",S(62));
+        RoAddColumn(winList,3,L"Desk",S(42));
+        HWND tabList=RoCtl(hwnd,IDC_RO_LIST_TAB);
+        RoAddColumn(tabList,0,L"Title",S(200));
+        RoAddColumn(tabList,1,L"Status",S(66));
+        RoAddColumn(tabList,2,L"URL",S(200));
+        RoEnableHeaderCheck(deskList);
+        RoEnableHeaderCheck(winList);
+        RoEnableHeaderCheck(tabList);
+
+        CreateWindowW(L"STATIC",L"",WS_CHILD|WS_VISIBLE,
+            0,0,10,10,hwnd,(HMENU)IDC_RO_STATUS,g_inst,nullptr);
+        CreateWindowExW(0,PROGRESS_CLASSW,L"",WS_CHILD|PBS_SMOOTH,
+            0,0,10,10,hwnd,(HMENU)IDC_RO_PROGRESS,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Reopen",WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON|WS_TABSTOP,
+            0,0,10,10,hwnd,(HMENU)IDC_RO_REOPEN,g_inst,nullptr);
+        CreateWindowW(L"BUTTON",L"Close",WS_CHILD|WS_VISIBLE|WS_TABSTOP,
+            0,0,10,10,hwnd,(HMENU)IDCANCEL,g_inst,nullptr);
+        SetChildFont(hwnd);
+
+        // Tab pages: one per checkpoint that exists, newest first.
+        g_reopenUi=ReopenDialogState();
+        if(g_uiFont){
+            LOGFONTW logical={0};
+            if(GetObjectW(g_uiFont,sizeof(logical),&logical)){
+                logical.lfWeight=FW_BOLD;
+                g_reopenUi.tabFontBold=CreateFontIndirectW(&logical);
+            }
+        }
+        {
+            HCURSOR previous=SetCursor(LoadCursorW(nullptr,IDC_WAIT));
+            g_reopenUi.openUrls=CollectOpenTabUrls(g_reopenUi.openUnknownApps);
+            if(!CurrentDesktops(g_reopenUi.currentDesktops))
+                g_reopenUi.currentDesktops.clear();
+            SetCursor(previous);
+        }
+        const std::vector<SnapshotSlot> slots=DescribeSnapshotSlots();
+        int widest=S(150);
+        HDC measure=GetDC(hwnd);
+        HFONT previousFont=measure ? (HFONT)SelectObject(measure,
+            g_reopenUi.tabFontBold?g_reopenUi.tabFontBold:g_uiFont) : nullptr;
+        for(size_t i=0;i<slots.size();++i){
+            if(!slots[i].present) continue;
+            std::wstring label=(slots[i].index==0?L"Last saved  ":L"Shutdown  ")+
+                FormatSnapshotTime(slots[i].capturedUtc);
+            if(measure){
+                SIZE extent={0,0};
+                if(GetTextExtentPoint32W(measure,label.c_str(),(int)label.size(),&extent))
+                    widest=(std::max)(widest,(int)extent.cx+S(28));
+            }
+            TCITEMW item={0};
+            item.mask=TCIF_TEXT;
+            item.pszText=const_cast<wchar_t*>(label.c_str());
+            TabCtrl_InsertItem(tabs,(int)g_reopenUi.slots.size(),&item);
+            g_reopenUi.slots.push_back(slots[i].index);
+        }
+        if(measure){
+            if(previousFont) SelectObject(measure,previousFont);
+            ReleaseDC(hwnd,measure);
+        }
+        TabCtrl_SetItemSize(tabs,widest,S(26));
+        RoLayout(hwnd);
+        if(g_reopenUi.slots.empty()){
+            RoSetText(hwnd,IDC_RO_STATUS,
+                L"No checkpoint has been saved yet. Save the layout, or exit VDE once, and come back.");
+            EnableWindow(RoCtl(hwnd,IDC_RO_REOPEN),FALSE);
+            RoRefreshAll(hwnd);
+        } else {
+            TabCtrl_SetCurSel(tabs,0);
+            RoLoadSlot(hwnd,g_reopenUi.slots[0]);
+        }
         return 0;
     }
-    case WM_COMMAND:
-        if(LOWORD(wp)==IDC_SNAP_LIST && HIWORD(wp)==LBN_SELCHANGE){
-            UpdateSnapshotDialogState(hwnd);
-            return 0;
-        }
-        if(LOWORD(wp)==IDC_SNAP_REOPEN){
-            const int selection=(int)SendMessageW(
-                GetDlgItem(hwnd,IDC_SNAP_LIST),LB_GETCURSEL,0,0);
-            if(selection<0 || (size_t)selection>=g_snapshotSlots.size() ||
-               !g_snapshotSlots[(size_t)selection].present) return 0;
-            SessionSnapshot snapshot;
-            if(!ReadSnapshotSlot(g_snapshotSlots[(size_t)selection].index,snapshot)){
-                MessageBoxW(hwnd,L"That checkpoint could not be read.",APP_NAME,
-                            MB_ICONWARNING);
-                return 0;
-            }
-            std::set<std::string> apps;
-            if(IsDlgButtonChecked(hwnd,IDC_SNAP_APP_FF)==BST_CHECKED) apps.insert("firefox");
-            if(IsDlgButtonChecked(hwnd,IDC_SNAP_APP_CR)==BST_CHECKED) apps.insert("chrome");
-            if(IsDlgButtonChecked(hwnd,IDC_SNAP_APP_ED)==BST_CHECKED) apps.insert("msedge");
-            if(apps.empty()){
-                MessageBoxW(hwnd,L"Select at least one browser to reopen.",APP_NAME,
-                            MB_ICONINFORMATION);
-                return 0;
-            }
-            size_t windows=0,tabs=0;
-            for(size_t i=0;i<snapshot.windows.size();++i){
-                if(!apps.count(snapshot.windows[i].app)) continue;
-                ++windows;
-                tabs+=snapshot.windows[i].tabs.size();
-            }
-            wchar_t question[320]={0};
-            swprintf_s(question,
-                L"Reopen %u browser window(s) with %u tab(s) from the checkpoint "
-                L"of %s?\r\n\r\nWindows that are already open are not closed or "
-                L"reused, so matching windows will appear twice.",
-                (unsigned)windows,(unsigned)tabs,
-                FormatSnapshotTime(snapshot.capturedUtc).c_str());
-            if(MessageBoxW(hwnd,question,APP_NAME,
-                           MB_ICONQUESTION|MB_OKCANCEL)!=IDOK) return 0;
-            std::wstring error;
-            if(!StartReopen(snapshot,apps,error)){
-                MessageBoxW(hwnd,error.c_str(),APP_NAME,MB_ICONWARNING);
-                return 0;
-            }
-            Balloon(L"Reopening browser windows from the checkpoint...");
-            DestroyWindow(hwnd);
-            return 0;
-        }
-        if(LOWORD(wp)==IDCANCEL){ DestroyWindow(hwnd); return 0; }
+    case WM_SIZE:
+        if(wp!=SIZE_MINIMIZED) RoLayout(hwnd);
         return 0;
+    case WM_GETMINMAXINFO:{
+        MINMAXINFO* info=reinterpret_cast<MINMAXINFO*>(lp);
+        RECT frame={0,0,S(RO_MIN_W),S(RO_MIN_H)};
+        AdjustWindowRect(&frame,WS_OVERLAPPEDWINDOW,FALSE);
+        info->ptMinTrackSize.x=frame.right-frame.left;
+        info->ptMinTrackSize.y=frame.bottom-frame.top;
+        return 0;
+    }
+    case WM_DRAWITEM:{
+        const DRAWITEMSTRUCT* draw=reinterpret_cast<const DRAWITEMSTRUCT*>(lp);
+        if(draw && draw->CtlType==ODT_TAB && draw->CtlID==IDC_RO_TABS){
+            RoDrawTab(draw);
+            return TRUE;
+        }
+        return 0;
+    }
+    case WM_NOTIFY:{
+        const NMHDR* header=reinterpret_cast<const NMHDR*>(lp);
+        if(!header) return 0;
+        if(header->idFrom==IDC_RO_TABS && header->code==TCN_SELCHANGE){
+            const int selected=TabCtrl_GetCurSel(header->hwndFrom);
+            if(selected>=0 && (size_t)selected<g_reopenUi.slots.size() && !g_reopenUi.busy)
+                RoLoadSlot(hwnd,g_reopenUi.slots[(size_t)selected]);
+            return 0;
+        }
+        if(header->code==HDN_ITEMSTATEICONCLICK){
+            const NMHEADERW* click=reinterpret_cast<const NMHEADERW*>(lp);
+            if(click->iItem==0) RoHandleHeaderCheck(hwnd,header->hwndFrom);
+            return 0;
+        }
+        const std::vector<RoRow>* cells=
+            header->idFrom==IDC_RO_LIST_DESK ? &g_reopenUi.desktopCells :
+            header->idFrom==IDC_RO_LIST_WIN ? &g_reopenUi.windowCells :
+            header->idFrom==IDC_RO_LIST_TAB ? &g_reopenUi.tabCells : nullptr;
+        if(cells && header->code==LVN_GETDISPINFO){
+            NMLVDISPINFOW* info=reinterpret_cast<NMLVDISPINFOW*>(lp);
+            const int row=info->item.iItem;
+            if(row<0 || (size_t)row>=cells->size()) return 0;
+            const RoRow& data=(*cells)[(size_t)row];
+            if((info->item.mask&LVIF_TEXT) && info->item.pszText && info->item.cchTextMax>0){
+                const int column=info->item.iSubItem;
+                const std::wstring& text=column>=0 && column<4 ? data.cells[column] : std::wstring();
+                wcsncpy_s(info->item.pszText,(size_t)info->item.cchTextMax,text.c_str(),_TRUNCATE);
+            }
+            if(info->item.mask&LVIF_STATE){
+                info->item.stateMask=LVIS_STATEIMAGEMASK;
+                info->item.state=INDEXTOSTATEIMAGEMASK(data.checked?2:1);
+            }
+            return 0;
+        }
+        if(cells && header->code==NM_CLICK && !g_reopenUi.busy){
+            const NMITEMACTIVATE* click=reinterpret_cast<const NMITEMACTIVATE*>(lp);
+            LVHITTESTINFO hit={0};
+            hit.pt=click->ptAction;
+            ListView_HitTest(header->hwndFrom,&hit);
+            if(hit.iItem>=0 && (hit.flags&LVHT_ONITEMSTATEICON) &&
+               (size_t)hit.iItem<cells->size())
+                RoHandleListCheck(hwnd,(int)header->idFrom,hit.iItem,
+                                  !(*cells)[(size_t)hit.iItem].checked);
+            return 0;
+        }
+        if(cells && header->code==LVN_KEYDOWN && !g_reopenUi.busy){
+            const NMLVKEYDOWN* key=reinterpret_cast<const NMLVKEYDOWN*>(lp);
+            if(key->wVKey==VK_SPACE){
+                const int row=ListView_GetNextItem(header->hwndFrom,-1,LVNI_FOCUSED);
+                if(row>=0 && (size_t)row<cells->size())
+                    RoHandleListCheck(hwnd,(int)header->idFrom,row,
+                                      !(*cells)[(size_t)row].checked);
+            }
+            return 0;
+        }
+        if(cells && header->code==NM_CUSTOMDRAW){
+            NMLVCUSTOMDRAW* draw=reinterpret_cast<NMLVCUSTOMDRAW*>(lp);
+            if(draw->nmcd.dwDrawStage==CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+            if(draw->nmcd.dwDrawStage==CDDS_ITEMPREPAINT){
+                const size_t row=(size_t)draw->nmcd.dwItemSpec;
+                if(row<cells->size() && (*cells)[row].grey)
+                    draw->clrText=GetSysColor(COLOR_GRAYTEXT);
+                return CDRF_DODEFAULT;
+            }
+            return CDRF_DODEFAULT;
+        }
+        return 0;
+    }
+    case WM_COMMAND:{
+        const int id=LOWORD(wp);
+        if((HIWORD(wp)==EN_CHANGE &&
+            (id==IDC_RO_FILTER_DESK || id==IDC_RO_FILTER_WIN || id==IDC_RO_FILTER_TAB)) ||
+           id==IDC_RO_HIDE_DESK || id==IDC_RO_HIDE_WIN || id==IDC_RO_HIDE_TAB){
+            if(!g_reopenUi.modelValid || g_reopenUi.busy) return 0;
+            RoApplyTextFilters(hwnd);
+            if(id==IDC_RO_FILTER_DESK || id==IDC_RO_HIDE_DESK) RoRefreshAll(hwnd);
+            else if(id==IDC_RO_FILTER_WIN || id==IDC_RO_HIDE_WIN){
+                RoRefreshWindows(hwnd);
+                RoRefreshTabs(hwnd);
+                RoRefreshStatus(hwnd);
+            } else {
+                RoRefreshTabs(hwnd);
+                RoRefreshStatus(hwnd);
+            }
+            return 0;
+        }
+        if(id==IDC_RO_APP_FF || id==IDC_RO_APP_CR || id==IDC_RO_APP_ED){
+            RoApplyBrowserFilter(hwnd);
+            return 0;
+        }
+        if(id==IDC_RO_REOPEN){
+            if(g_reopenUi.busy){
+                CancelReopen();
+                EnableWindow(RoCtl(hwnd,IDC_RO_REOPEN),FALSE);
+                NotifyReopenProgress();
+            } else RoStartReopen(hwnd);
+            return 0;
+        }
+        if(id==IDCANCEL){ DestroyWindow(hwnd); return 0; }
+        return 0;
+    }
     case WM_CTLCOLORSTATIC:{
         HDC dc=(HDC)wp;
         SetBkMode(dc,TRANSPARENT);
         return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
     }
     case WM_CLOSE: DestroyWindow(hwnd); return 0;
-    case WM_DESTROY: g_snapshotDialog=nullptr; return 0;
+    case WM_DESTROY:
+        if(g_reopenUi.tabFontBold) DeleteObject(g_reopenUi.tabFontBold);
+        g_snapshotDialog=nullptr;
+        g_reopenUi=ReopenDialogState();
+        return 0;
     }
     return DefWindowProcW(hwnd,msg,wp,lp);
 }
@@ -12148,15 +12891,14 @@ static void OpenSessionRestore(){
         RegisterClassW(&wc);
         registered=true;
     }
-    int W=S(548),H=S(348);
-    RECT wr={0,0,W,H};
-    AdjustWindowRect(&wr,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,FALSE);
+    RECT wr={0,0,S(RO_W),S(RO_H)};
+    AdjustWindowRect(&wr,WS_OVERLAPPEDWINDOW,FALSE);
     const int ww=wr.right-wr.left,wh=wr.bottom-wr.top;
     const int sx=(GetSystemMetrics(SM_CXSCREEN)-ww)/2;
     const int sy=(GetSystemMetrics(SM_CYSCREEN)-wh)/2;
     g_snapshotDialog=CreateWindowExW(0,L"VdeSnapshots",
         L"Reopen browser windows - Virtual Desktop Extension",
-        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,sx,sy,ww,wh,nullptr,nullptr,g_inst,nullptr);
+        WS_OVERLAPPEDWINDOW,sx,sy,ww,wh,nullptr,nullptr,g_inst,nullptr);
     if(g_snapshotDialog){
         ShowWindow(g_snapshotDialog,SW_SHOW);
         SetForegroundWindow(g_snapshotDialog);
@@ -12933,7 +13675,7 @@ static int RunGui(HINSTANCE hInst){
     ScopedUiShutdown shutdown;
     int runResult=0;
     g_inst=hInst;
-    INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_HOTKEY_CLASS|ICC_STANDARD_CLASSES|ICC_LINK_CLASS|ICC_BAR_CLASSES|ICC_TAB_CLASSES}; InitCommonControlsEx(&icc);
+    INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_HOTKEY_CLASS|ICC_STANDARD_CLASSES|ICC_LINK_CLASS|ICC_BAR_CLASSES|ICC_TAB_CLASSES|ICC_LISTVIEW_CLASSES|ICC_PROGRESS_CLASS}; InitCommonControlsEx(&icc);
     g_uiFont=CreateFontW(-S(12),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     LoadSettings();
 

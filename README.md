@@ -65,12 +65,23 @@ itself is never mistaken for a browser restart and moves nothing.
   expiry, VDE restores it before updating the saved layout.
 - **Two layouts** — a rolling *auto* layout plus a manual checkpoint you save on
   demand.
-- **Reopen a whole browsing session** — VDE also remembers *what* each window
-  contained. Pick one of five checkpoints — the last saved state plus the last
-  four shutdowns, each shown with its date and time — choose the browsers, and
-  VDE relaunches them with the saved tabs and puts every window back on its
-  desktop. Useful when the browser itself lost the session, not just its window
-  placement.
+- **Reopen exactly the tabs you pick** — VDE also remembers *what* each window
+  contained. The reopen window shows five checkpoints as tabs (the last saved
+  state plus the last four shutdowns, each with its date and time) and three
+  cascading columns: **desktops → browser windows → browser tabs**, each with
+  check boxes, a select-all box in the column header, a **Hide open** switch,
+  and a text filter underneath, plus a browser filter. Checking a desktop
+  selects its windows and their tabs; uncheck whatever you do not want; type to
+  narrow a column or hide what is already open (both only change what is
+  shown, never what is selected). Tabs that are open in the browser right now
+  are greyed out and left unchecked, so a reopen never duplicates them; a window
+  whose every tab is open, or a desktop whose every window is, is greyed too.
+  If a browser's open tabs cannot be read, its windows start unchecked and the
+  status line says so. A desktop that no longer exists is marked; its windows
+  reopen on desktop 1. The window is resizable and maximizes, and the lists are
+  virtual, so a checkpoint with hundreds of tabs stays instant. The selected
+  tabs come back grouped into their original windows, each on the desktop it
+  was on, with a progress bar and a Cancel button while it runs.
 - **All-window desktop picker** — the global hotkey (default `Ctrl+Alt+D`)
   opens a grid of desktops on the primary monitor, containing eligible ordinary
   application windows, not only tracked browsers. Rows show application icons,
@@ -157,7 +168,7 @@ icon for:
 | **Save windows layout** | Save current windows to a manual checkpoint file |
 | **Restore saved windows layout** | Restore from that manual checkpoint |
 | **Restore last auto saved layout** | Restore from the rolling auto layout |
-| **Reopen browser windows…** | Relaunch the browsers with the tabs of a saved session checkpoint |
+| **Reopen browser windows…** | Pick desktops, windows and tabs from a saved checkpoint and bring them back |
 | **Settings…** | Hotkey, auto-save/restore, start-with-Windows |
 | **About…** | Version, author, contact, project link |
 | **Exit** | Quit after saving the current automatic layout |
@@ -246,10 +257,16 @@ restore work unattended.
   generic failure — an unelevated app cannot move an elevated window.
 - Private Firefox windows aren't in the session store, so they're matched by
   title only, and they are not part of a session checkpoint.
-- Reopening a checkpoint **adds** windows; it never closes or reuses the ones
-  already open, so a checkpoint that is still open will appear twice. Tab
-  history, pinned tabs, tab groups, form data and scroll position are not
-  reopened — only the tab URLs, their order, and the window's desktop.
+- Reopening **adds** windows; it never closes or rearranges the ones already
+  open. Tabs that are already open are skipped by default (you can still check
+  one explicitly). Tab history, pinned tabs, tab groups, form data and scroll
+  position are not reopened — only the tab URLs, their order, and the window's
+  desktop.
+- Reopening is sequential by design — about a second per window — because a new
+  window is recognized as the difference in the browser's window set, and
+  Firefox routes extra tabs to its most recent window.
+- Edge keeps its session file exclusively locked while it runs, so Edge windows
+  are tracked by title only until Edge is closed.
 - Every browser profile that is currently open is read, not just the default
   one: win-vde detects an open profile from the lock the browser holds on it.
   A profile that is merely installed is ignored, so its old windows can never

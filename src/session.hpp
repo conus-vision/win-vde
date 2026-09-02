@@ -533,7 +533,11 @@ inline bool ParseChromiumSNSS(const std::string& data,std::vector<WinFp>& output
                 uint32_t declared=(uint32_t)command[0]|((uint32_t)command[1]<<8)|((uint32_t)command[2]<<16)|((uint32_t)command[3]<<24);
                 if((size_t)declared!=commandLength-4) return false;
                 SnssPR reader{command+4,commandLength-4}; int32_t tab=0,navigation=0; std::string url,title;
-                if(!reader.rInt(tab)||!reader.rInt(navigation)||tab<0||navigation<0||!reader.rStr(url)||!reader.rStr16(title)||!reader.finished()||!acceptTab(tab)) return false;
+                // A real navigation entry carries many more fields after the title
+                // (page state, transition, referrer, timestamps...).  Only the
+                // leading fields are needed, so trailing payload is expected,
+                // not an error.
+                if(!reader.rInt(tab)||!reader.rInt(navigation)||tab<0||navigation<0||!reader.rStr(url)||!reader.rStr16(title)||!acceptTab(tab)) return false;
                 std::map<int32_t,std::map<int32_t,Navigation> >::iterator tf=tabNavigations.find(tab);
                 bool duplicate=tf!=tabNavigations.end() && tf->second.find(navigation)!=tf->second.end();
                 if(!duplicate && navigationCount>=limits.maxNavigations) return false;

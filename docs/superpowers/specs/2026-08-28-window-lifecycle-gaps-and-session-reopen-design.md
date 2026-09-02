@@ -545,3 +545,118 @@ regression tests now cover a real 2^63+ signature and the top of the range.
 Restoring the 881-record layout and restarting VDE: the file loads as v5, grows
 to 887 records with 39 signatures, all 44 live windows bind, and **no window
 moves**.
+
+---
+
+## 7. Selective reopen (2026-09-02)
+
+The first reopen dialog offered a checkpoint and a browser filter, and brought
+back everything. In practice that is rarely what is wanted: most of a checkpoint
+is still open, and the interesting part is one desktop or one window.
+
+### 7.1 Three cascading columns
+
+`src/reopen_model.hpp` (pure, unit-tested) holds one checkpoint as
+desktops → windows → tabs with a check box on every row and an "All" switch per
+column, plus the browser filter:
+
+- **Cascade goes down only.** Checking a desktop checks its windows and their
+  tabs; checking a window checks its tabs; unchecking clears everything below.
+  Unchecking a tab never unchecks its window — a window with 0 of 12 tabs stays
+  listed, it just contributes nothing.
+- **Visibility follows the checks.** The windows column lists the windows of the
+  checked desktops; the tabs column lists the tabs of the checked windows. An
+  empty column says what to select instead of looking broken.
+- **Already-open tabs are never duplicated by default.** When the dialog opens
+  it reads the running browsers' session files (`CollectOpenTabUrls`) and marks
+  every checkpoint tab whose URL is open right now; those rows are greyed,
+  labelled "open now", and start unchecked. "All" leaves them alone; the user
+  can still check one explicitly. After a reopen the launched tabs are marked
+  open too.
+- **Reopen acts on the checked tabs of checked windows on checked desktops that
+  pass the browser filter**, grouped into their original windows
+  (`BuildReopenJobsFromSelection`); each window goes to its original desktop
+  (falling back to the saved position if that desktop is gone).
+
+### 7.2 The engine, faster and visible
+
+The engine still opens one window at a time: the new window is recognized as
+the difference in the browser's window set, and Firefox routes extra tabs to its
+most recent window, so launches cannot overlap. (Tested: a single
+`-new-window url1 url2` puts url2 into the *previous* window.) What changed:
+
+- polling at 150 ms instead of 400 ms, tab settle 500 ms instead of 900 ms, and
+  no idle gap between windows — measured under a second per window;
+- the dialog stays open, disables its controls, shows "Opening window i of n:
+  title" with a progress bar, and turns Reopen into Cancel (which stops after
+  the current window);
+- the finish summary lands in the dialog's status line, or in a tray balloon if
+  the dialog was closed meanwhile.
+
+### 7.3 Two bugs found on the way
+
+- The SNSS reader required a navigation entry (command 6) to end right after the
+  title. Real Chrome entries carry ~1.7 KB more (page state, referrer,
+  timestamps), so every current Chrome and Edge session file was rejected as a
+  whole. Fixed by reading only the leading fields.
+- Edge holds its `Session_*` file with no read sharing while it runs, so its
+  session cannot be read at all until Edge exits. Documented as a limitation.
+
+### 7.4 Verified live
+
+Synthetic checkpoint with three windows on two desktops: the four tabs opened
+by an earlier reopen showed as "open now" and unchecked; the two fresh tabs were
+selected; Reopen brought back exactly that one window with those two tabs on
+the right desktop in about a second, the progress bar and Cancel showed, the
+summary read "1 of 1 window(s) opened, 1 placed on their desktop", and the two
+tabs were then greyed as open.
+
+### 7.5 Second round of the dialog (same day)
+
+- **Resizable, maximizable.** `WS_OVERLAPPEDWINDOW`; `RoLayout` places every
+  control from the client size (first column fixed, the other two share the
+  rest, last list column fills), with a minimum size via `WM_GETMINMAXINFO`.
+- **The selected checkpoint tab is unmistakable.** The tab control is
+  owner-drawn (`TCS_OWNERDRAWFIXED`): highlight colour and bold text for the
+  current page, item width measured from the longest label.
+- **Select-all lives in the list header**, the way file managers do it:
+  `HDS_CHECKBOXES` on each header, `HDF_CHECKBOX` on the first column,
+  `HDN_ITEMSTATEICONCLICK` flips every visible row of that column, and the
+  header state is recomputed after every change. The "All" buttons are gone.
+- **A text filter under each column** (`ReopenModel::desktopFilter` /
+  `windowFilter` / `tabFilter`, case-insensitive substring over "index name",
+  "title browser", "title url"). A filter narrows what a column *shows* — and
+  therefore what its header box and the columns to its right act on — but never
+  what is selected: `ReopenSelectedWindows` (checks + browser filter only) feeds
+  the summary and the jobs, so a checked tab hidden by a filter is still
+  reopened and still counted.
+- **Reading the open tabs is retried and its failure is visible.** The session
+  read is stamp-verified, so it fails whenever the browser is mid-write;
+  `CollectOpenTabUrls` retries four times. A browser that still cannot be read
+  while it has live windows is listed in the status line ("duplicates cannot
+  be detected") and its windows start **unchecked**, so nothing is duplicated
+  by default. Seen live for Edge, whose session file is locked while it runs.
+
+### 7.6 Third round (same day)
+
+- **Virtual lists.** The three columns are `LVS_OWNERDATA` lists: a refresh is
+  a row-cache rebuild plus `ListView_SetItemCountEx`, and text and check state
+  are answered from the cache in `LVN_GETDISPINFO` (with
+  `ListView_SetCallbackMask(LVIS_STATEIMAGEMASK)`). Check clicks are taken from
+  `NM_CLICK` hit-tested on the state icon and from the space bar
+  (`LVN_KEYDOWN`), because the control stores nothing. Every click and every
+  filter keystroke used to rebuild up to ~700 rows with three messages each;
+  now nothing is inserted at all.
+- **Header select-all** needs a clickable header: `LVS_NOSORTHEADER` was in the
+  way (no `HDS_BUTTONS`, no state-icon clicks). Removed; the box now checks
+  every visible selectable row when at least one is unchecked, and clears them
+  all when all are checked.
+- **Hide open** per column (`hideOpenDesktops/Windows/Tabs`): a tab is open
+  when its URL is shown by the browser now, a window when all its tabs are, a
+  desktop when all its listed windows are. View-only, like the text filters;
+  fully open windows and desktops are greyed in the lists as well.
+- **Desktops that no longer exist.** `BuildReopenModel` receives the current
+  desktop list and flags the missing ones ("gone -> desktop 1", greyed);
+  `ResolveReopenDestination` now sends such windows to the **first** desktop
+  instead of the desktop at the saved position. Verified live with a checkpoint
+  pointing at a made-up desktop GUID: the window landed on desktop 1.

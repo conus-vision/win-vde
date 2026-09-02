@@ -16,6 +16,7 @@
 #include "layout_store.hpp"
 #include "tabsnap.hpp"
 #include "binding_store.hpp"
+#include "reopen_model.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -29936,6 +29937,253 @@ static void test_ordinary_tab_loss_still_restores(){
           GuidEq(plan.restores[0].destination,savedDesktop));
 }
 
+// ----------------------- reopen selection model (reopen_model.hpp) ----------
+static SessionSnapshot reopenModelSnapshot(){
+    SessionSnapshot snapshot;
+    snapshot.kind=SnapKind::Saved;
+    snapshot.capturedUtc=1756000000;
+    DeskRec first; first.index=1; first.guid=G(L"{51000000-0000-0000-0000-000000000001}"); first.name=L"Work";
+    DeskRec second; second.index=0; second.guid=G(L"{51000000-0000-0000-0000-000000000002}"); second.name=L"Home";
+    snapshot.desks.push_back(first);
+    snapshot.desks.push_back(second);
+    SnapWindow a; a.app="firefox"; a.desktop=first.guid; a.deskIndex=1; a.activeTitle="A";
+    a.tabs.push_back(snapTab("https://a.test/1","a1"));
+    a.tabs.push_back(snapTab("https://a.test/2","a2"));
+    a.tabs.push_back(snapTab("https://a.test/3","a3"));
+    SnapWindow b; b.app="chrome"; b.desktop=first.guid; b.deskIndex=1; b.activeTitle="B";
+    b.tabs.push_back(snapTab("https://b.test/1","b1"));
+    SnapWindow c; c.app="firefox"; c.desktop=second.guid; c.deskIndex=0; c.activeTitle="C";
+    c.tabs.push_back(snapTab("https://c.test/1","c1"));
+    c.tabs.push_back(snapTab("https://c.test/2","c2"));
+    snapshot.windows.push_back(a);
+    snapshot.windows.push_back(b);
+    snapshot.windows.push_back(c);
+    return snapshot;
+}
+
+static void test_reopen_model_starts_fully_selected_except_open_tabs(){
+    OpenUrlsByApp open;
+    open["firefox"].insert("https://a.test/2");
+    open["chrome"].insert("https://a.test/1");          // other browser: not "open" for firefox
+    ReopenModel model;
+    CHECK(BuildReopenModel(reopenModelSnapshot(),open,std::vector<DeskRec>(),model));
+    // Desktops are ordered by their on-screen index, not by first appearance.
+    CHECK(model.desktops.size()==2);
+    CHECK(model.desktops[0].index==0 && model.desktops[0].name==L"Home");
+    CHECK(model.desktops[1].index==1 && model.desktops[1].name==L"Work");
+    CHECK(model.desktops[1].windows.size()==2 && model.desktops[0].windows.size()==1);
+    CHECK(model.windows[0].desktop==1 && model.windows[2].desktop==0);
+    CHECK(model.desktops[0].checked && model.desktops[1].checked);
+    CHECK(model.windows[0].checked && model.windows[1].checked && model.windows[2].checked);
+    CHECK(model.windows[0].tabs[0].checked && !model.windows[0].tabs[0].open);
+    CHECK(!model.windows[0].tabs[1].checked && model.windows[0].tabs[1].open);
+    CHECK(model.windows[0].tabs[2].checked);
+    CHECK(model.apps.size()==2 && model.apps.count("firefox") && model.apps.count("chrome"));
+    const ReopenSelectionSummary summary=ReopenSummarize(model);
+    CHECK(summary.windows==3 && summary.tabs==5);
+    CHECK(ReopenAllDesktopsChecked(model) && ReopenAllWindowsChecked(model) &&
+          ReopenAllTabsChecked(model));
+}
+
+static void test_reopen_model_cascades_downward_only(){
+    ReopenModel model;
+    CHECK(BuildReopenModel(reopenModelSnapshot(),OpenUrlsByApp(),std::vector<DeskRec>(),model));
+    // Unchecking a desktop hides and clears everything under it.
+    ReopenSetDesktopChecked(model,1,false);
+    CHECK(!model.windows[0].checked && !model.windows[1].checked);
+    CHECK(!model.windows[0].tabs[0].checked);
+    CHECK(ReopenVisibleWindows(model).size()==1 && ReopenVisibleWindows(model)[0]==2);
+    CHECK(ReopenVisibleTabs(model).size()==2);
+    CHECK(ReopenSummarize(model).windows==1 && ReopenSummarize(model).tabs==2);
+    // Re-checking it brings the windows and their tabs back.
+    ReopenSetDesktopChecked(model,1,true);
+    CHECK(model.windows[0].checked && model.windows[0].tabs[2].checked);
+    CHECK(ReopenVisibleTabs(model).size()==6);
+    // Unchecking a single tab leaves its window and desktop checked.
+    ReopenSetTabChecked(model,0,0,false);
+    CHECK(model.windows[0].checked && model.desktops[1].checked);
+    CHECK(ReopenCheckedTabCount(model,0)==2);
+    CHECK(!ReopenAllTabsChecked(model));
+    // Unchecking every tab of a window keeps it listed but contributes nothing.
+    ReopenSetTabChecked(model,0,1,false);
+    ReopenSetTabChecked(model,0,2,false);
+    CHECK(ReopenSummarize(model).windows==2 && ReopenSummarize(model).tabs==3);
+    // Checking the window again re-selects its tabs.
+    ReopenSetWindowChecked(model,0,true);
+    CHECK(ReopenCheckedTabCount(model,0)==3);
+}
+
+static void test_reopen_model_all_switches_respect_open_tabs_and_filter(){
+    OpenUrlsByApp open;
+    open["firefox"].insert("https://c.test/1");
+    ReopenModel model;
+    CHECK(BuildReopenModel(reopenModelSnapshot(),open,std::vector<DeskRec>(),model));
+    // "All tabs" on never selects an already open tab...
+    ReopenSetAllTabsChecked(model,false);
+    CHECK(ReopenSummarize(model).tabs==0);
+    ReopenSetAllTabsChecked(model,true);
+    CHECK(!model.windows[2].tabs[0].checked && model.windows[2].tabs[1].checked);
+    CHECK(ReopenSummarize(model).tabs==5);
+    CHECK(ReopenAllTabsChecked(model));               // the open one does not count
+    // ...but the user may still ask for it explicitly.
+    ReopenSetTabChecked(model,2,0,true);
+    CHECK(ReopenSummarize(model).tabs==6);
+
+    // The browser filter hides chrome's window and desktop rows follow.
+    model.apps.erase("chrome");
+    CHECK(ReopenVisibleWindows(model).size()==2);
+    for(size_t i=0;i<ReopenVisibleWindows(model).size();++i)
+        CHECK(model.snapshot.windows[ReopenVisibleWindows(model)[i]].app=="firefox");
+    CHECK(ReopenVisibleDesktops(model).size()==2);     // both still hold firefox
+    model.apps.clear();
+    model.apps.insert("chrome");
+    CHECK(ReopenVisibleDesktops(model).size()==1);     // only "Work" has chrome
+    CHECK(ReopenVisibleWindows(model).size()==1);
+    // "All desktops" only touches desktops that are visible under the filter.
+    ReopenSetAllDesktopsChecked(model,false);
+    CHECK(!model.desktops[1].checked && model.desktops[0].checked);
+    CHECK(ReopenVisibleWindows(model).empty() && ReopenVisibleTabs(model).empty());
+    CHECK(!ReopenAllDesktopsChecked(model));
+}
+
+static void test_reopen_jobs_follow_the_selection_and_keep_desktops(){
+    OpenUrlsByApp open;
+    open["firefox"].insert("https://a.test/2");
+    ReopenModel model;
+    CHECK(BuildReopenModel(reopenModelSnapshot(),open,std::vector<DeskRec>(),model));
+    ReopenSetTabChecked(model,2,1,false);               // drop c2
+    model.apps.erase("chrome");                         // chrome filtered out
+    std::vector<ReopenWindowJob> jobs;
+    size_t skipped=99;
+    CHECK(BuildReopenJobsFromSelection(model,64,jobs,skipped));
+    CHECK(skipped==0);
+    CHECK(jobs.size()==2);
+    // Jobs follow desktop order: "Home" (index 0) before "Work" (index 1).
+    // Window C: only c1 left, on "Home".
+    CHECK(jobs[0].urls.size()==1 && jobs[0].urls[0]=="https://c.test/1");
+    CHECK(jobs[0].deskIndex==0);
+    // Window A: tabs 1 and 3 (2 is open), still bound for the "Work" desktop.
+    CHECK(jobs[1].app=="firefox" && jobs[1].urls.size()==2);
+    CHECK(jobs[1].urls[0]=="https://a.test/1" && jobs[1].urls[1]=="https://a.test/3");
+    CHECK(GuidEq(jobs[1].desktop,model.snapshot.windows[0].desktop) && jobs[1].deskIndex==1);
+    CHECK(!jobs[1].launches.empty() && jobs[1].launches[0].newWindow);
+
+    // A window whose every tab was deselected produces no job.
+    ReopenSetWindowChecked(model,0,false);
+    CHECK(BuildReopenJobsFromSelection(model,64,jobs,skipped) && jobs.size()==1);
+
+    // After a reopen the launched tabs count as open and are deselected.
+    ReopenMarkJobsOpen(model,jobs);
+    CHECK(model.windows[2].tabs[0].open && !model.windows[2].tabs[0].checked);
+    CHECK(!model.windows[2].tabs[1].open);
+    CHECK(ReopenSummarize(model).tabs==0);
+}
+
+static void test_reopen_jobs_skip_unreplayable_urls(){
+    SessionSnapshot snapshot=reopenModelSnapshot();
+    snapshot.windows[1].tabs.push_back(snapTab("javascript:void(0)","js"));
+    ReopenModel model;
+    CHECK(BuildReopenModel(snapshot,OpenUrlsByApp(),std::vector<DeskRec>(),model));
+    std::vector<ReopenWindowJob> jobs;
+    size_t skipped=0;
+    CHECK(BuildReopenJobsFromSelection(model,64,jobs,skipped));
+    CHECK(skipped==1 && jobs.size()==3);
+    CHECK(BuildReopenModel(SessionSnapshot(),OpenUrlsByApp(),std::vector<DeskRec>(),model));
+    CHECK(model.desktops.empty() && model.windows.empty());
+    CHECK(ReopenSummarize(model).tabs==0 && !ReopenAllDesktopsChecked(model));
+}
+
+static void test_reopen_text_filters_narrow_the_view_only(){
+    ReopenModel model;
+    CHECK(BuildReopenModel(reopenModelSnapshot(),OpenUrlsByApp(),std::vector<DeskRec>(),model));
+    CHECK(ReopenTextContains(L"Example Fresh 1",L"fresh"));
+    CHECK(ReopenTextContains(L"Example",L""));
+    CHECK(!ReopenTextContains(L"Example",L"zzz"));
+
+    // A desktop filter hides desktops and, through them, their windows and tabs -
+    // but changes no check box, so the selection count stays.
+    model.desktopFilter=L"work";
+    CHECK(ReopenVisibleDesktops(model).size()==1);
+    CHECK(model.desktops[ReopenVisibleDesktops(model)[0]].name==L"Work");
+    CHECK(ReopenVisibleWindows(model).size()==2);
+    CHECK(ReopenVisibleTabs(model).size()==4);
+    CHECK(ReopenSummarize(model).windows==3 && ReopenSummarize(model).tabs==6);
+    std::vector<ReopenWindowJob> jobs;
+    size_t skipped=0;
+    CHECK(BuildReopenJobsFromSelection(model,64,jobs,skipped) && jobs.size()==3);
+
+    // "All" in a column acts on what the column shows.
+    ReopenSetAllWindowsChecked(model,false);
+    CHECK(!model.windows[0].checked && !model.windows[1].checked && model.windows[2].checked);
+    CHECK(ReopenSummarize(model).windows==1 && ReopenSummarize(model).tabs==2);
+    ReopenSetAllWindowsChecked(model,true);
+    model.desktopFilter.clear();
+
+    // The window filter matches the title or the browser name, case-insensitively.
+    model.windowFilter=L"CHROME";
+    CHECK(ReopenVisibleWindows(model).size()==1 &&
+          model.snapshot.windows[ReopenVisibleWindows(model)[0]].app=="chrome");
+    model.windowFilter=L"a";
+    CHECK(ReopenVisibleWindows(model).size()==1);      // titles A, B, C: only "A"
+    model.windowFilter.clear();
+
+    // The tab filter matches title or URL; the all-tabs switch respects it.
+    model.tabFilter=L"c.test/2";
+    CHECK(ReopenVisibleTabs(model).size()==1);
+    CHECK(ReopenVisibleTabs(model)[0].first==2 && ReopenVisibleTabs(model)[0].second==1);
+    ReopenSetAllTabsChecked(model,false);
+    CHECK(!model.windows[2].tabs[1].checked && model.windows[2].tabs[0].checked);
+    CHECK(ReopenSummarize(model).tabs==5);
+    model.tabFilter=L"nothing-like-this";
+    CHECK(ReopenVisibleTabs(model).empty() && !ReopenAllTabsChecked(model));
+    CHECK(ReopenSummarize(model).tabs==5);              // hidden, still selected
+}
+
+static void test_reopen_hide_open_and_missing_desktops(){
+    OpenUrlsByApp open;
+    open["firefox"].insert("https://c.test/1");
+    open["firefox"].insert("https://c.test/2");          // window C fully open
+    open["chrome"].insert("https://b.test/1");           // window B fully open
+    // Only "Work" still exists; "Home" was deleted since the checkpoint.
+    std::vector<DeskRec> current(1,reopenModelSnapshot().desks[0]);
+    ReopenModel model;
+    CHECK(BuildReopenModel(reopenModelSnapshot(),open,current,model));
+    CHECK(!model.desktops[1].missing && model.desktops[1].name==L"Work");
+    CHECK(model.desktops[0].missing && model.desktops[0].name==L"Home");
+    // With no current list, nothing is called missing.
+    ReopenModel unknown;
+    CHECK(BuildReopenModel(reopenModelSnapshot(),open,std::vector<DeskRec>(),unknown));
+    CHECK(!unknown.desktops[0].missing && !unknown.desktops[1].missing);
+
+    CHECK(ReopenWindowFullyOpen(model,2) && ReopenWindowFullyOpen(model,1));
+    CHECK(!ReopenWindowFullyOpen(model,0));
+    CHECK(ReopenDesktopFullyOpen(model,0));              // Home: only window C
+    CHECK(!ReopenDesktopFullyOpen(model,1));             // Work: A is not open
+
+    // Hide-open tabs: window A's tabs stay, C's and B's vanish from the view.
+    model.hideOpenTabs=true;
+    CHECK(ReopenVisibleTabs(model).size()==3);
+    for(size_t i=0;i<ReopenVisibleTabs(model).size();++i)
+        CHECK(ReopenVisibleTabs(model)[i].first==0);
+    model.hideOpenTabs=false;
+    // Hide-open windows: B and C disappear, A remains.
+    model.hideOpenWindows=true;
+    CHECK(ReopenVisibleWindows(model).size()==1 && ReopenVisibleWindows(model)[0]==0);
+    model.hideOpenWindows=false;
+    // Hide-open desktops: Home (all open) goes, Work stays with both windows.
+    model.hideOpenDesktops=true;
+    CHECK(ReopenVisibleDesktops(model).size()==1 && ReopenVisibleDesktops(model)[0]==1);
+    CHECK(ReopenVisibleWindows(model).size()==2);
+    // Still view-only: the selection is untouched by any of the switches.
+    CHECK(ReopenSummarize(model).windows==1 && ReopenSummarize(model).tabs==3);
+    // A window with no tabs is never "open".
+    ReopenModel empty;
+    SessionSnapshot bare=reopenModelSnapshot();
+    bare.windows[0].tabs.clear();
+    CHECK(BuildReopenModel(bare,open,current,empty));
+    CHECK(!ReopenWindowFullyOpen(empty,0));
+}
+
 int main(){
     test_picker_trace_launch_requires_exact_opt_in_flag();
     test_picker_trace_launch_preserves_cli_routing();
@@ -30640,6 +30888,13 @@ int main(){
     test_split_window_is_recorded_but_never_moved();
     test_merged_window_is_recorded_but_never_moved();
     test_ordinary_tab_loss_still_restores();
+    test_reopen_model_starts_fully_selected_except_open_tabs();
+    test_reopen_model_cascades_downward_only();
+    test_reopen_model_all_switches_respect_open_tabs_and_filter();
+    test_reopen_jobs_follow_the_selection_and_keep_desktops();
+    test_reopen_jobs_skip_unreplayable_urls();
+    test_reopen_text_filters_narrow_the_view_only();
+    test_reopen_hide_open_and_missing_desktops();
     printf("%d/%d passed\n", g_total - g_fail, g_total);
     return g_fail ? 1 : 0;
 }
