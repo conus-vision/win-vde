@@ -6493,6 +6493,7 @@ static HINSTANCE g_inst=nullptr;
 static HFONT g_uiFont=nullptr;
 static const UINT WM_TRAY=WM_APP+1;
 static NOTIFYICONDATAW g_nid={0};
+static UINT g_taskbarCreatedMessage=0;
 static const size_t MAX_OWNED_APP_ICONS=7;
 static std::vector<HICON> g_ownedIcons;
 static FixedIconRetirement<MAX_OWNED_APP_ICONS>
@@ -10928,6 +10929,15 @@ static void TrayAdd(HWND hwnd){
     g_nid.hIcon=LoadAppIcon(GetSystemMetrics(SM_CXSMICON),GetSystemMetrics(SM_CYSMICON));
     wcsncpy_s(g_nid.szTip, g_degraded ? L"Virtual Desktop Extension (compatibility issue - see About)" : APP_NAME, _TRUNCATE);
     Shell_NotifyIconW(NIM_ADD,&g_nid);
+    // Explorer broadcasts "TaskbarCreated" whenever it (re)starts; a tray
+    // icon that is not added again then is gone for the rest of the session.
+    if(!g_taskbarCreatedMessage){
+        g_taskbarCreatedMessage=RegisterWindowMessageW(L"TaskbarCreated");
+        // An elevated VDE must still hear the broadcast from the shell.
+        if(g_taskbarCreatedMessage)
+            ChangeWindowMessageFilterEx(hwnd,g_taskbarCreatedMessage,
+                                        MSGFLT_ALLOW,nullptr);
+    }
 }
 static void TrayRemove(){ Shell_NotifyIconW(NIM_DELETE,&g_nid); }
 static void Balloon(const std::wstring& text){
@@ -13006,6 +13016,10 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
            g_pickerTabSearchCache,g_picker.modelGeneration,
            g_picker.searchText))
         SchedulePickerTabSearchRetry();
+    if(g_taskbarCreatedMessage!=0 && msg==g_taskbarCreatedMessage){
+        Shell_NotifyIconW(NIM_ADD,&g_nid);
+        return 0;
+    }
     switch(msg){
     case WM_HOTKEY: ShowPicker(CapturePickerTarget()); return 0;
     case WM_CLOSE:
