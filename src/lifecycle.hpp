@@ -2436,6 +2436,20 @@ inline FinalSnapshotResult CommitFinalSnapshotRecords(
             continue;
         }
 
+        // A record some window claims explicitly (bound, pending or
+        // provisional) is never another window's title match, whatever order
+        // the windows come in.
+        std::set<std::string> claimedIds;
+        for(const FinalWindowObservation& window : appObservation.windows){
+            const std::string* claims[]={&window.boundRecordId,
+                &window.pendingRecordId,&window.provisionalRecordId};
+            for(const std::string* claim : claims){
+                std::string canonical;
+                if(!claim->empty() &&
+                   final_snapshot_detail::CanonicalId(*claim,canonical))
+                    claimedIds.insert(canonical);
+            }
+        }
         std::set<std::string> seenIds;
         for(const FinalWindowObservation& window : appObservation.windows){
             if(window.observed.app!=appObservation.app) return result;
@@ -2470,7 +2484,8 @@ inline FinalSnapshotResult CommitFinalSnapshotRecords(
                     std::string canonical;
                     if(!final_snapshot_detail::CanonicalId(
                             candidate.recordId,canonical) ||
-                       seenIds.count(canonical)) continue;
+                       seenIds.count(canonical) ||
+                       claimedIds.count(canonical)) continue;
                     only=canonical;
                     ++matches;
                 }

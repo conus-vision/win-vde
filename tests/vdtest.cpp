@@ -20597,6 +20597,32 @@ static void test_final_snapshot_failed_reappeared_keeps_destination_and_adds_sib
     CHECK(GuidEq(result.records[1].desktop,sibling.observed.desktop));
 }
 
+// A record that one window claims explicitly must not be taken by another
+// window's title fallback, whatever order the windows come in.
+static void test_final_snapshot_title_fallback_skips_records_claimed_later(){
+    const UnixSeconds now=1700003000;
+    const GUID desktop=G(L"{231A0000-0000-0000-0000-000000000002}");
+    LayoutWin saved=ReconcileTestRecord(
+        "{00000000-0000-0000-0000-000000009231}","firefox","New Tab","a.test",1,
+        desktop,now-100);
+    FinalWindowObservation unbound=FinalObserved(
+        "firefox","New Tab",desktop,"{00000000-0000-0000-0000-000000009232}");
+    FinalWindowObservation bound=FinalObserved("firefox","New Tab",desktop,"");
+    bound.boundRecordId=saved.recordId;
+    FinalAppObservation app;
+    app.app="firefox";
+    app.quality=FinalProfileQuality::Complete;
+    app.windows={unbound,bound};          // the unbound window comes first
+    FinalSnapshotResult result=CommitFinalSnapshotRecords({saved},{app},now);
+    CHECK(result.valid && result.records.size()==2);
+    bool keptBound=false,recordedUnbound=false;
+    for(const LayoutWin& record : result.records){
+        if(record.recordId==saved.recordId) keptBound=true;
+        if(record.recordId==unbound.provisionalRecordId) recordedUnbound=true;
+    }
+    CHECK(keptBound && recordedUnbound);
+}
+
 static void test_final_snapshot_zero_live_marks_and_prunes_from_last_seen(){
     const UnixSeconds now=1700003000;
     LayoutWin recent=ReconcileTestRecord(
@@ -30782,6 +30808,7 @@ int main(){
     test_final_snapshot_captures_immediately_opened_new_window();
     test_final_snapshot_marks_unbound_additions_provisional_independent_of_title();
     test_final_snapshot_failed_reappeared_keeps_destination_and_adds_sibling();
+    test_final_snapshot_title_fallback_skips_records_claimed_later();
     test_final_snapshot_zero_live_marks_and_prunes_from_last_seen();
     test_final_snapshot_incomplete_profile_is_byte_preserved();
     test_final_snapshot_failed_desktop_lookup_preserves_saved_guid();
