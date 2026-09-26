@@ -6421,10 +6421,12 @@ static int CliRun(const std::wstring& cmd){
         return 0;
     }
     printf("Usage: vde <save|restore|restore-auto|status|list|checkpoints>\n");
-    printf("  checkpoints   list the saved browser-session checkpoints\n");
+    printf("  list          list virtual desktops\n");
+    printf("  status        desktops + live browser windows and their fingerprints\n");
     printf("  save          save current window layout to layout-manual.txt\n");
     printf("  restore       restore from layout-manual.txt\n");
     printf("  restore-auto  restore from the last auto-saved layout\n");
+    printf("  checkpoints   list the saved browser-session checkpoints\n");
     printf("  (no args) -> run resident in tray; Ctrl+Alt+D opens the desktop picker\n");
     return 2;
 }
