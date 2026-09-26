@@ -6574,6 +6574,10 @@ static void InitMetrics(){
         g_appIconOwnershipReady=true;
     } catch(...) { g_appIconOwnershipReady=false; }
     HDC dc=GetDC(nullptr); g_dpi=GetDeviceCaps(dc,LOGPIXELSX); ReleaseDC(nullptr,dc);
+    // In limited mode the compatibility notice is created before RunGui, so
+    // its SysLink controls and dialog font must already exist here.
+    INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_HOTKEY_CLASS|ICC_STANDARD_CLASSES|ICC_LINK_CLASS|ICC_BAR_CLASSES|ICC_TAB_CLASSES|ICC_LISTVIEW_CLASSES|ICC_PROGRESS_CLASS}; InitCommonControlsEx(&icc);
+    if(!g_uiFont) g_uiFont=CreateFontW(-S(12),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     TILE_W=S(240); TILE_H=S(150); PAD=S(16); HEADER=S(38); SEARCH_H=S(58);
     FOOTER_H=S(34); FOOTER_MIN_W=S(720); FOOTER_LINK_H=S(22);
     if(g_fPT)DeleteObject(g_fPT); if(g_fPN)DeleteObject(g_fPN); if(g_fPI)DeleteObject(g_fPI); if(g_fPX)DeleteObject(g_fPX);
@@ -13770,8 +13774,6 @@ static int RunGui(HINSTANCE hInst){
     ScopedUiShutdown shutdown;
     int runResult=0;
     g_inst=hInst;
-    INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_HOTKEY_CLASS|ICC_STANDARD_CLASSES|ICC_LINK_CLASS|ICC_BAR_CLASSES|ICC_TAB_CLASSES|ICC_LISTVIEW_CLASSES|ICC_PROGRESS_CLASS}; InitCommonControlsEx(&icc);
-    g_uiFont=CreateFontW(-S(12),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     LoadSettings();
 
     WNDCLASSEXW wc={0}; wc.cbSize=sizeof(wc); wc.lpfnWndProc=WndProc; wc.hInstance=hInst; wc.lpszClassName=L"VdeWindow";
