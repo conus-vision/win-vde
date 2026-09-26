@@ -1861,12 +1861,16 @@ static void RememberSessionTabsFromAssociation(
             LiveTabCapture capture;
             capture.app=app;
             capture.activeTitle=session->activeTitle;
-            capture.activeTab=session->activeTab;
+            // Oversized URLs are skipped, so the active tab's index is taken
+            // in the captured list, not in the session's.
+            capture.activeTab=-1;
             const size_t limit=(std::min)(session->tabs.size(),
                                           MAX_SNAPSHOT_TABS_PER_WINDOW);
             capture.tabs.reserve(limit);
             for(size_t tab=0;tab<limit;++tab){
                 if(session->tabs[tab].url.size()>MAX_SNAPSHOT_URL_BYTES) continue;
+                if(session->activeTab>=0 && (size_t)session->activeTab==tab)
+                    capture.activeTab=static_cast<int>(capture.tabs.size());
                 SnapTab converted;
                 converted.url=session->tabs[tab].url;
                 converted.title=session->tabs[tab].title.size()>MAX_SNAPSHOT_TITLE_BYTES
