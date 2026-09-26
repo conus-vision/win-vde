@@ -12317,6 +12317,21 @@ static void test_snss_accepts_negative_selection_indices(){
     CHECK(ParseChromiumSNSS(closed,w));
     CHECK(w.size()==1 && w[0].counts.count("github.com")==1);
 }
+// Chrome stores page titles as UTF-16 without validating them: an unpaired
+// surrogate becomes U+FFFD instead of making the whole session unreadable.
+static void test_snss_unpaired_surrogate_title_becomes_replacement(){
+    std::string f="SNSS"; wInt(f,3);
+    snssRaw(f,0,10,1);
+    std::string p; pkInt(p,1); pkInt(p,0); pkStr(p,"https://example.com/");
+    pkInt(p,2);                                   // two UTF-16 units
+    p.push_back((char)0x3d); p.push_back((char)0xd8);   // lone high surrogate
+    p.push_back('x'); p.push_back(0);
+    while(p.size()%4) p.push_back(0);
+    snssPickle(f,6,p);
+    std::vector<WinFp> w;
+    CHECK(ParseChromiumSNSS(f,w));
+    CHECK(w.size()==1 && w[0].activeTitle=="\xef\xbf\xbd" "x");
+}
 static void test_snss_garbage(){ std::vector<WinFp> w(1); CHECK(!ParseChromiumSNSS("not an snss file....",w)); CHECK(w.empty()); }
 
 static void test_snss_truncated_frame_returns_no_partial_windows(){
@@ -12362,7 +12377,6 @@ static void test_firefox_json_rejects_malformed_unicode_numbers_and_controls(){
     CHECK(value.t==JValue::OBJ && value.find("ok") && value.find("ok")->b);
     const char* invalid[]={
         "\"unterminated", "\"raw\nnewline\"", "\"\\x\"", "\"\\u12\"",
-        "\"\\ud800\"", "\"\\ud800\\u0041\"", "\"\\udc00\"",
         "01", "-01", "1.", ".1", "1e", "1e+", "+1", "--1", "1e309",
         "NaN", "Infinity"
     };
@@ -12373,6 +12387,13 @@ static void test_firefox_json_rejects_malformed_unicode_numbers_and_controls(){
     }
     CHECK(JParser("\"\\ud83d\\ude00\"").parse(value));
     CHECK(value.t==JValue::STR && value.str=="\xf0\x9f\x98\x80");
+    // An unpaired surrogate escape is valid JSON grammar and is what
+    // JSON.stringify writes for a title cut inside an emoji: it decodes to
+    // U+FFFD instead of rejecting the whole session.
+    CHECK(JParser("\"\\ud800\"").parse(value) && value.str=="\xef\xbf\xbd");
+    CHECK(JParser("\"\\ud800\\u0041\"").parse(value) && value.str=="\xef\xbf\xbd" "A");
+    CHECK(JParser("\"\\udc00x\"").parse(value) && value.str=="\xef\xbf\xbd" "x");
+    CHECK(!JParser("\"\\ud800\\u00zz\"").parse(value));   // a broken escape still fails
     CHECK(JParser("[-0,0,1.25,-2E-3,1e308]").parse(value));
     const std::string malformedUtf8[]={
         std::string("\"\xc0\x80\"",4), std::string("\"\x80\"",3),
@@ -30840,6 +30861,7 @@ int main(){
     test_dirty_flush_clock_ceiling_never_spins();
     test_snss_parse();
     test_snss_accepts_negative_selection_indices();
+    test_snss_unpaired_surrogate_title_becomes_replacement();
     test_snss_garbage();
     test_snss_truncated_frame_returns_no_partial_windows();
     test_mozlz4_rejects_huge_declared_output();
