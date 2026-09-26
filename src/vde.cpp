@@ -13079,10 +13079,14 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         return 0;
     case WM_PICKER_SEARCH_RETRY:
         if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
+        // A controlled transition keeps the posted retry for
+        // FinalizePickerRuntimeTransition.  A pointer gesture can end without
+        // a transition, so the retry is leased now and, while the button is
+        // still down, left pending for the idle kick to post again.
         if(AcquirePickerTabSearchRetryPostLeaseWhenIdle(
-                g_pickerTabSearchCache,
-                PickerInteractionBusy(g_picker,g_pickerGesture),
-                g_picker.modelGeneration,g_picker.searchText))
+                g_pickerTabSearchCache,g_picker.controlledTransition(),
+                g_picker.modelGeneration,g_picker.searchText) &&
+           !PickerInteractionBusy(g_picker,g_pickerGesture))
             EnsureTabSearch();
         return 0;
     case WM_PAINT:{
