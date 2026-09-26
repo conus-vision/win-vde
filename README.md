@@ -149,9 +149,10 @@ you save when you choose.
 
 ### Desktop picker
 
-The global hotkey (Ctrl+Alt+D by default) opens a grid of your desktops on the
-primary monitor. It lists ordinary application windows as well as the tracked
-browsers. Each row shows the application icon, and the exact active window is
+The global hotkey, Ctrl+Alt+D by default, opens a grid of your desktops on the
+primary monitor. You can pick another hotkey in Settings as long as it includes
+Ctrl or Alt. The picker lists ordinary application windows as well as the
+tracked browsers. Each row shows the application icon, and the exact active window is
 highlighted. Hovering a row highlights its whole clickable area, icon included,
 while the active-window highlight stays stronger. A tooltip shows any name that
 is cut off.
@@ -297,8 +298,9 @@ the layout come back after a reboot without you doing anything.
   applications, but it creates no restore records for them.
 - If a saved virtual desktop has been deleted, the window goes to the desktop
   that now sits at that position, so it doesn't stay stranded.
-- If the Windows shell (`explorer.exe`) restarts, win-vde reconnects to the
-  virtual-desktop services on its own, so moves keep working.
+- If the Windows shell (`explorer.exe`) restarts, win-vde puts its tray icon
+  back and reconnects to the virtual-desktop services on its own, so moves
+  keep working.
 - win-vde recognizes dragging a tab out of a window, or merging two windows,
   for what it is. The layout follows the windows instead of sending one half to
   the desktop where the original window was remembered.
