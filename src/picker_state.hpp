@@ -1246,6 +1246,7 @@ struct PickerTransition {
     int rollbackPopupAttempts=0;
     int rollbackSwitchAttempts=0;
     int focusAttempts=0;
+    int refreshAttempts=0;
     bool targetMayHaveMoved=false;
     bool popupMayHaveMoved=false;
     bool switchMayHaveChanged=false;
@@ -1313,6 +1314,7 @@ struct PickerTransition {
         std::swap(rollbackPopupAttempts,other.rollbackPopupAttempts);
         std::swap(rollbackSwitchAttempts,other.rollbackSwitchAttempts);
         std::swap(focusAttempts,other.focusAttempts);
+        std::swap(refreshAttempts,other.refreshAttempts);
         std::swap(targetMayHaveMoved,other.targetMayHaveMoved);
         std::swap(popupMayHaveMoved,other.popupMayHaveMoved);
         std::swap(switchMayHaveChanged,other.switchMayHaveChanged);
@@ -3069,6 +3071,7 @@ inline PickerEffect AdvancePickerTransition(
         transition.rollbackPopupAttempts=0;
         transition.rollbackSwitchAttempts=0;
         transition.focusAttempts=0;
+        transition.refreshAttempts=0;
         transition.targetMayHaveMoved=false;
         transition.popupMayHaveMoved=false;
         transition.switchMayHaveChanged=false;
@@ -3638,10 +3641,19 @@ inline PickerEffect AdvancePickerTransition(
             if(transition.mode==PickerTransitionMode::RowMoveOnly){
                 if(!observation.apiAccepted){
                     transition.failed=true;
-                    PickerAppendDiagnostic(
-                        transition,
-                        L"The picker model could not be refreshed.");
-                    return PickerStartRefresh(state);
+                    if(transition.refreshAttempts==0)
+                        PickerAppendDiagnostic(
+                            transition,
+                            L"The picker model could not be refreshed.");
+                    // A few retries, then end the move: a disconnected desktop
+                    // service can fail every refresh, and an unbounded retry
+                    // floods the message queue with posted work.
+                    if(transition.refreshAttempts<4){
+                        ++transition.refreshAttempts;
+                        return PickerStartRefresh(state);
+                    }
+                    PickerAcknowledgeTerminal(transition);
+                    return PickerNoEffect();
                 }
                 PickerAcknowledgeTerminal(transition);
                 return PickerNoEffect();

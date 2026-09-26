@@ -3994,6 +3994,32 @@ static void test_picker_row_move_cancel_after_exhausted_rollback_cannot_strand()
           std::wstring::npos);
 }
 
+// A row move whose model refresh keeps failing ends after a few retries
+// instead of reposting refresh work forever.
+static void test_picker_row_move_failed_refresh_retries_are_bounded(){
+    PickerState state=PickerRowMoveFixture(615);
+    state.transition.phase=PickerPhase::RefreshModel;
+    state.transition.pendingEffect=PickerEffectKind::Refresh;
+    state.transition.effectSerial=70;
+    PickerEffect effect;
+    effect.kind=PickerEffectKind::Refresh;
+    effect.generation=615;
+    effect.effectSerial=70;
+    int retries=0;
+    for(int round=0;round<10 && effect.kind==PickerEffectKind::Refresh;++round){
+        PickerObservation failed=PickerObservationFor(
+            effect,PickerEvent::EffectCompleted);
+        failed.apiAccepted=false;
+        effect=AdvancePickerTransition(state,failed);
+        if(effect.kind==PickerEffectKind::Refresh) ++retries;
+    }
+    CHECK(effect.kind==PickerEffectKind::None);
+    CHECK(state.transition.terminalAcknowledged);
+    CHECK(retries==4);
+    CHECK(state.transition.diagnostic==
+          L"The picker model could not be refreshed.");
+}
+
 static bool PickerRowOrderHasForbiddenEffect(
         const std::vector<PickerEffectKind>& order){
     for(PickerEffectKind kind : order)
@@ -30750,6 +30776,7 @@ int main(){
     test_picker_cancel_during_exhausted_rollback_cannot_strand();
     test_picker_row_move_second_cancel_keeps_rollback_effect();
     test_picker_row_move_cancel_after_exhausted_rollback_cannot_strand();
+    test_picker_row_move_failed_refresh_retries_are_bounded();
     test_picker_failed_current_rollback_suppresses_invisible_focus();
     test_picker_effect_serial_exhaustion_becomes_terminal_not_stranded();
     test_picker_unknown_identity_never_allows_future_target_api();
