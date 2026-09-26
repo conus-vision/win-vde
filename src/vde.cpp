@@ -1733,8 +1733,10 @@ struct LiveTabCapture {
 static std::map<std::string,LiveTabCapture> g_tabsByRecord;
 static uint64_t g_lastSavedSnapshotMs=0;
 // One shutdown must consume exactly one history slot: Windows delivers
-// WM_QUERYENDSESSION and then WM_ENDSESSION, and both checkpoint.
-static bool g_exitSnapshotWritten=false;
+// WM_QUERYENDSESSION and then WM_ENDSESSION, and both checkpoint.  The flag
+// records the rotation itself, so a retry after a failed write overwrites
+// slot 1 instead of pushing (and deleting) the history a second time.
+static bool g_exitSnapshotRotated=false;
 
 static std::wstring SnapshotDir(){
     std::wstring dir=DataDir()+L"\\sessions";
@@ -1946,10 +1948,11 @@ static bool CaptureSessionSnapshot(SnapKind kind) noexcept {
         if(snapshot.windows.empty()) return false;
         const std::string data=SerializeSessionSnapshot(snapshot);
         if(kind==SnapKind::Exit){
-            if(!g_exitSnapshotWritten) RotateExitSnapshots();
-            if(!WriteReplaceFileAtomic(SnapshotPath(1),data)) return false;
-            g_exitSnapshotWritten=true;
-            return true;
+            if(!g_exitSnapshotRotated){
+                RotateExitSnapshots();
+                g_exitSnapshotRotated=true;
+            }
+            return WriteReplaceFileAtomic(SnapshotPath(1),data);
         }
         g_lastSavedSnapshotMs=MonotonicNowMs();
         return WriteReplaceFileAtomic(SnapshotPath(0),data);
