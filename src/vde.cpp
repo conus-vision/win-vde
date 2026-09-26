@@ -11717,6 +11717,11 @@ struct ReopenRuntime {
     size_t moved=0;
     size_t moveFailed=0;
     size_t skippedTabs=0;
+    // What really reached the browser: the URLs of the current job's launches
+    // that went out, and the finished jobs whose window appeared.  The dialog
+    // greys out exactly these, never a tab whose launch failed or timed out.
+    std::vector<std::string> launchedUrls;
+    std::vector<ReopenWindowJob> openedJobs;
 };
 
 static ReopenRuntime g_reopen;
@@ -11758,11 +11763,7 @@ static void FinishReopen() noexcept {
     const size_t total=g_reopen.jobs.size();
     const bool cancelled=g_reopen.cancelRequested && g_reopen.jobIndex<total;
     std::vector<ReopenWindowJob> done;
-    try {
-        done.assign(g_reopen.jobs.begin(),
-                    g_reopen.jobs.begin()+
-                    (std::min)(g_reopen.jobIndex,g_reopen.jobs.size()));
-    } catch(...) { done.clear(); }
+    done.swap(g_reopen.openedJobs);
     g_reopen=ReopenRuntime();
     wchar_t message[240]={0};
     swprintf_s(message,
@@ -11775,6 +11776,16 @@ static void FinishReopen() noexcept {
 }
 
 static void ReopenScheduleNextJob(uint64_t nowMs) noexcept {
+    if(g_reopen.haveTarget && g_reopen.jobIndex<g_reopen.jobs.size() &&
+       !g_reopen.launchedUrls.empty()){
+        try {
+            ReopenWindowJob opened=g_reopen.jobs[g_reopen.jobIndex];
+            opened.urls.swap(g_reopen.launchedUrls);
+            opened.launches.clear();
+            g_reopen.openedJobs.push_back(std::move(opened));
+        } catch(...) {}
+    }
+    g_reopen.launchedUrls.clear();
     ++g_reopen.jobIndex;
     g_reopen.launchIndex=0;
     g_reopen.haveTarget=false;
@@ -11896,6 +11907,8 @@ static void AdvanceReopen() noexcept {
             ReopenScheduleNextJob(nowMs);
             return;
         }
+        try { g_reopen.launchedUrls=job.launches[0].urls; }
+        catch(...) { g_reopen.launchedUrls.clear(); }
         g_reopen.launchIndex=1;
         g_reopen.phase=ReopenPhase::AwaitWindow;
         g_reopen.phaseSinceMs=nowMs;
@@ -11945,9 +11958,14 @@ static void AdvanceReopen() noexcept {
             g_reopen.nextStepMs=nowMs;
             return;
         }
-        LaunchReopenCommand(exe->second,
-            BuildReopenCommandLine(job.app,exe->second,
-                                   job.launches[g_reopen.launchIndex]));
+        const ReopenLaunch& launch=job.launches[g_reopen.launchIndex];
+        if(LaunchReopenCommand(exe->second,
+               BuildReopenCommandLine(job.app,exe->second,launch))){
+            try {
+                g_reopen.launchedUrls.insert(g_reopen.launchedUrls.end(),
+                                             launch.urls.begin(),launch.urls.end());
+            } catch(...) {}
+        }
         ++g_reopen.launchIndex;
         if(g_reopen.launchIndex>=job.launches.size())
             g_reopen.phase=ReopenPhase::Move;
