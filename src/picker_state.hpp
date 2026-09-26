@@ -2628,8 +2628,12 @@ inline PickerEffect PickerNoEffect() noexcept {
 inline bool DiscardPickerUnissuedEffectForCancel(
         PickerEffect& scheduled,bool& hasScheduled,
         const PickerTransition& transition) noexcept {
+    // Once a cancel is being handled, the scheduled effect belongs to that
+    // handling (e.g. a row move's rollback): the reducer ignores repeated
+    // cancels, so discarding it would strand the transition.
     if(!hasScheduled || scheduled.kind==PickerEffectKind::None ||
-       transition.dismissed || scheduled.kind==PickerEffectKind::Hide ||
+       transition.dismissed || transition.cancelRequested ||
+       scheduled.kind==PickerEffectKind::Hide ||
        scheduled.generation!=transition.generation ||
        scheduled.effectSerial!=transition.effectSerial ||
        scheduled.kind!=transition.pendingEffect ||
@@ -2914,8 +2918,13 @@ inline PickerEffect PickerBeginRollback(PickerState& state,
                 L"The target identity cannot be safely rolled back.");
             return PickerStartRefresh(state);
         }
-        if(transition.targetMayHaveMoved)
-            return PickerIssueTarget(state,true);
+        if(transition.targetMayHaveMoved){
+            if(transition.rollbackTargetAttempts<4)
+                return PickerIssueTarget(state,true);
+            PickerAppendDiagnostic(
+                transition,L"The target remains displaced after rollback.");
+            return PickerContinueRollbackAfterTarget(state);
+        }
         transition.phase=PickerPhase::RollbackTargetVerify;
         return EmitPickerEffect(state,PickerEffectKind::ReadTarget);
     }

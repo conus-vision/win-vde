@@ -3912,6 +3912,84 @@ static PickerEffect PickerAdvanceRowMoveToSave(PickerState& state){
     return effect;
 }
 
+// Mirrors RequestPickerCancellation: the scheduled-but-unissued effect is
+// discarded before the reducer sees the cancel.
+static void PickerRequestCancelLikeUi(PickerState& state,PickerEffect& scheduled,
+                                      bool& hasScheduled){
+    const bool unissued=DiscardPickerUnissuedEffectForCancel(
+        scheduled,hasScheduled,state.transition);
+    PickerObservation cancel;
+    cancel.event=PickerEvent::CancelRequested;
+    cancel.generation=state.transition.generation;
+    cancel.unissuedEffectCancelled=unissued;
+    const PickerEffect next=AdvancePickerTransition(state,cancel);
+    if(next.kind!=PickerEffectKind::None){
+        scheduled=next;
+        hasScheduled=true;
+    }
+}
+
+// A second Escape during a row move's rollback must not throw away the
+// rollback's own effect, or the transition waits forever for its ack.
+static void test_picker_row_move_second_cancel_keeps_rollback_effect(){
+    PickerState state=PickerRowMoveFixture(611);
+    PickerObservation begin;
+    begin.event=PickerEvent::Begin;
+    begin.generation=611;
+    PickerEffect effect=AdvancePickerTransition(state,begin);
+    CHECK(effect.kind==PickerEffectKind::MoveTarget);
+    PickerObservation moved=PickerObservationFor(
+        effect,PickerEvent::ApiCompleted);
+    moved.identity=PickerIdentityValidity::Match;
+    moved.apiInvoked=true;
+    moved.apiAccepted=true;
+    PickerEffect scheduled=AdvancePickerTransition(state,moved);
+    CHECK(scheduled.kind==PickerEffectKind::ReadTarget);
+    bool hasScheduled=true;
+
+    PickerRequestCancelLikeUi(state,scheduled,hasScheduled);     // Escape #1
+    CHECK(hasScheduled && scheduled.kind==PickerEffectKind::MoveTarget);
+    PickerObservation back=PickerObservationFor(
+        scheduled,PickerEvent::ApiCompleted);
+    back.identity=PickerIdentityValidity::Match;
+    back.apiInvoked=true;
+    back.apiAccepted=true;
+    scheduled=AdvancePickerTransition(state,back);
+    hasScheduled=scheduled.kind!=PickerEffectKind::None;
+    CHECK(scheduled.kind==PickerEffectKind::ReadTarget);
+
+    PickerRequestCancelLikeUi(state,scheduled,hasScheduled);     // Escape #2
+    CHECK(hasScheduled && scheduled.kind==PickerEffectKind::ReadTarget);
+    PickerObservation read=PickerObservationFor(
+        scheduled,PickerEvent::ReadbackCompleted);
+    read.identity=PickerIdentityValidity::Match;
+    read.targetRead=PickerReadValidity::Valid;
+    read.actualTargetDesktop=state.transition.targetOrigin;
+    CHECK(AdvancePickerTransition(state,read).kind==PickerEffectKind::Refresh);
+}
+
+// Cancelling a row move whose rollback retries are already used up must end
+// the rollback instead of silently issuing nothing.
+static void test_picker_row_move_cancel_after_exhausted_rollback_cannot_strand(){
+    PickerState state=PickerRowMoveFixture(613);
+    state.transition.phase=PickerPhase::RollbackTargetVerify;
+    state.transition.failed=true;
+    state.transition.rollbackTargetAttempts=4;
+    state.transition.targetMayHaveMoved=true;
+    state.transition.rollbackVerificationRequired=true;
+    state.transition.pendingEffect=PickerEffectKind::ReadTarget;
+    state.transition.effectSerial=60;
+    PickerEffect scheduled;
+    scheduled.kind=PickerEffectKind::ReadTarget;
+    scheduled.generation=613;
+    scheduled.effectSerial=60;
+    bool hasScheduled=true;
+    PickerRequestCancelLikeUi(state,scheduled,hasScheduled);
+    CHECK(hasScheduled && scheduled.kind==PickerEffectKind::Refresh);
+    CHECK(state.transition.diagnostic.find(L"remains displaced")!=
+          std::wstring::npos);
+}
+
 static bool PickerRowOrderHasForbiddenEffect(
         const std::vector<PickerEffectKind>& order){
     for(PickerEffectKind kind : order)
@@ -30569,6 +30647,8 @@ int main(){
     test_picker_popup_recovery_after_fourth_switch_saves_without_fifth();
     test_picker_popup_repair_rechecks_current_before_save();
     test_picker_cancel_during_exhausted_rollback_cannot_strand();
+    test_picker_row_move_second_cancel_keeps_rollback_effect();
+    test_picker_row_move_cancel_after_exhausted_rollback_cannot_strand();
     test_picker_failed_current_rollback_suppresses_invisible_focus();
     test_picker_effect_serial_exhaustion_becomes_terminal_not_stranded();
     test_picker_unknown_identity_never_allows_future_target_api();
