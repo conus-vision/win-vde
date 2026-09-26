@@ -304,30 +304,31 @@ inline bool BuildReconcileLivePreparation(
         }
         std::vector<char> taken(sessions.size(),0);
 
-        for(size_t i=0;i<liveCount && !request.boundFingerprints.empty();++i){
-            const BoundLiveFingerprint& bound=request.boundFingerprints[i];
-            if(!bound.known) continue;
-            size_t matches=0;
-            size_t chosen=0;
-            if(bound.urlSignature!=0){
+        // Every bound window claims its exact URL-set match first; only then
+        // may the weaker domain-count match take what is left.  In a single
+        // pass, an earlier window whose pages changed could claim a later
+        // window's exact match through counts alone.
+        for(int pass=0;pass<2 && !request.boundFingerprints.empty();++pass){
+            for(size_t i=0;i<liveCount;++i){
+                const BoundLiveFingerprint& bound=request.boundFingerprints[i];
+                if(!bound.known || built.sessionIndexByFast[i]>=0) continue;
+                if(pass==0 ? bound.urlSignature==0 : bound.counts.empty())
+                    continue;
+                size_t matches=0;
+                size_t chosen=0;
                 for(size_t j=0;j<sessions.size();++j){
-                    if(taken[j] || sessionSignatures[j]!=bound.urlSignature) continue;
+                    if(taken[j]) continue;
+                    if(pass==0 ? sessionSignatures[j]!=bound.urlSignature
+                               : (sessions[j].counts!=bound.counts ||
+                                  sessions[j].tabCount!=bound.tabCount))
+                        continue;
                     ++matches;
                     chosen=j;
                 }
+                if(matches!=1) continue;
+                built.sessionIndexByFast[i]=static_cast<int>(chosen);
+                taken[chosen]=1;
             }
-            if(matches!=1 && !bound.counts.empty()){
-                matches=0;
-                for(size_t j=0;j<sessions.size();++j){
-                    if(taken[j] || sessions[j].counts!=bound.counts ||
-                       sessions[j].tabCount!=bound.tabCount) continue;
-                    ++matches;
-                    chosen=j;
-                }
-            }
-            if(matches!=1) continue;
-            built.sessionIndexByFast[i]=static_cast<int>(chosen);
-            taken[chosen]=1;
         }
 
         std::map<std::string,size_t> liveTitleCounts,sessionTitleCounts,sessionByTitle;

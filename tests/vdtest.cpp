@@ -29648,6 +29648,63 @@ static void test_duplicate_titles_are_left_unassociated(){
     CHECK(prepared.live[0].activeTitle=="Docs");        // title-only fingerprint
 }
 
+// A counts-only fallback for one bound window must not claim the session
+// that is another bound window's exact URL-set match, whatever the order.
+static void test_bound_exact_signature_beats_earlier_counts_match(){
+    DeskRec desktop{}; desktop.index=0;
+    desktop.guid=G(L"{7D000000-0000-0000-0000-000000000002}");
+    ReconcileRequest request;
+    request.app="chrome";
+    request.buildLiveFromInputs=true;
+    request.desktops={desktop};
+    request.titleSuffixes={L" - Browser"};
+    request.fastWindows={
+        SnapshotWindow(0x7201,7201,17201,L"B page - Browser",desktop.guid),
+        SnapshotWindow(0x7202,7202,17202,L"A page 2 - Browser",desktop.guid)
+    };
+    std::shared_ptr<std::vector<WinFp> > session(new std::vector<WinFp>());
+    WinFp navigated;             // window 0 went from a.test/1 to b.test
+    navigated.activeTitle="B page";
+    navigated.activeDomain="b.test";
+    navigated.tabCount=1;
+    navigated.counts["b.test"]=1;
+    navigated.tabs.push_back(SessionTab());
+    navigated.tabs.back().url="https://b.test/";
+    WinFp second;                // window 1 still shows a.test/2
+    second.activeTitle="A page 2";
+    second.activeDomain="a.test";
+    second.tabCount=1;
+    second.counts["a.test"]=1;
+    second.tabs.push_back(SessionTab());
+    second.tabs.back().url="https://a.test/2";
+    session->push_back(navigated);
+    session->push_back(second);
+    request.sessionWindows=session;
+
+    // Window 0's record still holds a.test/1: the same domain counts as
+    // window 1's session, but a different URL-set signature.
+    WinFp oldFirst=second;
+    oldFirst.tabs.back().url="https://a.test/1";
+    std::vector<BoundLiveFingerprint> bound(2);
+    bound[0].known=true;
+    bound[0].urlSignature=SessionUrlSignature(oldFirst);
+    bound[0].tabCount=1;
+    bound[0].counts=second.counts;
+    bound[1].known=true;
+    bound[1].urlSignature=SessionUrlSignature(second);
+    bound[1].tabCount=1;
+    bound[1].counts=second.counts;
+    request.boundFingerprints=bound;
+
+    PreparedReconcileLive prepared;
+    CHECK(BuildReconcileLivePreparation(request,prepared));
+    CHECK(prepared.sessionIndexByFast.size()==2);
+    CHECK(prepared.sessionIndexByFast.size()==2 &&
+          prepared.sessionIndexByFast[1]==1);      // exact match kept
+    CHECK(prepared.sessionIndexByFast.size()==2 &&
+          prepared.sessionIndexByFast[0]==0);      // then the unique title
+}
+
 static void test_bound_record_pages_resolve_a_duplicate_title(){
     ReconcileRequest request=DuplicateTitleRequest();
     // The second window already owns a record holding right.test's page.
@@ -30974,6 +31031,7 @@ int main(){
     test_equivalent_windows_are_assigned_without_moving_them();
     test_duplicate_titles_are_left_unassociated();
     test_bound_record_pages_resolve_a_duplicate_title();
+    test_bound_exact_signature_beats_earlier_counts_match();
     test_bound_record_counts_resolve_when_no_signature_is_known();
     test_association_survives_a_moving_unread_counter();
     test_live_preparation_rejects_mismatched_fingerprint_input();
