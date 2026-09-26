@@ -29879,6 +29879,24 @@ static void test_split_window_is_recorded_but_never_moved(){
     // dragged to the remembered desktop on the strength of half a fingerprint.
     CHECK(plan.restores.empty());
     CHECK(plan.newRecords.size()==1 && plan.newRecords[0].liveIndex==1);
+
+    // The commit accepts that plan: the record follows the remainder onto its
+    // live desktop instead of dropping the whole app's update.
+    const std::vector<LayoutWin> committed=CommitAppReconcile(
+        {parent},{remainder,derived},plan,{},now);
+    CHECK(committed.size()==2);
+    bool parentFollowed=false,derivedRecorded=false;
+    for(const LayoutWin& record : committed){
+        if(record.recordId==parent.recordId)
+            parentFollowed=GuidEq(record.desktop,liveDesktop) &&
+                record.tabCount==2 && record.lastSeenUtc==now;
+        else if(plan.newRecords.size()==1 &&
+                record.recordId==plan.newRecords[0].recordId)
+            derivedRecorded=GuidEq(record.desktop,liveDesktop) &&
+                record.tabCount==1;
+    }
+    CHECK(parentFollowed);
+    CHECK(derivedRecorded);
 }
 
 static void test_merged_window_is_recorded_but_never_moved(){
@@ -29911,6 +29929,28 @@ static void test_merged_window_is_recorded_but_never_moved(){
     CHECK(!plan.deferred);
     CHECK(plan.matches.size()==1);
     CHECK(plan.restores.empty());
+
+    // The surviving record follows the merged window; the absorbed one, seen
+    // a minute ago, is marked missing rather than the whole commit being
+    // discarded.
+    LayoutWin recentRight=right;
+    recentRight.lastSeenUtc=now-60;
+    const ReconcilePlan recentPlan=PlanAppReconcile(
+        {left,recentRight},{merged},"firefox",now);
+    CHECK(recentPlan.matches.size()==1 && recentPlan.restores.empty());
+    const std::vector<LayoutWin> committed=CommitAppReconcile(
+        {left,recentRight},{merged},recentPlan,{},now);
+    CHECK(committed.size()==2);
+    bool leftFollowed=false,rightMissing=false;
+    for(const LayoutWin& record : committed){
+        if(record.recordId==left.recordId)
+            leftFollowed=GuidEq(record.desktop,liveDesktop) &&
+                record.tabCount==3 && record.missingSinceUtc==0;
+        else if(record.recordId==right.recordId)
+            rightMissing=record.missingSinceUtc==now-60;
+    }
+    CHECK(leftFollowed);
+    CHECK(rightMissing);
 }
 
 static void test_ordinary_tab_loss_still_restores(){

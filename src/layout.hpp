@@ -114,6 +114,10 @@ struct LayoutMatch {
     // (same pages, same score) are interchangeable, so among equal-scoring
     // assignments the one that moves nothing wins.
     bool inPlace=false;
+    // A tab drag-out or a window merge (LooksLikeWindowSplit/Merge): the
+    // desktops differ, yet no move is requested and the record follows the
+    // live window instead.
+    bool recordOnly=false;
 };
 
 // Larger than any achievable sum of candidate orderings (candidates are capped

@@ -1959,20 +1959,23 @@ inline ReconcilePlan PlanAppReconcile(
     for(const LayoutMatch& assignedMatch : assigned){
         LayoutMatch match=assignedMatch;
         match.savedIndex=originalIndices[assignedMatch.savedIndex];
-        plan.matches.push_back(match);
         matchedSaved[match.savedIndex]=true;
         matchedLive[match.liveIndex]=true;
-        if(!GuidEq(existing[match.savedIndex].desktop,live[match.liveIndex].desktop) &&
-           !LooksLikeWindowSplit(existing[match.savedIndex],live[match.liveIndex],
-                                 live,match.liveIndex) &&
-           !LooksLikeWindowMerge(existing[match.savedIndex],live[match.liveIndex],
-                                 existing,match.savedIndex,nowUtc)){
-            RestoreRequest restore;
-            restore.savedIndex=match.savedIndex;
-            restore.liveIndex=match.liveIndex;
-            restore.destination=existing[match.savedIndex].desktop;
-            plan.restores.push_back(restore);
+        if(!GuidEq(existing[match.savedIndex].desktop,live[match.liveIndex].desktop)){
+            if(LooksLikeWindowSplit(existing[match.savedIndex],live[match.liveIndex],
+                                    live,match.liveIndex) ||
+               LooksLikeWindowMerge(existing[match.savedIndex],live[match.liveIndex],
+                                    existing,match.savedIndex,nowUtc)){
+                match.recordOnly=true;
+            } else {
+                RestoreRequest restore;
+                restore.savedIndex=match.savedIndex;
+                restore.liveIndex=match.liveIndex;
+                restore.destination=existing[match.savedIndex].desktop;
+                plan.restores.push_back(restore);
+            }
         }
+        plan.matches.push_back(match);
     }
 
     if(freshness==ReconcileFreshness::Fresh){
@@ -2219,7 +2222,9 @@ inline std::vector<LayoutWin> CommitAppReconcile(
             !GuidEq(existing[match.savedIndex].desktop,live[match.liveIndex].desktop);
         const bool hasRestore=restorePairs.count(
             std::make_pair(match.savedIndex,match.liveIndex))!=0;
-        if(needsRestore!=hasRestore) return existing;
+        if(match.recordOnly){
+            if(!needsRestore || hasRestore) return existing;
+        } else if(needsRestore!=hasRestore) return existing;
     }
     for(size_t liveIndex : successfulRestoreLiveIndices)
         if(restoreLiveIndices.count(liveIndex)==0) return existing;
@@ -2277,7 +2282,8 @@ inline std::vector<LayoutWin> CommitAppReconcile(
         }
         record.recordId=recordId;
         MarkSeen(record,nowUtc);
-        if(GuidEq(savedDestination,live[match.liveIndex].desktop)){
+        if(match.recordOnly ||
+           GuidEq(savedDestination,live[match.liveIndex].desktop)){
             record.desktop=live[match.liveIndex].desktop;
             record.deskIndex=live[match.liveIndex].deskIndex;
         } else {
