@@ -4364,6 +4364,46 @@ inline int AdvancePickerScroll(int savedScroll,int maxScroll,
     return visible;
 }
 
+// Moves a tile's scroll by whole rows: positive rows scroll up, as a positive
+// wheel delta does.
+inline int AdvancePickerScrollRows(int savedScroll,int maxScroll,
+                                   int rows) noexcept {
+    const int maximum=maxScroll>0?maxScroll:0;
+    const long long next=
+        (long long)PickerVisibleScroll(savedScroll,maximum)-(long long)rows;
+    return next<0 ? 0 : (next>maximum ? maximum : (int)next);
+}
+
+// High-resolution wheels and precision touchpads report fractions of a notch
+// (WHEEL_DELTA), and Windows may coalesce several notches into one message.
+// Deltas add up per tile into whole rows, the remainder carries over, and a
+// change of direction starts counting afresh.
+struct PickerWheelAccumulator {
+    std::string tileKey;
+    int remainder=0;
+};
+
+inline int TakePickerWheelRows(PickerWheelAccumulator& accumulator,
+                               const std::string& tileKey,
+                               int wheelDelta) noexcept {
+    try {
+        if(accumulator.tileKey!=tileKey){
+            accumulator.tileKey=tileKey;
+            accumulator.remainder=0;
+        }
+    } catch(...) {
+        accumulator.remainder=0;
+        return 0;
+    }
+    if((wheelDelta>0 && accumulator.remainder<0) ||
+       (wheelDelta<0 && accumulator.remainder>0))
+        accumulator.remainder=0;
+    const long long sum=(long long)accumulator.remainder+wheelDelta;
+    const long long rows=sum/WHEEL_DELTA;
+    accumulator.remainder=(int)(sum-rows*WHEEL_DELTA);
+    return (int)rows;
+}
+
 inline bool PublishPickerBitmapReplacement(
         PickerBitmapSelection& state,uintptr_t replacement,
         uintptr_t previouslySelected,uintptr_t& release) noexcept {

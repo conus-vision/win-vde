@@ -13438,8 +13438,10 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         for(size_t tileIndex=0;tileIndex<g_tiles.size();++tileIndex){
             const Tile& t=g_tiles[tileIndex];
             if(!PtInRect(&t.rc,pt)) continue;
+            static PickerWheelAccumulator wheel;
+            const int rows=TakePickerWheelRows(wheel,t.guidKey,delta);
             const int maximum=PickerTileMaxScroll(t);
-            const int next=AdvancePickerScroll(t.scroll,maximum,delta);
+            const int next=AdvancePickerScrollRows(t.scroll,maximum,rows);
             if(next!=t.scroll &&
                PublishPickerModelPaintUpdate(
                     [&](std::vector<Tile>& tiles,PickerState& state){

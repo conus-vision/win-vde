@@ -1648,6 +1648,21 @@ static void test_picker_wheel_scroll_saturates_at_integer_bounds(){
     CHECK(AdvancePickerScroll(2,3,-120)==3);
     CHECK(AdvancePickerScroll(3,3,-120)==3);
     CHECK(AdvancePickerScroll(99,3,120)==2);
+    // Partial notches add up; a coalesced message scrolls several rows.
+    PickerWheelAccumulator wheel;
+    CHECK(TakePickerWheelRows(wheel,"a",40)==0);
+    CHECK(TakePickerWheelRows(wheel,"a",40)==0);
+    CHECK(TakePickerWheelRows(wheel,"a",40)==1);
+    CHECK(TakePickerWheelRows(wheel,"a",240)==2);
+    CHECK(TakePickerWheelRows(wheel,"a",-60)==0);      // reversing starts over
+    CHECK(TakePickerWheelRows(wheel,"a",-60)==-1);
+    CHECK(TakePickerWheelRows(wheel,"a",100)==0);
+    CHECK(TakePickerWheelRows(wheel,"b",20)==0);       // another tile starts fresh
+    CHECK(wheel.remainder==20);
+    CHECK(AdvancePickerScrollRows(5,10,2)==3);
+    CHECK(AdvancePickerScrollRows(1,10,3)==0);
+    CHECK(AdvancePickerScrollRows(8,10,-5)==10);
+    CHECK(AdvancePickerScrollRows(99,3,0)==3);
     CHECK(AdvancePickerScroll(99,3,-120)==3);
     CHECK(AdvancePickerScroll(99,3,0)==3);
     CHECK(AdvancePickerScroll(2,3,0)==2);
