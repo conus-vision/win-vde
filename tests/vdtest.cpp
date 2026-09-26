@@ -9073,24 +9073,26 @@ static void test_layout_rejects_duplicate_record_ids(){
     CHECK(!error.empty()); CHECK(d.empty()); CHECK(w.empty());
 }
 
-static void test_layout_enforces_total_record_cap_transactionally(){
+static void test_layout_enforces_record_caps_transactionally(){
+    // Desktop and window lines have separate budgets: a full window budget
+    // still leaves room for the desktop lines written next to it.
     const char* desktop="{231A0000-0000-0000-0000-000000000001}";
     std::string data="# VDE snapshot v4\n";
-    data.reserve(600000);
+    data.reserve(1200000);
     std::string deskLine=std::string("D\t0\t")+desktop+"\t"+b64enc("Desk")+"\n";
     for(int i=0;i<2048;++i) data+=deskLine;
-    for(int i=0;i<2048;++i){
+    for(int i=0;i<(int)MAX_LAYOUT_RECORDS;++i){
         char id[64]; sprintf_s(id,"{00000000-0000-0000-0000-%012d}",i+1);
         data+=V4Line(desktop,id,"1700000000","0");
     }
 
     std::vector<DeskRec> acceptedDesks; std::vector<LayoutWin> acceptedWins; std::string error="stale";
     CHECK(ParseLayout(data,acceptedDesks,acceptedWins,1800000000,&error));
-    CHECK(error.empty()); CHECK(acceptedDesks.size()==2048); CHECK(acceptedWins.size()==2048);
+    CHECK(error.empty()); CHECK(acceptedDesks.size()==2048); CHECK(acceptedWins.size()==MAX_LAYOUT_RECORDS);
     CHECK(acceptedDesks.size()==2048 && acceptedDesks.front().name==L"Desk");
-    CHECK(acceptedWins.size()==2048 && acceptedWins.back().recordId=="{00000000-0000-0000-0000-000000002048}");
+    CHECK(acceptedWins.size()==MAX_LAYOUT_RECORDS && acceptedWins.back().recordId=="{00000000-0000-0000-0000-000000004096}");
 
-    char overflowId[64]; sprintf_s(overflowId,"{00000000-0000-0000-0000-%012d}",2049);
+    char overflowId[64]; sprintf_s(overflowId,"{00000000-0000-0000-0000-%012d}",(int)MAX_LAYOUT_RECORDS+1);
     std::string overflow=data+V4Line(desktop,overflowId,"1700000000","0");
     DeskRec sentinelDesk{}; sentinelDesk.index=77;
     sentinelDesk.guid=G(L"{231A0000-0000-0000-0000-000000000077}"); sentinelDesk.name=L"sentinel desk";
@@ -11396,9 +11398,9 @@ static void test_layout_rejects_embedded_carriage_returns_transactionally(){
     }
 }
 
-static void test_checked_snapshot_enforces_combined_record_cap(){
+static void test_checked_snapshot_enforces_separate_record_caps(){
     DeskRec desk{}; desk.index=0; desk.guid=G(L"{231A0000-0000-0000-0000-000000000001}"); desk.name=L"Desk";
-    std::vector<DeskRec> acceptedDesks(MAX_LAYOUT_RECORDS-1,desk);
+    std::vector<DeskRec> acceptedDesks(MAX_LAYOUT_RECORDS,desk);
     std::vector<LayoutWin> acceptedWins={StrictV4Record()};
     std::string output="sentinel", error="stale";
     CHECK(BuildCheckedLayoutSnapshot(acceptedDesks,acceptedWins,1700000000,output,&error));
@@ -11406,12 +11408,44 @@ static void test_checked_snapshot_enforces_combined_record_cap(){
     CHECK(acceptedWins[0].recordId=="{00000000-0000-0000-0000-000000000101}");
     CHECK(acceptedWins[0].lastSeenUtc==1700000000);
 
-    std::vector<DeskRec> overflowDesks(MAX_LAYOUT_RECORDS,desk);
+    std::vector<DeskRec> overflowDesks(MAX_LAYOUT_RECORDS+1,desk);
     std::vector<LayoutWin> overflowWins={OldStyleRecord()};
     output="prior snapshot bytes"; error.clear();
     CHECK(!BuildCheckedLayoutSnapshot(overflowDesks,overflowWins,1700000000,output,&error));
     CHECK(!error.empty()); CHECK(output=="prior snapshot bytes");
     CHECK(overflowWins.size()==1 && overflowWins[0].recordId.empty() && overflowWins[0].lastSeenUtc==0);
+
+    // Writers cap window records at MAX_LAYOUT_RECORDS on their own, so a full
+    // window budget plus the current desktops must still save and load.
+    std::vector<DeskRec> desks;
+    for(int index=0;index<3;++index){
+        DeskRec current=desk;
+        current.index=index;
+        current.guid=G(index==0 ? L"{231A0000-0000-0000-0000-000000000001}"
+                     : index==1 ? L"{231A0000-0000-0000-0000-000000000002}"
+                                : L"{231A0000-0000-0000-0000-000000000003}");
+        desks.push_back(current);
+    }
+    std::vector<LayoutWin> fullWins;
+    fullWins.reserve(MAX_LAYOUT_RECORDS+1);
+    for(size_t i=0;i<MAX_LAYOUT_RECORDS;++i)
+        fullWins.push_back(ReconcileTestRecord(
+            DeterministicRecordId(16000+i),"firefox","Full","full.example",1,
+            desk.guid,1700000000));
+    output.clear(); error="stale";
+    CHECK(BuildCheckedLayoutSnapshot(desks,fullWins,1700000000,output,&error));
+    CHECK(error.empty());
+    std::vector<DeskRec> parsedDesks;
+    std::vector<LayoutWin> parsedWins;
+    CHECK(ParseLayout(output,parsedDesks,parsedWins,1800000000,&error));
+    CHECK(parsedDesks.size()==3 && parsedWins.size()==MAX_LAYOUT_RECORDS);
+
+    fullWins.push_back(ReconcileTestRecord(
+        DeterministicRecordId(16000+MAX_LAYOUT_RECORDS),"firefox","Full",
+        "full.example",1,desk.guid,1700000000));
+    output="prior snapshot bytes"; error.clear();
+    CHECK(!BuildCheckedLayoutSnapshot(desks,fullWins,1700000000,output,&error));
+    CHECK(!error.empty()); CHECK(output=="prior snapshot bytes");
 }
 
 static void test_checked_snapshot_rejects_zero_desktop_record_transactionally(){
@@ -30700,7 +30734,7 @@ int main(){
     test_layout_rejects_embedded_carriage_returns_transactionally();
     test_layout_rejects_trailing_columns();
     test_layout_rejects_duplicate_record_ids();
-    test_layout_enforces_total_record_cap_transactionally();
+    test_layout_enforces_record_caps_transactionally();
     test_retention_expiration_boundaries();
     test_retention_future_and_zero_missing_are_not_expired();
     test_retention_mark_seen_clears_missing_and_updates_last_seen();
@@ -30770,7 +30804,7 @@ int main(){
     test_assignment_candidate_cap_direct_and_generated();
     test_assignment_flow_work_budget_rejects_connected_cycle();
     test_assignment_checked_score_scaling_boundary();
-    test_checked_snapshot_enforces_combined_record_cap();
+    test_checked_snapshot_enforces_separate_record_caps();
     test_checked_snapshot_rejects_zero_desktop_record_transactionally();
     test_checked_snapshot_rejects_malformed_record_id_transactionally();
     test_checked_snapshot_rejects_empty_id_and_zero_last_seen();

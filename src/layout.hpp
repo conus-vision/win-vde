@@ -887,7 +887,7 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
     bool headerSeen = false, recordsSeen = false;
     bool companionMarkerAllowed = false;
     std::string companionMarkerRecordId;
-    size_t recordCount = 0, lineNumber = 0, pos = 0;
+    size_t deskRecordCount = 0, windowRecordCount = 0, lineNumber = 0, pos = 0;
 
     auto fail = [&](const std::string& message)->bool {
         if(errorOut) *errorOut = message;
@@ -983,7 +983,10 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
         }
 
         companionMarkerAllowed=false;
-        if(++recordCount > MAX_LAYOUT_RECORDS)
+        // Desktop and window lines have separate budgets.  Every writer caps
+        // window records at MAX_LAYOUT_RECORDS on its own, so a layout at that
+        // cap must still have room for its desktop lines.
+        if((col[0]=="D" ? ++deskRecordCount : ++windowRecordCount) > MAX_LAYOUT_RECORDS)
             return failLine("snapshot record limit exceeded");
 
         if(col[0]=="D"){
@@ -1080,7 +1083,9 @@ inline bool BuildCheckedLayoutSnapshot(const std::vector<DeskRec>& desks, std::v
         if(errorOut) *errorOut=message;
         return false;
     };
-    if(desks.size()>MAX_LAYOUT_RECORDS || wins.size()>MAX_LAYOUT_RECORDS-desks.size())
+    // Separate budgets, matching ParseLayout: a full window budget plus the
+    // current desktops must stay serializable.
+    if(desks.size()>MAX_LAYOUT_RECORDS || wins.size()>MAX_LAYOUT_RECORDS)
         return fail("snapshot record limit exceeded");
     for(const auto& desk : desks) if(GuidIsZero(desk.guid)) return fail("desktop record has a zero GUID");
     std::string validationError;
