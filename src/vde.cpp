@@ -581,8 +581,21 @@ static bool GetRunAtLogon(){ HKEY hk; bool r=false;
     if(RegOpenKeyExW(HKEY_CURRENT_USER,RUN_KEY,0,KEY_READ,&hk)==ERROR_SUCCESS){ r=(RegQueryValueExW(hk,RUN_VAL,0,0,0,0)==ERROR_SUCCESS); RegCloseKey(hk); } return r; }
 static void SetRunAtLogon(bool on){ HKEY hk;
     if(RegOpenKeyExW(HKEY_CURRENT_USER,RUN_KEY,0,KEY_WRITE,&hk)!=ERROR_SUCCESS) return;
-    if(on){ wchar_t p[MAX_PATH]; GetModuleFileNameW(nullptr,p,MAX_PATH); std::wstring q=L"\""+std::wstring(p)+L"\"";
-        RegSetValueExW(hk,RUN_VAL,0,REG_SZ,(LPBYTE)q.c_str(),(DWORD)((q.size()+1)*sizeof(wchar_t))); }
+    if(on){
+        // Never write a failed or truncated exe path into the Run key.
+        std::wstring exe(MAX_PATH,L'\0');
+        for(;;){
+            const DWORD length=GetModuleFileNameW(nullptr,&exe[0],(DWORD)exe.size());
+            if(length==0){ exe.clear(); break; }
+            if(length<exe.size()){ exe.resize(length); break; }
+            if(exe.size()>=32768){ exe.clear(); break; }
+            exe.resize(exe.size()*2);
+        }
+        if(!exe.empty()){
+            const std::wstring q=L"\""+exe+L"\"";
+            RegSetValueExW(hk,RUN_VAL,0,REG_SZ,(LPBYTE)q.c_str(),(DWORD)((q.size()+1)*sizeof(wchar_t)));
+        }
+    }
     else RegDeleteValueW(hk,RUN_VAL);
     RegCloseKey(hk);
 }
