@@ -651,6 +651,10 @@ inline bool ParseBrowserSessionData(const AppProfile& profile,const std::string&
 
 struct SessionWorkerOps {
     std::function<std::wstring(const AppProfile&)> resolvePath;
+    // Optional: every session file the parser merges, primary first.  When it
+    // names more than one, a cache entry keyed by the primary file alone can
+    // be stale for the others and is not served as fresh.
+    std::function<std::vector<std::wstring>(const AppProfile&)> resolvePaths;
     std::function<bool(const std::wstring&,SessionStamp&)> getStamp;
     std::function<SessionFileReadResult(const std::wstring&)> readFile;
     std::function<bool(const AppProfile&,const std::string&,std::vector<WinFp>&)> parse;
@@ -664,6 +668,7 @@ struct SessionWorkerOps {
 inline SessionWorkerOps DefaultSessionWorkerOps(){
     SessionWorkerOps ops;
     ops.resolvePath=[](const AppProfile& profile){ return ResolveBrowserSessionPath(profile); };
+    ops.resolvePaths=[](const AppProfile& profile){ return ResolveBrowserSessionPaths(profile); };
     ops.getStamp=[](const std::wstring& path,SessionStamp& stamp){ return GetSessionStamp(path,stamp); };
     ops.readFile=[](const std::wstring& path){
         return ReadBrowserSessionFileBounded(path,MAX_BROWSER_SESSION_BYTES);
@@ -676,7 +681,12 @@ inline SessionWorkerOps DefaultSessionWorkerOps(){
 
 inline void FillMissingSessionWorkerOps(SessionWorkerOps& ops){
     SessionWorkerOps defaults=DefaultSessionWorkerOps();
-    if(!ops.resolvePath) ops.resolvePath=defaults.resolvePath;
+    // resolvePaths must agree with resolvePath, so a caller that supplies its
+    // own resolvePath keeps single-file behavior.
+    if(!ops.resolvePath){
+        ops.resolvePath=defaults.resolvePath;
+        if(!ops.resolvePaths) ops.resolvePaths=defaults.resolvePaths;
+    }
     if(!ops.getStamp) ops.getStamp=defaults.getStamp;
     if(!ops.readFile) ops.readFile=defaults.readFile;
     if(!ops.parse) ops.parse=defaults.parse;
@@ -1051,7 +1061,14 @@ private:
     }
     void Process(const SessionRequest& request,SessionResult& result){
         std::wstring before;
-        try { before=ops_.resolvePath(request.profile); } catch(...) { before.clear(); }
+        bool mergesProfiles=false;
+        try {
+            if(ops_.resolvePaths){
+                const std::vector<std::wstring> paths=ops_.resolvePaths(request.profile);
+                if(!paths.empty()) before=paths.front();
+                mergesProfiles=paths.size()>1;
+            } else before=ops_.resolvePath(request.profile);
+        } catch(...) { before.clear(); }
         result.path=before;
         SessionStamp stampBefore;
         bool beforeKnown=false;
@@ -1059,7 +1076,10 @@ private:
         if(beforeKnown){ result.sourceStampKnown=true; result.sourceStamp=stampBefore; }
         SessionCacheValue cached;
         WorkerStep(SessionWorkerStep::CacheLookup);
-        if(beforeKnown&&cache_.FindExact(request.app,before,stampBefore,cached)){
+        // The cache key covers the primary file only; merged data from other
+        // open profiles may have changed behind an unchanged primary stamp.
+        if(beforeKnown&&!mergesProfiles&&
+           cache_.FindExact(request.app,before,stampBefore,cached)){
             result.status=SessionDataStatus::Fresh; result.windows=cached.windows;
             result.dataStamp=cached.stamp; result.dataGeneration=ObserveCachedGeneration(request.app,cached);
             return;

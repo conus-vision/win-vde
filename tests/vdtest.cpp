@@ -12889,6 +12889,43 @@ static void test_session_worker_valid_empty_is_fresh_and_cache_hit_is_shared(){
     CHECK(!worker.Request(rejected));
 }
 
+// With more than one open profile the parsed data also holds the other
+// profiles' windows, which the primary file's stamp does not cover: the cache
+// must not serve them as fresh once the primary file is unchanged.
+static void test_session_worker_multi_profile_data_is_never_a_stale_cache_hit(){
+    SessionResultSink sink;
+    std::atomic<int> reads(0),parses(0);
+    SessionWorkerOps ops;
+    ops.resolvePath=[](const AppProfile&){ return std::wstring(L"primary"); };
+    ops.resolvePaths=[](const AppProfile&){
+        return std::vector<std::wstring>{L"primary",L"secondary"};
+    };
+    ops.getStamp=[&](const std::wstring&,SessionStamp& stamp){ stamp.size=5; stamp.mtime=9; return true; };
+    ops.readFile=[&](const std::wstring&){ ++reads; return successfulSessionRead("valid",5,9); };
+    ops.parse=[&](const AppProfile&,const std::string&,std::vector<WinFp>& output){
+        const int call=++parses;
+        output.assign(1,WinFp());
+        output[0].activeTitle=call==1 ? "before" : "after";   // secondary profile changed
+        return true;
+    };
+    ops.postMessage=[&](HWND hwnd,UINT message,WPARAM wp,LPARAM lp){ return sink.post(hwnd,message,wp,lp); };
+    SessionWorker worker((HWND)1,ops,16,1024*1024);
+    SessionRequest first;
+    first.requestId=1; first.app="chrome"; first.profile=sessionTestProfile("chrome",AppProfile::CHROMIUM);
+    first.purpose=SessionPurpose::Search; first.identityGeneration=7;
+    CHECK(worker.Request(first));
+    std::unique_ptr<SessionResult> one=sink.waitFor(1);
+    CHECK(one && one->status==SessionDataStatus::Fresh && one->windows &&
+          one->windows->size()==1 && one->windows->at(0).activeTitle=="before");
+    SessionRequest second=first; second.requestId=2;
+    CHECK(worker.Request(second));
+    std::unique_ptr<SessionResult> two=sink.waitFor(2);
+    CHECK(two && two->status==SessionDataStatus::Fresh && two->windows &&
+          two->windows->size()==1 && two->windows->at(0).activeTitle=="after");
+    CHECK(reads.load()==2 && parses.load()==2);
+    worker.Stop();
+}
+
 static void test_session_worker_malformed_cold_is_unavailable(){
     SessionResultSink sink;
     std::atomic<int> parses(0);
@@ -30829,6 +30866,7 @@ int main(){
     test_session_status_and_acceptance_policy_contract();
     test_session_cache_shares_payload_and_rejects_oversize();
     test_session_worker_valid_empty_is_fresh_and_cache_hit_is_shared();
+    test_session_worker_multi_profile_data_is_never_a_stale_cache_hit();
     test_session_worker_malformed_cold_is_unavailable();
     test_session_worker_non_ok_reads_never_parse_and_publish_current_stamp();
     test_session_worker_disappeared_source_is_not_reported_as_current();
