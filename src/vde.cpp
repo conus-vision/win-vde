@@ -11836,8 +11836,19 @@ static bool RecordReopenedWindow(const ReopenWindowJob& job,
     try {
         std::string recordId;
         GUID parsedId{};
-        if(job.recordId.empty() ||
-           !ParseNonzeroLayoutGuid(job.recordId,parsedId,&recordId)){
+        bool reuseRecord=!job.recordId.empty() &&
+            ParseNonzeroLayoutGuid(job.recordId,parsedId,&recordId);
+        // The checkpoint's record can still belong to a live window, e.g. when
+        // only the missing tabs of a partly open window were reopened.  Two
+        // windows must never share one record, so the new window gets its own.
+        if(reuseRecord)
+            for(const auto& bound : g_recordByRuntime)
+                if(bound.second.recordId==recordId &&
+                   !SameIdentity(bound.second.identity,identity)){
+                    reuseRecord=false;
+                    break;
+                }
+        if(!reuseRecord){
             const std::string generated=NewRecordId();
             if(!ParseNonzeroLayoutGuid(generated,parsedId,&recordId)) return false;
         }
