@@ -12701,6 +12701,9 @@ static void test_firefox_profile_ini_default_release_fallback(){
     const std::string installed="[Install123]\nDefault=Profiles/main\n[Profile0]\nDefault=1\nPath=Profiles/other\n";
     CHECK(ResolveFirefoxProfileDirectoryFromIni(L"C:\\Firefox",installed)==
           L"C:\\Firefox\\Profiles\\main");
+    // A profile kept outside the Firefox folder is recorded by absolute path.
+    const std::string elsewhere="[Install123]\nDefault=D:\\ff\n[Profile0]\nIsRelative=0\nPath=D:\\ff\n";
+    CHECK(ResolveFirefoxProfileDirectoryFromIni(L"C:\\Firefox",elsewhere)==L"D:\\ff");
 }
 
 static void test_firefox_json_valid_empty_is_distinct_from_failure(){

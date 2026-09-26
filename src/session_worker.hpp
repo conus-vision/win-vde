@@ -375,9 +375,20 @@ inline std::wstring ResolveFirefoxProfileDirectoryFromIni(const std::wstring& ba
         std::wstring path=U82W(normalized);
         return relative?base+L"\\"+path:path;
     };
+    // [Install*] Default= is relative to the Firefox folder for a profile
+    // inside it, and an absolute path for a profile kept elsewhere.
+    auto isAbsolute=[](const std::string& value){
+        const bool drive=value.size()>=3 &&
+            ((value[0]>='A'&&value[0]<='Z')||(value[0]>='a'&&value[0]<='z')) &&
+            value[1]==':' && (value[2]=='\\'||value[2]=='/');
+        const bool unc=value.size()>=2 &&
+            (value[0]=='\\'||value[0]=='/') && (value[1]=='\\'||value[1]=='/');
+        return drive || unc;
+    };
     for(size_t i=0;i<sections.size();++i) if(sections[i].first.find("Install")==0){
         std::map<std::string,std::string>::const_iterator found=sections[i].second.find("Default");
-        if(found!=sections[i].second.end()&&!found->second.empty()) return resolve(found->second,true);
+        if(found!=sections[i].second.end()&&!found->second.empty())
+            return resolve(found->second,!isAbsolute(found->second));
     }
     for(size_t i=0;i<sections.size();++i) if(sections[i].first.find("Profile")==0){
         const std::map<std::string,std::string>& values=sections[i].second;
