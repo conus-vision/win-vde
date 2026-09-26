@@ -434,8 +434,11 @@ static std::wstring DesktopNameFromRegistry(const GUID& g) {
     std::wstring key=L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VirtualDesktops\\Desktops\\"+GuidToString(g);
     HKEY hk=nullptr; std::wstring res;
     if(RegOpenKeyExW(HKEY_CURRENT_USER,key.c_str(),0,KEY_READ,&hk)==ERROR_SUCCESS){
-        wchar_t name[256]; DWORD cb=sizeof(name),type=0;
-        if(RegQueryValueExW(hk,L"Name",nullptr,&type,(LPBYTE)name,&cb)==ERROR_SUCCESS && type==REG_SZ) res=name;
+        // A REG_SZ is not guaranteed to be NUL-terminated; bound the copy by
+        // the byte count the registry actually returned.
+        wchar_t name[256]={0}; DWORD cb=sizeof(name),type=0;
+        if(RegQueryValueExW(hk,L"Name",nullptr,&type,(LPBYTE)name,&cb)==ERROR_SUCCESS && type==REG_SZ)
+            res.assign(name,wcsnlen(name,cb/sizeof(wchar_t)));
         RegCloseKey(hk);
     }
     return res;
