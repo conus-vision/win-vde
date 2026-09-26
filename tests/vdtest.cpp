@@ -12215,6 +12215,30 @@ static void test_snss_parse(){
     CHECK(w[wi10].tabsBlob.find("github.com/x")!=std::string::npos);  // full URL path is searchable, not just the domain
     CHECK(w[wi11].tabCount==1); CHECK(w[wi11].activeTitle=="Example");
 }
+// Closing a window's last tab, or dragging a window's only tab away, makes
+// Chrome record SetSelectedTabInIndex with kNoTab (-1) before the window
+// closes, and Chrome's own reader accepts it.  That is valid session data,
+// not corruption, and must not make the whole file unreadable.
+static void test_snss_accepts_negative_selection_indices(){
+    std::string noSelection=makeSnss();
+    snssRaw(noSelection,8,11,-1);
+    snssRaw(noSelection,2,3,-1);
+    snssRaw(noSelection,7,3,-1);
+    std::vector<WinFp> w;
+    CHECK(ParseChromiumSNSS(noSelection,w));
+    CHECK(w.size()==2);
+    for(const WinFp& window : w)
+        if(window.counts.count("example.com"))
+            CHECK(window.tabCount==1 && window.activeTitle=="Example");
+
+    std::string closed=makeSnss();
+    snssRaw(closed,8,11,-1);
+    std::string windowId; wInt(windowId,11);
+    snssFrame(closed,17,windowId);            // kCommandWindowClosed
+    w.clear();
+    CHECK(ParseChromiumSNSS(closed,w));
+    CHECK(w.size()==1 && w[0].counts.count("github.com")==1);
+}
 static void test_snss_garbage(){ std::vector<WinFp> w(1); CHECK(!ParseChromiumSNSS("not an snss file....",w)); CHECK(w.empty()); }
 
 static void test_snss_truncated_frame_returns_no_partial_windows(){
@@ -30641,6 +30665,7 @@ int main(){
     test_dirty_flush_preserves_mutation_during_write_and_limits_errors();
     test_dirty_flush_clock_ceiling_never_spins();
     test_snss_parse();
+    test_snss_accepts_negative_selection_indices();
     test_snss_garbage();
     test_snss_truncated_frame_returns_no_partial_windows();
     test_mozlz4_rejects_huge_declared_output();

@@ -525,9 +525,12 @@ inline bool ParseChromiumSNSS(const std::string& data,std::vector<WinFp>& output
                 first=ReadSnssI32(command); second=ReadSnssI32(command+4); return true;
             };
             if(id==0){ int32_t window=0,tab=0; if(!raw2(window,tab)||!acceptWindow(window)||!acceptTab(tab)) return false; tabWindow[tab]=window; }
-            else if(id==2){ int32_t tab=0,index=0; if(!raw2(tab,index)||!acceptTab(tab)||index<0) return false; tabIndex[tab]=index; }
-            else if(id==7){ int32_t tab=0,index=0; if(!raw2(tab,index)||!acceptTab(tab)||index<0) return false; tabSelectedNavigation[tab]=index; }
-            else if(id==8){ int32_t window=0,index=0; if(!raw2(window,index)||!acceptWindow(window)||index<0) return false; windowSelected[window]=index; }
+            // A negative index means "no position/selection", not corruption:
+            // Chrome writes kNoTab (-1) as the selected tab when a window
+            // loses its last tab, and its own reader accepts it.
+            else if(id==2){ int32_t tab=0,index=0; if(!raw2(tab,index)||!acceptTab(tab)) return false; if(index<0) tabIndex.erase(tab); else tabIndex[tab]=index; }
+            else if(id==7){ int32_t tab=0,index=0; if(!raw2(tab,index)||!acceptTab(tab)) return false; if(index<0) tabSelectedNavigation.erase(tab); else tabSelectedNavigation[tab]=index; }
+            else if(id==8){ int32_t window=0,index=0; if(!raw2(window,index)||!acceptWindow(window)) return false; if(index<0) windowSelected.erase(window); else windowSelected[window]=index; }
             else if(id==6){
                 if(commandLength<4) return false;
                 uint32_t declared=(uint32_t)command[0]|((uint32_t)command[1]<<8)|((uint32_t)command[2]<<16)|((uint32_t)command[3]<<24);
