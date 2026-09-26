@@ -12424,7 +12424,7 @@ static void RoRefreshWindows(HWND hwnd){
                g_reopenUi.modelValid && (!g_reopenUi.model.windowFilter.empty() ||
                                         g_reopenUi.model.hideOpenWindows)
                    ? L"No window matches the filter."
-                   : L"Select a desktop on the left to list its windows.");
+                   : L"Check a desktop on the left to list its windows.");
 }
 
 static void RoRefreshTabs(HWND hwnd){
@@ -12452,7 +12452,7 @@ static void RoRefreshTabs(HWND hwnd){
                g_reopenUi.modelValid && (!g_reopenUi.model.tabFilter.empty() ||
                                         g_reopenUi.model.hideOpenTabs)
                    ? L"No tab matches the filter."
-                   : L"Select a window to list its tabs.");
+                   : L"Check a window to list its tabs.");
 }
 
 static void RoRefreshAll(HWND hwnd){
@@ -12644,7 +12644,10 @@ static void RoStartReopen(HWND hwnd){
     std::vector<ReopenWindowJob> jobs;
     size_t skipped=0;
     if(!BuildReopenJobsFromSelection(g_reopenUi.model,64,jobs,skipped) || jobs.empty()){
-        MessageBoxW(hwnd,L"Nothing is selected to reopen.",APP_NAME,MB_ICONINFORMATION);
+        MessageBoxW(hwnd,skipped!=0
+            ? L"None of the selected tabs can be reopened: only http, https, "
+              L"ftp and file addresses are passed to a browser."
+            : L"Nothing is selected to reopen.",APP_NAME,MB_ICONINFORMATION);
         return;
     }
     std::wstring error;
@@ -12789,10 +12792,12 @@ static LRESULT CALLBACK SnapshotProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         TabCtrl_SetItemSize(tabs,widest,S(26));
         RoLayout(hwnd);
         if(g_reopenUi.slots.empty()){
+            // Refresh first: RoRefreshStatus would replace this explanation
+            // with the generic "No checkpoint is loaded."
+            RoRefreshAll(hwnd);
             RoSetText(hwnd,IDC_RO_STATUS,
                 L"No checkpoint has been saved yet. Save the layout, or exit VDE once, and come back.");
             EnableWindow(RoCtl(hwnd,IDC_RO_REOPEN),FALSE);
-            RoRefreshAll(hwnd);
         } else {
             TabCtrl_SetCurSel(tabs,0);
             RoLoadSlot(hwnd,g_reopenUi.slots[0]);
