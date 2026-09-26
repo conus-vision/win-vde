@@ -1709,7 +1709,10 @@ static bool EraseAutoRecord(const LayoutWin& previous,RecordDeltaKind kind,
         const LayoutWin before=g_autoRecords[index];
         if(!QueueRecordDelta(kind,&before,before,true,changedUtc,
                              causalGeneration)) return false;
-        g_validatedTouches.erase(previous.recordId);
+        // QueueRecordDelta swaps g_autoRecords for a staged copy, so a caller
+        // that passed an element of g_autoRecords now holds a dangling
+        // reference; only the local copy is safe to read here.
+        g_validatedTouches.erase(before.recordId);
         return true;
     }
     return false;
