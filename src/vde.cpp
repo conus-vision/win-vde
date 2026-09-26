@@ -6347,6 +6347,22 @@ static bool CliRestoreCheckpoint(bool manual,std::string& summary,
     return failed==0;
 }
 
+static bool IsCliHelpCommand(const std::wstring& cmd){
+    return cmd==L"-h" || cmd==L"--help" || cmd==L"/?";
+}
+
+static int PrintCliUsage(){
+    printf("Usage: vde <save|restore|restore-auto|status|list|checkpoints>\n");
+    printf("  list          list virtual desktops\n");
+    printf("  status        desktops + live browser windows and their fingerprints\n");
+    printf("  save          save current window layout to layout-manual.txt\n");
+    printf("  restore       restore from layout-manual.txt\n");
+    printf("  restore-auto  restore from the last auto-saved layout\n");
+    printf("  checkpoints   list the saved browser-session checkpoints\n");
+    printf("  (no args) -> run resident in tray; Ctrl+Alt+D opens the desktop picker\n");
+    return 2;
+}
+
 static int CliRun(const std::wstring& cmd){
     if(cmd==L"list"||cmd==L"status"){
         std::vector<DeskRec> desks;
@@ -6442,15 +6458,7 @@ static int CliRun(const std::wstring& cmd){
         }
         return 0;
     }
-    printf("Usage: vde <save|restore|restore-auto|status|list|checkpoints>\n");
-    printf("  list          list virtual desktops\n");
-    printf("  status        desktops + live browser windows and their fingerprints\n");
-    printf("  save          save current window layout to layout-manual.txt\n");
-    printf("  restore       restore from layout-manual.txt\n");
-    printf("  restore-auto  restore from the last auto-saved layout\n");
-    printf("  checkpoints   list the saved browser-session checkpoints\n");
-    printf("  (no args) -> run resident in tray; Ctrl+Alt+D opens the desktop picker\n");
-    return 2;
+    return PrintCliUsage();
 }
 
 // ================================ GUI: picker ================================
@@ -13875,11 +13883,30 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int){
     auto dispatch=[&](){
         int dispatchResult=1;
         if(cli){
-            if(AttachConsole(ATTACH_PARENT_PROCESS)){ FILE* f; freopen_s(&f,"CONOUT$","w",stdout); freopen_s(&f,"CONOUT$","w",stderr); }
-            SetConsoleOutputCP(CP_UTF8);
+            // A GUI-subsystem exe has no console of its own: attach to the
+            // parent's, but keep a stream the parent redirected (vde status >
+            // file, or a pipe), and give the console its code page back.
+            UINT previousOutputCp=0;
+            if(AttachConsole(ATTACH_PARENT_PROCESS)){
+                FILE* f=nullptr;
+                if(_fileno(stdout)<0) freopen_s(&f,"CONOUT$","w",stdout);
+                if(_fileno(stderr)<0) freopen_s(&f,"CONOUT$","w",stderr);
+                previousOutputCp=GetConsoleOutputCP();
+                SetConsoleOutputCP(CP_UTF8);
+            }
+            struct RestoreConsoleCp {
+                UINT codePage;
+                ~RestoreConsoleCp(){
+                    fflush(stdout); fflush(stderr);
+                    if(codePage) SetConsoleOutputCP(codePage);
+                }
+            } restoreConsoleCp{previousOutputCp};
             dispatchResult=RunCliWithLoadedSettings(
                 []{ LoadSettings(); },
                 [&](){
+                    // Help needs no desktop services, so it also works on a
+                    // build where they are unavailable.
+                    if(IsCliHelpCommand(cmd)) return PrintCliUsage();
                     if(!InitializeServicesWithRollback(
                             []{ return InitServices(); },
                             []{ return SanityCheckServices(); },
