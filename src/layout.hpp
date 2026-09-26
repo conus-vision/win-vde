@@ -114,6 +114,10 @@ struct LayoutMatch {
     // (same pages, same score) are interchangeable, so among equal-scoring
     // assignments the one that moves nothing wins.
     bool inPlace=false;
+    // A tab drag-out or a window merge (LooksLikeWindowSplit/Merge): the
+    // desktops differ, yet no move is requested and the record follows the
+    // live window instead.
+    bool recordOnly=false;
 };
 
 // Larger than any achievable sum of candidate orderings (candidates are capped
@@ -311,13 +315,20 @@ inline bool LooksLikeWindowMerge(const LayoutWin& saved,const LayoutWin& live,
     return false;
 }
 
+// The title half of the score ignores a leading unread counter, for the reason
+// given at StripTitleUnreadCounter.
+inline bool SameActiveTitle(const std::string& saved,const std::string& live){
+    return !saved.empty() &&
+        StripTitleUnreadCounter(saved)==StripTitleUnreadCounter(live);
+}
+
 inline double LayoutScore(const LayoutWin& saved, const LayoutWin& live){
     if(saved.app!=live.app) return 0;
     if(saved.provisional && saved.counts.empty()) return 0;
     // Same set of pages open: this is the window, whatever its title says.
     if(saved.urlSignature!=0 && saved.urlSignature==live.urlSignature) return 1.0;
     if(saved.counts.empty() || live.counts.empty())
-        return !saved.activeTitle.empty() && saved.activeTitle==live.activeTitle ? 1.0 : 0.0;
+        return SameActiveTitle(saved.activeTitle,live.activeTitle) ? 1.0 : 0.0;
 
     long double dot=0, savedSquares=0, liveSquares=0;
     for(const auto& item : saved.counts){
@@ -343,7 +354,7 @@ inline double LayoutScore(const LayoutWin& saved, const LayoutWin& live){
     double jaccard=unionSize ? static_cast<double>(intersection)/static_cast<double>(unionSize) : 0;
 
     double active=0;
-    if(!saved.activeTitle.empty() && saved.activeTitle==live.activeTitle) active=1;
+    if(SameActiveTitle(saved.activeTitle,live.activeTitle)) active=1;
     else if(!saved.activeDomain.empty() && saved.activeDomain==live.activeDomain) active=0.5;
 
     long long savedTabs=saved.tabCount, liveTabs=live.tabCount;
@@ -883,7 +894,7 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
     bool headerSeen = false, recordsSeen = false;
     bool companionMarkerAllowed = false;
     std::string companionMarkerRecordId;
-    size_t recordCount = 0, lineNumber = 0, pos = 0;
+    size_t deskRecordCount = 0, windowRecordCount = 0, lineNumber = 0, pos = 0;
 
     auto fail = [&](const std::string& message)->bool {
         if(errorOut) *errorOut = message;
@@ -979,7 +990,10 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
         }
 
         companionMarkerAllowed=false;
-        if(++recordCount > MAX_LAYOUT_RECORDS)
+        // Desktop and window lines have separate budgets.  Every writer caps
+        // window records at MAX_LAYOUT_RECORDS on its own, so a layout at that
+        // cap must still have room for its desktop lines.
+        if((col[0]=="D" ? ++deskRecordCount : ++windowRecordCount) > MAX_LAYOUT_RECORDS)
             return failLine("snapshot record limit exceeded");
 
         if(col[0]=="D"){
@@ -1076,7 +1090,9 @@ inline bool BuildCheckedLayoutSnapshot(const std::vector<DeskRec>& desks, std::v
         if(errorOut) *errorOut=message;
         return false;
     };
-    if(desks.size()>MAX_LAYOUT_RECORDS || wins.size()>MAX_LAYOUT_RECORDS-desks.size())
+    // Separate budgets, matching ParseLayout: a full window budget plus the
+    // current desktops must stay serializable.
+    if(desks.size()>MAX_LAYOUT_RECORDS || wins.size()>MAX_LAYOUT_RECORDS)
         return fail("snapshot record limit exceeded");
     for(const auto& desk : desks) if(GuidIsZero(desk.guid)) return fail("desktop record has a zero GUID");
     std::string validationError;

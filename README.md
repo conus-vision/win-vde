@@ -1,192 +1,209 @@
-# win-vde — Virtual Desktop Extension for Windows 11
+# win-vde: Virtual Desktop Extension for Windows 11
 
-A small tray utility for people who work in many browser windows spread over
-Windows 11 **virtual desktops**. It does three things:
+After a reboot, Windows 11 puts every browser window on desktop 1. win-vde
+remembers which virtual desktop each Firefox, Chrome, and Edge window was on
+and moves it back. It also remembers what each window held, so when the browser
+loses a session you can reopen a desktop, a window, or a single tab right where
+it used to be.
 
-1. **Keeps your desktop layout.** It remembers which virtual desktop every
-   browser window belongs to and puts the windows back after a reboot, a
-   browser restart or a crash — and only then; it never moves a window you
-   opened yourself.
-2. **Brings back lost browsing sessions.** It also remembers *what* each window
-   held. Five checkpoints — the last saved state plus the last four shutdowns,
-   each with date and time — let you reopen any desktop, any window or any
-   single tab, in its original window, on its original desktop, skipping
-   whatever is already open. Lost a session to a browser update, a crash, an
-   accidental "close all windows", or a profile reset? Pick what you need and
-   get it back in seconds.
-3. **Gives you a fast desktop picker.** A hotkey opens a searchable grid of all
-   your desktops and their windows: switch, activate an exact window, or drag a
-   window row onto another desktop.
+It is a small tray utility with three jobs:
 
-- **Author:** Volodymyr Moskvin — <info@conus.vision>
-- **Repository:** https://github.com/conus-vision/win-vde
-- **License:** MIT
+1. It keeps your desktop layout. After a reboot, a browser restart, or a
+   browser crash it puts each browser window back on its desktop. It acts only
+   then: a window you open yourself stays where you opened it.
+2. It brings back lost browsing sessions. Five checkpoints, the last saved
+   state plus the last four shutdowns, each with its date and time, let you
+   reopen any desktop, window, or single tab in its original window on its
+   original desktop. Whatever is already open gets skipped. If a browser
+   update, a crash, an accidental "close all windows", or a profile reset took
+   your session, pick what you need and it comes back at about a second per
+   window.
+3. It gives you a fast desktop picker. A hotkey opens a searchable grid of all
+   your desktops and their windows. From there you can switch desktops,
+   activate an exact window, or drag a window row onto another desktop.
 
-**➡ [Download the latest `vde.exe`](https://github.com/conus-vision/win-vde/releases/latest)** — a single file, no installer. Or build it from source (see [Quick start](#quick-start)).
+- Author: Volodymyr Moskvin, <info@conus.vision>
+- Repository: https://github.com/conus-vision/win-vde
+- License: MIT
 
-> Layout memory and session checkpoints support **Firefox, Chrome, and Edge**.
-> The picker also lists eligible ordinary windows from other applications, with
-> app icons, active-window highlighting, search, scrolling, and full-name
-> tooltips.
+**[Download the latest `vde.exe`](https://github.com/conus-vision/win-vde/releases/latest).**
+It is a single file and needs no installer. You can also build it yourself, see
+[Building from source](#building-from-source).
+
+> Layout memory and session checkpoints work with Firefox, Chrome, and Edge.
+> The picker also lists ordinary windows of other applications, with their
+> icons, the active window highlighted, search, scrolling, and tooltips that
+> show long names in full.
 
 ## Who it is for
 
-- **Anyone with more than a handful of browser windows** — a research desktop,
-  a work desktop, a shopping desktop. After a reboot Windows dumps them all on
-  desktop 1; win-vde puts each one back where it lived.
-- **Anyone who has lost a browser session** — the browser updated and forgot,
-  a crash swallowed the windows, "Restore previous session" restored the wrong
+- Anyone with more than a handful of browser windows: a research desktop, a
+  work desktop, a shopping desktop. After a reboot Windows dumps them all on
+  desktop 1, and win-vde puts each one back where it lived.
+- Anyone who has lost a browser session. The browser updated and forgot it, a
+  crash swallowed the windows, "Restore previous session" restored the wrong
   thing, or one careless click closed forty tabs. win-vde keeps its own
-  checkpoints, outside the browser, and lets you restore exactly the desktop,
-  window or tab you miss.
-- **Anyone who wants to rebuild a working context on demand** — bring back the
-  three windows of last Tuesday's project onto their desktop without touching
+  checkpoints outside the browser, so you can restore exactly the desktop,
+  window, or tab you miss.
+- Anyone who wants to rebuild a working context on demand: bring the three
+  windows of last Tuesday's project back onto their desktop without touching
   what is open now.
 
 <p align="center"><img src="docs/overview.svg" alt="How win-vde works: Windows scatters browser windows across virtual desktops after a reboot; win-vde remembers the layout and restores it; plus a fast searchable desktop picker" width="840"></p>
 
 ## Quick start
 
-1. **Get `vde.exe`.** Download it from the [Releases](https://github.com/conus-vision/win-vde/releases/latest) page, or build it with `build.bat` (see [Install / Build](#install--build)) — it lands at `build\vde.exe`. Either way it is a single, self-contained executable: no installer, no admin rights, no dependencies.
-2. **Put it somewhere permanent.** Move `vde.exe` into a folder you intend to keep (for example `C:\Users\<you>\Apps\win-vde\`). Autostart remembers the exe's *current* path, so choose the folder **before** enabling it — if you move the exe later, just toggle autostart off and on again.
-3. **Run it.** Double-click `vde.exe`; a tray icon appears next to the clock and it starts watching your browsers right away.
-4. **Turn on autostart.** Right-click the tray icon → **Settings…** → tick **Start with Windows (run at logon)** → **OK**. Your layout will now be restored automatically after every reboot.
+1. Download `vde.exe` from the
+   [Releases](https://github.com/conus-vision/win-vde/releases/latest) page, or
+   run `build.bat` (see [Building from source](#building-from-source)), which
+   writes `build\vde.exe`. Either way you get one self-contained executable,
+   and you don't need an installer, admin rights, or anything else.
+2. Move `vde.exe` into a folder you plan to keep, for example
+   `C:\Users\<you>\Apps\win-vde\`. Autostart stores the path the exe has when
+   you turn it on, so choose the folder first. If you move the exe later, turn
+   autostart off and on again.
+3. Double-click `vde.exe`. A tray icon appears next to the clock, and win-vde
+   starts watching your browsers right away.
+4. Right-click the tray icon, choose **Settings...**, tick **Start with Windows
+   (run at logon)**, and click **OK**. From then on your layout comes back by
+   itself after every reboot.
 
-That's all — arrange your browser windows across your virtual desktops and forget about it. Press **Ctrl+Alt+D** whenever you want the desktop picker.
+That is the whole setup. Arrange your browser windows across your virtual
+desktops and stop thinking about it. Press **Ctrl+Alt+D** whenever you want the
+desktop picker.
 
 ## Why this exists
 
 Three things Windows and the browser don't solve on their own:
 
-1. Windows 11 **doesn't remember** which virtual desktop a third-party app's
-   window was on across a reboot — everything lands on desktop 1.
-2. On session restore the browser recreates its windows, but their **window
-   handles (HWND) and PIDs change**, so nothing external can recognize them by
-   handle.
-3. There is **no public Windows API** for moving another process's window
-   between virtual desktops. It requires undocumented COM interfaces.
+1. Windows 11 doesn't remember which virtual desktop a third-party app's window
+   was on across a reboot. Everything lands on desktop 1.
+2. When a browser restores its session, it recreates its windows, and their
+   window handles (HWND) and process IDs change. Nothing outside the browser
+   can recognize them by handle.
+3. Windows has no public API for moving another process's window between
+   virtual desktops. It needs undocumented COM interfaces.
 
-win-vde bridges that gap from the window's *content*: it remembers the pages a
-window holds, matches the old windows to the new ones after a restart, and moves
-each of them to the desktop it was saved on. While it runs, a window needs no
-fingerprint at all — it is identified exactly by its handle, process ID and
-process start time, and those identities are kept on disk, so restarting win-vde
-itself is never mistaken for a browser restart and moves nothing.
+win-vde works around this by looking at what a window contains. It remembers
+the pages each window holds, matches the old windows to the new ones after a
+restart, and moves each window to the desktop it was saved on. While a window
+stays open, win-vde doesn't need its pages at all: it identifies the window
+exactly by its handle, process ID, and process start time. It keeps those
+identities on disk, so a restart of win-vde itself is never mistaken for a
+browser restart and moves nothing.
 
 ## Features
 
-### Session checkpoints — restore what was lost
+### Session checkpoints
 
-- **Five checkpoints, always up to date** — the current state is saved every
-  few minutes and on demand; the last four shutdowns are kept as well. Each is
-  shown with its date and time.
-- **Reopen exactly the tabs you pick** — three cascading columns, **desktops →
-  browser windows → browser tabs**, each with check boxes, a select-all box in
-  the column header, a "Hide open" switch and a text filter; a browser filter on
-  top. Checking a desktop selects its windows and their tabs; uncheck whatever
-  you do not want.
-- **Never a duplicate** — tabs that are open in the browser right now are
-  greyed out and left unchecked; windows and desktops that are fully open are
-  greyed too. If a browser's open tabs cannot be read, its windows start
-  unchecked and the status line says so.
-- **Back where it was** — selected tabs return grouped into their original
-  windows, each on its original desktop; a desktop that no longer exists is
-  marked and its windows go to desktop 1. About a second per window, with a
-  progress bar and Cancel.
-- **Built for big sessions** — the window resizes and maximizes; the lists are
-  virtual, so a checkpoint with hundreds of tabs stays instant.
+win-vde keeps five checkpoints of your browser sessions and shows each with its
+date and time. One holds the current state; win-vde refreshes it every few
+minutes and each time you use **Save windows layout**. The other four hold the
+last four shutdowns.
 
-### Layout memory — keep windows on their desktops
+**Reopen browser windows...** lets you pick exactly what comes back. The dialog
+has three cascading columns (desktops, then browser windows, then browser
+tabs), each with check boxes, a select-all box in the column header, a "Hide
+open" switch, and a text filter. A browser filter sits on top. Checking a
+desktop selects its windows and their tabs; uncheck whatever you don't want.
+The filters and "Hide open" change what you see, not what is selected.
 
-- **Multi-browser** — Firefox (via its session store), Chrome and Edge (via
-  their SNSS session files); each can be toggled in Settings. After a restart a
-  window is re-identified by its pages: an exact match of the whole tab-URL set
-  first, then tab domains, then the window title. Windows holding exactly the
-  same pages are treated as interchangeable, and among equally good placements
-  win-vde picks the one that moves the fewest windows.
-- **Automatic restore, only when it is warranted** — windows are put back when
-  their identity is actually gone, i.e. after a reboot, a browser restart, or a
-  browser crash (with a ~20 s stabilization first). Restarting win-vde itself
-  moves nothing: surviving windows are recognized by handle, process ID and
-  process start time and simply re-adopted. A window you open while the browser
-  is already running is never relocated — it is recorded where you opened it.
-- **30-day closed-window memory** — a closed Firefox, Chrome, or Edge window
-  keeps its remembered virtual desktop for 30 days. If it reappears before
-  expiry, VDE restores it before updating the saved layout.
-- **Two layouts** — a rolling *auto* layout plus a manual checkpoint you save on
-  demand.
-### Desktop picker — get around fast
+- Tabs that are open in the browser right now are greyed out and start
+  unchecked, and so are windows and desktops that are fully open. You can still
+  check such a tab yourself. If win-vde can't read a browser's open tabs, that
+  browser's windows start unchecked and the status line says so.
+- The selected tabs return grouped into their original windows, each window on
+  its original desktop. If a desktop no longer exists, the dialog marks it and
+  its windows go to desktop 1.
+- Reopening takes about a second per window. A progress bar shows how far it
+  got, and **Cancel** stops it.
+- The dialog resizes and maximizes, and its lists are virtual, so a checkpoint
+  with hundreds of tabs stays responsive.
 
-- **All-window desktop picker** — the global hotkey (default `Ctrl+Alt+D`)
-  opens a grid of desktops on the primary monitor, containing eligible ordinary
-  application windows, not only tracked browsers. Rows show application icons,
-  the exact active window, a full-row hover highlight, and tooltips for clipped
-  names.
-- **Exact click behavior** — click a window row to switch to its displayed
-  desktop and activate that exact window. Click a desktop title or empty tile
-  area to switch desktops without requesting activation of a listed window.
-- **Ctrl+Click and row Drag & Drop** — stationary `Ctrl`+click moves the
-  captured active window, follows it to the destination, and keeps the picker
-  open. Drag an exact row to another desktop to move that window without
-  switching desktops or closing the picker.
-- **Pinned/global-window safety** — windows shown on every desktop, individually
-  pinned views, and application-wide pins are never physically moved. Only the
-  selected row is visually assigned to the destination for the current popup
-  session; Windows pin state and saved layouts remain unchanged.
-- **Searchable window rows** — type to filter by window title. Browser windows
-  additionally match **any tab**, not just the active one, by tab title or full
-  **URL** (address bar). Scroll individual desktop tiles with the mouse wheel.
-- **Start with Windows** — optional run-at-logon toggle.
-- **Honest about breakage** — if a Windows update changes the undocumented
-  interfaces, the app explains what happened and runs in a limited mode instead
-  of failing silently.
+### Layout memory
 
-### Window memory and desktop picker
+win-vde reads Firefox windows from Firefox's session store and Chrome and Edge
+windows from their SNSS session files. You can turn each browser on or off in
+Settings.
 
-- Automatic window memory covers every Firefox, Google Chrome, and Microsoft
-  Edge top-level browser window, and no other application.
-- The picker displays eligible ordinary top-level windows from other
-  applications as well. This does not broaden automatic save/restore beyond
-  Firefox, Chrome, and Edge.
-- A closed browser window remains remembered for exactly 30 days. Reopening it
-  before expiry restores its remembered virtual desktop before the rolling
-  layout is updated; records expire at the 30-day boundary.
-- Hovering a window row highlights its complete clickable area, including the
-  icon; the active-window highlight remains visually stronger.
-- A plain click on a window row switches to the row's displayed desktop, closes
-  the picker, and attempts to activate that exact window. A click on a desktop
-  title or empty tile area only switches desktops and does not explicitly
-  activate any listed window.
-- Stationary Ctrl+Click anywhere in a desktop tile moves the captured active
-  window, switches to the destination, and keeps the picker open with its active
-  context highlighted.
-- Dragging a row to another desktop moves that exact window while leaving the
-  current desktop unchanged and the picker open. Verified Firefox, Chrome, and
-  Edge moves update their supported saved assignment; moves for other
-  applications affect the current live window but create no restore record.
+After a restart, win-vde recognizes a window by its pages. It first looks for
+an exact match of the whole set of tab URLs, then for matching tab domains, then
+for the window title. Windows that hold exactly the same pages count as
+interchangeable, and among equally good placements win-vde picks the one that
+moves the fewest windows.
+
+Windows move only when their identity is gone: after a reboot, a browser
+restart, or a browser crash. Even then win-vde first waits about 20 seconds for
+the windows to settle. When win-vde itself restarts, it moves nothing: it
+recognizes the windows that survived by handle, process ID, and process start
+time and adopts them again. A window you open while the browser is already
+running is never relocated; win-vde records it where you opened it.
+
+A closed Firefox, Chrome, or Edge window keeps its remembered virtual desktop
+for exactly 30 days. If it reappears before then, win-vde puts it back on that
+desktop before it updates the saved layout. At the 30-day mark the record
+expires.
+
+There are two layouts: a rolling automatic one, and a manual checkpoint that
+you save when you choose.
+
+### Desktop picker
+
+The global hotkey, Ctrl+Alt+D by default, opens a grid of your desktops on the
+primary monitor. You can pick another hotkey in Settings as long as it includes
+Ctrl or Alt. The picker lists ordinary application windows as well as the
+tracked browsers. Each row shows the application icon, and the exact active window is
+highlighted. Hovering a row highlights its whole clickable area, icon included,
+while the active-window highlight stays stronger. A tooltip shows any name that
+is cut off.
+
+- Click a window row to switch to the desktop it is shown on, close the picker,
+  and activate that exact window. Click a desktop title or an empty part of a
+  tile to switch desktops without activating any listed window.
+- Hold Ctrl and click anywhere in a desktop tile, without dragging, to move the
+  captured active window there. The picker switches to that desktop and stays
+  open with the active window highlighted.
+- Drag a window row to another desktop to move that exact window. The current
+  desktop stays in place and the picker stays open.
   During the drag, a translucent copy with the application icon and window title follows the pointer.
   Drop it on another desktop to move or visually assign that window without switching desktops or closing the picker.
-- A globally visible, view-pinned, or application-pinned window is never sent
-  through a physical move. The picker instead shows only the selected row under
-  the destination tile until the popup session ends, then reconstructs the next
-  popup from actual Windows state.
-- The footer links to [Virtual Desktop Extension](https://github.com/conus-vision/win-vde)
-  and [Conus Vision](https://conus.vision).
-- Layout v5 is migrated automatically from v2/v3/v4. The legacy
-  `%LOCALAPPDATA%\VirtualDesktopsExtention` directory and matching registry key
-  keep their historical spelling for compatibility.
+- When you move a Firefox, Chrome, or Edge window and the move is verified,
+  win-vde updates its saved desktop. Moving another application's window
+  changes only the live window and creates no restore record.
+- Windows shown on every desktop, individually pinned windows, and
+  application-wide pins are never physically moved. Instead, the picker shows
+  the selected row under the destination tile until the popup closes, then
+  builds the next popup from the actual Windows state. Pin state and saved
+  layouts stay as they were.
+- Type to filter rows by window title. A browser window also matches on any of
+  its tabs, including inactive ones, by tab title or by full URL. The mouse
+  wheel scrolls each desktop tile on its own.
+- Keyboard: the arrow keys and Tab move the selection, Enter or Space switches
+  to the selected desktop, and the keys 1 to 9 and 0 pick desktops 1 to 10.
+  Hold Ctrl with Enter, Space, or a number to move the active window there
+  instead. Esc closes the picker.
 
-## Install / Build
+The picker footer links to
+[Virtual Desktop Extension](https://github.com/conus-vision/win-vde) and
+[Conus Vision](https://conus.vision).
 
-Requires **Visual Studio 2022 or 2017** with the x64 build tools. From a normal
-shell in the repo root:
+## Building from source
+
+You need Visual Studio 2017 or later with the C++ x64 build tools. Any edition
+works, including Build Tools. Open a command prompt in the repository folder
+and run:
 
 ```
 build.bat
 ```
 
-This compiles `src/vde.cpp` (+ `src/vde.rc`) into `build\vde.exe`. There are no
-third-party dependencies. To run the unit tests for the pure logic:
+The script finds Visual Studio through `vswhere`; if you already have an x64
+Native Tools Command Prompt open, it uses that. It compiles the sources in
+`src\` together with the icon and manifest from `src\vde.rc` into
+`build\vde.exe`. There are no third-party dependencies. `build-dev.bat` builds
+the same program as `build\vde-dev.exe`.
+
+To build and run the unit tests:
 
 ```
 build-test.bat
@@ -194,28 +211,22 @@ build-test.bat
 
 ## Usage
 
-Run `vde.exe` with no arguments to start the tray resident. Right-click the tray
-icon for:
+Run `vde.exe` with no arguments to start it in the tray. Right-click the tray
+icon for the menu:
 
-| Menu item | Action |
+| Menu item | What it does |
 |---|---|
-| **Open desktop picker** | Grid of desktops (also via the global hotkey) |
-| **Save windows layout** | Save current windows to a manual checkpoint file |
-| **Restore saved windows layout** | Restore from that manual checkpoint |
-| **Restore last auto saved layout** | Restore from the rolling auto layout |
-| **Reopen browser windows…** | Pick desktops, windows and tabs from a saved checkpoint and bring them back |
-| **Settings…** | Hotkey, auto-save/restore, start-with-Windows |
-| **About…** | Version, author, contact, project link |
-| **Exit** | Quit after saving the current automatic layout |
+| Open desktop picker | Opens the grid of desktops (the global hotkey does the same) |
+| Save windows layout | Saves the current windows to the manual checkpoint file |
+| Restore saved windows layout | Puts windows back from that manual checkpoint |
+| Restore last auto saved layout | Puts windows back from the rolling automatic layout |
+| Reopen browser windows... | Lets you pick desktops, windows, and tabs from a checkpoint and brings them back |
+| Settings... | Hotkey, automatic save and restore, start with Windows, and which browsers to track |
+| Help... | A short guide inside the app, with the contact and project links |
+| About... | Version, author, contact, and project link |
+| Exit | Saves the current automatic layout and quits |
 
-**Picker:** click a window row to switch to its displayed desktop and activate
-that exact window. Click a desktop title or empty tile area to switch without
-activating a listed window. `Ctrl`+click a tile to move the captured active
-window there and keep the picker open. Drag a row to move that exact window
-without switching desktops or closing the picker. Arrow keys / number keys
-navigate; `Esc` closes.
-
-**Command line:**
+### Command line
 
 ```
 vde.exe list          list virtual desktops
@@ -226,95 +237,100 @@ vde.exe restore-auto  restore from the last auto-saved layout
 vde.exe checkpoints   list the saved browser-session checkpoints
 ```
 
+`vde.exe --help` prints the same list.
+
 ### Picker diagnostics
 
-For an explicitly requested one-shot picker trace, first exit the running tray
-instance, then start:
+If you are asked for a picker trace, first exit the running tray instance, then
+start:
 
 ```text
 build\vde.exe --trace-picker
 ```
 
-Reproduce one picker opening and Ctrl+Click, then exit VDE from the tray. The
-bounded JSONL file is stored under
-`%LOCALAPPDATA%\VirtualDesktopsExtention\diagnostics`. Tracing is off during
-ordinary launches and is never added to autostart. It does not record window
-titles, searches, URLs, browser-session data, layout records, or full paths of
-other applications.
+Open the picker once, do one Ctrl+click, then exit VDE from the tray. The trace
+is a size-limited JSONL file in
+`%LOCALAPPDATA%\VirtualDesktopsExtention\diagnostics`. Ordinary launches never
+trace, and autostart never adds the switch. The trace records no window titles,
+searches, URLs, browser-session data, layout records, or full paths of other
+applications.
 
 ## Data files
 
-Stored under `%LOCALAPPDATA%\VirtualDesktopsExtention\`:
+win-vde keeps its files in `%LOCALAPPDATA%\VirtualDesktopsExtention\`:
 
-- `layout-auto.txt` — the rolling auto layout with 30-day closed-window
-  retention.
-- `layout-manual.txt` — your manual checkpoint (full snapshot).
-- `sessions\session-saved.txt` — the last saved browser session (windows,
-  their desktops, and every tab URL/title).
-- `sessions\session-exit-1..4.txt` — the same for the last four shutdowns,
+- `layout-auto.txt`: the rolling automatic layout, including closed windows
+  for 30 days.
+- `layout-manual.txt`: your manual checkpoint, a full snapshot.
+- `sessions\session-saved.txt`: the last saved browser session, meaning the
+  windows, their desktops, and the URL and title of every tab.
+- `sessions\session-exit-1..4.txt`: the same for the last four shutdowns,
   newest first.
-- `bindings.txt` — which live window (handle, process ID, process start time)
-  currently owns which layout record. It is what lets win-vde tell a browser
-  restart from its own restart; a stale or missing file only costs one extra
-  restore pass.
+- `bindings.txt`: which live window (handle, process ID, process start time)
+  currently owns which layout record. This file is how win-vde tells a browser
+  restart from its own restart. If it is stale or missing, the only cost is one
+  extra restore pass.
 
-A legacy `layout.txt` from earlier builds is migrated to `layout-auto.txt` on
-first run.
+On first run, win-vde migrates a `layout.txt` from earlier builds to
+`layout-auto.txt`, and it upgrades older v2, v3, and v4 layouts to v5 on its
+own. The data folder and the registry key keep the historical spelling
+"Extention" so that existing installs keep working.
 
 ## Autostart
 
-Enable **Settings → Start with Windows (run at logon)** to have the utility
-launch at sign-in (an `HKCU\…\Run` entry). This is what makes after-reboot
-restore work unattended.
+Turn on **Settings > Start with Windows (run at logon)** and win-vde starts
+when you sign in. It adds a value to
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. Autostart is what lets
+the layout come back after a reboot without you doing anything.
 
-## Limitations & compatibility
+## Limitations and compatibility
 
-- Moving other apps' windows between desktops uses **undocumented COM
-  interfaces** whose identifiers can change between Windows 11 builds. If a
-  build isn't recognized, win-vde shows a **compatibility notice** and runs in a
-  limited (read-only) mode — it won't move windows blindly. Please report your
-  Windows build to <info@conus.vision> so a fix can be published.
-- Only the **virtual desktop** of each window is saved/restored — on-screen size
-  and position are left to the browser's own session restore.
-- Persistent automatic/manual window memory remains limited to Firefox, Chrome,
-  and Edge. The picker can display, activate, and move eligible windows from
-  other applications, but it does not create restore records for them.
-- Globally visible or pinned windows are protected from physical moves. Their
-  session-only visual placement in the picker disappears when the popup closes.
-- If a saved virtual desktop has been deleted, the window is restored to the
-  desktop that now occupies that position rather than staying put forever.
-- If the Windows shell (`explorer.exe`) restarts, win-vde reconnects to the
-  virtual-desktop services by itself instead of silently failing every move.
-- Dragging a tab out of a window, or merging two windows, is recognized as such:
-  the layout follows the windows instead of dragging one half to the desktop the
-  original was remembered on.
-- If a browser runs as administrator, win-vde says so once instead of reporting a
-  generic failure — an unelevated app cannot move an elevated window.
-- Private Firefox windows aren't in the session store, so they're matched by
-  title only, and they are not part of a session checkpoint.
-- Reopening **adds** windows; it never closes or rearranges the ones already
-  open. Tabs that are already open are skipped by default (you can still check
-  one explicitly). Tab history, pinned tabs, tab groups, form data and scroll
-  position are not reopened — only the tab URLs, their order, and the window's
-  desktop.
-- Reopening is sequential by design — about a second per window — because a new
-  window is recognized as the difference in the browser's window set, and
-  Firefox routes extra tabs to its most recent window.
-- Edge keeps its session file exclusively locked while it runs, so Edge windows
-  are tracked by title only until Edge is closed.
-- Every browser profile that is currently open is read, not just the default
-  one: win-vde detects an open profile from the lock the browser holds on it.
-  A profile that is merely installed is ignored, so its old windows can never
+- Moving other apps' windows between desktops relies on undocumented COM
+  interfaces whose identifiers can change between Windows 11 builds. If win-vde
+  doesn't recognize your build, it explains what happened and runs in a limited,
+  read-only mode rather than moving windows blindly or failing silently. Please
+  send your Windows build number to <info@conus.vision> so a fix can be
+  published.
+- win-vde saves and restores only the virtual desktop of each window. Size and
+  position on screen are left to the browser's own session restore.
+- Persistent window memory, automatic or manual, covers only Firefox, Chrome,
+  and Edge. The picker can show, activate, and move windows of other
+  applications, but it creates no restore records for them.
+- If a saved virtual desktop has been deleted, the window goes to the desktop
+  that now sits at that position, so it doesn't stay stranded.
+- If the Windows shell (`explorer.exe`) restarts, win-vde puts its tray icon
+  back and reconnects to the virtual-desktop services on its own, so moves
+  keep working.
+- win-vde recognizes dragging a tab out of a window, or merging two windows,
+  for what it is. The layout follows the windows instead of sending one half to
+  the desktop where the original window was remembered.
+- If a browser runs as administrator, win-vde tells you once instead of
+  reporting a generic failure: a program that isn't elevated can't move an
+  elevated window.
+- Private Firefox windows aren't in the session store, so win-vde matches them
+  by title only, and they are not part of any session checkpoint.
+- Reopening only adds windows. It never closes or rearranges the ones that are
+  open. It skips tabs that are already open unless you check them yourself.
+  It brings back the tab URLs, their order, and the window's desktop, but not
+  tab history, pinned tabs, tab groups, form data, or scroll position.
+- Reopening is sequential on purpose, at about a second per window: win-vde
+  recognizes a new window as the difference in the browser's window set, and
+  Firefox sends extra tabs to its most recent window.
+- Edge keeps its session file locked while it runs, so until Edge closes,
+  win-vde tracks Edge windows by title only.
+- win-vde reads every browser profile that is currently open, not just the
+  default one. It detects an open profile by the lock the browser holds on it.
+  A profile that is merely installed is ignored, so its old windows can't
   confuse the matching.
 
 ## Roadmap
 
-- Persistent restore profiles for generic (user-defined) multi-window apps
+- Persistent restore profiles for other multi-window apps that you define,
   beyond the three built-in browsers.
-- Optional restore of on-screen geometry (size/position), not just the desktop.
-- Telling a browser's PWA / app windows apart from ordinary browsing windows
-  (Windows exposes no signal for it today).
+- Optional restore of window size and position, not just the desktop.
+- Telling a browser's PWA and app windows apart from ordinary browsing windows.
+  Windows exposes no signal for this today.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). © 2026 Volodymyr Moskvin (conus.vision).
+MIT, see [LICENSE](LICENSE). © 2026 Volodymyr Moskvin (conus.vision).

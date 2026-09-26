@@ -170,6 +170,23 @@ private:
         output.append((const char*)encoded,count);
         return true;
     }
+    // Reads a "\\uXXXX" low surrogate right after the cursor without consuming
+    // it or failing the parse.
+    bool peekLowSurrogate(unsigned& low) const {
+        if((size_t)(end_-p_)<6 || p_[0]!='\\' || p_[1]!='u') return false;
+        unsigned value=0;
+        for(int i=2;i<6;++i){
+            const char c=p_[i];
+            value<<=4;
+            if(c>='0' && c<='9') value|=(unsigned)(c-'0');
+            else if(c>='a' && c<='f') value|=(unsigned)(c-'a'+10);
+            else if(c>='A' && c<='F') value|=(unsigned)(c-'A'+10);
+            else return false;
+        }
+        if(value<0xdc00 || value>0xdfff) return false;
+        low=value;
+        return true;
+    }
     bool hex4(unsigned& output){
         if((size_t)(end_-p_)<4){ fail(); return false; }
         unsigned value=0;
@@ -209,15 +226,16 @@ private:
                 case 'u': {
                     unsigned codePoint=0;
                     if(!hex4(codePoint)) return false;
+                    // JSON.stringify writes an unpaired surrogate as a lone
+                    // escape (a page title cut inside an emoji).  It is valid
+                    // JSON and becomes U+FFFD instead of failing the session.
                     if(codePoint>=0xd800 && codePoint<=0xdbff){
-                        if((size_t)(end_-p_)<2 || p_[0]!='\\' || p_[1]!='u'){
-                            fail(); return false;
-                        }
-                        p_+=2;
                         unsigned low=0;
-                        if(!hex4(low) || low<0xdc00 || low>0xdfff){ fail(); return false; }
-                        codePoint=0x10000+((codePoint-0xd800)<<10)+(low-0xdc00);
-                    } else if(codePoint>=0xdc00 && codePoint<=0xdfff){ fail(); return false; }
+                        if(peekLowSurrogate(low)){
+                            p_+=6;
+                            codePoint=0x10000+((codePoint-0xd800)<<10)+(low-0xdc00);
+                        } else codePoint=0xfffd;
+                    } else if(codePoint>=0xdc00 && codePoint<=0xdfff) codePoint=0xfffd;
                     if(!appendUtf8(output,codePoint)) return false;
                     break;
                 }
@@ -442,12 +460,15 @@ struct SnssPR {
         while(i<stop){
             unsigned first=(unsigned)p[i]|((unsigned)p[i+1]<<8); i+=2;
             unsigned codePoint=first;
+            // Chrome stores titles as UTF-16 without validating them; an
+            // unpaired surrogate becomes U+FFFD instead of failing the file.
             if(first>=0xd800 && first<=0xdbff){
-                if(stop-i<2) return false;
-                unsigned low=(unsigned)p[i]|((unsigned)p[i+1]<<8); i+=2;
-                if(low<0xdc00 || low>0xdfff) return false;
-                codePoint=0x10000+((first-0xd800)<<10)+(low-0xdc00);
-            } else if(first>=0xdc00 && first<=0xdfff) return false;
+                const unsigned low=stop-i>=2 ? ((unsigned)p[i]|((unsigned)p[i+1]<<8)) : 0;
+                if(low>=0xdc00 && low<=0xdfff){
+                    i+=2;
+                    codePoint=0x10000+((first-0xd800)<<10)+(low-0xdc00);
+                } else codePoint=0xfffd;
+            } else if(first>=0xdc00 && first<=0xdfff) codePoint=0xfffd;
             if(!AppendUtf8Scalar(output,codePoint)) return false;
         }
         return true;
@@ -525,9 +546,12 @@ inline bool ParseChromiumSNSS(const std::string& data,std::vector<WinFp>& output
                 first=ReadSnssI32(command); second=ReadSnssI32(command+4); return true;
             };
             if(id==0){ int32_t window=0,tab=0; if(!raw2(window,tab)||!acceptWindow(window)||!acceptTab(tab)) return false; tabWindow[tab]=window; }
-            else if(id==2){ int32_t tab=0,index=0; if(!raw2(tab,index)||!acceptTab(tab)||index<0) return false; tabIndex[tab]=index; }
-            else if(id==7){ int32_t tab=0,index=0; if(!raw2(tab,index)||!acceptTab(tab)||index<0) return false; tabSelectedNavigation[tab]=index; }
-            else if(id==8){ int32_t window=0,index=0; if(!raw2(window,index)||!acceptWindow(window)||index<0) return false; windowSelected[window]=index; }
+            // A negative index means "no position/selection", not corruption:
+            // Chrome writes kNoTab (-1) as the selected tab when a window
+            // loses its last tab, and its own reader accepts it.
+            else if(id==2){ int32_t tab=0,index=0; if(!raw2(tab,index)||!acceptTab(tab)) return false; if(index<0) tabIndex.erase(tab); else tabIndex[tab]=index; }
+            else if(id==7){ int32_t tab=0,index=0; if(!raw2(tab,index)||!acceptTab(tab)) return false; if(index<0) tabSelectedNavigation.erase(tab); else tabSelectedNavigation[tab]=index; }
+            else if(id==8){ int32_t window=0,index=0; if(!raw2(window,index)||!acceptWindow(window)) return false; if(index<0) windowSelected.erase(window); else windowSelected[window]=index; }
             else if(id==6){
                 if(commandLength<4) return false;
                 uint32_t declared=(uint32_t)command[0]|((uint32_t)command[1]<<8)|((uint32_t)command[2]<<16)|((uint32_t)command[3]<<24);

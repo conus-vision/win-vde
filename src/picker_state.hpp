@@ -1246,6 +1246,7 @@ struct PickerTransition {
     int rollbackPopupAttempts=0;
     int rollbackSwitchAttempts=0;
     int focusAttempts=0;
+    int refreshAttempts=0;
     bool targetMayHaveMoved=false;
     bool popupMayHaveMoved=false;
     bool switchMayHaveChanged=false;
@@ -1313,6 +1314,7 @@ struct PickerTransition {
         std::swap(rollbackPopupAttempts,other.rollbackPopupAttempts);
         std::swap(rollbackSwitchAttempts,other.rollbackSwitchAttempts);
         std::swap(focusAttempts,other.focusAttempts);
+        std::swap(refreshAttempts,other.refreshAttempts);
         std::swap(targetMayHaveMoved,other.targetMayHaveMoved);
         std::swap(popupMayHaveMoved,other.popupMayHaveMoved);
         std::swap(switchMayHaveChanged,other.switchMayHaveChanged);
@@ -2628,8 +2630,12 @@ inline PickerEffect PickerNoEffect() noexcept {
 inline bool DiscardPickerUnissuedEffectForCancel(
         PickerEffect& scheduled,bool& hasScheduled,
         const PickerTransition& transition) noexcept {
+    // Once a cancel is being handled, the scheduled effect belongs to that
+    // handling (e.g. a row move's rollback): the reducer ignores repeated
+    // cancels, so discarding it would strand the transition.
     if(!hasScheduled || scheduled.kind==PickerEffectKind::None ||
-       transition.dismissed || scheduled.kind==PickerEffectKind::Hide ||
+       transition.dismissed || transition.cancelRequested ||
+       scheduled.kind==PickerEffectKind::Hide ||
        scheduled.generation!=transition.generation ||
        scheduled.effectSerial!=transition.effectSerial ||
        scheduled.kind!=transition.pendingEffect ||
@@ -2914,8 +2920,13 @@ inline PickerEffect PickerBeginRollback(PickerState& state,
                 L"The target identity cannot be safely rolled back.");
             return PickerStartRefresh(state);
         }
-        if(transition.targetMayHaveMoved)
-            return PickerIssueTarget(state,true);
+        if(transition.targetMayHaveMoved){
+            if(transition.rollbackTargetAttempts<4)
+                return PickerIssueTarget(state,true);
+            PickerAppendDiagnostic(
+                transition,L"The target remains displaced after rollback.");
+            return PickerContinueRollbackAfterTarget(state);
+        }
         transition.phase=PickerPhase::RollbackTargetVerify;
         return EmitPickerEffect(state,PickerEffectKind::ReadTarget);
     }
@@ -3060,6 +3071,7 @@ inline PickerEffect AdvancePickerTransition(
         transition.rollbackPopupAttempts=0;
         transition.rollbackSwitchAttempts=0;
         transition.focusAttempts=0;
+        transition.refreshAttempts=0;
         transition.targetMayHaveMoved=false;
         transition.popupMayHaveMoved=false;
         transition.switchMayHaveChanged=false;
@@ -3629,10 +3641,19 @@ inline PickerEffect AdvancePickerTransition(
             if(transition.mode==PickerTransitionMode::RowMoveOnly){
                 if(!observation.apiAccepted){
                     transition.failed=true;
-                    PickerAppendDiagnostic(
-                        transition,
-                        L"The picker model could not be refreshed.");
-                    return PickerStartRefresh(state);
+                    if(transition.refreshAttempts==0)
+                        PickerAppendDiagnostic(
+                            transition,
+                            L"The picker model could not be refreshed.");
+                    // A few retries, then end the move: a disconnected desktop
+                    // service can fail every refresh, and an unbounded retry
+                    // floods the message queue with posted work.
+                    if(transition.refreshAttempts<4){
+                        ++transition.refreshAttempts;
+                        return PickerStartRefresh(state);
+                    }
+                    PickerAcknowledgeTerminal(transition);
+                    return PickerNoEffect();
                 }
                 PickerAcknowledgeTerminal(transition);
                 return PickerNoEffect();
@@ -4341,6 +4362,46 @@ inline int AdvancePickerScroll(int savedScroll,int maxScroll,
     if(wheelDelta>0) return visible>0?visible-1:0;
     if(wheelDelta<0) return visible<maximum?visible+1:maximum;
     return visible;
+}
+
+// Moves a tile's scroll by whole rows: positive rows scroll up, as a positive
+// wheel delta does.
+inline int AdvancePickerScrollRows(int savedScroll,int maxScroll,
+                                   int rows) noexcept {
+    const int maximum=maxScroll>0?maxScroll:0;
+    const long long next=
+        (long long)PickerVisibleScroll(savedScroll,maximum)-(long long)rows;
+    return next<0 ? 0 : (next>maximum ? maximum : (int)next);
+}
+
+// High-resolution wheels and precision touchpads report fractions of a notch
+// (WHEEL_DELTA), and Windows may coalesce several notches into one message.
+// Deltas add up per tile into whole rows, the remainder carries over, and a
+// change of direction starts counting afresh.
+struct PickerWheelAccumulator {
+    std::string tileKey;
+    int remainder=0;
+};
+
+inline int TakePickerWheelRows(PickerWheelAccumulator& accumulator,
+                               const std::string& tileKey,
+                               int wheelDelta) noexcept {
+    try {
+        if(accumulator.tileKey!=tileKey){
+            accumulator.tileKey=tileKey;
+            accumulator.remainder=0;
+        }
+    } catch(...) {
+        accumulator.remainder=0;
+        return 0;
+    }
+    if((wheelDelta>0 && accumulator.remainder<0) ||
+       (wheelDelta<0 && accumulator.remainder>0))
+        accumulator.remainder=0;
+    const long long sum=(long long)accumulator.remainder+wheelDelta;
+    const long long rows=sum/WHEEL_DELTA;
+    accumulator.remainder=(int)(sum-rows*WHEEL_DELTA);
+    return (int)rows;
 }
 
 inline bool PublishPickerBitmapReplacement(
