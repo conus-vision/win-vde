@@ -5931,7 +5931,14 @@ static ReservedAutoIdentity ReservationForManualMove(
             origin.app=fast.app;
             origin.desktop=fast.desktop;
             origin.deskIndex=SnapshotDesktopIndex(fast.desktop);
-            origin.activeTitle=W2U8(fast.title);
+            // Like every other record, keep the tab title, not the window
+            // title with its " - Browser" suffix, or title matching and
+            // provisional adoption can never find this record again.
+            std::vector<AppProfile> profiles;
+            const AppProfile* profile=FindActiveProfile(fast.app,profiles);
+            origin.activeTitle=W2U8(profile
+                ? StripReconcileTitleSuffix(fast.title,profile->titleSuffixes)
+                : fast.title);
             MarkSeen(origin,UtcNowSeconds());
             if(!BindReservationToProvisionalOrigin(
                     origin,reservation.recordId)){
