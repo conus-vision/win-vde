@@ -169,7 +169,13 @@ inline std::string hostOf(const std::string& url){
     size_t e=url.find_first_of("/:?#",s);
     std::string h=url.substr(s,(e==std::string::npos?url.size():e)-s);
     if(h.size()>4&&h.compare(0,4,"www.")==0)h=h.substr(4);
-    for(auto&c:h) if(c>='A'&&c<='Z')c+=32;
+    for(auto&c:h){
+        // Layout records list domains comma-separated in tab-delimited lines,
+        // so a "host" holding a separator or a blank (a data: URL that merely
+        // contains "://", or a host a browser keeps leniently) is no domain.
+        if(c==','||(unsigned char)c<=0x20||c==0x7f) return "";
+        if(c>='A'&&c<='Z')c+=32;
+    }
     return h;
 }
 inline std::string etld1(const std::string& host){

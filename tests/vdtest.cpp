@@ -46,6 +46,10 @@ static void test_etld1(){
     CHECK(etld1("mail.google.com") == "google.com");
     CHECK(etld1("docs.python.org") == "python.org");
     CHECK(hostOf("https://www.GitHub.com/x/y") == "github.com");
+    // A domain with a separator could never be saved in a layout record.
+    CHECK(hostOf("http://example,com/") == "");
+    CHECK(hostOf("data:text/plain,see%20https://a.com,%20then%20b") == "");
+    CHECK(hostOf("https://tab\there.example/") == "");
 }
 static void test_b64(){
     std::string s = "Inbox \xE2\x80\x94 Mozilla";   // includes a UTF-8 em dash
