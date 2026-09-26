@@ -4297,8 +4297,13 @@ static bool QueueAutoMove(AutoRestoreOperation& operation,
     const FastWin& fast=operation.reconcileFast[restore.liveIndex];
     const std::string runtimeKey=RuntimeKey(fast);
     const LayoutWin& saved=result.saved[restore.savedIndex];
-    if(!SavedRestoreDestinationAvailable(
-            saved,restore.destination,operation.currentDesktops)) return false;
+    // The destination must be where the record resolves today: its saved
+    // desktop, or the desktop now at the saved position when the saved one
+    // was deleted.  Requiring the saved GUID itself would reject every
+    // deleted-desktop fallback the caller has already resolved.
+    GUID resolved={0};
+    if(!ResolveRestoreDestination(saved,operation.currentDesktops,resolved) ||
+       !GuidEq(resolved,restore.destination)) return false;
     if(g_reservedAutoIdentities.count(runtimeKey)) return false;
     g_pendingRecordByRuntime[runtimeKey]=saved.recordId;
 
