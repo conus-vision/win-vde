@@ -11447,7 +11447,12 @@ static void AboutCopy(HWND hwnd){
     std::wstring s=std::wstring(L"Virtual Desktop Extension v")+APP_VERSION+L" | info@conus.vision | Windows build "+std::to_wstring(GetWindowsBuild());
     if(OpenClipboard(hwnd)){ EmptyClipboard();
         size_t bytes=(s.size()+1)*sizeof(wchar_t); HGLOBAL h=GlobalAlloc(GMEM_MOVEABLE,bytes);
-        if(h){ void* d=GlobalLock(h); if(d){ memcpy(d,s.c_str(),bytes); GlobalUnlock(h); SetClipboardData(CF_UNICODETEXT,h); } }
+        if(h){
+            bool owned=false;   // the clipboard owns h only after SetClipboardData succeeds
+            void* d=GlobalLock(h);
+            if(d){ memcpy(d,s.c_str(),bytes); GlobalUnlock(h); owned=SetClipboardData(CF_UNICODETEXT,h)!=nullptr; }
+            if(!owned) GlobalFree(h);
+        }
         CloseClipboard();
     }
 }
@@ -13615,6 +13620,9 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             AppendMenuW(m,MF_STRING,209,L"Exit");
             SetForegroundWindow(hwnd);
             int cmd=TrackPopupMenu(m,TPM_RETURNCMD|TPM_RIGHTBUTTON,pt.x,pt.y,0,hwnd,nullptr); DestroyMenu(m);
+            // Documented TrackPopupMenu quirk for notification-area menus:
+            // without this the next menu can flash and close at once.
+            PostMessageW(hwnd,WM_NULL,0,0);
             if(g_picker.controlledTransition() && cmd!=209) return 0;
             if(cmd==200)ShowPicker(std::move(pickerTarget));
             else if(cmd==201)StartManualSave();
