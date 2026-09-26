@@ -12082,6 +12082,10 @@ static OpenUrlsByApp CollectOpenTabUrls(std::set<std::string>& unknownApps) noex
             const std::map<std::string,AppFastSnapshot>::const_iterator windows=
                 live.find(profiles[p].id);
             const bool running=windows!=live.end() && !windows->second.windows.empty();
+            // A browser with no windows has nothing open.  Its session file
+            // still lists the last session - exactly what a reopen restores -
+            // so reading it would grey out every tab worth bringing back.
+            if(!running) continue;
             std::shared_ptr<const std::vector<WinFp> > session;
             bool acquired=false;
             for(int attempt=0;attempt<4 && !acquired;++attempt){
@@ -12089,7 +12093,7 @@ static OpenUrlsByApp CollectOpenTabUrls(std::set<std::string>& unknownApps) noex
                 acquired=AcquireCliSession(profiles[p],session) && session;
             }
             if(!acquired){
-                if(running) unknownApps.insert(profiles[p].id);
+                unknownApps.insert(profiles[p].id);
                 continue;
             }
             std::set<std::string>& urls=open[profiles[p].id];
