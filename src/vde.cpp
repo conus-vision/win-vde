@@ -10958,6 +10958,13 @@ static void LoadSettings(){
         cb=sizeof(v); if(RegQueryValueExW(hk,L"AppEdge",0,0,(LPBYTE)&v,&cb)==ERROR_SUCCESS)g_appEdge=(v!=0);
         RegCloseKey(hk);
     }
+    // A stored hotkey without Ctrl or Alt would swallow a plain key in every
+    // application; such a value (or garbage) falls back to the default.
+    g_hotMods&=MOD_ALT|MOD_CONTROL|MOD_SHIFT|MOD_WIN;
+    if(g_hotVk==0 || g_hotVk>0xFE || !(g_hotMods&(MOD_CONTROL|MOD_ALT))){
+        g_hotMods=MOD_CONTROL|MOD_ALT;
+        g_hotVk='D';
+    }
 }
 static void SaveSettings(){
     HKEY hk;
@@ -11317,6 +11324,10 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         if(g_hotMods&MOD_CONTROL)hf|=HOTKEYF_CONTROL;
         if(g_hotMods&MOD_ALT)hf|=HOTKEYF_ALT;
         SendMessageW(hk,HKM_SETHOTKEY,MAKEWORD((BYTE)g_hotVk,(BYTE)hf),0);
+        // A global hotkey without Ctrl or Alt would swallow that key in every
+        // application; the control substitutes Ctrl+Alt for such entries.
+        SendMessageW(hk,HKM_SETRULES,HKCOMB_NONE|HKCOMB_S,
+                     MAKELPARAM(HOTKEYF_CONTROL|HOTKEYF_ALT,0));
         SendMessageW(GetDlgItem(hwnd,IDC_AUTOFIX),BM_SETCHECK,g_autoFix?BST_CHECKED:BST_UNCHECKED,0);
         SendMessageW(GetDlgItem(hwnd,IDC_AUTOSTART),BM_SETCHECK,GetRunAtLogon()?BST_CHECKED:BST_UNCHECKED,0);
         SendMessageW(GetDlgItem(hwnd,IDC_APP_FF),BM_SETCHECK,g_appFirefox?BST_CHECKED:BST_UNCHECKED,0);
@@ -11372,6 +11383,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
                 MessageBoxW(hwnd,L"The current automatic layout could not be saved. Settings were not changed; retry after storage becomes available.",APP_NAME,MB_ICONWARNING);
                 return 0;
             }
+            const UINT previousHotVk=g_hotVk,previousHotMods=g_hotMods;
             g_hotVk=currentSettings.hotkeyVk;
             g_hotMods=currentSettings.hotkeyMods;
             g_autoFix=currentSettings.autoFix;
@@ -11379,11 +11391,18 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             g_appChrome=currentSettings.chrome;
             g_appEdge=currentSettings.edge;
             SetRunAtLogon(currentSettings.runAtLogon);
+            // Register before saving: a combination another app owns must
+            // neither replace the hotkey that works nor be saved.
+            const bool ok=ApplyHotkey();
+            if(!ok){
+                g_hotVk=previousHotVk;
+                g_hotMods=previousHotMods;
+                ApplyHotkey();
+            }
             SaveSettings();
-            bool ok=ApplyHotkey();
             ApplyAutoFix();
             DestroyWindow(hwnd);
-            if(!ok) MessageBoxW(nullptr,L"Could not register that hotkey (it may be in use by another app).",APP_NAME,MB_ICONWARNING);
+            if(!ok) MessageBoxW(nullptr,L"Could not register that hotkey (it may be in use by another app). The previous hotkey was kept.",APP_NAME,MB_ICONWARNING);
             return 0;
         }
         if(LOWORD(wp)==IDCANCEL){ DestroyWindow(hwnd); return 0; }
