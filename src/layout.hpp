@@ -315,13 +315,20 @@ inline bool LooksLikeWindowMerge(const LayoutWin& saved,const LayoutWin& live,
     return false;
 }
 
+// The title half of the score ignores a leading unread counter, for the reason
+// given at StripTitleUnreadCounter.
+inline bool SameActiveTitle(const std::string& saved,const std::string& live){
+    return !saved.empty() &&
+        StripTitleUnreadCounter(saved)==StripTitleUnreadCounter(live);
+}
+
 inline double LayoutScore(const LayoutWin& saved, const LayoutWin& live){
     if(saved.app!=live.app) return 0;
     if(saved.provisional && saved.counts.empty()) return 0;
     // Same set of pages open: this is the window, whatever its title says.
     if(saved.urlSignature!=0 && saved.urlSignature==live.urlSignature) return 1.0;
     if(saved.counts.empty() || live.counts.empty())
-        return !saved.activeTitle.empty() && saved.activeTitle==live.activeTitle ? 1.0 : 0.0;
+        return SameActiveTitle(saved.activeTitle,live.activeTitle) ? 1.0 : 0.0;
 
     long double dot=0, savedSquares=0, liveSquares=0;
     for(const auto& item : saved.counts){
@@ -347,7 +354,7 @@ inline double LayoutScore(const LayoutWin& saved, const LayoutWin& live){
     double jaccard=unionSize ? static_cast<double>(intersection)/static_cast<double>(unionSize) : 0;
 
     double active=0;
-    if(!saved.activeTitle.empty() && saved.activeTitle==live.activeTitle) active=1;
+    if(SameActiveTitle(saved.activeTitle,live.activeTitle)) active=1;
     else if(!saved.activeDomain.empty() && saved.activeDomain==live.activeDomain) active=0.5;
 
     long long savedTabs=saved.tabCount, liveTabs=live.tabCount;

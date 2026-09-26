@@ -29612,6 +29612,16 @@ static void test_unread_counter_is_stripped_before_matching(){
     CHECK(StripTitleUnreadCounter("()")=="()");
     CHECK(StripTitleUnreadCounter("Inbox (3)")=="Inbox (3)");
     CHECK(StripTitleUnreadCounter("")=="");
+    // The match score compares titles the same way.
+    LayoutWin countedSaved;
+    countedSaved.app="firefox";
+    countedSaved.activeTitle="(3) Inbox - Mail";
+    LayoutWin countedLive=countedSaved;
+    countedLive.activeTitle="(5) Inbox - Mail";
+    CHECK(LayoutScore(countedSaved,countedLive)==1.0);        // title-only
+    countedSaved.counts={{"mail.example",1}}; countedSaved.tabCount=1;
+    countedLive.counts=countedSaved.counts; countedLive.tabCount=1;
+    CHECK(std::fabs(LayoutScore(countedSaved,countedLive)-1.0)<1e-12);
     // The counter moves the moment the page changes it while the session file
     // still holds the previous value, so both sides must normalize to the same.
     CHECK(NormalizeProvisionalAdoptionTitle("(4) Inbox — Gmail")==
