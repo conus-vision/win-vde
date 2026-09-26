@@ -5774,10 +5774,12 @@ static void StartManualRestore(bool manualSource){
     for(uint64_t id : old) CancelManualMoveOperation(id);
     LayoutLoadResult loaded=LoadLayoutWithBackup(
         LayoutPath(manualSource),UtcNowSeconds());
-    if(!loaded.usable() || loaded.sourceVersion!=4 || loaded.wins.empty()){
+    // Every writer emits v5 and v4 still parses unchanged; legacy v2/v3 files
+    // stay refused.
+    if(!loaded.usable() || loaded.sourceVersion<4 || loaded.wins.empty()){
         Balloon(manualSource
-            ? L"No valid v4 manual layout is available. Save one first."
-            : L"No valid v4 automatic layout is available.");
+            ? L"No valid manual layout is available. Save one first."
+            : L"No valid automatic layout is available.");
         return;
     }
     ManualMoveOperation operation;
@@ -6150,8 +6152,8 @@ static bool CliRestoreCheckpoint(bool manual,std::string& summary,
                                  std::vector<std::string>& lines){
     LayoutLoadResult loaded=LoadLayoutWithBackup(
         LayoutPath(manual),UtcNowSeconds());
-    if(!loaded.usable() || loaded.sourceVersion!=4 || loaded.wins.empty()){
-        summary=manual ? "No valid v4 manual layout." : "No valid v4 automatic layout.";
+    if(!loaded.usable() || loaded.sourceVersion<4 || loaded.wins.empty()){
+        summary=manual ? "No valid manual layout." : "No valid automatic layout.";
         return false;
     }
     std::vector<DeskRec> desktops;
