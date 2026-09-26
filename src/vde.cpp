@@ -3391,7 +3391,12 @@ static bool RetryableMoveHresult(HRESULT result){
 static MoveAttemptOutcome ReadMoveDestination(const MoveRuntimeBinding& binding,
                                               WindowIdentityRecapture& identity){
     identity=WindowIdentityRecapture::Match;
-    if(GetDesktopIndexByGuid(binding.destination)<0)
+    // A failed enumeration says nothing about the destination: explorer.exe
+    // may be restarting, and CurrentDesktops repairs the services.  Only a
+    // successful enumeration without the GUID proves the desktop is gone.
+    std::vector<DeskRec> desktops;
+    if(!CurrentDesktops(desktops)) return MoveAttemptOutcome::TransientFailure;
+    if(!ConcreteDesktopExists(binding.destination,desktops,DeskGuid))
         return MoveAttemptOutcome::PermanentFailure;
     if(!g_vdmDoc) return MoveAttemptOutcome::PermanentFailure;
     GUID current={0};
