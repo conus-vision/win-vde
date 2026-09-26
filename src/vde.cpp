@@ -5124,6 +5124,7 @@ static void SwapLayoutWinNoThrow(LayoutWin& left,LayoutWin& right) noexcept {
     std::swap(left.lastSeenUtc,right.lastSeenUtc);
     std::swap(left.missingSinceUtc,right.missingSinceUtc);
     std::swap(left.provisional,right.provisional);
+    std::swap(left.urlSignature,right.urlSignature);
 }
 
 static void SwapReservedAutoIdentityNoThrow(

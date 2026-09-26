@@ -2272,6 +2272,7 @@ inline std::vector<LayoutWin> CommitAppReconcile(
             record.activeDomain=live[match.liveIndex].activeDomain;
             record.tabCount=live[match.liveIndex].tabCount;
             record.counts=live[match.liveIndex].counts;
+            record.urlSignature=live[match.liveIndex].urlSignature;
             record.provisional=false;
         }
         record.recordId=recordId;
