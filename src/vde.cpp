@@ -63,6 +63,7 @@
 #include "tabsnap.hpp"  // session snapshots (checkpoints) + reopen planning
 #include "binding_store.hpp"  // persisted window identities + restore gate
 #include "reopen_model.hpp"   // checkpoint selection model for the reopen dialog
+#include "tab_overlay.hpp"    // scrolling/selection of the picker's tab list overlay
 #include <dwmapi.h>
 #pragma comment(lib, "dwmapi.lib")
 
@@ -6617,6 +6618,39 @@ struct WinItem {
 };   // search = titleLC (+ all-tab text for browser windows)
 struct Tile { GUID guid; std::string guidKey; std::wstring name; std::wstring displayName; int index; std::vector<WinItem> windows; std::vector<size_t> filtered; RECT rc; int scroll=0; };
 static std::vector<Tile> g_tiles;
+
+// ---- tab list overlay (Ctrl+click a window row) ----
+// Tabs the picker read for its all-tab search, by window runtime key. The
+// overlay falls back to them when the observation loop has no capture for
+// the window (auto-fix off, or a window VDE has not recorded yet).
+struct PickerSearchTabs {
+    WindowIdentityKey identity;
+    std::vector<SnapTab> tabs;
+    int activeTab=-1;
+};
+static std::map<std::string,PickerSearchTabs> g_pickerSearchTabs;
+struct PickerTabOverlay {
+    bool open=false;
+    std::wstring title;      // window title in the header
+    std::wstring subtitle;   // browser, tab count, age of the data
+    std::wstring note;       // shown when there is no tab list
+    std::wstring status;     // footer feedback, e.g. the copied URL
+    std::vector<std::wstring> rowTitles;
+    std::vector<std::wstring> rowUrls;
+    int activeTab=-1;
+    int selected=-1;
+    int hover=-1;
+    int scroll=-1;           // -1 until the first paint scrolls to the active tab
+    // Geometry of the last paint, for hit testing.
+    RECT panel={0,0,0,0};
+    RECT close={0,0,0,0};
+    int listTop=0;
+    int rowHeight=1;
+    int visibleRows=0;
+};
+static PickerTabOverlay g_tabOverlay;
+static const wchar_t kPickerCtrlHint[]=
+    L"Ctrl+Click: window - show its tabs  \x00B7  desktop - move the current window there";
 static PickerEffect g_pickerScheduledEffect;
 static bool g_pickerEffectScheduled=false;
 static uint64_t g_pickerEffectNotBeforeMs=0;
@@ -6708,6 +6742,7 @@ static int TILE_W=240,TILE_H=150,PAD=16,HEADER=44,SEARCH_H=40;
 static int FOOTER_H=34,FOOTER_MIN_W=720,FOOTER_LINK_H=22;
 static int g_cols=1,g_rows=1;
 static HFONT g_fPT=nullptr,g_fPN=nullptr,g_fPI=nullptr,g_fPX=nullptr;   // cached picker fonts (avoid re-create per repaint)
+static HFONT g_fPU=nullptr;   // tab overlay URL line
 static HBRUSH g_searchBrush=nullptr;
 static int g_lastHoverRow=-1;                                          // last tooltip row (avoid redundant TTM churn)
 static uint64_t g_lastHoverGeneration=0;
@@ -6731,6 +6766,8 @@ static void InitMetrics(){
     g_fPN=CreateFontW(S(17),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     g_fPI=CreateFontW(S(15),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     g_fPX=CreateFontW(S(30),0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+    if(g_fPU)DeleteObject(g_fPU);
+    g_fPU=CreateFontW(S(13),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     if(!g_searchBrush) g_searchBrush=CreateSolidBrush(RGB(34,33,38));
 }
 // ---- picker search / scroll / tooltip state ----
@@ -7883,6 +7920,23 @@ static void HandleSearchReconcileResult(std::unique_ptr<ReconcileResult> result)
                     if(PickerSearchResultMatches(
                             item.identity,resultIdentity))
                         item.search=item.titleLC+L" "+blob;
+            try {
+                PickerSearchTabs searched;
+                searched.identity=resultIdentity;
+                const size_t limit=(std::min)(session->tabs.size(),
+                                              MAX_SNAPSHOT_TABS_PER_WINDOW);
+                searched.tabs.reserve(limit);
+                for(size_t tab=0;tab<limit;++tab){
+                    if(session->activeTab>=0 && (size_t)session->activeTab==tab)
+                        searched.activeTab=static_cast<int>(searched.tabs.size());
+                    SnapTab copy;
+                    copy.url=session->tabs[tab].url;
+                    copy.title=session->tabs[tab].title;
+                    searched.tabs.push_back(std::move(copy));
+                }
+                g_pickerSearchTabs[RuntimeKey(result->fastWindows[index])]=
+                    std::move(searched);
+            } catch(...) {}
         }
         accepted=true;
     }
@@ -8242,7 +8296,7 @@ static bool BuildPickerPaintCache(
         ScopedPickerMeasureDc measure(g_main,g_fPI);
         if(!measure.get()) return false;
         const wchar_t* hint=
-            L"Ctrl+Click - Move current window to selected desktop";
+            kPickerCtrlHint;
         SIZE hintSize={0,0};
         if(!GetTextExtentPoint32W(measure.get(),hint,
                 static_cast<int>(wcslen(hint)),&hintSize)) return false;
@@ -8608,6 +8662,165 @@ static bool PaintPickerDragPreview(HDC target,RECT client) noexcept {
     return blended && targetRestored && regionDeleted;
 }
 
+static void ClosePickerTabOverlay(bool restoreFocus) noexcept {
+    if(!g_tabOverlay.open) return;
+    try { g_tabOverlay=PickerTabOverlay(); } catch(...) { g_tabOverlay.open=false; }
+    if(g_search){
+        ShowWindow(g_search,SW_SHOW);
+        if(restoreFocus) SetFocus(g_search);
+    }
+    if(g_main) InvalidateRect(g_main,nullptr,FALSE);
+}
+
+// Tabs of one picker row: the capture the observation loop keeps for the
+// window's layout record first, then what the all-tab search read.
+static bool LookupPickerRowTabs(const WinItem& item,std::vector<SnapTab>& tabs,
+                                int& activeTab,UnixSeconds& capturedUtc){
+    tabs.clear();
+    activeTab=-1;
+    capturedUtc=0;
+    auto binding=g_recordByRuntime.find(item.runtimeKey);
+    if(binding!=g_recordByRuntime.end() && !binding->second.recordId.empty() &&
+       SameIdentity(binding->second.identity,item.identity)){
+        auto capture=g_tabsByRecord.find(binding->second.recordId);
+        if(capture!=g_tabsByRecord.end() && !capture->second.tabs.empty()){
+            tabs=capture->second.tabs;
+            activeTab=capture->second.activeTab;
+            capturedUtc=capture->second.capturedUtc;
+            return true;
+        }
+    }
+    auto searched=g_pickerSearchTabs.find(item.runtimeKey);
+    if(searched!=g_pickerSearchTabs.end() && !searched->second.tabs.empty() &&
+       SameIdentity(searched->second.identity,item.identity)){
+        tabs=searched->second.tabs;
+        activeTab=searched->second.activeTab;
+        return true;
+    }
+    return false;
+}
+
+// Darkens the whole picker behind the overlay panel: one black pixel is
+// stretched over the client area with constant alpha.
+static GdiBuffer g_tabOverlayDimBuffer;
+static void DimPickerBackground(HDC hdc,RECT client) noexcept {
+    if(!g_tabOverlayDimBuffer.ensure(hdc,1,1)) return;
+    HDC source=g_tabOverlayDimBuffer.get();
+    if(!source) return;
+    SetPixel(source,0,0,RGB(0,0,0));
+    BLENDFUNCTION blend={AC_SRC_OVER,0,150,0};
+    AlphaBlend(hdc,0,0,client.right,client.bottom,source,0,0,1,1,blend);
+}
+
+static void PaintPickerTabOverlay(HDC hdc,RECT client){
+    PickerTabOverlay& o=g_tabOverlay;
+    if(!o.open) return;
+    DimPickerBackground(hdc,client);
+    const size_t count=o.rowUrls.size();
+    const int margin=S(36),headerH=S(66),footerH=S(34),rowH=S(46);
+    int panelW=(std::min)(static_cast<int>(client.right)-2*margin,S(1000));
+    if(panelW<S(320)) panelW=(std::max)(static_cast<int>(client.right)-S(16),S(200));
+    const int listMax=static_cast<int>(client.bottom)-2*margin-headerH-footerH;
+    const int wanted=count ? static_cast<int>((std::min)(count,(size_t)4096)) : 2;
+    int visible=(std::max)(1,(std::min)(wanted,listMax/rowH));
+    const int panelH=headerH+visible*rowH+footerH;
+    RECT panel;
+    panel.left=(client.right-panelW)/2;
+    panel.top=(std::max)(S(8),(static_cast<int>(client.bottom)-panelH)/2);
+    panel.right=panel.left+panelW;
+    panel.bottom=panel.top+panelH;
+    FillRoundRect(hdc,panel,S(16),CLR_TILE,CLR_ACTIVE,S(2));
+
+    const int inner=S(18);
+    RECT close={panel.right-inner-S(28),panel.top+S(14),panel.right-inner,panel.top+S(42)};
+    SelectObject(hdc,g_fPN);
+    SetTextColor(hdc,o.hover==-2?CLR_HEAD:CLR_HINT);
+    DrawTextW(hdc,L"\x2715",-1,&close,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    RECT title={panel.left+inner,panel.top+S(10),close.left-S(10),panel.top+S(36)};
+    SetTextColor(hdc,CLR_HEAD);
+    DrawTextW(hdc,o.title.c_str(),-1,&title,
+              DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
+    RECT subtitle={panel.left+inner,panel.top+S(36),close.left-S(10),panel.top+S(58)};
+    SelectObject(hdc,g_fPI);
+    SetTextColor(hdc,CLR_HINT);
+    DrawTextW(hdc,o.subtitle.c_str(),-1,&subtitle,
+              DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
+    { HPEN pen=CreatePen(PS_SOLID,1,CLR_BORDER); HGDIOBJ old=SelectObject(hdc,pen);
+      MoveToEx(hdc,panel.left+inner,panel.top+headerH-S(2),nullptr);
+      LineTo(hdc,panel.right-inner,panel.top+headerH-S(2));
+      SelectObject(hdc,old); DeleteObject(pen); }
+
+    const int listTop=panel.top+headerH;
+    const int listRight=panel.right-inner-(count>(size_t)visible?S(12):0);
+    if(o.scroll<0)
+        o.scroll=TabOverlayScrollToShow(0,o.activeTab,count,visible);
+    o.scroll=TabOverlayClampScroll(o.scroll,count,visible);
+    if(!count){
+        RECT note={panel.left+inner,listTop+S(8),panel.right-inner,listTop+visible*rowH};
+        SetTextColor(hdc,CLR_TEXT);
+        DrawTextW(hdc,o.note.c_str(),-1,&note,DT_LEFT|DT_WORDBREAK|DT_NOPREFIX);
+    }
+    for(int slot=0;slot<visible;++slot){
+        const long long row=static_cast<long long>(o.scroll)+slot;
+        if(row<0 || row>=static_cast<long long>(count)) break;
+        const int index=static_cast<int>(row);
+        RECT r={panel.left+S(8),listTop+slot*rowH,listRight,listTop+(slot+1)*rowH};
+        if(index==o.selected || index==o.hover){
+            RECT h=r; InflateRect(&h,0,-S(2));
+            FillRoundRect(hdc,h,S(10),index==o.selected?CLR_SEARCH:CLR_TILE_DIM,
+                          index==o.selected?CLR_PASSIVE:CLR_TILE_DIM,1);
+        }
+        if(index==o.activeTab){
+            RECT bar={r.left+S(2),r.top+S(8),r.left+S(6),r.bottom-S(8)};
+            FillRoundRect(hdc,bar,S(3),CLR_ACTIVE,CLR_ACTIVE,1);
+        }
+        RECT t={r.left+S(14),r.top+S(5),r.right-S(8),r.top+S(25)};
+        SelectObject(hdc,g_fPI);
+        SetTextColor(hdc,index==o.activeTab?CLR_HEAD:CLR_TEXT);
+        const std::wstring& rowTitle=o.rowTitles[index].empty()
+            ? o.rowUrls[index] : o.rowTitles[index];
+        DrawTextW(hdc,rowTitle.c_str(),-1,&t,
+                  DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
+        RECT u={r.left+S(14),r.top+S(25),r.right-S(8),r.bottom-S(4)};
+        SelectObject(hdc,g_fPU?g_fPU:g_fPI);
+        SetTextColor(hdc,CLR_HINT);
+        DrawTextW(hdc,o.rowUrls[index].c_str(),-1,&u,
+                  DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
+    }
+    if(count>(size_t)visible){
+        const int trackTop=listTop+S(4),trackH=visible*rowH-S(8);
+        RECT track={panel.right-inner-S(6),trackTop,panel.right-inner-S(2),trackTop+trackH};
+        FillRoundRect(hdc,track,S(2),CLR_SCROLL_TRK,CLR_SCROLL_TRK,1);
+        const int maximum=TabOverlayMaxScroll(count,visible);
+        int thumbH=static_cast<int>((long long)trackH*visible/(long long)count);
+        if(thumbH<S(24)) thumbH=S(24);
+        const int thumbY=trackTop+(maximum>0
+            ?static_cast<int>((long long)(trackH-thumbH)*o.scroll/maximum):0);
+        RECT thumb={track.left,thumbY,track.right,thumbY+thumbH};
+        FillRoundRect(hdc,thumb,S(2),CLR_SCROLL_THB,CLR_SCROLL_THB,1);
+    }
+    RECT footer={panel.left+inner,panel.bottom-footerH,panel.right-inner,panel.bottom-S(4)};
+    SelectObject(hdc,g_fPU?g_fPU:g_fPI);
+    SetTextColor(hdc,CLR_HINT);
+    const wchar_t* keys=count
+        ? L"Click or Enter - copy the URL  \x00B7  \x2191\x2193 PgUp PgDn - move  \x00B7  Esc - close"
+        : L"Esc - close";
+    DrawTextW(hdc,keys,-1,&footer,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+    if(!o.status.empty()){
+        SIZE keysSize={0,0};
+        GetTextExtentPoint32W(hdc,keys,static_cast<int>(wcslen(keys)),&keysSize);
+        RECT status=footer; status.left+=keysSize.cx+S(24);
+        SetTextColor(hdc,CLR_ACTIVE);
+        DrawTextW(hdc,o.status.c_str(),-1,&status,
+                  DT_RIGHT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
+    }
+    o.panel=panel;
+    o.close=close;
+    o.listTop=listTop;
+    o.rowHeight=rowH;
+    o.visibleRows=visible;
+}
+
 static void Paint(HDC hdcReal,HDC hdc,RECT client){
     HBRUSH bg=CreateSolidBrush(CLR_BG); FillRect(hdc,&client,bg); DeleteObject(bg); SetBkMode(hdc,TRANSPARENT);
     HFONT fT=g_fPT, fN=g_fPN, fI=g_fPI, fX=g_fPX;   // cached (created in InitMetrics)
@@ -8629,7 +8842,7 @@ static void Paint(HDC hdcReal,HDC hdc,RECT client){
     // ---- header: left title + right Ctrl+Click hint ----
     int headTop=SEARCH_H, headBot=SEARCH_H+HEADER;
     SelectObject(hdc,fI); SetTextColor(hdc,CLR_HINT);
-    const wchar_t* hint=L"Ctrl+Click - Move current window to selected desktop";
+    const wchar_t* hint=kPickerCtrlHint;
     RECT hr={PAD,headTop,client.right-PAD,headBot}; DrawTextW(hdc,hint,-1,&hr,DT_RIGHT|DT_SINGLELINE|DT_VCENTER);
     SelectObject(hdc,fT); SetTextColor(hdc,CLR_HEAD);
     const wchar_t* head=paintCacheReady
@@ -8735,6 +8948,7 @@ static void Paint(HDC hdcReal,HDC hdc,RECT client){
             static_cast<int>(g_pickerPaintCache.footer.conus.size()));
     }
     (void)PaintPickerDragPreview(hdc,client);
+    PaintPickerTabOverlay(hdc,client);
     if(hdc!=hdcReal)
         BitBlt(hdcReal,0,0,client.right,client.bottom,hdc,0,0,SRCCOPY);
 }
@@ -8797,6 +9011,8 @@ static void EndPickerVisualSessionRuntime() noexcept {
 
 static void HidePicker(PickerHideDisposition disposition) noexcept {
     if(g_picker.controlledTransition()) return;
+    ClosePickerTabOverlay(false);
+    g_pickerSearchTabs.clear();
     if(PickerHideEndsVisualSession(disposition))
         EndPickerVisualSessionRuntime();
     else
@@ -8805,6 +9021,188 @@ static void HidePicker(PickerHideDisposition disposition) noexcept {
     CancelPickerIconPreload(g_main);
     ResetPickerHoverState(PickerHoverResetReason::Hide);
     ShowWindow(g_main,SW_HIDE);
+}
+
+static bool CopyTextToClipboard(HWND owner,const std::wstring& text) noexcept {
+    if(!OpenClipboard(owner)) return false;
+    bool owned=false;   // the clipboard owns the memory only after SetClipboardData
+    EmptyClipboard();
+    const size_t bytes=(text.size()+1)*sizeof(wchar_t);
+    HGLOBAL memory=GlobalAlloc(GMEM_MOVEABLE,bytes);
+    if(memory){
+        void* data=GlobalLock(memory);
+        if(data){
+            memcpy(data,text.c_str(),bytes);
+            GlobalUnlock(memory);
+            owned=SetClipboardData(CF_UNICODETEXT,memory)!=nullptr;
+        }
+        if(!owned) GlobalFree(memory);
+    }
+    CloseClipboard();
+    return owned;
+}
+
+static void CopyTabOverlayUrl(int index){
+    PickerTabOverlay& o=g_tabOverlay;
+    if(index<0 || static_cast<size_t>(index)>=o.rowUrls.size()) return;
+    o.selected=index;
+    o.status=CopyTextToClipboard(g_main,o.rowUrls[index])
+        ? L"Copied: "+o.rowUrls[index]
+        : std::wstring(L"The URL could not be copied.");
+    InvalidateRect(g_main,nullptr,FALSE);
+}
+
+static std::wstring TabOverlayAge(UnixSeconds capturedUtc){
+    const UnixSeconds now=UtcNowSeconds();
+    if(capturedUtc<=0 || now<=0) return std::wstring();
+    const long long age=now>capturedUtc ? now-capturedUtc : 0;
+    if(age<60) return L"read just now";
+    if(age<3600) return L"read "+std::to_wstring(age/60)+L" min ago";
+    return L"read "+std::to_wstring(age/3600)+L" h ago";
+}
+
+// Ctrl+click on a window row: shows that window's tabs and their URLs over
+// the picker. The list comes from data VDE already holds; nothing is read
+// from disk on the UI thread.
+static void OpenPickerTabOverlay(const PickerRowActionSnapshot& row){
+    const WinItem* item=nullptr;
+    if(row.tileIndex>=0 && static_cast<size_t>(row.tileIndex)<g_tiles.size() &&
+       row.windowIndex<g_tiles[row.tileIndex].windows.size() &&
+       SameIdentity(g_tiles[row.tileIndex].windows[row.windowIndex].identity,
+                    row.identity))
+        item=&g_tiles[row.tileIndex].windows[row.windowIndex];
+    for(size_t tile=0;!item && tile<g_tiles.size();++tile)
+        for(const WinItem& candidate : g_tiles[tile].windows)
+            if(SameIdentity(candidate.identity,row.identity)){
+                item=&candidate;
+                break;
+            }
+    if(!item) return;
+    PickerTabOverlay overlay;
+    overlay.open=true;
+    overlay.title=item->title;
+    std::string app;
+    const bool browser=ClassifyTrackedBrowserWindow(item->identity,app)==
+        PopupBrowserClassification::Tracked;
+    std::vector<SnapTab> tabs;
+    UnixSeconds capturedUtc=0;
+    int activeTab=-1;
+    if(LookupPickerRowTabs(*item,tabs,activeTab,capturedUtc)){
+        overlay.rowTitles.reserve(tabs.size());
+        overlay.rowUrls.reserve(tabs.size());
+        for(const SnapTab& tab : tabs){
+            overlay.rowTitles.push_back(U82W(tab.title));
+            overlay.rowUrls.push_back(U82W(tab.url));
+        }
+        overlay.activeTab=activeTab>=0 && static_cast<size_t>(activeTab)<tabs.size()
+            ? activeTab : -1;
+        overlay.selected=overlay.activeTab;
+        overlay.subtitle=U82W(app.empty() ? std::string("browser") : app)+L"  \x00B7  "+
+            std::to_wstring(tabs.size())+(tabs.size()==1 ? L" tab" : L" tabs");
+        const std::wstring age=TabOverlayAge(capturedUtc);
+        if(!age.empty()) overlay.subtitle+=L"  \x00B7  "+age;
+    } else if(!browser){
+        overlay.subtitle=L"No tab list";
+        overlay.note=L"Tab lists are available for Firefox, Chrome and Edge windows.";
+    } else {
+        overlay.subtitle=U82W(app)+L"  \x00B7  no tab list yet";
+        overlay.note=g_autoFix
+            ? L"VDE has no tab list for this window yet. It reads tabs from the "
+              L"browser's session file: a new window is usually recorded within "
+              L"about 20 seconds, and Chrome or Edge may keep that file locked "
+              L"while a window is open."
+            : L"Automatic restore is off, so VDE does not observe this window. "
+              L"Type in the search box first and the picker reads the tabs; "
+              L"then Ctrl+click the window again.";
+    }
+    TipDeactivate();
+    ResetPickerHoverState(PickerHoverResetReason::Hide);
+    g_tabOverlay=std::move(overlay);
+    if(g_search) ShowWindow(g_search,SW_HIDE);
+    SetFocus(g_main);
+    InvalidateRect(g_main,nullptr,FALSE);
+}
+
+// Routes input while the tab overlay is open; returns true when handled.
+static bool HandlePickerTabOverlayMessage(HWND hwnd,UINT msg,WPARAM wp,
+                                          LPARAM lp,LRESULT& result){
+    if(!g_tabOverlay.open) return false;
+    PickerTabOverlay& o=g_tabOverlay;
+    const size_t count=o.rowUrls.size();
+    auto rowAt=[&](POINT pt){
+        if(!PtInRect(&o.panel,pt)) return -1;
+        return TabOverlayHitRow(pt.y,o.listTop,o.rowHeight,o.scroll,
+                                count,o.visibleRows);
+    };
+    result=0;
+    // if/else rather than case labels: tests slice the picker WndProc source
+    // by its first "case WM_..." markers.
+    if(msg==WM_KEYDOWN){
+        if(wp==VK_ESCAPE){ ClosePickerTabOverlay(true); return true; }
+        if(wp==VK_RETURN || (wp=='C' && (GetAsyncKeyState(VK_CONTROL)&0x8000))){
+            CopyTabOverlayUrl(o.selected);
+            return true;
+        }
+        TabOverlayKey key=TabOverlayKey::Down;
+        bool navigate=true;
+        if(wp==VK_UP) key=TabOverlayKey::Up;
+        else if(wp==VK_DOWN) key=TabOverlayKey::Down;
+        else if(wp==VK_PRIOR) key=TabOverlayKey::PageUp;
+        else if(wp==VK_NEXT) key=TabOverlayKey::PageDown;
+        else if(wp==VK_HOME) key=TabOverlayKey::Home;
+        else if(wp==VK_END) key=TabOverlayKey::End;
+        else navigate=false;
+        if(navigate && count){
+            o.selected=TabOverlayMoveSelection(o.selected,key,count,o.visibleRows);
+            o.scroll=TabOverlayScrollToShow(o.scroll,o.selected,count,o.visibleRows);
+            InvalidateRect(hwnd,nullptr,FALSE);
+        }
+        return true;
+    }
+    if(msg==WM_KEYUP || msg==WM_CHAR || msg==WM_SYSCHAR || msg==WM_DEADCHAR)
+        return true;
+    if(msg==WM_MOUSEMOVE){
+        const POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+        const int hover=PtInRect(&o.close,pt) ? -2 : rowAt(pt);
+        if(hover!=o.hover){ o.hover=hover; InvalidateRect(hwnd,nullptr,FALSE); }
+        return true;
+    }
+    if(msg==WM_LBUTTONDOWN){
+        const POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+        if(!PtInRect(&o.panel,pt) || PtInRect(&o.close,pt))
+            ClosePickerTabOverlay(true);
+        else
+            CopyTabOverlayUrl(rowAt(pt));
+        return true;
+    }
+    if(msg==WM_LBUTTONUP || msg==WM_LBUTTONDBLCLK || msg==WM_RBUTTONDOWN ||
+       msg==WM_RBUTTONUP || msg==WM_MBUTTONDOWN || msg==WM_MBUTTONUP)
+        return true;
+    if(msg==WM_MOUSEWHEEL){
+        static PickerWheelAccumulator wheel;
+        const int rows=TakePickerWheelRows(wheel,"tab-overlay",
+                                           GET_WHEEL_DELTA_WPARAM(wp));
+        if(rows){
+            o.scroll=TabOverlayClampScroll(
+                static_cast<long long>(o.scroll)-3LL*rows,count,o.visibleRows);
+            POINT pt={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+            ScreenToClient(hwnd,&pt);
+            o.hover=PtInRect(&o.close,pt) ? -2 : rowAt(pt);
+            InvalidateRect(hwnd,nullptr,FALSE);
+        }
+        return true;
+    }
+    if(msg==WM_SETCURSOR){
+        if(LOWORD(lp)!=HTCLIENT) return false;
+        POINT pt={0,0};
+        if(!GetCursorPos(&pt) || !ScreenToClient(hwnd,&pt)) return false;
+        const bool hand=PtInRect(&o.close,pt) || rowAt(pt)>=0;
+        SetCursor(LoadCursorW(nullptr,hand?IDC_HAND:IDC_ARROW));
+        result=TRUE;
+        return true;
+    }
+    if(msg==WM_HOTKEY) ClosePickerTabOverlay(false);   // then shown as usual
+    return false;
 }
 // Search EDIT subclass: forward navigation keys to the grid; let letters/numbers type.
 static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM wp, LPARAM lp){
@@ -11699,7 +12097,7 @@ static const wchar_t* HELP_TEXT =
 L"What this solves\r\n"
 L"Windows 11 does not remember which virtual desktop your app windows were on after a reboot, and browsers change their window handles when they restore a session - so nothing external can recognize the windows. win-vde identifies each browser window by its pages, matches old windows to new ones after a restart, and moves each one back to the desktop it was saved on. It also keeps its own session checkpoints, outside the browser: when a session is lost to a crash, an update or a careless click, any desktop, window or single tab can be brought back from one of them.\r\n\r\n"
 L"Picker  (hotkey Ctrl+Alt+D)\r\n"
-L"A grid of your virtual desktops and their eligible application windows. Click a window row to switch to its displayed desktop and activate that exact window. Click a desktop title or empty tile area to switch without activating a listed window. Ctrl+click a desktop tile to move the captured active window there, follow it, and keep the picker open. During the drag, a translucent copy with the application icon and window title follows the pointer. Drop it on another desktop to move or visually assign that window without switching desktops or closing the picker. Globally visible and pinned windows are only visually assigned for the current popup session; their real Windows state is not changed. Type in the box to filter windows by name, scroll a tile with the mouse wheel, and hover a clipped name to see it in full.\r\n\r\n"
+L"A grid of your virtual desktops and their eligible application windows. Click a window row to switch to its displayed desktop and activate that exact window. Click a desktop title or empty tile area to switch without activating a listed window. Ctrl+click a window row to see all its tabs with their URLs; click a tab to copy its URL. Ctrl+click elsewhere in a desktop tile to move the captured active window there, follow it, and keep the picker open. During the drag, a translucent copy with the application icon and window title follows the pointer. Drop it on another desktop to move or visually assign that window without switching desktops or closing the picker. Globally visible and pinned windows are only visually assigned for the current popup session; their real Windows state is not changed. Type in the box to filter windows by name, scroll a tile with the mouse wheel, and hover a clipped name to see it in full.\r\n\r\n"
 L"Menu\r\n"
 L"- Save windows layout: save the current windows to a manual checkpoint file.\r\n"
 L"- Restore saved windows layout: put windows back from that manual checkpoint.\r\n"
@@ -13196,6 +13594,11 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         Shell_NotifyIconW(NIM_ADD,&g_nid);
         return 0;
     }
+    {
+        LRESULT overlayResult=0;
+        if(HandlePickerTabOverlayMessage(hwnd,msg,wp,lp,overlayResult))
+            return overlayResult;
+    }
     switch(msg){
     case WM_HOTKEY: ShowPicker(CapturePickerTarget()); return 0;
     case WM_CLOSE:
@@ -13513,9 +13916,10 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             resolution.action,false,resolution.dropTileIndex);
         switch(resolution.action){
         case PickerGestureAction::Click:
+            // Ctrl+click on a window row lists that window's tabs; Ctrl+click
+            // elsewhere in a tile still moves the current window there.
             if(resolution.ctrlAtDown)
-                Activate(resolution.row.tileIndex,true,
-                         PickerTraceActivationSource::Mouse);
+                OpenPickerTabOverlay(resolution.row);
             else
                 (void)ActivateExactPickerRow(resolution.row);
             break;
@@ -13827,12 +14231,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 static bool CleanupUiResources() noexcept {
     g_pickerBuffer.reset();
     g_pickerDragBuffer.reset();
+    g_tabOverlayDimBuffer.reset();
     if(!g_pickerBuffer.released()) return false;
     if(!g_pickerDragBuffer.released()) return false;
+    if(!g_tabOverlayDimBuffer.released()) return false;
     if(!ClearWindowIconCache()) return false;
     bool released=true;
     HFONT* fonts[]={
-        &g_uiFont,&g_fPT,&g_fPN,&g_fPI,&g_fPX,&g_searchFont
+        &g_uiFont,&g_fPT,&g_fPN,&g_fPI,&g_fPX,&g_fPU,&g_searchFont
     };
     for(HFONT* font : fonts){
         if(*font){

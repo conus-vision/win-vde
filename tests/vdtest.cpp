@@ -17,6 +17,7 @@
 #include "tabsnap.hpp"
 #include "binding_store.hpp"
 #include "reopen_model.hpp"
+#include "tab_overlay.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -21760,6 +21761,47 @@ static void test_settings_checkpoint_rejects_enabled_unloaded_and_preserves_stat
     CHECK(recoveryPending && settingEnabled);
 }
 
+// The Ctrl+click tab list scrolls by whole rows, keeps the last page full,
+// hit-tests only real rows and moves the keyboard selection within bounds.
+static void test_tab_overlay_scroll_hit_and_selection(){
+    CHECK(TabOverlayMaxScroll(0,5)==0);
+    CHECK(TabOverlayMaxScroll(5,5)==0);
+    CHECK(TabOverlayMaxScroll(12,5)==7);
+    CHECK(TabOverlayMaxScroll(12,0)==0);
+    CHECK(TabOverlayClampScroll(-3,12,5)==0);
+    CHECK(TabOverlayClampScroll(4,12,5)==4);
+    CHECK(TabOverlayClampScroll(99,12,5)==7);
+    CHECK(TabOverlayClampScroll(99,3,5)==0);
+
+    CHECK(TabOverlayScrollToShow(0,2,12,5)==0);     // already visible
+    CHECK(TabOverlayScrollToShow(0,9,12,5)==5);     // last visible row
+    CHECK(TabOverlayScrollToShow(6,1,12,5)==1);     // scroll up to it
+    CHECK(TabOverlayScrollToShow(3,-1,12,5)==3);    // no row: just clamp
+    CHECK(TabOverlayScrollToShow(0,11,12,5)==7);
+
+    // listTop 100, rows 40 px high, scrolled by 3, 5 visible of 10.
+    CHECK(TabOverlayHitRow(99,100,40,3,10,5)==-1);
+    CHECK(TabOverlayHitRow(100,100,40,3,10,5)==3);
+    CHECK(TabOverlayHitRow(179,100,40,3,10,5)==4);
+    CHECK(TabOverlayHitRow(299,100,40,3,10,5)==7);
+    CHECK(TabOverlayHitRow(300,100,40,3,10,5)==-1); // below the visible slots
+    CHECK(TabOverlayHitRow(260,100,40,7,10,5)==-1); // slot past the last row
+    CHECK(TabOverlayHitRow(120,100,0,0,10,5)==-1);
+
+    CHECK(TabOverlayMoveSelection(-1,TabOverlayKey::Down,0,5)==-1);
+    CHECK(TabOverlayMoveSelection(-1,TabOverlayKey::Down,10,5)==0);
+    CHECK(TabOverlayMoveSelection(-1,TabOverlayKey::Up,10,5)==9);
+    CHECK(TabOverlayMoveSelection(0,TabOverlayKey::Up,10,5)==0);
+    CHECK(TabOverlayMoveSelection(9,TabOverlayKey::Down,10,5)==9);
+    CHECK(TabOverlayMoveSelection(2,TabOverlayKey::PageDown,10,5)==6);
+    CHECK(TabOverlayMoveSelection(8,TabOverlayKey::PageDown,10,5)==9);
+    CHECK(TabOverlayMoveSelection(6,TabOverlayKey::PageUp,10,5)==2);
+    CHECK(TabOverlayMoveSelection(1,TabOverlayKey::PageUp,10,5)==0);
+    CHECK(TabOverlayMoveSelection(4,TabOverlayKey::Home,10,5)==0);
+    CHECK(TabOverlayMoveSelection(4,TabOverlayKey::End,10,5)==9);
+    CHECK(TabOverlayMoveSelection(0,TabOverlayKey::PageDown,10,1)==1);
+}
+
 // OK in Settings with an untouched autostart box must not rewrite the Run key
 // to the exe that happens to be running.
 static void test_settings_writes_run_key_only_when_autostart_toggled(){
@@ -29083,9 +29125,12 @@ static void test_picker_exact_activation_runtime_has_no_fallback_target(){
 
     const std::string up=SourceSection(
         source,"case WM_LBUTTONUP:","case WM_MOUSELEAVE:");
+    // Ctrl+click on a row opens that exact row's tab list; a plain click
+    // activates the exact row.
     const size_t clickCase=up.find("case PickerGestureAction::Click:");
     const size_t ctrlBranch=up.find("if(resolution.ctrlAtDown)",clickCase);
-    const size_t ctrlActivate=up.find("Activate(",ctrlBranch);
+    const size_t ctrlActivate=up.find(
+        "OpenPickerTabOverlay(resolution.row)",ctrlBranch);
     const size_t exactActivate=up.find(
         "ActivateExactPickerRow(resolution.row)",ctrlActivate);
     CHECK(clickCase!=std::string::npos && ctrlBranch!=std::string::npos &&
@@ -30980,6 +31025,7 @@ int main(){
     test_settings_transaction_rolls_back_and_cancels_only_auto_owner();
     test_settings_writes_run_key_only_when_autostart_toggled();
     test_manual_save_carries_over_skipped_app_records();
+    test_tab_overlay_scroll_hit_and_selection();
     test_checkpoint_reservation_defers_one_heartbeat_but_not_final();
     test_tray_instance_scope_is_gui_only_and_covers_work_lifetime();
     test_browser_classifier_requires_enabled_class_and_exact_executable_basename();

@@ -160,9 +160,14 @@ is cut off.
 - Click a window row to switch to the desktop it is shown on, close the picker,
   and activate that exact window. Click a desktop title or an empty part of a
   tile to switch desktops without activating any listed window.
-- Hold Ctrl and click anywhere in a desktop tile, without dragging, to move the
-  captured active window there. The picker switches to that desktop and stays
-  open with the active window highlighted.
+- Hold Ctrl and click a browser window row to see all of that window's tabs
+  with their URLs, over the picker. The active tab is marked. Click a tab, or
+  select it with the arrow keys and press Enter, to copy its URL; Esc or a click
+  outside the list closes it. The list comes from the browser's session data
+  that VDE already reads, so a window VDE has not recorded yet has none.
+- Hold Ctrl and click anywhere else in a desktop tile, without dragging, to
+  move the captured active window there. The picker switches to that desktop
+  and stays open with the active window highlighted.
 - Drag a window row to another desktop to move that exact window. The current
   desktop stays in place and the picker stays open.
   During the drag, a translucent copy with the application icon and window title follows the pointer.
