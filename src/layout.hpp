@@ -1084,6 +1084,25 @@ inline bool ParseLayout(const std::string& data, std::vector<DeskRec>& desksOut,
     return true;
 }
 
+// A manual checkpoint replaces the whole file. An app whose fresh session data
+// was unavailable is left out of the new checkpoint, so the records it had in
+// the previous one are carried over instead of being lost. Returns how many
+// records were carried.
+inline size_t CarryOverManualRecords(const std::vector<LayoutWin>& prior,
+                                     const std::set<std::string>& apps,
+                                     std::vector<LayoutWin>& records,
+                                     std::set<std::string>& recordIds){
+    size_t carried=0;
+    for(const LayoutWin& record : prior){
+        if(apps.count(record.app)==0) continue;
+        if(records.size()>=MAX_LAYOUT_RECORDS) break;
+        if(!recordIds.insert(record.recordId).second) continue;
+        records.push_back(record);
+        ++carried;
+    }
+    return carried;
+}
+
 inline bool BuildCheckedLayoutSnapshot(const std::vector<DeskRec>& desks, std::vector<LayoutWin>& wins,
         UnixSeconds nowUtc, std::string& textOut, std::string* errorOut=nullptr){
     auto fail = [&](const std::string& message)->bool {

@@ -21760,6 +21760,43 @@ static void test_settings_checkpoint_rejects_enabled_unloaded_and_preserves_stat
     CHECK(recoveryPending && settingEnabled);
 }
 
+// OK in Settings with an untouched autostart box must not rewrite the Run key
+// to the exe that happens to be running.
+static void test_settings_writes_run_key_only_when_autostart_toggled(){
+    CHECK(!RunAtLogonWriteNeeded(true,true));
+    CHECK(!RunAtLogonWriteNeeded(false,false));
+    CHECK(RunAtLogonWriteNeeded(false,true));
+    CHECK(RunAtLogonWriteNeeded(true,false));
+}
+
+// A manual save that skips a browser without fresh session data keeps that
+// browser's records from the previous manual layout, never duplicates an ID,
+// and leaves other browsers' old records out.
+static void test_manual_save_carries_over_skipped_app_records(){
+    auto rec=[](const char* id,const char* app){
+        LayoutWin w; w.recordId=id; w.app=app; w.activeTitle=id; return w;
+    };
+    const std::vector<LayoutWin> prior{
+        rec("A","chrome"),rec("B","firefox"),rec("C","chrome"),rec("D","msedge")};
+    std::vector<LayoutWin> records{rec("N1","firefox"),rec("C","firefox")};
+    std::set<std::string> ids{"N1","C"};
+    const std::set<std::string> skipped{"chrome"};
+    CHECK(CarryOverManualRecords(prior,skipped,records,ids)==1);
+    CHECK(records.size()==3);
+    CHECK(records[2].recordId=="A" && records[2].app=="chrome");
+    CHECK(ids.count("A")==1 && ids.count("B")==0 && ids.count("D")==0);
+
+    std::vector<LayoutWin> none;
+    std::set<std::string> noIds;
+    CHECK(CarryOverManualRecords(prior,std::set<std::string>(),none,noIds)==0);
+    CHECK(none.empty());
+
+    std::vector<LayoutWin> full(MAX_LAYOUT_RECORDS,rec("X","firefox"));
+    std::set<std::string> fullIds;
+    CHECK(CarryOverManualRecords(prior,skipped,full,fullIds)==0);
+    CHECK(full.size()==MAX_LAYOUT_RECORDS);
+}
+
 static void test_settings_transaction_rolls_back_and_cancels_only_auto_owner(){
     SettingsRuntimeSnapshot current;
     current.hotkeyVk='D';
@@ -30941,6 +30978,8 @@ int main(){
     test_corrective_message_routes_are_no_throw_and_retire_exactly_once();
     test_settings_checkpoint_rejects_enabled_unloaded_and_preserves_state();
     test_settings_transaction_rolls_back_and_cancels_only_auto_owner();
+    test_settings_writes_run_key_only_when_autostart_toggled();
+    test_manual_save_carries_over_skipped_app_records();
     test_checkpoint_reservation_defers_one_heartbeat_but_not_final();
     test_tray_instance_scope_is_gui_only_and_covers_work_lifetime();
     test_browser_classifier_requires_enabled_class_and_exact_executable_basename();

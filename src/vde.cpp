@@ -289,6 +289,9 @@ struct ManualSaveOperation {
     std::vector<DeskRec> desktops;
     std::map<std::string,std::vector<LayoutWin> > preparedLive;
     std::set<std::string> waitingReconcileApps;
+    // Apps whose fresh session data was unavailable: they keep the records
+    // of the previous manual layout instead of failing the whole save.
+    std::set<std::string> skippedApps;
     size_t outstanding=0;
     bool failed=false;
     bool completionReported=false;
@@ -302,6 +305,8 @@ struct ManualMoveOperation {
     std::vector<LayoutWin> saved;
     std::set<std::string> waitingSessionApps;
     std::set<std::string> waitingReconcileApps;
+    // Apps left out because their session data was unusable.
+    std::set<std::string> skippedApps;
     std::set<uint64_t> liveJobIds;
     size_t outstanding=0;
     size_t succeeded=0;
@@ -5294,6 +5299,29 @@ static void RetireSessionRoutesForOperation(AsyncOperationOwner owner,
         } else ++route;
 }
 
+static std::string JoinAppIds(const std::set<std::string>& apps){
+    std::string joined;
+    for(const std::string& app : apps){
+        if(!joined.empty()) joined+=", ";
+        joined+=app;
+    }
+    return joined;
+}
+
+// The parts of a manual save summary that explain what was not saved fresh.
+static std::string ManualSaveNotes(const std::set<std::string>& skippedApps,
+                                   size_t carried,size_t leftOut){
+    std::string notes;
+    if(!skippedApps.empty())
+        notes+=" Fresh session data was unavailable for "+JoinAppIds(skippedApps)+
+            "; kept "+std::to_string(carried)+
+            " record(s) from the previous manual layout.";
+    if(leftOut)
+        notes+=" Left out "+std::to_string(leftOut)+
+            " window(s) shown on all desktops.";
+    return notes;
+}
+
 static void FinishManualSave(uint64_t operationId){
     auto found=g_manualSaveOperations.find(operationId);
     if(found==g_manualSaveOperations.end() || found->second.outstanding!=0) return;
@@ -5317,6 +5345,7 @@ static void FinishManualSave(uint64_t operationId){
     }
     std::vector<LayoutWin> records;
     std::set<std::string> ids;
+    size_t leftOut=0;
     for(const AppProfile& profile : operation.profiles.all()){
         auto captured=operation.snapshots.find(profile.id);
         auto now=current.find(profile.id);
@@ -5328,17 +5357,23 @@ static void FinishManualSave(uint64_t operationId){
             return;
         }
         if(captured->second.windows.empty()) continue;
+        if(operation.skippedApps.count(profile.id)) continue;
         auto prepared=operation.preparedLive.find(profile.id);
         if(prepared==operation.preparedLive.end()){
             fail(L"Manual layout was not saved because fresh browser data was unavailable.");
             return;
         }
         for(LayoutWin record : prepared->second){
+            // A window shown on all desktops, or pinned, reports a desktop
+            // that is not in the list and has no single desktop to restore to.
+            if(!ConcreteDesktopExists(record.desktop,currentDesktops,DeskGuid)){
+                ++leftOut;
+                continue;
+            }
             record.recordId=NewRecordId();
             GUID id{};
             std::string canonical;
-            if(!ConcreteDesktopExists(record.desktop,currentDesktops,DeskGuid) ||
-               !ParseNonzeroLayoutGuid(record.recordId,id,&canonical) ||
+            if(!ParseNonzeroLayoutGuid(record.recordId,id,&canonical) ||
                !ids.insert(canonical).second){
                 fail(L"Manual layout could not allocate stable record identities.");
                 return;
@@ -5349,8 +5384,32 @@ static void FinishManualSave(uint64_t operationId){
             records.push_back(std::move(record));
         }
     }
+    if(records.empty() && operation.skippedApps.empty()){
+        fail(leftOut ? L"Only windows shown on all desktops are open. Nothing was saved."
+                     : L"No browser windows found. Nothing was saved.");
+        return;
+    }
+    ScopedLayoutLock lock;
+    if(!lock.acquired()){
+        fail(L"Manual layout storage is busy; the previous checkpoint was kept.");
+        return;
+    }
+    const size_t fresh=records.size();
+    size_t carried=0;
+    if(!operation.skippedApps.empty()){
+        LayoutLoadResult prior=LoadLayoutWithBackupLocked(
+            LayoutPath(true),UtcNowSeconds());
+        if(prior.status==LayoutLoadStatus::Unavailable){
+            fail(L"The previous manual layout could not be read; it was kept.");
+            return;
+        }
+        if(prior.usable())
+            carried=CarryOverManualRecords(
+                prior.wins,operation.skippedApps,records,ids);
+    }
     if(records.empty()){
-        fail(L"No browser windows found. Nothing was saved.");
+        Balloon(U82W("Manual layout was not saved: fresh session data was unavailable for "+
+                     JoinAppIds(operation.skippedApps)+".").c_str());
         return;
     }
     std::string bytes;
@@ -5358,11 +5417,6 @@ static void FinishManualSave(uint64_t operationId){
     if(!BuildCheckedLayoutSnapshot(
             currentDesktops,checked,UtcNowSeconds(),bytes,&error)){
         fail(L"Manual layout validation failed; the previous checkpoint was kept.");
-        return;
-    }
-    ScopedLayoutLock lock;
-    if(!lock.acquired()){
-        fail(L"Manual layout storage is busy; the previous checkpoint was kept.");
         return;
     }
     const bool published=PublishManualSnapshotIfCurrent(
@@ -5381,10 +5435,8 @@ static void FinishManualSave(uint64_t operationId){
     // The manual checkpoint is also the natural moment to refresh the "last
     // saved" session snapshot the reopen dialog offers.
     CaptureSessionSnapshot(SnapKind::Saved);
-    wchar_t message[160]={0};
-    swprintf_s(message,L"Saved manual layout: %u window(s).",
-               static_cast<unsigned>(records.size()));
-    Balloon(message);
+    Balloon(U82W("Saved manual layout: "+std::to_string(fresh)+" window(s)."+
+                 ManualSaveNotes(operation.skippedApps,carried,leftOut)).c_str());
 }
 
 static void CancelManualSaveOperation(uint64_t operationId){
@@ -5445,17 +5497,30 @@ static void HandleManualSaveSessionResult(const SessionRoute& route,
                                            const SessionResult& result){
     auto operation=g_manualSaveOperations.find(route.operationId);
     if(operation==g_manualSaveOperations.end()) return;
-    bool accepted=result.status==SessionDataStatus::Fresh && result.windows &&
-        result.dataGeneration!=0;
+    const bool sessionFresh=result.status==SessionDataStatus::Fresh &&
+        result.windows && result.dataGeneration!=0;
     std::map<std::string,AppFastSnapshot> current=
         CollectFastSnapshots(operation->second.profiles.all());
     auto captured=operation->second.snapshots.find(route.app);
     auto now=current.find(route.app);
-    accepted=accepted && captured!=operation->second.snapshots.end() &&
+    const bool snapshotCurrent=captured!=operation->second.snapshots.end() &&
         now!=current.end() && FastSnapshotCanPersistAll(now->second) &&
         captured->second.identityGeneration==now->second.identityGeneration &&
         captured->second.generation==now->second.generation &&
         route.contentGeneration==now->second.generation;
+    if(snapshotCurrent && !sessionFresh){
+        // A browser that holds its session file locked (Chrome and Edge do
+        // while a window is open) must not block the other apps' save.
+        bool skipped=false;
+        try { skipped=operation->second.skippedApps.insert(route.app).second; }
+        catch(...) { skipped=false; }
+        if(skipped){
+            if(operation->second.outstanding>0) --operation->second.outstanding;
+            FinishManualSave(route.operationId);
+            return;
+        }
+    }
+    bool accepted=sessionFresh && snapshotCurrent;
     if(accepted){
         const AppProfile* profile=operation->second.profiles.find(route.app);
         ReconcileRequest request;
@@ -5545,18 +5610,24 @@ static void FinishManualMove(uint64_t operationId){
     const size_t succeeded=found->second.succeeded;
     const size_t failed=found->second.failed;
     const size_t already=found->second.already;
+    std::string skipped;
+    try { skipped=JoinAppIds(found->second.skippedApps); } catch(...) {}
     g_manualMoveOperations.erase(found);
     g_reconcileDeadlines.cancel(operationId);
-    wchar_t message[220]={0};
-    if(succeeded==0 && failed==0)
-        swprintf_s(message,L"Restore: nothing to move; %u matched window(s) were already in place.",
-                   static_cast<unsigned>(already));
+    std::string message;
+    if(succeeded==0 && failed==0 && already==0 && !skipped.empty())
+        message="Restore did nothing: session data was unavailable for "+
+            skipped+".";
+    else if(succeeded==0 && failed==0)
+        message="Restore: nothing to move; "+std::to_string(already)+
+            " matched window(s) were already in place.";
     else
-        swprintf_s(message,L"Restore: moved %u, %u already in place, %u failed.",
-                   static_cast<unsigned>(succeeded),
-                   static_cast<unsigned>(already),
-                   static_cast<unsigned>(failed));
-    Balloon(message);
+        message="Restore: moved "+std::to_string(succeeded)+", "+
+            std::to_string(already)+" already in place, "+
+            std::to_string(failed)+" failed.";
+    if(!skipped.empty() && (succeeded || failed || already))
+        message+=" Skipped "+skipped+": its session data was unavailable.";
+    Balloon(U82W(message));
 }
 
 static void CancelManualMoveOperation(uint64_t operationId){
@@ -5873,14 +5944,24 @@ static void HandleManualRestoreSessionResult(const SessionRoute& route,
         CollectFastSnapshots(operation->second.profiles.all());
     auto captured=operation->second.snapshots.find(route.app);
     auto now=current.find(route.app);
-    if(!SessionDataUsable(result.status) || !result.windows ||
-       captured==operation->second.snapshots.end() || now==current.end() ||
+    if(captured==operation->second.snapshots.end() || now==current.end() ||
        !FastSnapshotCanPersistAll(now->second) ||
        captured->second.identityGeneration!=now->second.identityGeneration ||
        captured->second.generation!=now->second.generation ||
        route.contentGeneration!=now->second.generation){
         CancelManualMoveOperation(route.operationId);
         Balloon(L"Restore was cancelled because its window snapshot became stale.");
+        return;
+    }
+    if(!SessionDataUsable(result.status) || !result.windows){
+        // One browser without usable session data (Chrome and Edge lock the
+        // file while a window is open) is left out; the others restore.
+        try { operation->second.skippedApps.insert(route.app); }
+        catch(...) {
+            CancelManualMoveOperation(route.operationId);
+            return;
+        }
+        FinishManualMove(route.operationId);
         return;
     }
     const AppProfile* profile=operation->second.profiles.find(route.app);
@@ -6110,6 +6191,7 @@ static bool CliSaveCheckpoint(std::string& summary){
         return false;
     }
     std::vector<ReconcileRequest> requests;
+    std::set<std::string> skippedApps;
     const std::vector<AppProfile> profiles=ActiveProfiles();
     requests.reserve(profiles.size());
     for(const AppProfile& profile : profiles){
@@ -6121,26 +6203,34 @@ static bool CliSaveCheckpoint(std::string& summary){
         if(snapshot->second.windows.empty()) continue;
         std::shared_ptr<const std::vector<WinFp> > session;
         if(!AcquireCliSession(profile,session)){
-            summary="Fresh browser session data was unavailable; no file was changed.";
-            return false;
+            // A browser that holds its session file locked must not block
+            // the others; it keeps the records of the previous checkpoint.
+            skippedApps.insert(profile.id);
+            continue;
         }
         requests.push_back(MakeCliLiveRequest(
             profile,snapshot->second,session,desktops));
     }
     PreparedCliProfileBatch prepared;
-    if(!BuildCliProfileBatch(requests,prepared)){
+    if(!requests.empty() && !BuildCliProfileBatch(requests,prepared)){
         summary="Browser window preparation failed; no file was changed.";
         return false;
     }
     std::vector<LayoutWin> records;
     std::set<std::string> recordIds;
+    size_t leftOut=0;
     records.reserve(prepared.live.size());
     for(LayoutWin& record : prepared.live){
+        // A window shown on all desktops, or pinned, reports a desktop that
+        // is not in the list and has no single desktop to be restored to.
+        if(!ConcreteDesktopExists(record.desktop,desktops,DeskGuid)){
+            ++leftOut;
+            continue;
+        }
         record.recordId=NewRecordId();
         GUID id{};
         std::string canonical;
-        if(!ConcreteDesktopExists(record.desktop,desktops,DeskGuid) ||
-           !ParseNonzeroLayoutGuid(record.recordId,id,&canonical) ||
+        if(!ParseNonzeroLayoutGuid(record.recordId,id,&canonical) ||
            !recordIds.insert(canonical).second){
             summary="Could not allocate valid record IDs; no file was changed.";
             return false;
@@ -6150,15 +6240,10 @@ static bool CliSaveCheckpoint(std::string& summary){
         record.missingSinceUtc=0;
         records.push_back(std::move(record));
     }
-    if(records.empty()){
-        summary="No browser windows found. Nothing to save.";
-        return false;
-    }
-    std::string bytes;
-    std::vector<LayoutWin> checked=records;
-    if(!BuildCheckedLayoutSnapshot(
-            desktops,checked,UtcNowSeconds(),bytes,&error)){
-        summary="Failed to validate manual layout: "+error;
+    if(records.empty() && skippedApps.empty()){
+        summary=leftOut
+            ? "Only windows shown on all desktops are open. Nothing to save."
+            : "No browser windows found. Nothing to save.";
         return false;
     }
     std::map<std::string,AppFastSnapshot> currentSnapshots=
@@ -6177,13 +6262,32 @@ static bool CliSaveCheckpoint(std::string& summary){
     }
     LayoutLoadResult prior=LoadLayoutWithBackupLocked(
         LayoutPath(true),UtcNowSeconds());
-    if(prior.status==LayoutLoadStatus::Unavailable ||
-       !AtomicWriteText(LayoutPath(true),bytes,&error,
+    if(prior.status==LayoutLoadStatus::Unavailable){
+        summary="The previous manual layout could not be read; no file was changed.";
+        return false;
+    }
+    const size_t fresh=records.size();
+    const size_t carried=prior.usable()
+        ? CarryOverManualRecords(prior.wins,skippedApps,records,recordIds) : 0;
+    if(records.empty()){
+        summary="Fresh browser session data was unavailable for "+
+            JoinAppIds(skippedApps)+"; no file was changed.";
+        return false;
+    }
+    std::string bytes;
+    std::vector<LayoutWin> checked=records;
+    if(!BuildCheckedLayoutSnapshot(
+            desktops,checked,UtcNowSeconds(),bytes,&error)){
+        summary="Failed to validate manual layout: "+error;
+        return false;
+    }
+    if(!AtomicWriteText(LayoutPath(true),bytes,&error,
                         prior.status==LayoutLoadStatus::Recovered)){
         summary="Failed to atomically write manual layout: "+error;
         return false;
     }
-    summary="Saved layout: "+std::to_string(records.size())+" window(s).";
+    summary="Saved layout: "+std::to_string(fresh)+" window(s)."+
+        ManualSaveNotes(skippedApps,carried,leftOut);
     return true;
 }
 
@@ -6210,6 +6314,7 @@ static bool CliRestoreCheckpoint(bool manual,std::string& summary,
     }
     std::map<std::string,AppFastSnapshot> snapshots=CollectFastSnapshots();
     std::vector<ReconcileRequest> requests;
+    std::set<std::string> skippedApps;
     const std::vector<AppProfile> profiles=ActiveProfiles();
     requests.reserve(profiles.size());
     for(const AppProfile& profile : profiles){
@@ -6221,26 +6326,33 @@ static bool CliRestoreCheckpoint(bool manual,std::string& summary,
         if(snapshot->second.windows.empty()) continue;
         std::shared_ptr<const std::vector<WinFp> > session;
         if(!AcquireCliSession(profile,session)){
-            summary="Fresh browser session data was unavailable.";
-            return false;
+            // Leave this browser out; the others still restore.
+            skippedApps.insert(profile.id);
+            continue;
         }
         requests.push_back(MakeCliLiveRequest(
             profile,snapshot->second,session,desktops));
     }
+    const std::string skippedNote=skippedApps.empty() ? std::string()
+        : " Skipped "+JoinAppIds(skippedApps)+": its session data was unavailable.";
     PreparedCliProfileBatch prepared;
-    if(!BuildCliProfileBatch(requests,prepared)){
+    if(!requests.empty() && !BuildCliProfileBatch(requests,prepared)){
         summary="Browser window preparation failed; no windows were moved.";
         return false;
     }
     std::vector<LayoutWin> live=std::move(prepared.live);
     std::vector<FastWin> fast=std::move(prepared.fastWindows);
     if(live.empty()){
-        summary="No browser windows are open to restore.";
+        summary=skippedApps.empty()
+            ? "No browser windows are open to restore."
+            : "Fresh browser session data was unavailable for "+
+              JoinAppIds(skippedApps)+"; no windows were moved.";
         return false;
     }
     std::vector<std::string> enabledApps;
     enabledApps.reserve(profiles.size());
-    for(const AppProfile& profile : profiles) enabledApps.push_back(profile.id);
+    for(const AppProfile& profile : profiles)
+        if(skippedApps.count(profile.id)==0) enabledApps.push_back(profile.id);
     const CliRestoreMatchPlan matchPlan=PlanCliCheckpointRestoreMatches(
         manual,loaded.wins,live,enabledApps,UtcNowSeconds());
     if(matchPlan.status==CliRestoreMatchStatus::TooComplex){
@@ -6369,7 +6481,7 @@ static bool CliRestoreCheckpoint(bool manual,std::string& summary,
     }
     summary="Restore: moved "+std::to_string(moved)+", "+
         std::to_string(already)+" already in place, "+
-        std::to_string(failed)+" failed.";
+        std::to_string(failed)+" failed."+skippedNote;
     return failed==0;
 }
 
@@ -11400,6 +11512,7 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             currentSettings.firefox=g_appFirefox;
             currentSettings.chrome=g_appChrome;
             currentSettings.edge=g_appEdge;
+            const bool runAtLogonBefore=currentSettings.runAtLogon;
             SettingsRuntimeSnapshot requestedSettings=currentSettings;
             requestedSettings.hotkeyVk=newHotVk;
             requestedSettings.hotkeyMods=newHotMods;
@@ -11428,7 +11541,8 @@ static LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
             g_appFirefox=currentSettings.firefox;
             g_appChrome=currentSettings.chrome;
             g_appEdge=currentSettings.edge;
-            SetRunAtLogon(currentSettings.runAtLogon);
+            if(RunAtLogonWriteNeeded(runAtLogonBefore,currentSettings.runAtLogon))
+                SetRunAtLogon(currentSettings.runAtLogon);
             // Register before saving: a combination another app owns must
             // neither replace the hotkey that works nor be saved.
             const bool ok=ApplyHotkey();

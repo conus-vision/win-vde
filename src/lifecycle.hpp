@@ -237,6 +237,13 @@ inline bool SettingsProfilesChanged(
         current.chrome!=requested.chrome || current.edge!=requested.edge;
 }
 
+// The autostart box only shows whether a Run value exists, whichever exe it
+// names. Writing an unchanged box back would point autostart at the exe that
+// happens to be running (a test build, say), so only a real toggle writes.
+inline bool RunAtLogonWriteNeeded(bool before,bool requested) noexcept {
+    return before!=requested;
+}
+
 template<class Checkpoint,class CancelAutoRuntime>
 inline bool ApplySettingsRuntimeTransaction(
         SettingsRuntimeSnapshot& current,
