@@ -151,7 +151,7 @@ static bool g_appFirefox = true, g_appChrome = true, g_appEdge = true;  // ка�
 #define IDC_RO_HIDE_DESK 1323
 #define IDC_RO_HIDE_WIN 1324
 #define IDC_RO_HIDE_TAB 1325
-static const wchar_t* APP_VERSION = L"1.3.0";
+static const wchar_t* APP_VERSION = L"1.4.0";
 
 static HWND g_main=nullptr;
 static void Balloon(const std::wstring& text);
