@@ -168,8 +168,11 @@ is cut off.
   During the drag, a translucent copy with the application icon and window title follows the pointer.
   Drop it on another desktop to move or visually assign that window without switching desktops or closing the picker.
 - When you move a Firefox, Chrome, or Edge window and the move is verified,
-  win-vde updates its saved desktop. Moving another application's window
-  changes only the live window and creates no restore record.
+  win-vde updates its saved desktop. If that update cannot be saved, the
+  window goes back, so automatic restore does not undo the move later. With
+  automatic restore turned off, a browser window simply moves and nothing is
+  saved. Moving another application's window changes only the live window and
+  creates no restore record.
 - Windows shown on every desktop, individually pinned windows, and
   application-wide pins are never physically moved. Instead, the picker shows
   the selected row under the destination tile until the popup closes, then

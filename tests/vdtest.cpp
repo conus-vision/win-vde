@@ -5469,6 +5469,58 @@ static void test_ctrl_move_tracked_browser_unwritable_reports_failed(){
     CHECK(GuidEq(automaticLayout[0].desktop,before.desktop));
 }
 
+// With automatic restore off nothing would move the window back, so a row
+// drag of a tracked browser must commit like an untracked window instead of
+// being rolled back as an unsaved assignment.
+static void test_picker_move_with_autofix_off_commits_without_record(){
+    LayoutWin remembered;
+    remembered.recordId="tracked-firefox";
+    remembered.app="firefox";
+    remembered.activeTitle="saved tab";
+    std::vector<LayoutWin> automaticLayout{remembered};
+    const LayoutWin before=automaticLayout[0];
+    int mutations=0,callbacks=0;
+
+    const PopupSaveResult result=RunPickerPersistenceTransaction(
+        PopupBrowserClassification::Tracked,"firefox",
+        PopupPersistenceReadiness::Disabled,
+        [&](const std::string& app){
+            ++mutations;
+            automaticLayout[0].desktop=
+                G(L"{231A0000-0000-0000-0000-000000000099}");
+            PopupSaveResult saved;
+            saved.status=PopupSaveStatus::Saved;
+            saved.app=app;
+            return saved;
+        });
+    CHECK(result.status==PopupSaveStatus::NotTracked);
+    CHECK(result.failure==PopupSaveFailure::None);
+    CHECK(PickerRowMoveSaveCommits(result.status,result.failure));
+    CHECK(!CompletePickerLifecycleForSave(
+        result,[&](const std::string&){ ++callbacks; }));
+    CHECK(mutations==0 && callbacks==0);
+    CHECK(automaticLayout.size()==1);
+    CHECK(GuidEq(automaticLayout[0].desktop,before.desktop));
+
+    // A classification failure still blocks the move, auto-fix or not.
+    const PopupSaveResult unclassified=RunPickerPersistenceTransaction(
+        PopupBrowserClassification::Failed,"firefox",
+        PopupPersistenceReadiness::Disabled,
+        [&](const std::string&){ ++mutations; return PopupSaveResult(); });
+    CHECK(unclassified.status==PopupSaveStatus::Failed);
+    CHECK(unclassified.failure==PopupSaveFailure::Classification);
+    CHECK(!PickerRowMoveSaveCommits(unclassified.status,unclassified.failure));
+    CHECK(mutations==0);
+
+    // Read-only storage while auto-fix is on keeps the compensating rollback.
+    const PopupSaveResult readOnly=RunPickerPersistenceTransaction(
+        PopupBrowserClassification::Tracked,"firefox",
+        PopupPersistenceReadiness::ReadOnly,
+        [&](const std::string&){ ++mutations; return PopupSaveResult(); });
+    CHECK(!PickerRowMoveSaveCommits(readOnly.status,readOnly.failure));
+    CHECK(mutations==0);
+}
+
 static void test_picker_persistence_app_staging_contains_allocation_failure(){
     PopupSaveResult result;
     const std::string app(256,'f');
@@ -21934,6 +21986,15 @@ static void test_popup_persistence_recaptures_before_classification_and_reports_
               captured,matchingRecapture,classify,readiness,[&](){ ++writes; return false; })==
           PopupPersistenceResult::SaveFailed);
     CHECK(recaptures==6 && classifications==5 && readinessChecks==4 && writes==2);
+
+    // Auto-fix off: the move stands and nothing is written.
+    CHECK(CompletePopupMovePersistence(
+              captured,matchingRecapture,classify,
+              [&](){
+                  ++readinessChecks;
+                  return PopupPersistenceReadiness::Disabled;
+              },persist)==PopupPersistenceResult::NotTracked);
+    CHECK(recaptures==7 && classifications==6 && readinessChecks==5 && writes==2);
 }
 
 static void test_popup_saved_only_completes_exact_lifecycle_save_generation(){
@@ -30766,6 +30827,7 @@ int main(){
     test_picker_save_result_and_fresh_generation_callbacks_are_typed();
     test_ctrl_move_non_browser_never_mutates_auto_layout();
     test_ctrl_move_tracked_browser_unwritable_reports_failed();
+    test_picker_move_with_autofix_off_commits_without_record();
     test_picker_persistence_app_staging_contains_allocation_failure();
     test_picker_api_ack_distinguishes_invocation_and_identity_quality();
     test_picker_post_switch_reads_current_then_popup_and_requires_both();

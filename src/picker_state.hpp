@@ -1565,6 +1565,12 @@ inline PopupSaveResult RunPickerPersistenceTransaction(
         TryStagePickerPersistenceAppNoThrow(result,app);
         return result;
     }
+    // With automatic restore off, a tracked save failure would only roll back
+    // a move that nothing is going to undo; move without a record instead.
+    if(readiness==PopupPersistenceReadiness::Disabled){
+        result.status=PopupSaveStatus::NotTracked;
+        return result;
+    }
     if(readiness==PopupPersistenceReadiness::Unavailable){
         result.failure=PopupSaveFailure::StorageUnavailable;
         TryStagePickerPersistenceAppNoThrow(result,app);

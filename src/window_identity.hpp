@@ -44,7 +44,11 @@ enum class PopupBrowserClassification {
 enum class PopupPersistenceReadiness {
     Ready,
     Unavailable,
-    ReadOnly
+    ReadOnly,
+    // Automatic restore is turned off: nothing would put the window back on
+    // its old desktop, so a tracked window moves like an untracked one and
+    // no record is written.
+    Disabled
 };
 
 enum class PopupPersistenceResult {
@@ -122,6 +126,8 @@ inline PopupPersistenceResult CompletePopupMovePersistence(
     PopupPersistenceReadiness storage=PopupPersistenceReadiness::Unavailable;
     try { storage=readiness(); }
     catch(...) { return PopupPersistenceResult::StorageUnavailable; }
+    if(storage==PopupPersistenceReadiness::Disabled)
+        return PopupPersistenceResult::NotTracked;
     if(storage==PopupPersistenceReadiness::Unavailable)
         return PopupPersistenceResult::StorageUnavailable;
     if(storage==PopupPersistenceReadiness::ReadOnly)

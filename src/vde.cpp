@@ -2267,7 +2267,9 @@ static PopupSaveResult SavePopupMovedWindow(
         std::string app;
         const PopupBrowserClassification classification=
             ClassifyTrackedBrowserWindow(identity,app);
-        const PopupPersistenceReadiness readiness=!g_autoLoaded
+        const PopupPersistenceReadiness readiness=(!g_autoFix && !g_degraded)
+            ? PopupPersistenceReadiness::Disabled
+            : !g_autoLoaded
             ? PopupPersistenceReadiness::Unavailable
             : (!g_autoWritesAllowed || !g_autoFix || g_degraded)
                 ? PopupPersistenceReadiness::ReadOnly
