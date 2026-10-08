@@ -20,7 +20,8 @@ It is a small tray utility with three jobs:
    window.
 3. It gives you a fast desktop picker. A hotkey opens a searchable grid of all
    your desktops and their windows. From there you can switch desktops,
-   activate an exact window, or drag a window row onto another desktop.
+   activate an exact window, drag a window row onto another desktop, or
+   Ctrl+click a browser window to see all its tabs and their URLs.
 
 - Author: Volodymyr Moskvin, <info@conus.vision>
 - Repository: https://github.com/conus-vision/win-vde
@@ -147,6 +148,15 @@ expires.
 There are two layouts: a rolling automatic one, and a manual checkpoint that
 you save when you choose.
 
+Saving and restoring the manual checkpoint never stops at one problem window:
+
+- A window shown on all desktops, or pinned, has no single desktop to go back
+  to. **Save windows layout** leaves it out and says how many it left out.
+- If a browser's session data can't be read right now (Chrome and Edge can keep
+  the file locked while a window is open), Save stores the other browsers and
+  keeps that browser's records from the previous manual checkpoint, and Restore
+  puts the other browsers' windows back. Both name the browser they skipped.
+
 ### Desktop picker
 
 The global hotkey, Ctrl+Alt+D by default, opens a grid of your desktops on the
@@ -162,9 +172,12 @@ is cut off.
   tile to switch desktops without activating any listed window.
 - Hold Ctrl and click a browser window row to see all of that window's tabs
   with their URLs, over the picker. The active tab is marked. Click a tab, or
-  select it with the arrow keys and press Enter, to copy its URL; Esc or a click
-  outside the list closes it. The list comes from the browser's session data
-  that VDE already reads, so a window VDE has not recorded yet has none.
+  select it with the arrow keys and press Enter, to copy its URL; the wheel
+  scrolls the list, and Esc or a click outside closes it. The list comes from
+  the browser session data win-vde already reads, so it is empty for a window
+  win-vde has not recorded yet (usually its first 20 seconds) and for a browser
+  whose session file is locked. With automatic restore turned off, type in the
+  search box first: the search reads every window's tabs.
 - Hold Ctrl and click anywhere else in a desktop tile, without dragging, to
   move the captured active window there. The picker switches to that desktop
   and stays open with the active window highlighted.
@@ -211,6 +224,9 @@ Native Tools Command Prompt open, it uses that. It compiles the sources in
 `build\vde.exe`. There are no third-party dependencies. `build-dev.bat` builds
 the same program as `build\vde-dev.exe`.
 
+Visual Studio 2017 works with a Windows SDK up to 10.0.22621. The headers of
+SDK 10.0.26100 need the compiler of Visual Studio 2019 or later.
+
 To build and run the unit tests:
 
 ```
@@ -256,7 +272,8 @@ start:
 build\vde.exe --trace-picker
 ```
 
-Open the picker once, do one Ctrl+click, then exit VDE from the tray. The trace
+Open the picker once, Ctrl+click an empty part of a desktop tile, then exit VDE
+from the tray. The trace
 is a size-limited JSONL file in
 `%LOCALAPPDATA%\VirtualDesktopsExtention\diagnostics`. Ordinary launches never
 trace, and autostart never adds the switch. The trace records no window titles,
@@ -291,6 +308,11 @@ when you sign in. It adds a value to
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. Autostart is what lets
 the layout come back after a reboot without you doing anything.
 
+The box is ticked whenever that value exists, even if it points to another copy
+of `vde.exe`. Clicking **OK** changes the value only when you toggle the box, so
+opening Settings in a second copy, a test build for example, doesn't move
+autostart to it.
+
 ## Limitations and compatibility
 
 - Moving other apps' windows between desktops relies on undocumented COM
@@ -324,8 +346,12 @@ the layout come back after a reboot without you doing anything.
 - Reopening is sequential on purpose, at about a second per window: win-vde
   recognizes a new window as the difference in the browser's window set, and
   Firefox sends extra tabs to its most recent window.
-- Edge keeps its session file locked while it runs, so until Edge closes,
-  win-vde tracks Edge windows by title only.
+- Edge, and current Chrome versions, keep the current session file locked while
+  a window is open. Until they release it, win-vde tracks their windows by title
+  only and the Ctrl+click tab list has no tabs for them. Firefox is not
+  affected.
+- Windows shown on all desktops, or pinned, have no desktop of their own. The
+  manual checkpoint leaves them out, and no restore moves them.
 - win-vde reads every browser profile that is currently open, not just the
   default one. It detects an open profile by the lock the browser holds on it.
   A profile that is merely installed is ignored, so its old windows can't
@@ -338,6 +364,10 @@ the layout come back after a reboot without you doing anything.
 - Optional restore of window size and position, not just the desktop.
 - Telling a browser's PWA and app windows apart from ordinary browsing windows.
   Windows exposes no signal for this today.
+- An optional companion browser extension. It would let the picker search the
+  text of open pages, list Chrome and Edge tabs while their session file is
+  locked, and switch to a tab straight from the Ctrl+click list. Session files
+  hold only URLs and titles, so this needs the browser's help.
 
 ## License
 
