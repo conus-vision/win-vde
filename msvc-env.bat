@@ -11,9 +11,10 @@ set "VDE_VSDIR="
 set "VDE_VSWHERE_DIR=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer"
 if not exist "%VDE_VSWHERE_DIR%\vswhere.exe" set "VDE_VSWHERE_DIR="
 rem vswhere runs from its own folder so that no quoted path containing the
-rem parentheses of "Program Files (x86)" has to pass through FOR /F.
+rem parentheses of "Program Files (x86)" has to pass through FOR /F. The .\
+rem prefix keeps it found when NoDefaultCurrentDirectoryInExePath is set.
 if defined VDE_VSWHERE_DIR pushd "%VDE_VSWHERE_DIR%"
-if defined VDE_VSWHERE_DIR for /f "usebackq delims=" %%i in (`vswhere.exe -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VDE_VSDIR=%%i"
+if defined VDE_VSWHERE_DIR for /f "usebackq delims=" %%i in (`.\vswhere.exe -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VDE_VSDIR=%%i"
 if defined VDE_VSWHERE_DIR popd
 if defined VDE_VSDIR if exist "%VDE_VSDIR%\VC\Auxiliary\Build\vcvars64.bat" call "%VDE_VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul
 if /i "%VSCMD_ARG_TGT_ARCH%"=="x64" exit /b 0
