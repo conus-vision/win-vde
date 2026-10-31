@@ -4,6 +4,7 @@
 #include "move_queue.hpp"
 #include "window_identity.hpp"
 #include "window_mobility.hpp"
+#include "program_filter.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -177,6 +178,7 @@ struct PickerFooterPaintCache {
 template<class Row>
 struct PickerPaintCacheState {
     std::vector<Row> hoverRows;
+    std::vector<PickerProgramChip> programChips;
     std::wstring switchHeader,moveHeader;
     PickerFooterPaintCache footer;
     uint64_t generation=0;
@@ -189,6 +191,7 @@ struct PickerPaintCacheState {
         static_assert(noexcept(switchHeader.swap(other.switchHeader)),
                       "picker header publication must be noexcept");
         hoverRows.swap(other.hoverRows);
+        programChips.swap(other.programChips);
         switchHeader.swap(other.switchHeader);
         moveHeader.swap(other.moveHeader);
         footer.swap(other.footer);
@@ -205,6 +208,7 @@ struct PickerPaintCacheState {
 
     void clear() noexcept {
         hoverRows.clear();
+        programChips.clear();
         switchHeader.clear();
         moveHeader.clear();
         footer.clear();
@@ -4116,14 +4120,18 @@ inline bool AppendUniquePickerDesktop(std::vector<GUID>& desktops,
     }
 }
 
-template<class Rows,class GetSearchText>
+// A row is listed when the program filter lets it through and the search text,
+// if any, matches.
+template<class Rows,class GetSearchText,class RowAllowed>
 inline bool BuildPickerFilteredIndices(
         const Rows& rows,const std::wstring& searchText,
-        std::vector<size_t>& output,GetSearchText&& getSearchText) noexcept {
+        std::vector<size_t>& output,GetSearchText&& getSearchText,
+        RowAllowed&& rowAllowed) noexcept {
     try {
         std::vector<size_t> staged;
         staged.reserve(rows.size());
         for(size_t index=0;index<rows.size();++index){
+            if(!rowAllowed(rows[index])) continue;
             const std::wstring& searchable=getSearchText(rows[index]);
             if(searchText.empty() ||
                searchable.find(searchText)!=std::wstring::npos)
@@ -4134,6 +4142,15 @@ inline bool BuildPickerFilteredIndices(
     } catch(...) {
         return false;
     }
+}
+
+template<class Rows,class GetSearchText>
+inline bool BuildPickerFilteredIndices(
+        const Rows& rows,const std::wstring& searchText,
+        std::vector<size_t>& output,GetSearchText&& getSearchText) noexcept {
+    return BuildPickerFilteredIndices(
+        rows,searchText,output,getSearchText,
+        [](const typename Rows::value_type&) noexcept { return true; });
 }
 
 inline PickerState PreservePickerUi(const PickerState& state){

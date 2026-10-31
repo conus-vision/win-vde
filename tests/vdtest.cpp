@@ -18,6 +18,8 @@
 #include "binding_store.hpp"
 #include "reopen_model.hpp"
 #include "tab_overlay.hpp"
+#include "desktop_pin.hpp"
+#include "program_filter.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -21763,6 +21765,214 @@ static void test_settings_checkpoint_rejects_enabled_unloaded_and_preserves_stat
 
 // The Ctrl+click tab list scrolls by whole rows, keeps the last page full,
 // hit-tests only real rows and moves the keyboard selection within bounds.
+static void test_program_key_and_display_name(){
+    CHECK(ProgramKeyFromImagePath(L"C:\\Program Files\\Mozilla Firefox\\firefox.exe")==L"firefox");
+    CHECK(ProgramKeyFromImagePath(L"D:/Apps/Opera/OPERA.EXE")==L"opera");
+    CHECK(ProgramKeyFromImagePath(L"tool")==L"tool");
+    CHECK(ProgramKeyFromImagePath(L"")==L"");
+    CHECK(ProgramKeyFromImagePath(L"C:\\x\\.exe")==L".exe");
+    CHECK(ProgramDisplayName(L"firefox")==L"Firefox");
+    CHECK(ProgramDisplayName(L"opera")==L"Opera");
+    CHECK(ProgramDisplayName(L"msedge")==L"Edge");
+    CHECK(ProgramDisplayName(L"chrome")==L"Chrome");
+    CHECK(ProgramDisplayName(L"winword")==L"Word");
+    CHECK(ProgramDisplayName(L"windowsterminal")==L"Terminal");
+    CHECK(ProgramDisplayName(L"idea64")==L"Idea");
+    CHECK(ProgramDisplayName(L"64")==L"64");
+    CHECK(ProgramDisplayName(L"")==L"");
+}
+
+static void test_program_chips_need_two_windows_or_a_hidden_program(){
+    std::map<std::wstring,size_t> windows;
+    windows[L"opera"]=2;
+    windows[L"firefox"]=38;
+    windows[L"notepad"]=1;
+    windows[L"chrome"]=1;
+    windows[L""]=9;
+    std::set<std::wstring> hidden;
+    hidden.insert(L"chrome");
+    hidden.insert(L"steam");
+    const std::vector<PickerProgramChip> chips=
+        BuildPickerProgramChips(windows,hidden);
+    CHECK(chips.size()==3);
+    if(chips.size()==3){
+        CHECK(chips[0].name==L"Chrome" && chips[0].hidden);
+        CHECK(chips[1].name==L"Firefox" && !chips[1].hidden);
+        CHECK(chips[2].name==L"Opera" && !chips[2].hidden);
+    }
+}
+
+static void test_program_chip_layout_wraps_and_respects_the_row_limit(){
+    std::vector<PickerProgramChip> chips(5);
+    const std::vector<int> widths(5,100);
+    int rows=LayoutPickerProgramChips(chips,widths,10,50,240,20,10,4,3);
+    CHECK(rows==3);
+    CHECK(chips[0].rect.left==10 && chips[0].rect.top==50 &&
+          chips[0].rect.right==110 && chips[0].rect.bottom==70);
+    CHECK(chips[1].rect.left==120 && chips[1].rect.top==50);
+    CHECK(chips[2].rect.left==10 && chips[2].rect.top==74);
+    CHECK(chips[4].rect.left==10 && chips[4].rect.top==98);
+
+    rows=LayoutPickerProgramChips(chips,widths,10,50,240,20,10,4,1);
+    CHECK(rows==1);
+    CHECK(chips[1].rect.right==220);
+    CHECK(chips[2].rect.right==0 && chips[4].rect.right==0);
+
+    POINT inside={15,55},outside={15,75};
+    CHECK(PickerProgramChipAt(chips,inside)==0);
+    CHECK(PickerProgramChipAt(chips,outside)==-1);
+
+    rows=LayoutPickerProgramChips(chips,widths,10,50,240,20,10,4,0);
+    CHECK(rows==0);
+    CHECK(chips[0].rect.right==0);
+    CHECK(PickerProgramChipAt(chips,inside)==-1);
+
+    std::vector<PickerProgramChip> wide(2);
+    const std::vector<int> wideWidths(2,1000);
+    rows=LayoutPickerProgramChips(wide,wideWidths,10,50,240,20,10,4,3);
+    CHECK(rows==2);
+    CHECK(wide[0].rect.right==1010 && wide[1].rect.top==74);
+}
+
+static void test_hidden_programs_round_trip(){
+    std::set<std::wstring> programs;
+    CHECK(FormatHiddenPrograms(programs).empty());
+    CHECK(ParseHiddenPrograms(L"").empty());
+    programs.insert(L"opera");
+    programs.insert(L"firefox");
+    CHECK(FormatHiddenPrograms(programs)==L"firefox|opera");
+    CHECK(ParseHiddenPrograms(L"firefox|opera")==programs);
+    CHECK(ParseHiddenPrograms(L"|firefox||opera|")==programs);
+}
+
+static void test_filtered_indices_apply_the_program_filter_before_search(){
+    struct Row { std::wstring search; std::wstring program; };
+    const std::vector<Row> rows={
+        {L"github - firefox",L"firefox"},
+        {L"github - opera",L"opera"},
+        {L"inbox - firefox",L"firefox"},
+    };
+    const auto text=[](const Row& row)->const std::wstring& { return row.search; };
+    const auto notOpera=[](const Row& row){ return row.program!=L"opera"; };
+    std::vector<size_t> filtered;
+    CHECK(BuildPickerFilteredIndices(rows,L"",filtered,text,notOpera));
+    CHECK((filtered==std::vector<size_t>{0,2}));
+    CHECK(BuildPickerFilteredIndices(rows,L"github",filtered,text,notOpera));
+    CHECK((filtered==std::vector<size_t>{0}));
+    CHECK(BuildPickerFilteredIndices(rows,L"github",filtered,text));
+    CHECK((filtered==std::vector<size_t>{0,1}));
+}
+
+static void test_desktop_pin_switches_back_and_releases_after_settling(){
+    const GUID a={1},b={2},none={0};
+    DesktopPin pin;
+    CHECK(pin.observe(a,0,true,false)==DesktopPinAction::None);
+    CHECK(!pin.arm(none,0));
+    CHECK(!pin.armed());
+    CHECK(pin.arm(a,1000));
+    CHECK(pin.armed());
+
+    CHECK(pin.observe(a,1040,true,false)==DesktopPinAction::None);
+    CHECK(pin.observe(b,1080,true,false)==DesktopPinAction::SwitchBack);
+    pin.onSwitchBackResult(true);
+    // Explorer can still report the old desktop right after the switch.
+    CHECK(pin.observe(b,1120,true,false)==DesktopPinAction::None);
+    CHECK(pin.observe(b,1240,true,false)==DesktopPinAction::SwitchBack);
+    CHECK(pin.observe(a,1280,false,false)==DesktopPinAction::None);
+    // A read failure is not a desktop change.
+    CHECK(pin.observe(none,1320,false,false)==DesktopPinAction::None);
+
+    // Settling counts from the last disturbance, not from the last tick.
+    CHECK(pin.observe(a,1240+DesktopPin::kSettleMs-1,false,false)==DesktopPinAction::None);
+    CHECK(pin.armed());
+    CHECK(pin.observe(a,1240+DesktopPin::kSettleMs,false,false)==DesktopPinAction::Released);
+    CHECK(!pin.armed());
+}
+
+static void test_desktop_pin_follows_the_user(){
+    const GUID a={1},b={2},c={3};
+    DesktopPin pin;
+    CHECK(pin.arm(a,0));
+    CHECK(pin.observe(a,40,true,true)==DesktopPinAction::None);
+    CHECK(pin.observe(b,40+DesktopPin::kUserIntentMs,true,false)==DesktopPinAction::None);
+    CHECK(IsEqualGUID(pin.pinned(),b));
+    CHECK(pin.observe(c,41+2*DesktopPin::kUserIntentMs,true,false)==DesktopPinAction::SwitchBack);
+    pin.retarget(c);
+    CHECK(IsEqualGUID(pin.pinned(),c));
+    const GUID none={0};
+    pin.retarget(none);
+    CHECK(IsEqualGUID(pin.pinned(),c));
+    CHECK(pin.observe(c,2000,true,false)==DesktopPinAction::None);
+}
+
+static void test_desktop_pin_gives_up_rather_than_fight_forever(){
+    const GUID a={1},b={2};
+    {
+        DesktopPin pin;
+        CHECK(pin.arm(a,0));
+        uint64_t now=1000;
+        for(int i=0;i<DesktopPin::kMaxSwitchBacks;++i,now+=DesktopPin::kSwitchBackSpacingMs)
+            CHECK(pin.observe(b,now,true,false)==DesktopPinAction::SwitchBack);
+        CHECK(pin.observe(b,now,true,false)==DesktopPinAction::Released);
+        CHECK(!pin.armed());
+    }
+    {
+        DesktopPin pin;
+        CHECK(pin.arm(a,0));
+        for(int i=0;i<DesktopPin::kMaxFailures-1;++i){
+            pin.onSwitchBackResult(false);
+            CHECK(pin.armed());
+        }
+        pin.onSwitchBackResult(true);
+        pin.onSwitchBackResult(false);
+        CHECK(pin.armed());
+        pin.onSwitchBackResult(false);
+        pin.onSwitchBackResult(false);
+        CHECK(!pin.armed());
+    }
+    {
+        DesktopPin pin;
+        CHECK(pin.arm(a,0));
+        CHECK(pin.observe(a,DesktopPin::kMaxPinnedMs,true,false)==DesktopPinAction::Released);
+        CHECK(!pin.armed());
+    }
+    {
+        DesktopPin pin;
+        CHECK(pin.arm(a,0));
+        CHECK(pin.observe(a,100,true,false)==DesktopPinAction::None);
+        CHECK(pin.arm(b,200));
+        CHECK(IsEqualGUID(pin.pinned(),a));
+        CHECK(pin.observe(a,200+DesktopPin::kSettleMs,false,false)==DesktopPinAction::Released);
+    }
+    CHECK(DesktopPinShellClassShowsIntent(L"XamlExplorerHostIslandWindow"));
+    CHECK(DesktopPinShellClassShowsIntent(L"Shell_TrayWnd"));
+    CHECK(!DesktopPinShellClassShowsIntent(L"MozillaWindowClass"));
+    CHECK(!DesktopPinShellClassShowsIntent(nullptr));
+}
+
+static void test_desktop_pin_wiring_covers_every_background_move(){
+    const std::string source=ReadSourceFile(L"src\\vde.cpp");
+    const std::string queue=SourceSection(
+        source,"static void AdvanceMoveQueue(){",
+        "static bool ReleaseMoveReservation(");
+    const size_t arm=queue.find("ArmDesktopPin();");
+    const size_t issue=queue.find("IssueWindowMove(");
+    CHECK(arm!=std::string::npos && issue!=std::string::npos && arm<issue);
+    const std::string cli=SourceSection(
+        source,"static bool CliRestoreCheckpoint(",
+        "static bool IsCliHelpCommand(");
+    CHECK(cli.find("ArmDesktopPin();")!=std::string::npos);
+    CHECK(cli.find("TickDesktopPin(true);")!=std::string::npos);
+    CHECK(cli.find("TickDesktopPin(false);")!=std::string::npos);
+    const std::string reopen=SourceSection(
+        source,"static bool StartReopenJobs(","static void CancelReopen(");
+    CHECK(reopen.find("ArmDesktopPin();")!=std::string::npos);
+    const std::string helper=SourceSection(
+        source,"static HRESULT SwitchDesktopWithForegroundHandoff(",
+        "static PickerObservation ExecutePickerEffect(");
+    CHECK(helper.find("g_desktopPin.retarget(destinationGuid);")!=std::string::npos);
+}
+
 static void test_tab_overlay_scroll_hit_and_selection(){
     CHECK(TabOverlayMaxScroll(0,5)==0);
     CHECK(TabOverlayMaxScroll(5,5)==0);
@@ -31026,6 +31236,15 @@ int main(){
     test_settings_writes_run_key_only_when_autostart_toggled();
     test_manual_save_carries_over_skipped_app_records();
     test_tab_overlay_scroll_hit_and_selection();
+    test_program_key_and_display_name();
+    test_program_chips_need_two_windows_or_a_hidden_program();
+    test_program_chip_layout_wraps_and_respects_the_row_limit();
+    test_hidden_programs_round_trip();
+    test_filtered_indices_apply_the_program_filter_before_search();
+    test_desktop_pin_switches_back_and_releases_after_settling();
+    test_desktop_pin_follows_the_user();
+    test_desktop_pin_gives_up_rather_than_fight_forever();
+    test_desktop_pin_wiring_covers_every_background_move();
     test_checkpoint_reservation_defers_one_heartbeat_but_not_final();
     test_tray_instance_scope_is_gui_only_and_covers_work_lifetime();
     test_browser_classifier_requires_enabled_class_and_exact_executable_basename();

@@ -64,6 +64,7 @@
 #include "binding_store.hpp"  // persisted window identities + restore gate
 #include "reopen_model.hpp"   // checkpoint selection model for the reopen dialog
 #include "tab_overlay.hpp"    // scrolling/selection of the picker's tab list overlay
+#include "desktop_pin.hpp"    // keeps the current desktop in place during window moves
 #include <dwmapi.h>
 #pragma comment(lib, "dwmapi.lib")
 
@@ -96,6 +97,7 @@ static bool g_appFirefox = true, g_appChrome = true, g_appEdge = true;  // ка�
 #define TIMER_PICKER_SEARCH_RETRY 7
 #define TIMER_PICKER_ICON_PRELOAD 8
 #define TIMER_REOPEN 9
+#define TIMER_DESKTOP_PIN 10
 #define WM_PICKER_TRANSITION (WM_APP + 16)
 #define WM_PICKER_SEARCH_RETRY (WM_APP + 17)
 #define WM_MOVE_CANCEL_RETRY (WM_APP + 14)
@@ -103,6 +105,7 @@ static bool g_appFirefox = true, g_appChrome = true, g_appEdge = true;  // ка�
 #define WM_FOREGROUND_KICK (WM_APP + 18)
 #define MONITOR_INTERVAL_MS 5000
 #define MOVE_VERIFY_INTERVAL_MS 150
+#define DESKTOP_PIN_POLL_MS 40
 #define PICKER_IDLE_REFRESH_MS 1000
 #define AUTO_FLUSH_INTERVAL_MS 500
 #define CONFLICT_RECHECK_INTERVAL_MS (60U * 1000U)
@@ -151,7 +154,7 @@ static bool g_appFirefox = true, g_appChrome = true, g_appEdge = true;  // ка�
 #define IDC_RO_HIDE_DESK 1323
 #define IDC_RO_HIDE_WIN 1324
 #define IDC_RO_HIDE_TAB 1325
-static const wchar_t* APP_VERSION = L"1.4.0";
+static const wchar_t* APP_VERSION = L"1.5.0";
 
 static HWND g_main=nullptr;
 static void Balloon(const std::wstring& text);
@@ -334,6 +337,10 @@ static std::map<uint64_t,ManualSaveOperation> g_manualSaveOperations;
 static std::map<uint64_t,ManualMoveOperation> g_manualMoveOperations;
 static std::map<std::string,uint64_t> g_lastFreshSessionSignature;
 static MoveQueue g_moveQueue;
+static DesktopPin g_desktopPin;
+static void ArmDesktopPin() noexcept;
+static void TickDesktopPin(bool workPending) noexcept;
+static void HandForegroundOffMovingWindow(HWND window) noexcept;
 static RestoreBudgets g_restoreBudgets;
 static CheckpointController g_checkpointController;
 static RuntimeQuiescenceState g_runtimeQuiescence;
@@ -3558,6 +3565,8 @@ static void AdvanceMoveQueue(){
            current==MoveAttemptOutcome::PermanentFailure){
             result=g_moveQueue.onIssued(current);
         } else {
+            ArmDesktopPin();
+            HandForegroundOffMovingWindow(runtime->second.window.hwnd);
             HRESULT issued=IssueWindowMove(runtime->second,identity);
             if(HandleIndeterminateMoveIdentity(
                     jobId,runtime->second,identity)) return;
@@ -6409,7 +6418,9 @@ static bool CliRestoreCheckpoint(bool manual,std::string& summary,
         summary="Could not create the restore verification timer.";
         return false;
     }
+    if(!queue.empty()) ArmDesktopPin();
     while(!queue.empty()){
+        TickDesktopPin(true);
         const MoveJob* front=queue.front();
         if(!front) break;
         auto runtime=runtimes.find(front->token.jobId);
@@ -6432,6 +6443,7 @@ static bool CliRestoreCheckpoint(bool manual,std::string& summary,
                current==MoveAttemptOutcome::PermanentFailure)
                 result=queue.onIssued(current);
             else {
+                HandForegroundOffMovingWindow(runtime->second.window.hwnd);
                 HRESULT issued=IssueWindowMove(runtime->second,identity);
                 if(identity==WindowIdentityRecapture::Lost)
                     result=queue.cancelJob(front->token.jobId);
@@ -6480,6 +6492,10 @@ static bool CliRestoreCheckpoint(bool manual,std::string& summary,
             }
         }
     }
+    // The browser can still activate a moved window right after the last move.
+    while(g_desktopPin.armed() &&
+          WaitForCliVerify(timer.get(),DESKTOP_PIN_POLL_MS))
+        TickDesktopPin(false);
     summary="Restore: moved "+std::to_string(moved)+", "+
         std::to_string(already)+" already in place, "+
         std::to_string(failed)+" failed."+skippedNote;
@@ -6608,6 +6624,7 @@ struct WinItem {
     std::wstring title;
     std::wstring titleLC;
     std::wstring search;
+    std::wstring programKey;
     GUID observedDesktop={0};
     GUID baseDesktop={0};
     GUID displayedDesktop={0};
@@ -6715,6 +6732,7 @@ static bool QuiesceRuntime(HWND messageWindow) noexcept {
         KillTimer(messageWindow,TIMER_PICKER_TRANSITION);
         KillTimer(messageWindow,TIMER_PICKER_SEARCH_RETRY);
         KillTimer(messageWindow,TIMER_REOPEN);
+        KillTimer(messageWindow,TIMER_DESKTOP_PIN);
         RemoveForegroundHook();
         CancelPickerIconPreload(messageWindow);
         g_flushTimerArmed=false;
@@ -6739,6 +6757,8 @@ static bool QuiesceRuntime(HWND messageWindow) noexcept {
     });
 }
 static int TILE_W=240,TILE_H=150,PAD=16,HEADER=44,SEARCH_H=40;
+static int g_pickerStripH=0;   // program filter rows under the search box, fixed when the picker opens
+static int g_pickerStripRows=0;
 static int FOOTER_H=34,FOOTER_MIN_W=720,FOOTER_LINK_H=22;
 static int g_cols=1,g_rows=1;
 static HFONT g_fPT=nullptr,g_fPN=nullptr,g_fPI=nullptr,g_fPX=nullptr;   // cached picker fonts (avoid re-create per repaint)
@@ -7185,6 +7205,7 @@ struct PickerEnumContext {
     std::set<std::string>* liveKeys=nullptr;
     GUID currentDesktop{};
     std::map<DWORD,uint64_t> processStarts;
+    std::map<DWORD,std::wstring> programKeys;
     uint64_t modelGeneration=0;
     uint64_t enumSequence=0;
     uint64_t candidates=0;
@@ -7193,6 +7214,23 @@ struct PickerEnumContext {
     bool traceActive=false;
     bool failed=false;
 };
+
+static std::wstring PickerRowProgramKey(PickerEnumContext& context,DWORD pid){
+    if(pid==0) return std::wstring();
+    auto known=context.programKeys.find(pid);
+    if(known!=context.programKeys.end()) return known->second;
+    std::wstring key;
+    UniqueWinHandle process(OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid));
+    if(process){
+        wchar_t path[1024]={0};
+        DWORD length=static_cast<DWORD>(_countof(path));
+        if(QueryFullProcessImageNameW(process.get(),0,path,&length) && length)
+            key=ProgramKeyFromImagePath(std::wstring(path,length));
+    }
+    context.programKeys.emplace(pid,key);
+    return key;
+}
 
 static BOOL HandlePickerRowReadResult(
         PickerEnumContext& context,PickerRowReadResult result) noexcept {
@@ -7399,6 +7437,7 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
         item.titleLC=title;
         if(!item.titleLC.empty()) CharLowerW(&item.titleLC[0]);
         item.search=item.titleLC;
+        item.programKey=PickerRowProgramKey(context,pid);
         if(PickerRowUsesStableIdentity(admission)){
             item.identity=identity;
             item.runtimeKey=RuntimeKey(identity);
@@ -7435,13 +7474,23 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
     }
 }
 
+static std::set<std::wstring> g_pickerHiddenPrograms;
+
+static bool BuildPickerTileFilteredRows(
+        Tile& tile,const std::wstring& searchText) noexcept {
+    return BuildPickerFilteredIndices(tile.windows,searchText,tile.filtered,
+        [](const WinItem& item)->const std::wstring& {
+            return item.search;
+        },
+        [](const WinItem& item){
+            return g_pickerHiddenPrograms.count(item.programKey)==0;
+        });
+}
+
 static bool PopulatePickerFilteredRows(std::vector<Tile>& tiles,
                                        const std::wstring& searchText) noexcept {
     for(Tile& tile : tiles)
-        if(!BuildPickerFilteredIndices(tile.windows,searchText,tile.filtered,
-                [](const WinItem& item)->const std::wstring& {
-                    return item.search;
-                })) return false;
+        if(!BuildPickerTileFilteredRows(tile,searchText)) return false;
     return true;
 }
 
@@ -7496,6 +7545,8 @@ static void RecordPickerDesktopSnapshotObservation(
 
 static bool ResolvePickerModelClientSize(
         bool resetUi,size_t tileCount,int& width,int& height) noexcept;
+static void FixPickerProgramStripRows(
+        const std::vector<Tile>& tiles) noexcept;
 static bool BuildPickerPaintCache(
         PickerPaintCache& cache,std::vector<Tile>& tiles,
         PickerState& state,int clientWidth,int clientHeight,
@@ -7692,6 +7743,7 @@ static bool BuildModel(const WindowIdentityKey& activeWindow,bool resetUi,
             const uint64_t paintGeneration=
                 BeginPickerPaintRefresh(state);
             int clientWidth=0,clientHeight=0;
+            if(resetUi) FixPickerProgramStripRows(tiles);
             if(!ResolvePickerModelClientSize(
                     resetUi,tiles.size(),clientWidth,clientHeight))
                 return false;
@@ -7777,14 +7829,7 @@ static bool PublishPickerModelPaintUpdate(
 static bool RebuildPickerFilteredRows() noexcept {
     return PublishPickerModelPaintUpdate(
         [](std::vector<Tile>& tiles,PickerState& state){
-        for(size_t index=0;index<tiles.size();++index)
-            if(!BuildPickerFilteredIndices(
-                    tiles[index].windows,state.searchText,
-                    tiles[index].filtered,
-                    [](const WinItem& item)->const std::wstring& {
-                        return item.search;
-                    })) return false;
-        return true;
+        return PopulatePickerFilteredRows(tiles,state.searchText);
     },true);
 }
 
@@ -7792,13 +7837,7 @@ static bool ApplyPickerSearchText(const std::wstring& editText,
                                   const std::wstring& searchText) noexcept {
     const bool published=PublishPickerModelPaintUpdate(
         [&](std::vector<Tile>& tiles,PickerState& state){
-        for(size_t index=0;index<tiles.size();++index)
-            if(!BuildPickerFilteredIndices(
-                    tiles[index].windows,searchText,
-                    tiles[index].filtered,
-                    [](const WinItem& item)->const std::wstring& {
-                        return item.search;
-                    })) return false;
+        if(!PopulatePickerFilteredRows(tiles,searchText)) return false;
         return SetPickerSearchText(state,editText,searchText);
     },true);
     if(published && searchText.empty())
@@ -8094,7 +8133,7 @@ static void LayoutPickerTiles(
         const int column=value%columns;
         RECT rect;
         rect.left=PAD+column*(TILE_W+PAD);
-        rect.top=SEARCH_H+HEADER+PAD+row*(TILE_H+PAD);
+        rect.top=SEARCH_H+g_pickerStripH+HEADER+PAD+row*(TILE_H+PAD);
         rect.right=rect.left+TILE_W;
         rect.bottom=rect.top+TILE_H;
         tiles[index].rc=rect;
@@ -8107,7 +8146,7 @@ static void LayoutTiles(int clientWidth){
 }
 static SIZE DesiredClientSize(){
     return PickerDesiredClientSize(
-        g_tiles.size(),TILE_W,TILE_H,PAD,SEARCH_H,HEADER,
+        g_tiles.size(),TILE_W,TILE_H,PAD,SEARCH_H+g_pickerStripH,HEADER,
         FOOTER_H,FOOTER_MIN_W);
 }
 
@@ -8125,7 +8164,7 @@ static bool ResolvePickerModelClientSize(
         }
     }
     const SIZE desired=PickerDesiredClientSize(
-        tileCount,TILE_W,TILE_H,PAD,SEARCH_H,HEADER,
+        tileCount,TILE_W,TILE_H,PAD,SEARCH_H+g_pickerStripH,HEADER,
         FOOTER_H,FOOTER_MIN_W);
     if(desired.cx<=0 || desired.cy<=0) return false;
     width=desired.cx;
@@ -8266,6 +8305,64 @@ public:
     HDC get() const noexcept { return dc_; }
 };
 
+// Check box plus label; everything around it scales with the picker.
+static int PickerProgramChipWidth(HDC measure,const std::wstring& name) noexcept {
+    SIZE extent={0,0};
+    GetTextExtentPoint32W(measure,name.c_str(),static_cast<int>(name.size()),&extent);
+    return S(16)+S(7)+extent.cx+S(4);
+}
+
+static std::vector<PickerProgramChip> PickerProgramChipsFor(
+        const std::vector<Tile>& tiles){
+    std::map<std::wstring,size_t> windowsByProgram;
+    for(const Tile& tile : tiles)
+        for(const WinItem& window : tile.windows)
+            if(!window.programKey.empty()) ++windowsByProgram[window.programKey];
+    return BuildPickerProgramChips(windowsByProgram,g_pickerHiddenPrograms);
+}
+
+static int LayoutPickerProgramStrip(
+        std::vector<PickerProgramChip>& chips,HDC measure,int clientWidth,
+        int maxRows) noexcept {
+    try {
+        std::vector<int> widths;
+        widths.reserve(chips.size());
+        for(const PickerProgramChip& chip : chips)
+            widths.push_back(PickerProgramChipWidth(measure,chip.name));
+        return LayoutPickerProgramChips(
+            chips,widths,PAD+S(6),SEARCH_H,clientWidth-PAD,S(22),S(18),S(4),
+            maxRows);
+    } catch(...) {
+        for(PickerProgramChip& chip : chips) chip.rect=RECT{0,0,0,0};
+        return 0;
+    }
+}
+
+// The window cannot grow while it is open, so the rows are decided once per
+// opening; a program that gains a second window later fits into them or waits
+// for the next opening.
+static void FixPickerProgramStripRows(const std::vector<Tile>& tiles) noexcept {
+    g_pickerStripRows=0;
+    g_pickerStripH=0;
+    try {
+        std::vector<PickerProgramChip> chips=PickerProgramChipsFor(tiles);
+        if(chips.empty()) return;
+        ScopedPickerMeasureDc measure(g_main,g_fPI);
+        if(!measure.get()) return;
+        const SIZE desired=PickerDesiredClientSize(
+            tiles.size(),TILE_W,TILE_H,PAD,SEARCH_H,HEADER,
+            FOOTER_H,FOOTER_MIN_W);
+        g_pickerStripRows=LayoutPickerProgramStrip(
+            chips,measure.get(),desired.cx,3);
+        if(g_pickerStripRows>0)
+            g_pickerStripH=g_pickerStripRows*S(22)+
+                (g_pickerStripRows-1)*S(4)+S(2);
+    } catch(...) {
+        g_pickerStripRows=0;
+        g_pickerStripH=0;
+    }
+}
+
 static bool BuildPickerPaintCache(
         PickerPaintCache& cache,std::vector<Tile>& tiles,
         PickerState& state,int clientWidth,int clientHeight,
@@ -8301,6 +8398,9 @@ static bool BuildPickerPaintCache(
         if(!GetTextExtentPoint32W(measure.get(),hint,
                 static_cast<int>(wcslen(hint)),&hintSize)) return false;
         cache.hintWidth=hintSize.cx;
+        cache.programChips=PickerProgramChipsFor(tiles);
+        (void)LayoutPickerProgramStrip(
+            cache.programChips,measure.get(),clientWidth,g_pickerStripRows);
         SIZE repoExtent={0,0},middleExtent={0,0},conusExtent={0,0};
         if(!GetTextExtentPoint32W(
                 measure.get(),cache.footer.repo.c_str(),
@@ -8839,8 +8939,34 @@ static void Paint(HDC hdcReal,HDC hdc,RECT client){
         SelectObject(hdc,fX); SetTextColor(hdc,CLR_HINT); RECT xr=g_pickerPaintCache.clearButton; DrawTextW(hdc,L"\x2715",-1,&xr,DT_CENTER|DT_SINGLELINE|DT_VCENTER);
     }
 
+    // ---- program filter: a check box per program with several windows ----
+    if(paintCacheReady){
+        SelectObject(hdc,fI);
+        for(const PickerProgramChip& chip : g_pickerPaintCache.programChips){
+            if(chip.rect.right<=chip.rect.left) continue;
+            const int boxTop=chip.rect.top+(chip.rect.bottom-chip.rect.top-S(16))/2;
+            RECT box={chip.rect.left,boxTop,chip.rect.left+S(16),boxTop+S(16)};
+            FillRoundRect(hdc,box,S(4),chip.hidden?CLR_SEARCH:CLR_ACTIVE,
+                          chip.hidden?CLR_PASSIVE:CLR_ACTIVE,1);
+            if(!chip.hidden){
+                HPEN pen=CreatePen(PS_SOLID,(std::max)(1,S(2)),CLR_BG);
+                HGDIOBJ oldPen=SelectObject(hdc,pen);
+                MoveToEx(hdc,box.left+S(4),box.top+S(8),nullptr);
+                LineTo(hdc,box.left+S(7),box.top+S(11));
+                LineTo(hdc,box.left+S(12),box.top+S(5));
+                SelectObject(hdc,oldPen);
+                DeleteObject(pen);
+            }
+            RECT label=chip.rect;
+            label.left=box.right+S(7);
+            SetTextColor(hdc,chip.hidden?CLR_DIM:CLR_TEXT);
+            DrawTextW(hdc,chip.name.c_str(),-1,&label,
+                      DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+        }
+    }
+
     // ---- header: left title + right Ctrl+Click hint ----
-    int headTop=SEARCH_H, headBot=SEARCH_H+HEADER;
+    int headTop=SEARCH_H+g_pickerStripH, headBot=headTop+HEADER;
     SelectObject(hdc,fI); SetTextColor(hdc,CLR_HINT);
     const wchar_t* hint=kPickerCtrlHint;
     RECT hr={PAD,headTop,client.right-PAD,headBot}; DrawTextW(hdc,hint,-1,&hr,DT_RIGHT|DT_SINGLELINE|DT_VCENTER);
@@ -9481,6 +9607,7 @@ static HRESULT SwitchDesktopWithForegroundHandoff(
             plan,prog,desktopThread,foregroundThread,currentThread,
             ops,g_pickerTrace.active()?&observer:nullptr);
     invoked=result.invoked;
+    if(SUCCEEDED(result.switchResult)) g_desktopPin.retarget(destinationGuid);
     return result.switchResult;
 }
 
@@ -9512,6 +9639,8 @@ static PickerObservation ExecutePickerEffect(
         switch(effect.kind){
         case PickerEffectKind::MoveTarget: {
             observation.event=PickerEvent::ApiCompleted;
+            if(g_picker.transition.mode==PickerTransitionMode::RowMoveOnly)
+                ArmDesktopPin();
             const TargetMoveIssueResult issued=IssueGuardedTargetMove(
                 g_picker.transition.target,
                 TargetDesktopRoute::Indeterminate,effect.desktop,
@@ -11504,6 +11633,12 @@ static void LoadSettings(){
         cb=sizeof(v); if(RegQueryValueExW(hk,L"AppFirefox",0,0,(LPBYTE)&v,&cb)==ERROR_SUCCESS)g_appFirefox=(v!=0);
         cb=sizeof(v); if(RegQueryValueExW(hk,L"AppChrome",0,0,(LPBYTE)&v,&cb)==ERROR_SUCCESS)g_appChrome=(v!=0);
         cb=sizeof(v); if(RegQueryValueExW(hk,L"AppEdge",0,0,(LPBYTE)&v,&cb)==ERROR_SUCCESS)g_appEdge=(v!=0);
+        wchar_t hidden[2048]={0};
+        DWORD type=0;
+        cb=sizeof(hidden)-sizeof(wchar_t);
+        if(RegQueryValueExW(hk,L"PickerHiddenPrograms",0,&type,(LPBYTE)hidden,&cb)==ERROR_SUCCESS && type==REG_SZ){
+            try { g_pickerHiddenPrograms=ParseHiddenPrograms(hidden); } catch(...) {}
+        }
         RegCloseKey(hk);
     }
     // A stored hotkey without Ctrl or Alt would swallow a plain key in every
@@ -11527,6 +11662,36 @@ static void SaveSettings(){
         RegCloseKey(hk);
     }
 }
+static void SavePickerHiddenPrograms() noexcept {
+    try {
+        const std::wstring text=FormatHiddenPrograms(g_pickerHiddenPrograms);
+        HKEY hk;
+        if(RegCreateKeyExW(HKEY_CURRENT_USER,L"Software\\VirtualDesktopsExtention",0,nullptr,0,KEY_WRITE,nullptr,&hk,nullptr)==ERROR_SUCCESS){
+            RegSetValueExW(hk,L"PickerHiddenPrograms",0,REG_SZ,(const BYTE*)text.c_str(),(DWORD)((text.size()+1)*sizeof(wchar_t)));
+            RegCloseKey(hk);
+        }
+    } catch(...) {}
+}
+
+// Ticking or unticking a program in the picker's filter strip.
+static void TogglePickerProgram(size_t chipIndex) noexcept {
+    try {
+        if(chipIndex>=g_pickerPaintCache.programChips.size()) return;
+        const std::wstring key=g_pickerPaintCache.programChips[chipIndex].key;
+        const bool wasHidden=g_pickerHiddenPrograms.count(key)!=0;
+        if(wasHidden) g_pickerHiddenPrograms.erase(key);
+        else g_pickerHiddenPrograms.insert(key);
+        if(!RebuildPickerFilteredRows()){
+            if(wasHidden) g_pickerHiddenPrograms.insert(key);
+            else g_pickerHiddenPrograms.erase(key);
+            return;
+        }
+        SavePickerHiddenPrograms();
+        PreloadVisiblePickerIcons();
+        if(g_main) InvalidateRect(g_main,nullptr,FALSE);
+    } catch(...) {}
+}
+
 static bool ApplyHotkey(){
     UnregisterHotKey(g_main,1);
     return RegisterHotKey(g_main,1,g_hotMods|MOD_NOREPEAT,g_hotVk)!=0;
@@ -12000,7 +12165,7 @@ static LRESULT CALLBACK AboutProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         int y=S(16);
         std::wstring title=std::wstring(L"Virtual Desktop Extension for Windows 11  \x2014  v")+APP_VERSION;
         CreateWindowW(L"STATIC",title.c_str(),WS_CHILD|WS_VISIBLE,S(16),y,S(352),S(20),hwnd,nullptr,g_inst,nullptr); y+=S(26);
-        CreateWindowW(L"STATIC",L"Keeps browser windows on their virtual desktops, and brings back lost browsing sessions - any desktop, window or tab.",WS_CHILD|WS_VISIBLE,S(16),y,S(352),S(34),hwnd,nullptr,g_inst,nullptr); y+=S(40);
+        CreateWindowW(L"STATIC",L"Find any window fast, move between virtual desktops, and keep browser windows on their desktops.",WS_CHILD|WS_VISIBLE,S(16),y,S(352),S(34),hwnd,nullptr,g_inst,nullptr); y+=S(40);
         CreateWindowW(L"STATIC",L"Author:  Volodymyr Moskvin",WS_CHILD|WS_VISIBLE,S(16),y,S(352),S(20),hwnd,nullptr,g_inst,nullptr); y+=S(24);
         CreateWindowW(L"SysLink",L"Email:  <a href=\"mailto:info@conus.vision\">info@conus.vision</a>",WS_CHILD|WS_VISIBLE|WS_TABSTOP,S(16),y,S(352),S(20),hwnd,(HMENU)IDC_LINK_MAIL,g_inst,nullptr); y+=S(24);
         CreateWindowW(L"SysLink",L"GitHub:  <a href=\"https://github.com/conus-vision/win-vde\">github.com/conus-vision/win-vde</a>",WS_CHILD|WS_VISIBLE|WS_TABSTOP,S(16),y,S(352),S(20),hwnd,(HMENU)IDC_LINK_REPO,g_inst,nullptr); y+=S(28);
@@ -12094,10 +12259,11 @@ static void ShowCompatIssue(bool buildChanged){
 
 // --------------------------- Help window -------------------------------------
 static const wchar_t* HELP_TEXT =
-L"What this solves\r\n"
-L"Windows 11 does not remember which virtual desktop your app windows were on after a reboot, and browsers change their window handles when they restore a session - so nothing external can recognize the windows. win-vde identifies each browser window by its pages, matches old windows to new ones after a restart, and moves each one back to the desktop it was saved on. It also keeps its own session checkpoints, outside the browser: when a session is lost to a crash, an update or a careless click, any desktop, window or single tab can be brought back from one of them.\r\n\r\n"
+L"What it does\r\n"
+L"Press the hotkey, type part of a window title, a tab title or an address, and click the row: you are in that window, on whatever desktop it was on. The same panel takes you between virtual desktops and moves windows between them.\r\n"
+L"In the background win-vde keeps browser windows on their desktops. Windows 11 does not remember which virtual desktop a browser window was on after a reboot, and browsers change their window handles when they restore a session, so win-vde identifies each browser window by its pages and moves it back to the desktop it was saved on. Your current desktop stays in place while windows are being moved. It also keeps its own session checkpoints, outside the browser: when a session is lost to a crash, an update or a careless click, any desktop, window or single tab can be brought back from one of them.\r\n\r\n"
 L"Picker  (hotkey Ctrl+Alt+D)\r\n"
-L"A grid of your virtual desktops and their eligible application windows. Click a window row to switch to its displayed desktop and activate that exact window. Click a desktop title or empty tile area to switch without activating a listed window. Ctrl+click a window row to see all its tabs with their URLs; click a tab to copy its URL. Ctrl+click elsewhere in a desktop tile to move the captured active window there, follow it, and keep the picker open. During the drag, a translucent copy with the application icon and window title follows the pointer. Drop it on another desktop to move or visually assign that window without switching desktops or closing the picker. Globally visible and pinned windows are only visually assigned for the current popup session; their real Windows state is not changed. Type in the box to filter windows by name, scroll a tile with the mouse wheel, and hover a clipped name to see it in full.\r\n\r\n"
+L"A grid of your virtual desktops and their eligible application windows. Click a window row to switch to its displayed desktop and activate that exact window. Click a desktop title or empty tile area to switch without activating a listed window. Ctrl+click a window row to see all its tabs with their URLs; click a tab to copy its URL. Ctrl+click elsewhere in a desktop tile to move the captured active window there, follow it, and keep the picker open. During the drag, a translucent copy with the application icon and window title follows the pointer. Drop it on another desktop to move or visually assign that window without switching desktops or closing the picker. Globally visible and pinned windows are only visually assigned for the current popup session; their real Windows state is not changed. Type in the box to filter windows by name; a browser window also matches on the title or address of any of its tabs. Every program with more than one window gets a check box under the search box: untick it to take that program's windows out of the desktop tiles until you tick it again. Scroll a tile with the mouse wheel, and hover a clipped name to see it in full.\r\n\r\n"
 L"Menu\r\n"
 L"- Save windows layout: save the current windows to a manual checkpoint file.\r\n"
 L"- Restore saved windows layout: put windows back from that manual checkpoint.\r\n"
@@ -12581,6 +12747,8 @@ static void AdvanceReopen() noexcept {
             bool placed=false;
             if(alreadyHome){ ++g_reopen.moved; placed=true; }
             else {
+                HandForegroundOffMovingWindow(
+                    reinterpret_cast<HWND>(g_reopen.target.hwnd));
                 TargetMoveIssueResult issued=IssueGuardedTargetMove(
                     g_reopen.target,TargetDesktopRoute::Indeterminate,
                     destination,
@@ -12644,12 +12812,90 @@ static bool StartReopenJobs(std::vector<ReopenWindowJob> jobs,
         errorOut=L"The reopen timer could not be started.";
         return false;
     }
+    ArmDesktopPin();
     NotifyReopenProgress();
     return true;
 }
 
 static void CancelReopen() noexcept {
     if(g_reopen.active) g_reopen.cancelRequested=true;
+}
+
+// ------------------------------ desktop pin ----------------------------------
+// While windows are being moved the current desktop stays where the user left
+// it, and so does the keyboard focus. See desktop_pin.hpp.
+static HWND g_desktopPinForeground=nullptr;
+
+static bool DesktopPinWindowIsHere(HWND window) noexcept {
+    if(!window || !IsWindow(window) || !g_vdmDoc) return false;
+    BOOL here=FALSE;
+    try {
+        return SUCCEEDED(g_vdmDoc->IsWindowOnCurrentVirtualDesktop(window,&here)) &&
+            here!=FALSE;
+    } catch(...) { return false; }
+}
+
+static bool DesktopPinUserIsSwitching() noexcept {
+    const bool win=GetAsyncKeyState(VK_LWIN)!=0 || GetAsyncKeyState(VK_RWIN)!=0;
+    if(win && GetAsyncKeyState(VK_CONTROL)!=0) return true;
+    HWND foreground=GetForegroundWindow();
+    wchar_t className[64]={0};
+    return foreground &&
+        GetClassNameW(foreground,className,static_cast<int>(_countof(className)))>0 &&
+        DesktopPinShellClassShowsIntent(className);
+}
+
+static void GiveForegroundTo(HWND window) noexcept {
+    const HWND foreground=GetForegroundWindow();
+    if(!window || foreground==window) return;
+    DWORD ignored=0;
+    const DWORD foregroundThread=foreground
+        ?GetWindowThreadProcessId(foreground,&ignored):0;
+    const DWORD currentThread=GetCurrentThreadId();
+    const bool attach=foregroundThread!=0 && foregroundThread!=currentThread;
+    if(attach) AttachThreadInput(currentThread,foregroundThread,TRUE);
+    SetForegroundWindow(window);
+    if(attach) AttachThreadInput(currentThread,foregroundThread,FALSE);
+}
+
+static void ArmDesktopPin() noexcept {
+    const bool wasArmed=g_desktopPin.armed();
+    if(!g_desktopPin.arm(CurrentDesktopGuid(),MonotonicNowMs())) return;
+    if(wasArmed) return;
+    const HWND foreground=GetForegroundWindow();
+    g_desktopPinForeground=foreground!=g_main && DesktopPinWindowIsHere(foreground)
+        ?foreground:nullptr;
+    if(g_main) SetTimer(g_main,TIMER_DESKTOP_PIN,DESKTOP_PIN_POLL_MS,nullptr);
+}
+
+// The focused window cannot keep the focus on its way to another desktop.  The
+// focus goes back to what the user had, or to the desktop itself, before the
+// move rather than after a flip.
+static void HandForegroundOffMovingWindow(HWND window) noexcept {
+    if(!g_desktopPin.armed() || !window) return;
+    if(GetAncestor(GetForegroundWindow(),GA_ROOT)!=window) return;
+    HWND next=g_desktopPinForeground;
+    if(next==window || !DesktopPinWindowIsHere(next))
+        next=FindWindowW(L"Progman",L"Program Manager");
+    GiveForegroundTo(next);
+}
+
+static void TickDesktopPin(bool workPending) noexcept {
+    const GUID current=CurrentDesktopGuid();
+    const DesktopPinAction action=g_desktopPin.observe(
+        current,MonotonicNowMs(),workPending,DesktopPinUserIsSwitching());
+    if(action==DesktopPinAction::SwitchBack){
+        bool invoked=false;
+        const HRESULT result=SwitchDesktopWithForegroundHandoff(
+            g_desktopPin.pinned(),invoked);
+        g_desktopPin.onSwitchBackResult(SUCCEEDED(result));
+        if(SUCCEEDED(result) && DesktopPinWindowIsHere(g_desktopPinForeground))
+            GiveForegroundTo(g_desktopPinForeground);
+    }
+    if(!g_desktopPin.armed()){
+        g_desktopPinForeground=nullptr;
+        if(g_main) KillTimer(g_main,TIMER_DESKTOP_PIN);
+    }
 }
 
 // ------------------------------- checkpoint dialog ---------------------------
@@ -13639,9 +13885,10 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         POINT point={0,0};
         if(cacheReady && GetCursorPos(&point) &&
            ScreenToClient(hwnd,&point) &&
-           PickerFooterUsesHandCursor(HitCurrentPickerFooterLink(
+           (PickerProgramChipAt(g_pickerPaintCache.programChips,point)>=0 ||
+            PickerFooterUsesHandCursor(HitCurrentPickerFooterLink(
                g_picker,g_pickerPaintCache.generation,
-               g_pickerPaintCache.footer.layout,point))){
+               g_pickerPaintCache.footer.layout,point)))){
             HCURSOR hand=LoadCursorW(nullptr,IDC_HAND);
             if(hand){ SetCursor(hand); return TRUE; }
         }
@@ -13724,6 +13971,12 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         mouseEvent.tileIndex=activation.tileIndex;
         mouseEvent.rowIndex=activation.rowIndex;
         g_pickerTrace.emit(mouseEvent);
+        const int programChip=cacheReady
+            ?PickerProgramChipAt(g_pickerPaintCache.programChips,pt):-1;
+        if(programChip>=0){
+            TogglePickerProgram(static_cast<size_t>(programChip));
+            return 0;
+        }
         if(DispatchPickerPointerActivation(activation,
             [&](const PickerFooterActivation& footer){
                 OpenPickerFooterLink(hwnd,footer);
@@ -14117,6 +14370,10 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
         if(wp==TIMER_REOPEN){
             RunMessageRouteNoThrow([&](){ AdvanceReopen(); },
                                    [](){ FinishReopen(); },[](){});
+            return 0;
+        }
+        if(wp==TIMER_DESKTOP_PIN){
+            TickDesktopPin(!g_moveQueue.empty() || g_reopen.active);
             return 0;
         }
         if(wp==TIMER_MONITOR) RunMonitorTick(hwnd);
