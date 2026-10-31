@@ -1,29 +1,28 @@
-# win-vde: Virtual Desktop Extension for Windows 11
+# win-vde: find any window on any virtual desktop
 
-After a reboot, Windows 11 puts every browser window on desktop 1. win-vde
-remembers which virtual desktop each Firefox, Chrome, and Edge window was on
-and moves it back. It also remembers what each window held, so when the browser
-loses a session you can reopen a desktop, a window, or a single tab right where
-it used to be.
+Press Ctrl+Alt+D, type part of a window title, a tab title or an address, and
+click the row. You land in that window, on whatever Windows 11 virtual desktop
+it was on. win-vde is a small tray utility for people with too many windows, and
+it does three things:
 
-It is a small tray utility with three jobs:
+1. It finds windows fast. One panel lists every desktop and the windows on it.
+   A browser window matches on any of its tabs, by title or by full URL, not only
+   the tab on top. Every program with more than one window gets a check box under
+   the search bar: untick it, and its windows leave the list until you tick it
+   again.
+2. It moves you around your virtual desktops. Click a tile or press a digit to go
+   there. Drag a row onto another desktop to move that window while you stay where
+   you are. Ctrl+click a browser window to see all its tabs and their URLs.
+3. It keeps browser windows in place. After a reboot, a browser restart, or a
+   browser crash, Windows 11 leaves every browser window on desktop 1. win-vde
+   recognizes each Firefox, Chrome, and Edge window by its tabs and sends it back,
+   while your screen stays on the desktop you are using. If a session is lost, five
+   checkpoints let you reopen a desktop, a window, or a single tab where it was.
 
-1. It keeps your desktop layout. After a reboot, a browser restart, or a
-   browser crash it puts each browser window back on its desktop. It acts only
-   then: a window you open yourself stays where you opened it.
-2. It brings back lost browsing sessions. Five checkpoints, the last saved
-   state plus the last four shutdowns, each with its date and time, let you
-   reopen any desktop, window, or single tab in its original window on its
-   original desktop. Whatever is already open gets skipped. If a browser
-   update, a crash, an accidental "close all windows", or a profile reset took
-   your session, pick what you need and it comes back at about a second per
-   window.
-3. It gives you a fast desktop picker. A hotkey opens a searchable grid of all
-   your desktops and their windows. From there you can switch desktops,
-   activate an exact window, drag a window row onto another desktop, or
-   Ctrl+click a browser window to see all its tabs and their URLs.
+<p align="center"><a href="https://vde.conus.vision/#film"><img src="docs/tour-poster.png" alt="Watch the tour of win-vde, English and Russian" width="840"></a></p>
 
 - Author: Volodymyr Moskvin, <info@conus.vision>
+- Website: https://vde.conus.vision/
 - Repository: https://github.com/conus-vision/win-vde
 - License: MIT
 
@@ -31,26 +30,24 @@ It is a small tray utility with three jobs:
 It is a single file and needs no installer. You can also build it yourself, see
 [Building from source](#building-from-source).
 
-> Layout memory and session checkpoints work with Firefox, Chrome, and Edge.
-> The picker also lists ordinary windows of other applications, with their
-> icons, the active window highlighted, search, scrolling, and tooltips that
-> show long names in full.
+> The panel and the search work with ordinary windows of any application. Layout
+> memory and session checkpoints work with Firefox, Chrome, and Edge.
 
 ## Who it is for
 
-- Anyone with more than a handful of browser windows: a research desktop, a
-  work desktop, a shopping desktop. After a reboot Windows dumps them all on
-  desktop 1, and win-vde puts each one back where it lived.
+- Anyone who knows a page is open somewhere and can't find it. Alt+Tab shows one
+  thumbnail per window, and the page you want is a background tab in a window on
+  another desktop. Here you type three letters of its title or address.
+- Anyone with more than a handful of browser windows: a research desktop, a work
+  desktop, a shopping desktop. After a reboot Windows dumps them all on desktop 1,
+  and win-vde puts each one back where it lived.
 - Anyone who has lost a browser session. The browser updated and forgot it, a
   crash swallowed the windows, "Restore previous session" restored the wrong
   thing, or one careless click closed forty tabs. win-vde keeps its own
   checkpoints outside the browser, so you can restore exactly the desktop,
   window, or tab you miss.
-- Anyone who wants to rebuild a working context on demand: bring the three
-  windows of last Tuesday's project back onto their desktop without touching
-  what is open now.
 
-<p align="center"><img src="docs/overview.svg" alt="How win-vde works: Windows scatters browser windows across virtual desktops after a reboot; win-vde remembers the layout and restores it; plus a fast searchable desktop picker" width="840"></p>
+<p align="center"><img src="docs/overview.svg" alt="win-vde in three moves: type to find a window in the panel, untick a program to hide its windows, and browser windows go back to their desktops after a reboot while your screen stays put" width="840"></p>
 
 ## Quick start
 
@@ -69,11 +66,11 @@ It is a single file and needs no installer. You can also build it yourself, see
    (run at logon)**, and click **OK**. From then on your layout comes back by
    itself after every reboot.
 
-That is the whole setup. Arrange your browser windows across your virtual
-desktops and stop thinking about it. Press **Ctrl+Alt+D** whenever you want the
-desktop picker.
+That is the whole setup. Press **Ctrl+Alt+D** whenever you are looking for a
+window. Arrange your browser windows across your virtual desktops once, and they
+stay there.
 
-## Why this exists
+## Why browser windows need help
 
 Three things Windows and the browser don't solve on their own:
 
@@ -140,6 +137,15 @@ recognizes the windows that survived by handle, process ID, and process start
 time and adopts them again. A window you open while the browser is already
 running is never relocated; win-vde records it where you opened it.
 
+While windows are being moved, your screen stays on the desktop you are using. A
+window that takes the foreground on another desktop makes Windows switch to that
+desktop, and browsers do this while they restore a session. win-vde watches the
+current desktop during the moves and for a moment after them, switches straight
+back, and returns the keyboard focus to the window that had it. This covers
+automatic restores, manual restores, reopening from a checkpoint, the command line,
+and dragging a row in the picker. If you change desktops yourself meanwhile, with
+Ctrl+Win+arrow, Task View, the taskbar, or the picker, win-vde follows you instead.
+
 A closed Firefox, Chrome, or Edge window keeps its remembered virtual desktop
 for exactly 30 days. If it reappears before then, win-vde puts it back on that
 desktop before it updates the saved layout. At the 30-day mark the record
@@ -157,7 +163,7 @@ Saving and restoring the manual checkpoint never stops at one problem window:
   keeps that browser's records from the previous manual checkpoint, and Restore
   puts the other browsers' windows back. Both name the browser they skipped.
 
-### Desktop picker
+### The panel: search and navigation
 
 The global hotkey, Ctrl+Alt+D by default, opens a grid of your desktops on the
 primary monitor. You can pick another hotkey in Settings as long as it includes
@@ -199,6 +205,12 @@ is cut off.
 - Type to filter rows by window title. A browser window also matches on any of
   its tabs, including inactive ones, by tab title or by full URL. The mouse
   wheel scrolls each desktop tile on its own.
+- Under the search bar, every program with more than one window has a check box
+  with its name: Firefox, Opera, Explorer. Untick one to take its windows out of
+  the desktop tiles and out of the search results. win-vde remembers your choice
+  between sessions, and an unticked program keeps its box down to its last window,
+  so you can always bring it back. The filter changes what you see, not the windows
+  or the saved layouts.
 - Keyboard: the arrow keys and Tab move the selection, Enter or Space switches
   to the selected desktop, and the keys 1 to 9 and 0 pick desktops 1 to 10.
   Hold Ctrl with Enter, Space, or a number to move the active window there
@@ -301,6 +313,9 @@ On first run, win-vde migrates a `layout.txt` from earlier builds to
 own. The data folder and the registry key keep the historical spelling
 "Extention" so that existing installs keep working.
 
+The list of unticked programs lives in the registry value
+`HKCU\Software\VirtualDesktopsExtention\PickerHiddenPrograms`.
+
 ## Autostart
 
 Turn on **Settings > Start with Windows (run at logon)** and win-vde starts
@@ -326,6 +341,8 @@ autostart to it.
 - Persistent window memory, automatic or manual, covers only Firefox, Chrome,
   and Edge. The picker can show, activate, and move windows of other
   applications, but it creates no restore records for them.
+- Clicking a row activates the window, not the tab that matched the search.
+  Switching to a tab needs the browser's help, see the roadmap.
 - If a saved virtual desktop has been deleted, the window goes to the desktop
   that now sits at that position, so it doesn't stay stranded.
 - If the Windows shell (`explorer.exe`) restarts, win-vde puts its tray icon

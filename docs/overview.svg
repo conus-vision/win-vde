@@ -1,115 +1,135 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 582" font-family="Segoe UI, system-ui, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 600" role="img" aria-label="win-vde in three moves: type to find a window in the panel, untick a program to hide its windows, and browser windows go back to their desktops after a reboot while your screen stays put.">
   <style>
-    text{font-family:'Segoe UI',system-ui,sans-serif;}
-    .cap{font-size:15px;font-weight:600;fill:#ececf0;}
-    .lbl{font-size:11px;fill:#a8a6b0;}
-    .dt{font-size:9px;fill:#8a8892;}
-    .feat{font-size:13.5px;fill:#d8d6dc;}
-    .st{fill:#22222a;stroke:#3a3a44;stroke-width:1;}
-    .dbox{fill:#1a1a20;stroke:#33333c;stroke-width:1;}
-    .arw{stroke:#f29605;stroke-width:2.5;fill:none;}
-    .brand{fill:#f29605;}
+    text{font-family:'Segoe UI',system-ui,-apple-system,sans-serif}
+    .cap{font-size:17px;font-weight:600;fill:#eeeef2}
+    .sub{font-size:13px;fill:#969187}
+    .nm{font-size:11.5px;font-weight:600;fill:#eeeef2}
+    .r{font-size:10.5px;fill:#d0ced2}
+    .q{font-size:13px;fill:#eeeef2}
+    .chip{font-size:11px;fill:#d0ced2}
+    .tile{fill:#1c1c21;stroke:#6b604f;stroke-width:1}
+    .lbl{font-size:10.5px;fill:#a8a6b0}
+    .desk{fill:#1a1a20;stroke:#33333c;stroke-width:1}
+    /* one 18-second loop: find, filter, keep */
+    .a{animation-duration:18s;animation-iteration-count:infinite;animation-timing-function:ease-in-out}
+    @media (prefers-reduced-motion:reduce){.a{animation:none!important}}
+    .type{animation-name:type;animation-timing-function:steps(7)}
+    @keyframes type{0%,4%{width:0}13%,27%{width:62px}29%,100%{width:0}}
+    .caret{animation-name:caret}
+    @keyframes caret{0%,4%{transform:translateX(0)}13%,27%{transform:translateX(44px)}29%,100%{transform:translateX(0)}}
+    .cue{animation-name:cue}
+    @keyframes cue{0%,4%{opacity:1}5%,28%{opacity:0}30%,100%{opacity:1}}
+    .up1{animation-name:up1}
+    @keyframes up1{0%,37%{transform:translateY(0)}39%,49%{transform:translateY(-21px)}52%,100%{transform:translateY(0)}}
+    .up2{animation-name:up2}
+    @keyframes up2{0%,37%{transform:translateY(0)}39%,49%{transform:translateY(-42px)}52%,100%{transform:translateY(0)}}
+    .nomatch{animation-name:nomatch}
+    @keyframes nomatch{0%,11%{opacity:1}14%,27%{opacity:0}30%,100%{opacity:1}}
+    .hit{animation-name:hit}
+    @keyframes hit{0%,15%{opacity:0}18%,27%{opacity:1}29%,100%{opacity:0}}
+    .ff{animation-name:ff}
+    @keyframes ff{0%,37%{opacity:1}39%,49%{opacity:0}52%,100%{opacity:1}}
+    .tick{animation-name:tick}
+    @keyframes tick{0%,37%{opacity:1}38%,50%{opacity:0}51%,100%{opacity:1}}
+    .cap1{animation-name:cap1}
+    @keyframes cap1{0%,28%{opacity:1}31%,97%{opacity:.34}100%{opacity:1}}
+    .cap2{animation-name:cap2}
+    @keyframes cap2{0%,30%{opacity:.34}33%,52%{opacity:1}55%,100%{opacity:.34}}
+    .cap3{animation-name:cap3}
+    @keyframes cap3{0%,54%{opacity:.34}57%,96%{opacity:1}99%,100%{opacity:.34}}
+    .w{animation-name:w}
+    @keyframes w{0%,56%{transform:translate(0,0)}60%,70%{transform:translate(var(--px),var(--py))}84%,100%{transform:translate(0,0)}}
+    .frame{animation-name:frame}
+    @keyframes frame{0%,66%{opacity:0}72%,94%{opacity:1}98%,100%{opacity:0}}
   </style>
   <defs>
-    <marker id="ah" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#f29605"/></marker>
-    <!-- one desktop = box + label + 2 window bars; windows filled per-instance below -->
+    <clipPath id="typed"><rect class="a type" x="44" y="30" width="0" height="26"/></clipPath>
+    <g id="check"><path d="M2.500 7 5.500 10 11 3.800" fill="none" stroke="#141418" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></g>
   </defs>
 
-  <rect x="1" y="1" width="898" height="580" rx="18" fill="#16161a" stroke="#2a2a32"/>
+  <rect x="1" y="1" width="898" height="598" rx="18" fill="#141418" stroke="#3a3734"/>
 
-  <!-- ============ ROW 1 : the problem ============ -->
-  <text class="cap" x="40" y="42">1.  After a reboot, Windows scatters your browser windows</text>
-
-  <!-- state A: correct -->
-  <g transform="translate(60,56)">
-    <rect class="st" width="210" height="100" rx="12"/>
-    <rect class="dbox" x="12" y="12" width="90" height="76" rx="8"/><text class="dt" x="18" y="28">Desktop 1</text>
-    <rect x="18" y="35" width="78" height="13" rx="3" fill="#e05a54"/><rect x="18" y="53" width="78" height="13" rx="3" fill="#4f8fe6"/>
-    <rect class="dbox" x="108" y="12" width="90" height="76" rx="8"/><text class="dt" x="114" y="28">Desktop 2</text>
-    <rect x="114" y="35" width="78" height="13" rx="3" fill="#e6bf4f"/><rect x="114" y="53" width="78" height="13" rx="3" fill="#57b877"/>
+  <!-- the panel -->
+  <rect x="28" y="24" width="844" height="36" rx="10" fill="#222126" stroke="#f29605" stroke-width="1.500"/>
+  <text class="a sub cue" x="44" y="47">Ctrl+Alt+D, then type</text>
+  <g clip-path="url(#typed)">
+    <rect x="42" y="28" width="150" height="28" fill="#222126"/>
+    <text class="q" x="44" y="47">invoice</text>
   </g>
-  <!-- arrow -->
-  <text class="lbl" x="310" y="94" text-anchor="middle">After reboot</text>
-  <line class="arw" x1="282" y1="106" x2="336" y2="106" marker-end="url(#ah)"/>
-  <!-- state B: scrambled — 3 windows piled on Desktop 1, only 1 on Desktop 2 -->
-  <g transform="translate(345,56)">
-    <rect class="st" width="210" height="100" rx="12"/>
-    <rect class="dbox" x="12" y="12" width="90" height="76" rx="8"/><text class="dt" x="18" y="28">Desktop 1</text>
-    <rect x="18" y="34" width="78" height="13" rx="3" fill="#e05a54"/><rect x="18" y="50" width="78" height="13" rx="3" fill="#4f8fe6"/><rect x="18" y="66" width="78" height="13" rx="3" fill="#e6bf4f"/>
-    <rect class="dbox" x="108" y="12" width="90" height="76" rx="8"/><text class="dt" x="114" y="28">Desktop 2</text>
-    <rect x="114" y="50" width="78" height="13" rx="3" fill="#57b877"/>
+  <rect class="a caret" x="45" y="33" width="1.200" height="18" fill="#eeeef2"/>
+
+  <!-- program check boxes -->
+  <g transform="translate(34,70)">
+    <rect width="14" height="14" rx="3.500" fill="#f29605"/><use href="#check"/><text class="chip" x="20" y="11">Chrome</text>
+    <g transform="translate(78,0)"><rect width="14" height="14" rx="3.500" fill="#f29605"/><use href="#check"/><text class="chip" x="20" y="11">Edge</text></g>
+    <g transform="translate(138,0)">
+      <rect width="14" height="14" rx="3.500" fill="#222126" stroke="#6b604f"/>
+      <g class="a tick"><rect width="14" height="14" rx="3.500" fill="#f29605"/><use href="#check"/></g>
+      <text class="chip" x="20" y="11">Firefox</text>
+    </g>
+    <g transform="translate(208,0)"><rect width="14" height="14" rx="3.500" fill="#f29605"/><use href="#check"/><text class="chip" x="20" y="11">VS Code</text></g>
   </g>
 
-  <!-- ============ ROW 2 : win-vde restores ============ -->
-  <text class="cap" x="40" y="214">2.  VDE remembers the layout and puts every window back</text>
-
-  <!-- correct -->
-  <g transform="translate(60,228)">
-    <rect class="st" width="210" height="100" rx="12"/>
-    <rect class="dbox" x="12" y="12" width="90" height="76" rx="8"/><text class="dt" x="18" y="28">Desktop 1</text>
-    <rect x="18" y="35" width="78" height="13" rx="3" fill="#e05a54"/><rect x="18" y="53" width="78" height="13" rx="3" fill="#4f8fe6"/>
-    <rect class="dbox" x="108" y="12" width="90" height="76" rx="8"/><text class="dt" x="114" y="28">Desktop 2</text>
-    <rect x="114" y="35" width="78" height="13" rx="3" fill="#e6bf4f"/><rect x="114" y="53" width="78" height="13" rx="3" fill="#57b877"/>
+  <!-- desktops -->
+  <g transform="translate(28,96)">
+    <rect class="tile" width="270" height="118" rx="9" style="fill:#44331c"/>
+    <text class="nm" x="12" y="20">1. Research</text>
+    <g class="a nomatch"><g class="a ff"><circle cx="18" cy="39" r="5" fill="#ff7139"/><text class="r" x="30" y="43">Virtual desktops overview - Firefox</text></g></g>
+    <g class="a nomatch"><g class="a ff"><circle cx="18" cy="60" r="5" fill="#ff7139"/><text class="r" x="30" y="64">win-vde: issues - Firefox</text></g></g>
+    <g class="a up2"><g class="a nomatch"><circle cx="18" cy="81" r="5" fill="#4285f4"/><text class="r" x="30" y="85">Picker layout v3 - Chrome</text></g></g>
   </g>
-  <text class="lbl" x="310" y="266" text-anchor="middle">After reboot</text>
-  <line class="arw" x1="282" y1="278" x2="336" y2="278" marker-end="url(#ah)"/>
-  <!-- scrambled: 3 windows piled on Desktop 1, only 1 on Desktop 2 -->
-  <g transform="translate(345,228)">
-    <rect class="st" width="210" height="100" rx="12"/>
-    <rect class="dbox" x="12" y="12" width="90" height="76" rx="8"/><text class="dt" x="18" y="28">Desktop 1</text>
-    <rect x="18" y="34" width="78" height="13" rx="3" fill="#e05a54"/><rect x="18" y="50" width="78" height="13" rx="3" fill="#4f8fe6"/><rect x="18" y="66" width="78" height="13" rx="3" fill="#e6bf4f"/>
-    <rect class="dbox" x="108" y="12" width="90" height="76" rx="8"/><text class="dt" x="114" y="28">Desktop 2</text>
-    <rect x="114" y="50" width="78" height="13" rx="3" fill="#57b877"/>
+  <g transform="translate(315,96)">
+    <rect class="tile" width="270" height="118" rx="9"/>
+    <text class="nm" x="12" y="20">2. Work</text>
+    <rect class="a hit" x="6" y="28" width="258" height="22" rx="5" fill="#58401a"/>
+    <g class="a ff"><circle cx="18" cy="39" r="5" fill="#ff7139"/><text class="r" x="30" y="43">Northwind billing - Firefox</text></g>
+    <g class="a hit"><text class="r" x="30" y="66" style="fill:#f29605">tab: Invoice 2041 &#183; Northwind</text></g>
+    <g class="a up1"><g class="a nomatch"><circle cx="18" cy="60" r="5" fill="#0f7bd6"/><text class="r" x="30" y="64">Inbox - Edge</text></g></g>
+    <g class="a nomatch"><g class="a ff"><circle cx="18" cy="81" r="5" fill="#ff7139"/><text class="r" x="30" y="85">Sprint 42 board - Firefox</text></g></g>
   </g>
-  <text class="lbl" x="590" y="266" text-anchor="middle">VDE restores</text>
-  <line class="arw" x1="562" y1="278" x2="616" y2="278" marker-end="url(#ah)"/>
-  <!-- restored -->
-  <g transform="translate(625,228)">
-    <rect class="st" width="210" height="100" rx="12"/>
-    <rect class="dbox" x="12" y="12" width="90" height="76" rx="8"/><text class="dt" x="18" y="28">Desktop 1</text>
-    <rect x="18" y="35" width="78" height="13" rx="3" fill="#e05a54"/><rect x="18" y="53" width="78" height="13" rx="3" fill="#4f8fe6"/>
-    <rect class="dbox" x="108" y="12" width="90" height="76" rx="8"/><text class="dt" x="114" y="28">Desktop 2</text>
-    <rect x="114" y="35" width="78" height="13" rx="3" fill="#e6bf4f"/><rect x="114" y="53" width="78" height="13" rx="3" fill="#57b877"/>
-  </g>
-  <!-- VDE icon, centered between rows 2 and 3 -->
-  <g transform="translate(418,338)">
-    <rect class="brand" width="26" height="26" rx="6"/>
-    <rect x="6" y="6" width="6" height="6" rx="1" fill="#141418"/><rect x="14" y="6" width="6" height="6" rx="1" fill="#141418"/>
-    <rect x="6" y="14" width="6" height="6" rx="1" fill="#141418"/><rect x="14" y="14" width="6" height="6" rx="1" fill="#141418"/>
-    <text x="34" y="18" font-size="13" font-weight="700" fill="#f29605">VDE</text>
+  <g transform="translate(602,96)">
+    <rect class="tile" width="270" height="118" rx="9"/>
+    <text class="nm" x="12" y="20">3. Writing</text>
+    <g class="a nomatch"><g class="a ff"><circle cx="18" cy="39" r="5" fill="#ff7139"/><text class="r" x="30" y="43">Release notes - Firefox</text></g></g>
+    <g class="a up1"><g class="a nomatch"><circle cx="18" cy="60" r="5" fill="#4285f4"/><text class="r" x="30" y="64">Outline - Chrome</text></g></g>
+    <g class="a nomatch"><g class="a ff"><circle cx="18" cy="81" r="5" fill="#ff7139"/><text class="r" x="30" y="85">Thesaurus - Firefox</text></g></g>
   </g>
 
-  <!-- ============ ROW 3 : the picker + features ============ -->
-  <text class="cap" x="40" y="392">3.  Plus a fast, searchable desktop picker</text>
-
-  <!-- base state -->
-  <g transform="translate(60,406)">
-    <rect class="st" width="210" height="100" rx="12"/>
-    <rect class="dbox" x="12" y="12" width="90" height="76" rx="8"/><text class="dt" x="18" y="28">Desktop 1</text>
-    <rect x="18" y="35" width="78" height="13" rx="3" fill="#e05a54"/><rect x="18" y="53" width="78" height="13" rx="3" fill="#4f8fe6"/>
-    <rect class="dbox" x="108" y="12" width="90" height="76" rx="8"/><text class="dt" x="114" y="28">Desktop 2</text>
-    <rect x="114" y="35" width="78" height="13" rx="3" fill="#e6bf4f"/><rect x="114" y="53" width="78" height="13" rx="3" fill="#57b877"/>
-  </g>
-  <!-- custom popup overlaid on top -->
-  <g transform="translate(104,446)">
-    <rect width="252" height="98" rx="11" fill="#1b1b22" stroke="#f29605" stroke-width="2"/>
-    <rect x="12" y="12" width="228" height="22" rx="7" fill="#2a2a32" stroke="#f29605" stroke-width="1.4"/>
-    <text class="lbl" x="22" y="27">Type window name to search</text>
-    <rect x="12" y="44" width="70" height="44" rx="7" fill="#242430" stroke="#f29605" stroke-width="1.6"/>
-    <rect x="20" y="54" width="54" height="7" rx="2" fill="#e05a54"/><rect x="20" y="66" width="54" height="7" rx="2" fill="#4f8fe6"/>
-    <rect x="91" y="44" width="70" height="44" rx="7" fill="#242430" stroke="#3a3a44"/>
-    <rect x="99" y="54" width="54" height="7" rx="2" fill="#e6bf4f"/><rect x="99" y="66" width="54" height="7" rx="2" fill="#57b877"/>
-    <rect x="170" y="44" width="70" height="44" rx="7" fill="#242430" stroke="#3a3a44"/>
-    <rect x="178" y="54" width="54" height="7" rx="2" fill="#e05a54"/><rect x="178" y="66" width="54" height="7" rx="2" fill="#e6bf4f"/>
+  <!-- what is happening -->
+  <g transform="translate(28,246)">
+    <g class="a cap1"><text class="cap" y="0">Find</text><text class="sub" y="20">A few letters of a title, a tab or an address.</text></g>
+    <g class="a cap2" transform="translate(300,0)"><text class="cap" y="0">Clear the view</text><text class="sub" y="20">Untick a program to hide its windows.</text></g>
+    <g class="a cap3" transform="translate(587,0)"><text class="cap" y="0">Keep</text><text class="sub" y="20">After a reboot, every window goes back.</text></g>
   </g>
 
-  <!-- features -->
-  <g transform="translate(404,0)">
-    <circle cx="6" cy="428" r="3.5" class="brand"/><text class="feat" x="20" y="432">Custom desktop switcher</text>
-    <circle cx="6" cy="452" r="3.5" class="brand"/><text class="feat" x="20" y="456">Search open windows</text>
-    <circle cx="6" cy="476" r="3.5" class="brand"/><text class="feat" x="20" y="480">Move a window in one click</text>
-    <circle cx="6" cy="500" r="3.5" class="brand"/><text class="feat" x="20" y="504">Start with Windows</text>
-    <circle cx="6" cy="524" r="3.5" class="brand"/><text class="feat" x="20" y="528">Automatic layout restore</text>
-    <circle cx="6" cy="548" r="3.5" class="brand"/><text class="feat" x="20" y="552">Customizable hotkey</text>
+  <!-- the desktops themselves -->
+  <g transform="translate(28,300)">
+    <text class="lbl" x="0" y="12">Desktop 1</text>
+    <text class="lbl" x="218" y="12">Desktop 2</text>
+    <text class="lbl" x="436" y="12">Desktop 3</text>
+    <text class="lbl" x="654" y="12">Desktop 4</text>
+    <rect class="desk" y="20" width="190" height="130" rx="9"/>
+    <rect class="desk" x="218" y="20" width="190" height="130" rx="9"/>
+    <rect class="desk" x="436" y="20" width="190" height="130" rx="9"/>
+    <rect class="desk" x="654" y="20" width="190" height="130" rx="9"/>
+    <rect class="a frame" x="-4" y="16" width="198" height="138" rx="12" fill="none" stroke="#f29605" stroke-width="3"/>
+    <text class="a frame" x="0" y="176" style="font-size:12.500px;font-weight:600;fill:#f29605">Your screen stays here</text>
+    <rect class="a w" style="--px:0px;--py:0px" x="12" y="34" width="120" height="30" rx="4" fill="#e05a54"/>
+    <rect class="a w" style="--px:14px;--py:8px" x="26" y="66" width="120" height="30" rx="4" fill="#4f8fe6"/>
+    <rect class="a w" style="--px:-200px;--py:18px" x="230" y="34" width="120" height="30" rx="4" fill="#e6bf4f"/>
+    <rect class="a w" style="--px:-192px;--py:-2px" x="244" y="66" width="120" height="30" rx="4" fill="#57b877"/>
+    <rect class="a w" style="--px:-402px;--py:34px" x="448" y="34" width="120" height="30" rx="4" fill="#9b7be6"/>
+    <rect class="a w" style="--px:-394px;--py:12px" x="462" y="66" width="120" height="30" rx="4" fill="#3fb8c4"/>
+    <rect class="a w" style="--px:-616px;--py:52px" x="666" y="34" width="120" height="30" rx="4" fill="#f29605"/>
+    <rect class="a w" style="--px:-612px;--py:26px" x="680" y="66" width="120" height="30" rx="4" fill="#d0455f"/>
+  </g>
+
+  <text class="sub" x="28" y="520">Firefox, Chrome and Edge keep their desktops. The search and the panel work with any application.</text>
+  <text class="sub" x="28" y="544">One file, no installer, no admin rights. MIT.</text>
+  <g transform="translate(28,560)">
+    <rect width="18" height="18" rx="4" fill="#f29605"/>
+    <rect x="4" y="4" width="4" height="4" rx=".800" fill="#141418"/><rect x="10" y="4" width="4" height="4" rx=".800" fill="#141418"/>
+    <rect x="4" y="10" width="4" height="4" rx=".800" fill="#141418"/><rect x="10" y="10" width="4" height="4" rx=".800" fill="#141418"/>
+    <text x="26" y="14" style="font-size:13px;font-weight:700;fill:#f29605">win-vde</text>
   </g>
 </svg>
