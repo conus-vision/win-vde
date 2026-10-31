@@ -19,7 +19,9 @@ it does three things:
    while your screen stays on the desktop you are using. If a session is lost, five
    checkpoints let you reopen a desktop, a window, or a single tab where it was.
 
-<p align="center"><a href="https://vde.conus.vision/#film"><img src="docs/tour-poster.png" alt="Watch the tour of win-vde, English and Russian" width="840"></a></p>
+<p align="center"><img src="docs/demo.gif" alt="win-vde at work: Ctrl+Alt+D opens the panel, typing finds a window by a background tab, unticking a program hides its windows, a window is dragged to another desktop, and after a reboot every browser window goes back while the screen stays put" width="840"></p>
+
+<p align="center"><a href="https://vde.conus.vision/#film">Watch the full tour with voice-over, in English or Russian</a></p>
 
 - Author: Volodymyr Moskvin, <info@conus.vision>
 - Website: https://vde.conus.vision/
