@@ -181,11 +181,14 @@ is cut off.
 - Hold Ctrl and click a browser window row to see all of that window's tabs
   with their URLs, over the picker. The active tab is marked. Click a tab, or
   select it with the arrow keys and press Enter, to copy its URL; the wheel
-  scrolls the list, and Esc or a click outside closes it. The list comes from
-  the browser session data win-vde already reads, so it is empty for a window
-  win-vde has not recorded yet (usually its first 20 seconds) and for a browser
-  whose session file is locked. With automatic restore turned off, type in the
-  search box first: the search reads every window's tabs.
+  scrolls the list, and Esc or a click outside closes it. Firefox's list comes
+  from the session data win-vde already reads, so it is empty for a window
+  win-vde has not recorded yet (usually its first 20 seconds); with automatic
+  restore turned off, type in the search box first. Chrome and Edge lock their
+  session file while a window is open, so for them, and for Opera, win-vde asks
+  the window itself through UI Automation: you get the tab titles without URLs,
+  and a click copies the title. Search uses the same titles, and win-vde only
+  asks when you Ctrl+click or start typing.
 - Hold Ctrl and click anywhere else in a desktop tile, without dragging, to
   move the captured active window there. The picker switches to that desktop
   and stays open with the active window highlighted.
@@ -366,9 +369,9 @@ autostart to it.
   recognizes a new window as the difference in the browser's window set, and
   Firefox sends extra tabs to its most recent window.
 - Edge, and current Chrome versions, keep the current session file locked while
-  a window is open. Until they release it, win-vde tracks their windows by title
-  only and the Ctrl+click tab list has no tabs for them. Firefox is not
-  affected.
+  a window is open. Until they release it, win-vde remembers their windows by
+  title only, and the search and the Ctrl+click tab list know their tabs' titles
+  but not their URLs. Firefox is not affected.
 - Windows shown on all desktops, or pinned, have no desktop of their own. The
   manual checkpoint leaves them out, and no restore moves them.
 - win-vde reads every browser profile that is currently open, not just the
@@ -384,8 +387,8 @@ autostart to it.
 - Telling a browser's PWA and app windows apart from ordinary browsing windows.
   Windows exposes no signal for this today.
 - An optional companion browser extension. It would let the picker search the
-  text of open pages, list Chrome and Edge tabs while their session file is
-  locked, and switch to a tab straight from the Ctrl+click list. Session files
+  text of open pages, get the URLs of Chrome and Edge tabs while their session
+  file is locked, and switch to a tab straight from the Ctrl+click list. Session files
   hold only URLs and titles, so this needs the browser's help.
 
 ## License

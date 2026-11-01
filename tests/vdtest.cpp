@@ -20,6 +20,7 @@
 #include "tab_overlay.hpp"
 #include "desktop_pin.hpp"
 #include "program_filter.hpp"
+#include "tab_strip.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -14985,6 +14986,115 @@ static void test_firefox_scan_matches_the_tree_walk(){
 static void test_release_builds_are_optimized(){
     CHECK(ReadSourceFile(L"build.bat").find(" /O2 ")!=std::string::npos);
     CHECK(ReadSourceFile(L"build-dev.bat").find(" /O2 ")!=std::string::npos);
+}
+
+static void test_tab_strip_keeps_only_browser_tabs(){
+    CHECK(TabStripProgramEligible(L"msedge"));
+    CHECK(TabStripProgramEligible(L"chrome"));
+    CHECK(TabStripProgramEligible(L"opera"));
+    CHECK(!TabStripProgramEligible(L"firefox"));
+    CHECK(!TabStripProgramEligible(L"code"));
+    CHECK(!TabStripProgramEligible(L""));
+
+    std::vector<TabStripRow> rows;
+    const auto add=[&](const wchar_t* name,const wchar_t* className,const wchar_t* id,bool selected){
+        TabStripRow row;
+        row.name=name; row.className=className; row.automationId=id; row.selected=selected;
+        rows.push_back(row);
+    };
+    add(L"PageTabOne",L"Tab",L"",true);             // a page with role=tab and class=Tab
+    add(L"PageTabTwo",L"",L"view_9",true);          // a page with role=tab and id=view_9
+    add(L"First",L"EdgeTab",L"view_24",false);
+    add(L"Second - Memory usage - 20.6 MB",L"EdgeTab",L"view_24",true);
+    add(L"Third",L"Tab",L"view_20",false);
+    add(L"Fourth",L"TabView",L"view_65556",false);  // Opera
+    add(L"Stray",L"Toolbar",L"view_7",false);
+    add(L"PageTabThree",L"TabView",L"",false);
+    TabStripWindow window;
+    FillTabStripWindow(rows,window);
+    CHECK((window.titles==std::vector<std::wstring>{L"First",L"Second",L"Third",L"Fourth"}));
+    CHECK(window.activeTab==1);
+
+    rows.clear();
+    add(L"Only",L"EdgeTab",L"view_24",false);
+    FillTabStripWindow(rows,window);
+    CHECK(window.titles.size()==1 && window.activeTab==-1);
+}
+
+static void test_tab_strip_title_loses_the_hover_card_only(){
+    CHECK(CleanTabStripTitle(L"Page - Memory usage - 20.6 MB")==L"Page");
+    CHECK(CleanTabStripTitle(L"Page - High memory usage - 1,2 GB")==L"Page");
+    CHECK(CleanTabStripTitle(L"A - B - Memory usage - 300 MB")==L"A - B");
+    CHECK(CleanTabStripTitle(L"Page - Sleeping")==L"Page");
+    CHECK(CleanTabStripTitle(L"Page - Pinned - Memory usage - 20.6 MB")==L"Page");
+    CHECK(CleanTabStripTitle(L"Page - Memory usage - 20.6 MB - Pinned")==L"Page");
+    CHECK(CleanTabStripTitle(L"Page - YouTube - Audio playing")==L"Page - YouTube");
+    CHECK(CleanTabStripTitle(L" - Sleeping")==L" - Sleeping");
+    CHECK(CleanTabStripTitle(L"Sleeping")==L"Sleeping");
+    CHECK(CleanTabStripTitle(L"\x0421\x0442\x0440\x0430\x043D\x0438\x0446\x0430 - \x041F\x0430\x043C\x044F\x0442\x044C - 20,6 \x041C\x0411")==
+          L"\x0421\x0442\x0440\x0430\x043D\x0438\x0446\x0430");
+    // Titles that only look a little like one stay whole.
+    CHECK(CleanTabStripTitle(L"Page")==L"Page");
+    CHECK(CleanTabStripTitle(L"")==L"");
+    CHECK(CleanTabStripTitle(L"Page - YouTube")==L"Page - YouTube");
+    CHECK(CleanTabStripTitle(L"Top 10 - best")==L"Top 10 - best");
+    CHECK(CleanTabStripTitle(L"Size - 20 MB")==L"Size - 20 MB");
+    CHECK(CleanTabStripTitle(L"A - B - 20 megabytes")==L"A - B - 20 megabytes");
+    CHECK(CleanTabStripTitle(L"A - B - MB")==L"A - B - MB");
+    CHECK(CleanTabStripTitle(L" - Memory usage - 20 MB")==L" - Memory usage - 20 MB");
+}
+
+static void test_tab_strip_worker_reads_on_its_thread_and_stops(){
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::vector<uintptr_t> posted;
+    int begun=0,ended=0;
+    std::thread::id readThread;
+    TabStripWorker::Ops ops;
+    ops.threadBegin=[&](){ std::lock_guard<std::mutex> lock(mutex); ++begun; };
+    ops.threadEnd=[&](){ std::lock_guard<std::mutex> lock(mutex); ++ended; };
+    ops.read=[&](HWND hwnd,std::vector<TabStripRow>& rows){
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            readThread=std::this_thread::get_id();
+        }
+        if(reinterpret_cast<uintptr_t>(hwnd)==2) return false;
+        TabStripRow row;
+        row.name=L"Tab"; row.className=L"Tab"; row.automationId=L"view_1";
+        rows.push_back(row);
+        return true;
+    };
+    ops.post=[&](TabStripWindow* raw){
+        std::unique_ptr<TabStripWindow> result(raw);
+        std::lock_guard<std::mutex> lock(mutex);
+        posted.push_back(result->identity.hwnd);
+        if(result->identity.hwnd==1) CHECK(result->ok && result->titles.size()==1);
+        if(result->identity.hwnd==2) CHECK(!result->ok && result->titles.empty());
+        changed.notify_all();
+        return true;
+    };
+    {
+        TabStripWorker worker(ops);
+        WindowIdentityKey first,second;
+        first.hwnd=1; first.pid=10; first.processStart=100;
+        second.hwnd=2; second.pid=10; second.processStart=100;
+        CHECK(worker.Request(first));
+        CHECK(worker.Request(second));
+        std::unique_lock<std::mutex> lock(mutex);
+        CHECK(changed.wait_for(lock,std::chrono::seconds(10),
+                               [&](){ return posted.size()==2; }));
+        CHECK(readThread!=std::this_thread::get_id());
+        lock.unlock();
+        worker.Stop();
+        CHECK(!worker.Request(first));
+    }
+    CHECK(begun==1 && ended==1);
+    // A worker that was never asked starts no thread at all.
+    int neverBegun=0;
+    TabStripWorker::Ops idle;
+    idle.threadBegin=[&](){ ++neverBegun; };
+    { TabStripWorker worker(idle); }
+    CHECK(neverBegun==0);
 }
 
 static void test_picker_ctrl_move_uses_shared_foreground_handoff(){
@@ -31387,6 +31497,9 @@ int main(){
     test_manual_save_carries_over_skipped_app_records();
     test_tab_overlay_scroll_hit_and_selection();
     test_firefox_scan_matches_the_tree_walk();
+    test_tab_strip_keeps_only_browser_tabs();
+    test_tab_strip_title_loses_the_hover_card_only();
+    test_tab_strip_worker_reads_on_its_thread_and_stops();
     test_release_builds_are_optimized();
     test_program_key_and_display_name();
     test_program_chips_need_two_windows_or_a_hidden_program();

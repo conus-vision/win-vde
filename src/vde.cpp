@@ -65,6 +65,8 @@
 #include "reopen_model.hpp"   // checkpoint selection model for the reopen dialog
 #include "tab_overlay.hpp"    // scrolling/selection of the picker's tab list overlay
 #include "desktop_pin.hpp"    // keeps the current desktop in place during window moves
+#include "tab_strip.hpp"      // Chromium tab titles through UI Automation
+#include <uiautomation.h>
 #include <dwmapi.h>
 #pragma comment(lib, "dwmapi.lib")
 
@@ -103,6 +105,7 @@ static bool g_appFirefox = true, g_appChrome = true, g_appEdge = true;  // ка�
 #define WM_MOVE_CANCEL_RETRY (WM_APP + 14)
 #define WM_AUTO_TIMER_RETRY (WM_APP + 15)
 #define WM_FOREGROUND_KICK (WM_APP + 18)
+#define WM_TAB_STRIP_RESULT (WM_APP + 19)
 #define MONITOR_INTERVAL_MS 5000
 #define MOVE_VERIFY_INTERVAL_MS 150
 #define DESKTOP_PIN_POLL_MS 40
@@ -6644,14 +6647,22 @@ struct PickerSearchTabs {
     WindowIdentityKey identity;
     std::vector<SnapTab> tabs;
     int activeTab=-1;
+    bool fromStrip=false;      // read from the window, so titles only
+    std::wstring stripSearch;  // the same titles, ready for item.search
 };
 static std::map<std::string,PickerSearchTabs> g_pickerSearchTabs;
+static std::unique_ptr<TabStripWorker> g_tabStripWorker;
+static std::set<std::string> g_tabStripRequested;
 struct PickerTabOverlay {
     bool open=false;
     std::wstring title;      // window title in the header
     std::wstring subtitle;   // browser, tab count, age of the data
     std::wstring note;       // shown when there is no tab list
     std::wstring status;     // footer feedback, e.g. the copied URL
+    std::wstring label;      // the program's name
+    WindowIdentityKey identity;
+    bool stripPending=false; // waiting for the window's tab strip
+    bool titlesOnly=false;   // the list has no URLs
     std::vector<std::wstring> rowTitles;
     std::vector<std::wstring> rowUrls;
     int activeTab=-1;
@@ -6721,6 +6732,10 @@ static void StopWorkers(HWND messageWindow){
     if(g_reconcileWorker){ g_reconcileWorker->Stop(); g_reconcileWorker.reset(); }
     DrainPostedSessionResults(messageWindow);
     DrainPostedReconcileResults(messageWindow);
+    g_tabStripWorker.reset();
+    MSG pending;
+    while(PeekMessageW(&pending,messageWindow,WM_TAB_STRIP_RESULT,WM_TAB_STRIP_RESULT,PM_REMOVE))
+        delete reinterpret_cast<TabStripWindow*>(pending.lParam);
 }
 
 static bool QuiesceRuntime(HWND messageWindow) noexcept {
@@ -7441,6 +7456,10 @@ static BOOL CALLBACK EnumAll(HWND hwnd,LPARAM parameter){
         if(PickerRowUsesStableIdentity(admission)){
             item.identity=identity;
             item.runtimeKey=RuntimeKey(identity);
+            auto strip=g_pickerSearchTabs.find(item.runtimeKey);
+            if(strip!=g_pickerSearchTabs.end() && strip->second.fromStrip &&
+               SameIdentity(strip->second.identity,identity))
+                item.search=item.titleLC+L" "+strip->second.stripSearch;
             IApplicationView* rawView=nullptr;
             HRESULT viewResult=E_NOINTERFACE;
             if(g_avc){
@@ -7485,6 +7504,18 @@ static bool BuildPickerTileFilteredRows(
         [](const WinItem& item){
             return g_pickerHiddenPrograms.count(item.programKey)==0;
         });
+}
+
+static bool PickerTileRowsWouldChange(const Tile& tile,
+                                      const std::wstring& searchText) noexcept {
+    std::vector<size_t> rows;
+    return !BuildPickerFilteredIndices(tile.windows,searchText,rows,
+        [](const WinItem& item)->const std::wstring& {
+            return item.search;
+        },
+        [](const WinItem& item){
+            return g_pickerHiddenPrograms.count(item.programKey)==0;
+        }) || rows!=tile.filtered;
 }
 
 static bool PopulatePickerFilteredRows(std::vector<Tile>& tiles,
@@ -8014,6 +8045,21 @@ static void CleanupPickerTabSearchEnsureOperation(
     g_searchOperations.erase(operationId);
 }
 
+// The first keystroke asks every Chromium window for its tabs: their session
+// files are usually locked, so this is what makes their tabs searchable.
+static void RequestPickerTabStripsForSearch() noexcept {
+    try {
+        if(!g_tabStripWorker) return;
+        for(const Tile& tile : g_tiles)
+            for(const WinItem& item : tile.windows){
+                if(!PickerRowUsesStableIdentity(item.admission) ||
+                   !TabStripProgramEligible(item.programKey) ||
+                   !g_tabStripRequested.insert(item.runtimeKey).second) continue;
+                g_tabStripWorker->Request(item.identity);
+            }
+    } catch(...) {}
+}
+
 // Lazily request all-tab text without reading browser files on the UI thread.
 static PickerTabSearchEnsureOutcome EnsureTabSearch() noexcept {
     try {
@@ -8022,6 +8068,7 @@ static PickerTabSearchEnsureOutcome EnsureTabSearch() noexcept {
                 g_pickerTabSearchCache,g_picker.modelGeneration);
             return PickerTabSearchEnsureOutcome::AttemptCommitted;
         }
+        RequestPickerTabStripsForSearch();
         if(PickerTabSearchCacheUsable(
                 g_pickerTabSearchCache,g_picker.modelGeneration,
                 g_picker.searchText) ||
@@ -8817,7 +8864,7 @@ static void PaintPickerTabOverlay(HDC hdc,RECT client){
     if(!o.open) return;
     DimPickerBackground(hdc,client);
     const size_t count=o.rowUrls.size();
-    const int margin=S(36),headerH=S(66),footerH=S(34),rowH=S(46);
+    const int margin=S(36),headerH=S(66),footerH=S(34),rowH=S(o.titlesOnly?30:46);
     int panelW=(std::min)(static_cast<int>(client.right)-2*margin,S(1000));
     if(panelW<S(320)) panelW=(std::max)(static_cast<int>(client.right)-S(16),S(200));
     const int listMax=static_cast<int>(client.bottom)-2*margin-headerH-footerH;
@@ -8902,9 +8949,10 @@ static void PaintPickerTabOverlay(HDC hdc,RECT client){
     RECT footer={panel.left+inner,panel.bottom-footerH,panel.right-inner,panel.bottom-S(4)};
     SelectObject(hdc,g_fPU?g_fPU:g_fPI);
     SetTextColor(hdc,CLR_HINT);
-    const wchar_t* keys=count
-        ? L"Click or Enter - copy the URL  \x00B7  \x2191\x2193 PgUp PgDn - move  \x00B7  Esc - close"
-        : L"Esc - close";
+    const wchar_t* keys=!count ? L"Esc - close"
+        : o.titlesOnly
+            ? L"Click or Enter - copy the title  \x00B7  \x2191\x2193 PgUp PgDn - move  \x00B7  Esc - close"
+            : L"Click or Enter - copy the URL  \x00B7  \x2191\x2193 PgUp PgDn - move  \x00B7  Esc - close";
     DrawTextW(hdc,keys,-1,&footer,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
     if(!o.status.empty()){
         SIZE keysSize={0,0};
@@ -9139,6 +9187,7 @@ static void HidePicker(PickerHideDisposition disposition) noexcept {
     if(g_picker.controlledTransition()) return;
     ClosePickerTabOverlay(false);
     g_pickerSearchTabs.clear();
+    g_tabStripRequested.clear();
     if(PickerHideEndsVisualSession(disposition))
         EndPickerVisualSessionRuntime();
     else
@@ -9172,9 +9221,10 @@ static void CopyTabOverlayUrl(int index){
     PickerTabOverlay& o=g_tabOverlay;
     if(index<0 || static_cast<size_t>(index)>=o.rowUrls.size()) return;
     o.selected=index;
-    o.status=CopyTextToClipboard(g_main,o.rowUrls[index])
-        ? L"Copied: "+o.rowUrls[index]
-        : std::wstring(L"The URL could not be copied.");
+    const std::wstring& text=o.rowUrls[index].empty() ? o.rowTitles[index] : o.rowUrls[index];
+    o.status=CopyTextToClipboard(g_main,text)
+        ? L"Copied: "+text
+        : std::wstring(L"It could not be copied.");
     InvalidateRect(g_main,nullptr,FALSE);
 }
 
@@ -9187,9 +9237,35 @@ static std::wstring TabOverlayAge(UnixSeconds capturedUtc){
     return L"read "+std::to_wstring(age/3600)+L" h ago";
 }
 
+static void FillPickerTabOverlay(PickerTabOverlay& overlay,
+                                 const std::vector<SnapTab>& tabs,int activeTab,
+                                 UnixSeconds capturedUtc){
+    overlay.rowTitles.clear();
+    overlay.rowUrls.clear();
+    overlay.rowTitles.reserve(tabs.size());
+    overlay.rowUrls.reserve(tabs.size());
+    overlay.titlesOnly=!tabs.empty();
+    for(const SnapTab& tab : tabs){
+        overlay.rowTitles.push_back(U82W(tab.title));
+        overlay.rowUrls.push_back(U82W(tab.url));
+        if(!tab.url.empty()) overlay.titlesOnly=false;
+    }
+    overlay.activeTab=activeTab>=0 && static_cast<size_t>(activeTab)<tabs.size()
+        ? activeTab : -1;
+    overlay.selected=overlay.activeTab;
+    overlay.scroll=-1;
+    overlay.note.clear();
+    overlay.subtitle=overlay.label+L"  \x00B7  "+
+        std::to_wstring(tabs.size())+(tabs.size()==1 ? L" tab" : L" tabs");
+    if(overlay.titlesOnly)
+        overlay.subtitle+=L"  \x00B7  titles only, the session file can't be read";
+    const std::wstring age=TabOverlayAge(capturedUtc);
+    if(!age.empty()) overlay.subtitle+=L"  \x00B7  "+age;
+}
+
 // Ctrl+click on a window row: shows that window's tabs and their URLs over
-// the picker. The list comes from data VDE already holds; nothing is read
-// from disk on the UI thread.
+// the picker. Firefox's list comes from data VDE already holds; a Chromium
+// window that has none is asked for its tab strip on the worker thread.
 static void OpenPickerTabOverlay(const PickerRowActionSnapshot& row){
     const WinItem* item=nullptr;
     if(row.tileIndex>=0 && static_cast<size_t>(row.tileIndex)<g_tiles.size() &&
@@ -9207,36 +9283,31 @@ static void OpenPickerTabOverlay(const PickerRowActionSnapshot& row){
     PickerTabOverlay overlay;
     overlay.open=true;
     overlay.title=item->title;
+    overlay.identity=item->identity;
     std::string app;
     const bool browser=ClassifyTrackedBrowserWindow(item->identity,app)==
         PopupBrowserClassification::Tracked;
+    overlay.label=!item->programKey.empty() ? ProgramDisplayName(item->programKey)
+        : U82W(app.empty() ? std::string("browser") : app);
     std::vector<SnapTab> tabs;
     UnixSeconds capturedUtc=0;
     int activeTab=-1;
     if(LookupPickerRowTabs(*item,tabs,activeTab,capturedUtc)){
-        overlay.rowTitles.reserve(tabs.size());
-        overlay.rowUrls.reserve(tabs.size());
-        for(const SnapTab& tab : tabs){
-            overlay.rowTitles.push_back(U82W(tab.title));
-            overlay.rowUrls.push_back(U82W(tab.url));
-        }
-        overlay.activeTab=activeTab>=0 && static_cast<size_t>(activeTab)<tabs.size()
-            ? activeTab : -1;
-        overlay.selected=overlay.activeTab;
-        overlay.subtitle=U82W(app.empty() ? std::string("browser") : app)+L"  \x00B7  "+
-            std::to_wstring(tabs.size())+(tabs.size()==1 ? L" tab" : L" tabs");
-        const std::wstring age=TabOverlayAge(capturedUtc);
-        if(!age.empty()) overlay.subtitle+=L"  \x00B7  "+age;
+        FillPickerTabOverlay(overlay,tabs,activeTab,capturedUtc);
+    } else if(TabStripProgramEligible(item->programKey) && g_tabStripWorker &&
+              PickerRowUsesStableIdentity(item->admission) &&
+              g_tabStripWorker->Request(item->identity)){
+        overlay.stripPending=true;
+        overlay.subtitle=overlay.label+L"  \x00B7  reading tabs...";
     } else if(!browser){
         overlay.subtitle=L"No tab list";
-        overlay.note=L"Tab lists are available for Firefox, Chrome and Edge windows.";
+        overlay.note=L"Tab lists are available for Firefox, Chrome, Edge and Opera windows.";
     } else {
-        overlay.subtitle=U82W(app)+L"  \x00B7  no tab list yet";
+        overlay.subtitle=overlay.label+L"  \x00B7  no tab list yet";
         overlay.note=g_autoFix
             ? L"VDE has no tab list for this window yet. It reads tabs from the "
               L"browser's session file: a new window is usually recorded within "
-              L"about 20 seconds, and Chrome or Edge may keep that file locked "
-              L"while a window is open."
+              L"about 20 seconds."
             : L"Automatic restore is off, so VDE does not observe this window. "
               L"Type in the search box first and the picker reads the tabs; "
               L"then Ctrl+click the window again.";
@@ -9247,6 +9318,66 @@ static void OpenPickerTabOverlay(const PickerRowActionSnapshot& row){
     if(g_search) ShowWindow(g_search,SW_HIDE);
     SetFocus(g_main);
     InvalidateRect(g_main,nullptr,FALSE);
+}
+
+// A window's tab strip arrived: it feeds the search and an overlay waiting for it.
+static void HandleTabStripResult(std::unique_ptr<TabStripWindow> result){
+    if(!result || !g_main) return;
+    const bool hasTabs=result->ok && !result->titles.empty();
+    std::vector<SnapTab> tabs;
+    if(hasTabs){
+        tabs.reserve(result->titles.size());
+        for(const std::wstring& title : result->titles){
+            SnapTab tab;
+            tab.title=W2U8(title);
+            tabs.push_back(std::move(tab));
+        }
+    }
+    bool rowsChanged=false;
+    if(hasTabs && IsWindowVisible(g_main)){
+        const std::string key=RuntimeKey(result->identity);
+        auto known=g_pickerSearchTabs.find(key);
+        // Tabs from the session file have URLs too, so they stay.
+        if(known==g_pickerSearchTabs.end() || known->second.fromStrip){
+            PickerSearchTabs searched;
+            searched.identity=result->identity;
+            searched.tabs=tabs;
+            searched.activeTab=result->activeTab;
+            searched.fromStrip=true;
+            for(const std::wstring& title : result->titles){
+                searched.stripSearch+=title;
+                searched.stripSearch.push_back(L' ');
+            }
+            if(!searched.stripSearch.empty()) CharLowerW(&searched.stripSearch[0]);
+            for(Tile& tile : g_tiles)
+                for(WinItem& item : tile.windows)
+                    if(SameIdentity(item.identity,result->identity)){
+                        item.search=item.titleLC+L" "+searched.stripSearch;
+                        // Every window answers: only an answer that changes
+                        // what the query shows is worth a new row layout.
+                        if(PickerTileRowsWouldChange(tile,g_picker.searchText))
+                            rowsChanged=true;
+                    }
+            g_pickerSearchTabs[key]=std::move(searched);
+        }
+    }
+    PickerTabOverlay& overlay=g_tabOverlay;
+    if(overlay.open && overlay.stripPending &&
+       SameIdentity(overlay.identity,result->identity)){
+        overlay.stripPending=false;
+        if(hasTabs){
+            FillPickerTabOverlay(overlay,tabs,result->activeTab,0);
+        } else {
+            overlay.subtitle=overlay.label+L"  \x00B7  no tab list";
+            overlay.note=L"The browser did not report any tabs for this window, and "
+                         L"its session file can't be read while a window is open.";
+        }
+        InvalidateRect(g_main,nullptr,FALSE);
+    }
+    if(rowsChanged){
+        RebuildPickerFilteredRows();
+        InvalidateRect(g_main,nullptr,FALSE);
+    }
 }
 
 // Routes input while the tab overlay is open; returns true when handled.
@@ -12263,7 +12394,7 @@ L"What it does\r\n"
 L"Press the hotkey, type part of a window title, a tab title or an address, and click the row: you are in that window, on whatever desktop it was on. The same panel takes you between virtual desktops and moves windows between them.\r\n"
 L"In the background win-vde keeps browser windows on their desktops. Windows 11 does not remember which virtual desktop a browser window was on after a reboot, and browsers change their window handles when they restore a session, so win-vde identifies each browser window by its pages and moves it back to the desktop it was saved on. Your current desktop stays in place while windows are being moved. It also keeps its own session checkpoints, outside the browser: when a session is lost to a crash, an update or a careless click, any desktop, window or single tab can be brought back from one of them.\r\n\r\n"
 L"Picker  (hotkey Ctrl+Alt+D)\r\n"
-L"A grid of your virtual desktops and their eligible application windows. Click a window row to switch to its displayed desktop and activate that exact window. Click a desktop title or empty tile area to switch without activating a listed window. Ctrl+click a window row to see all its tabs with their URLs; click a tab to copy its URL. Ctrl+click elsewhere in a desktop tile to move the captured active window there, follow it, and keep the picker open. During the drag, a translucent copy with the application icon and window title follows the pointer. Drop it on another desktop to move or visually assign that window without switching desktops or closing the picker. Globally visible and pinned windows are only visually assigned for the current popup session; their real Windows state is not changed. Type in the box to filter windows by name; a browser window also matches on the title or address of any of its tabs. Every program with more than one window gets a check box under the search box: untick it to take that program's windows out of the desktop tiles until you tick it again. Scroll a tile with the mouse wheel, and hover a clipped name to see it in full.\r\n\r\n"
+L"A grid of your virtual desktops and their eligible application windows. Click a window row to switch to its displayed desktop and activate that exact window. Click a desktop title or empty tile area to switch without activating a listed window. Ctrl+click a window row to see all its tabs with their URLs; click a tab to copy its URL. Chrome and Edge lock their session file while a window is open, so for them, and for Opera, the list and the search use the tab titles the window itself reports, without URLs. Ctrl+click elsewhere in a desktop tile to move the captured active window there, follow it, and keep the picker open. During the drag, a translucent copy with the application icon and window title follows the pointer. Drop it on another desktop to move or visually assign that window without switching desktops or closing the picker. Globally visible and pinned windows are only visually assigned for the current popup session; their real Windows state is not changed. Type in the box to filter windows by name; a browser window also matches on the title or address of any of its tabs. Every program with more than one window gets a check box under the search box: untick it to take that program's windows out of the desktop tiles until you tick it again. Scroll a tile with the mouse wheel, and hover a clipped name to see it in full.\r\n\r\n"
 L"Menu\r\n"
 L"- Save windows layout: save the current windows to a manual checkpoint file.\r\n"
 L"- Restore saved windows layout: put windows back from that manual checkpoint.\r\n"
@@ -13797,6 +13928,96 @@ static void OpenSessionRestore(){
     }
 }
 
+// ---------------------------- tab strip reader -------------------------------
+static bool ReadWindowTabStrip(IUIAutomation* automation,HWND hwnd,
+                               std::vector<TabStripRow>& rows){
+    if(!automation) return false;
+    IUIAutomationElement* rawRoot=nullptr;
+    if(FAILED(automation->ElementFromHandle(hwnd,&rawRoot)) || !rawRoot) return false;
+    ScopedComPtr<IUIAutomationElement> root(rawRoot);
+    VARIANT tabItem;
+    VariantInit(&tabItem);
+    tabItem.vt=VT_I4;
+    tabItem.lVal=UIA_TabItemControlTypeId;
+    IUIAutomationCondition* rawCondition=nullptr;
+    if(FAILED(automation->CreatePropertyCondition(
+           UIA_ControlTypePropertyId,tabItem,&rawCondition)) || !rawCondition) return false;
+    ScopedComPtr<IUIAutomationCondition> condition(rawCondition);
+    IUIAutomationCacheRequest* rawCache=nullptr;
+    if(FAILED(automation->CreateCacheRequest(&rawCache)) || !rawCache) return false;
+    ScopedComPtr<IUIAutomationCacheRequest> cache(rawCache);
+    if(FAILED(cache->AddProperty(UIA_NamePropertyId)) ||
+       FAILED(cache->AddProperty(UIA_ClassNamePropertyId)) ||
+       FAILED(cache->AddProperty(UIA_AutomationIdPropertyId)) ||
+       FAILED(cache->AddProperty(UIA_SelectionItemIsSelectedPropertyId))) return false;
+    IUIAutomationElementArray* rawFound=nullptr;
+    if(FAILED(root->FindAllBuildCache(TreeScope_Descendants,condition.get(),
+                                      cache.get(),&rawFound)) || !rawFound) return false;
+    ScopedComPtr<IUIAutomationElementArray> found(rawFound);
+    int count=0;
+    if(FAILED(found->get_Length(&count))) return false;
+    auto text=[](BSTR value,std::wstring& output){
+        if(!value) return;
+        output.assign(value,SysStringLen(value));
+        SysFreeString(value);
+    };
+    rows.clear();
+    rows.reserve(static_cast<size_t>((std::max)(count,0)));
+    for(int index=0;index<count;++index){
+        IUIAutomationElement* rawElement=nullptr;
+        if(FAILED(found->GetElement(index,&rawElement)) || !rawElement) continue;
+        ScopedComPtr<IUIAutomationElement> element(rawElement);
+        TabStripRow row;
+        BSTR value=nullptr;
+        if(SUCCEEDED(element->get_CachedName(&value))) text(value,row.name);
+        value=nullptr;
+        if(SUCCEEDED(element->get_CachedClassName(&value))) text(value,row.className);
+        value=nullptr;
+        if(SUCCEEDED(element->get_CachedAutomationId(&value))) text(value,row.automationId);
+        VARIANT selected;
+        VariantInit(&selected);
+        if(SUCCEEDED(element->GetCachedPropertyValue(
+               UIA_SelectionItemIsSelectedPropertyId,&selected)) && selected.vt==VT_BOOL)
+            row.selected=selected.boolVal==VARIANT_TRUE;
+        VariantClear(&selected);
+        rows.push_back(std::move(row));
+    }
+    return true;
+}
+
+static TabStripWorker::Ops MakeTabStripOps(HWND window){
+    // Touched only by the worker thread, which owns its COM apartment.
+    auto automation=std::make_shared<IUIAutomation*>(nullptr);
+    TabStripWorker::Ops ops;
+    ops.threadBegin=[automation](){
+        if(FAILED(CoInitializeEx(nullptr,COINIT_MULTITHREADED))) return;
+        IUIAutomation* created=nullptr;
+        if(FAILED(CoCreateInstance(__uuidof(CUIAutomation),nullptr,CLSCTX_INPROC_SERVER,
+                                   __uuidof(IUIAutomation),(void**)&created)) || !created)
+            return;
+        // A hung browser must not hold the thread, or the exit that joins it.
+        IUIAutomation2* limits=nullptr;
+        if(SUCCEEDED(created->QueryInterface(__uuidof(IUIAutomation2),(void**)&limits)) && limits){
+            limits->put_ConnectionTimeout(1500);
+            limits->put_TransactionTimeout(3000);
+            limits->Release();
+        }
+        *automation=created;
+    };
+    ops.threadEnd=[automation](){
+        if(*automation){ (*automation)->Release(); *automation=nullptr; }
+        CoUninitialize();
+    };
+    ops.read=[automation](HWND hwnd,std::vector<TabStripRow>& rows){
+        return ReadWindowTabStrip(*automation,hwnd,rows);
+    };
+    ops.post=[window](TabStripWindow* result){
+        return PostMessageW(window,WM_TAB_STRIP_RESULT,0,
+                            reinterpret_cast<LPARAM>(result))!=FALSE;
+    };
+    return ops;
+}
+
 // The observation pass, shared by the 5 s timer and the foreground wake-up.
 static void RunMonitorTick(HWND hwnd){
     RunMessageRouteNoThrow([&](){
@@ -14383,6 +14604,13 @@ static LRESULT CALLBACK WndProcImpl(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
            !PickerInteractionBusy(g_picker,g_pickerGesture))
             HidePicker(PickerHideDisposition::DismissSession);
         return 0;
+    case WM_TAB_STRIP_RESULT: {
+        std::unique_ptr<TabStripWindow> result((TabStripWindow*)lp);
+        if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
+        RunMessageRouteNoThrow(
+            [&](){ HandleTabStripResult(std::move(result)); },[](){},[](){});
+        return 0;
+    }
     case WM_SESSION_RESULT: {
         std::unique_ptr<SessionResult> result((SessionResult*)lp);
         if(!g_runtimeQuiescence.acceptsDispatch()) return 0;
@@ -14610,6 +14838,8 @@ static int RunGui(HINSTANCE hInst){
     if(!g_main)return 3;
     try { g_sessionWorker.reset(new SessionWorker(g_main)); }
     catch(...) { g_sessionWorker.reset(); }
+    try { g_tabStripWorker.reset(new TabStripWorker(MakeTabStripOps(g_main))); }
+    catch(...) { g_tabStripWorker.reset(); }
     try { g_reconcileWorker.reset(new ReconcileWorker(g_main)); }
     catch(...) { g_reconcileWorker.reset(); }
     { DWORD pref=2; DwmSetWindowAttribute(g_main,33,&pref,sizeof(pref)); }   // DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND (Win11)
