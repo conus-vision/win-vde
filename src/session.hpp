@@ -101,6 +101,43 @@ public:
         }
     }
 
+    // Reads a Firefox session the way parse() + ExtractFirefoxWindows() would,
+    // without building the tree: a real session is tens of megabytes of page
+    // state, and only each tab's current url and title are ever used.  The whole
+    // document is still validated with the same rules.
+    bool scanFirefoxWindows(std::vector<WinFp>& output){
+        output.clear();
+        try {
+            std::vector<WinFp> parsed;
+            bool windowsSeen=false,windowsBad=false;
+            whitespace();
+            if(p_>=end_ || *p_!='{'){
+                // Valid JSON of another shape has no windows either.
+                skipValue(0);
+                return false;
+            }
+            if(!countValue(0)) return false;
+            if(!members([&](const std::string& key){
+                if(key!="windows") return skipValue(1);
+                windowsSeen=true;
+                std::vector<WinFp>().swap(parsed);
+                return scanWindows(1,parsed,windowsBad);
+            })) return false;
+            whitespace();
+            if(!ok_ || p_!=end_ || !windowsSeen || windowsBad) return false;
+            output.swap(parsed);
+            return true;
+        } catch(const std::bad_alloc&) {
+            output.clear();
+            ok_=false;
+            return false;
+        } catch(const std::length_error&) {
+            output.clear();
+            ok_=false;
+            return false;
+        }
+    }
+
 private:
     const char* p_;
     const char* end_;
@@ -108,6 +145,14 @@ private:
     size_t nodes_=0;
     size_t decodedStringBytes_=0;
     bool ok_=true;
+
+    struct KeepText {
+        std::string& out;
+        void add(const char* text,size_t count){ out.append(text,count); }
+    };
+    struct DropText {
+        void add(const char*,size_t){}
+    };
 
     void fail(){ ok_=false; }
     void whitespace(){
@@ -119,35 +164,37 @@ private:
         decodedStringBytes_+=count;
         return true;
     }
-    bool appendByte(std::string& output,char byte){
-        if(!reserveDecoded(1)) return false;
-        output.push_back(byte);
+    template<class Text> bool append(Text& output,const char* text,size_t count){
+        if(!reserveDecoded(count)) return false;
+        output.add(text,count);
         return true;
+    }
+    template<class Text> bool appendByte(Text& output,char byte){
+        return append(output,&byte,1);
     }
     static size_t utf8Length(unsigned codePoint){
         return codePoint<=0x7f?1:(codePoint<=0x7ff?2:(codePoint<=0xffff?3:4));
     }
-    bool appendUtf8(std::string& output,unsigned codePoint){
-        size_t count=utf8Length(codePoint);
-        if(!reserveDecoded(count)) return false;
-        if(codePoint<=0x7f) output.push_back((char)codePoint);
-        else if(codePoint<=0x7ff){
-            output.push_back((char)(0xc0|(codePoint>>6)));
-            output.push_back((char)(0x80|(codePoint&0x3f)));
-        } else if(codePoint<=0xffff){
-            output.push_back((char)(0xe0|(codePoint>>12)));
-            output.push_back((char)(0x80|((codePoint>>6)&0x3f)));
-            output.push_back((char)(0x80|(codePoint&0x3f)));
+    template<class Text> bool appendUtf8(Text& output,unsigned codePoint){
+        char encoded[4];
+        const size_t count=utf8Length(codePoint);
+        if(count==1) encoded[0]=(char)codePoint;
+        else if(count==2){
+            encoded[0]=(char)(0xc0|(codePoint>>6));
+            encoded[1]=(char)(0x80|(codePoint&0x3f));
+        } else if(count==3){
+            encoded[0]=(char)(0xe0|(codePoint>>12));
+            encoded[1]=(char)(0x80|((codePoint>>6)&0x3f));
+            encoded[2]=(char)(0x80|(codePoint&0x3f));
         } else {
-            output.push_back((char)(0xf0|(codePoint>>18)));
-            output.push_back((char)(0x80|((codePoint>>12)&0x3f)));
-            output.push_back((char)(0x80|((codePoint>>6)&0x3f)));
-            output.push_back((char)(0x80|(codePoint&0x3f)));
+            encoded[0]=(char)(0xf0|(codePoint>>18));
+            encoded[1]=(char)(0x80|((codePoint>>12)&0x3f));
+            encoded[2]=(char)(0x80|((codePoint>>6)&0x3f));
+            encoded[3]=(char)(0x80|(codePoint&0x3f));
         }
-        return true;
+        return append(output,encoded,count);
     }
-    bool appendRawUtf8(std::string& output,unsigned char first){
-        if(first<0x80) return appendByte(output,(char)first);
+    template<class Text> bool appendRawUtf8(Text& output,unsigned char first){
         unsigned codePoint=0;
         size_t continuation=0;
         unsigned minimum=0;
@@ -156,19 +203,16 @@ private:
         else if(first>=0xf0 && first<=0xf4){ codePoint=first&0x07; continuation=3; minimum=0x10000; }
         else { fail(); return false; }
         if((size_t)(end_-p_)<continuation){ fail(); return false; }
-        unsigned char encoded[4]={first,0,0,0};
+        char encoded[4]={(char)first,0,0,0};
         for(size_t i=0;i<continuation;++i){
             unsigned char next=(unsigned char)*p_++;
             if((next&0xc0)!=0x80){ fail(); return false; }
-            encoded[i+1]=next;
+            encoded[i+1]=(char)next;
             codePoint=(codePoint<<6)|(next&0x3f);
         }
         if(codePoint<minimum || codePoint>0x10ffff ||
            (codePoint>=0xd800 && codePoint<=0xdfff)){ fail(); return false; }
-        size_t count=continuation+1;
-        if(!reserveDecoded(count)) return false;
-        output.append((const char*)encoded,count);
-        return true;
+        return append(output,encoded,continuation+1);
     }
     // Reads a "\\uXXXX" low surrogate right after the cursor without consuming
     // it or failing the parse.
@@ -202,9 +246,23 @@ private:
         return true;
     }
     bool string(std::string& output){
+        KeepText text{output};
+        return readString(text);
+    }
+    bool skipString(){
+        DropText text;
+        return readString(text);
+    }
+    template<class Text> bool readString(Text& output){
         if(p_>=end_ || *p_!='\"'){ fail(); return false; }
         ++p_;
         while(p_<end_){
+            // Almost every byte of a session is plain ASCII: take it in runs.
+            const char* run=p_;
+            while(p_<end_ && (unsigned char)*p_>=0x20 && (unsigned char)*p_<0x80 &&
+                  *p_!='\"' && *p_!='\\') ++p_;
+            if(p_!=run && !append(output,run,(size_t)(p_-run))) return false;
+            if(p_>=end_) break;
             unsigned char byte=(unsigned char)*p_++;
             if(byte=='\"') return true;
             if(byte<0x20){ fail(); return false; }
@@ -245,8 +303,11 @@ private:
         fail();
         return false;
     }
-    bool number(JValue& output){
-        const char* start=p_;
+    // Consumes a number's token; exact is false when only strtod can tell whether
+    // it stays in range.
+    bool numberToken(const char*& start,bool& exact){
+        start=p_;
+        exact=true;
         if(p_<end_ && *p_=='-') ++p_;
         if(p_>=end_){ fail(); return false; }
         if(*p_=='0') ++p_;
@@ -259,19 +320,32 @@ private:
             if(p_==fraction){ fail(); return false; }
         }
         if(p_<end_ && (*p_=='e' || *p_=='E')){
+            exact=false;
             ++p_;
             if(p_<end_ && (*p_=='+' || *p_=='-')) ++p_;
             const char* exponent=p_;
             while(p_<end_ && *p_>='0' && *p_<='9') ++p_;
             if(p_==exponent){ fail(); return false; }
         }
+        if(p_-start>300) exact=false;
+        return true;
+    }
+    bool convertNumber(const char* start,double& converted){
         std::string token(start,p_);
         errno=0;
         char* convertedEnd=nullptr;
-        double converted=std::strtod(token.c_str(),&convertedEnd);
+        converted=std::strtod(token.c_str(),&convertedEnd);
         if(errno==ERANGE || convertedEnd!=token.c_str()+token.size() || !std::isfinite(converted)){
             fail(); return false;
         }
+        return true;
+    }
+    bool number(JValue& output){
+        const char* start=nullptr;
+        bool exact=true;
+        if(!numberToken(start,exact)) return false;
+        double converted=0;
+        if(!convertNumber(start,converted)) return false;
         output.t=JValue::NUM;
         output.num=converted;
         return true;
@@ -332,6 +406,261 @@ private:
             fail(); return false;
         }
         fail(); return false;
+    }
+
+    bool countValue(unsigned depth){
+        if(depth>limits_.maxDepth || nodes_>=limits_.maxNodes){ fail(); return false; }
+        ++nodes_;
+        return true;
+    }
+    // Both walk one container with the cursor on its opening bracket and leave it
+    // after the closing one; a callback consumes the value it is called for.
+    template<class OnMember> bool members(OnMember&& onMember){
+        ++p_;
+        whitespace();
+        if(p_<end_ && *p_=='}'){ ++p_; return true; }
+        std::string key;
+        while(p_<end_){
+            whitespace();
+            key.clear();
+            if(!string(key)) return false;
+            whitespace();
+            if(p_>=end_ || *p_!=':'){ fail(); return false; }
+            ++p_;
+            if(!onMember(key)) return false;
+            whitespace();
+            if(p_<end_ && *p_==','){ ++p_; continue; }
+            if(p_<end_ && *p_=='}'){ ++p_; return true; }
+            fail(); return false;
+        }
+        fail(); return false;
+    }
+    template<class OnElement> bool elements(OnElement&& onElement){
+        ++p_;
+        whitespace();
+        if(p_<end_ && *p_==']'){ ++p_; return true; }
+        while(p_<end_){
+            if(!onElement()) return false;
+            whitespace();
+            if(p_<end_ && *p_==','){ ++p_; continue; }
+            if(p_<end_ && *p_==']'){ ++p_; return true; }
+            fail(); return false;
+        }
+        fail(); return false;
+    }
+    bool skipValue(unsigned depth){
+        if(!countValue(depth)) return false;
+        whitespace();
+        if(p_>=end_){ fail(); return false; }
+        const char first=*p_;
+        if(first=='\"') return skipString();
+        if(first=='{'){
+            ++p_;
+            whitespace();
+            if(p_<end_ && *p_=='}'){ ++p_; return true; }
+            while(p_<end_){
+                whitespace();
+                if(!skipString()) return false;
+                whitespace();
+                if(p_>=end_ || *p_!=':'){ fail(); return false; }
+                ++p_;
+                if(!skipValue(depth+1)) return false;
+                whitespace();
+                if(p_<end_ && *p_==','){ ++p_; continue; }
+                if(p_<end_ && *p_=='}'){ ++p_; return true; }
+                fail(); return false;
+            }
+            fail(); return false;
+        }
+        if(first=='['){
+            return elements([&](){ return skipValue(depth+1); });
+        }
+        if((size_t)(end_-p_)>=4 && std::memcmp(p_,"true",4)==0){ p_+=4; return true; }
+        if((size_t)(end_-p_)>=5 && std::memcmp(p_,"false",5)==0){ p_+=5; return true; }
+        if((size_t)(end_-p_)>=4 && std::memcmp(p_,"null",4)==0){ p_+=4; return true; }
+        const char* start=nullptr;
+        bool exact=true;
+        if(!numberToken(start,exact)) return false;
+        if(exact) return true;
+        double converted=0;
+        return convertNumber(start,converted);
+    }
+
+    struct EntryRef {
+        bool object=false;
+        const char* url=nullptr;
+        const char* title=nullptr;
+        bool urlBad=false,titleBad=false;
+    };
+    struct ScannedTab {
+        bool hasEntry=false;
+        std::string url,title;
+    };
+
+    // A number's value when the next value is a number, otherwise bad is set.
+    bool scanNumberMember(unsigned depth,double& output,bool& bad){
+        whitespace();
+        if(p_<end_ && (*p_=='-' || (*p_>='0' && *p_<='9'))){
+            if(!countValue(depth)) return false;
+            const char* start=nullptr;
+            bool exact=true;
+            if(!numberToken(start,exact)) return false;
+            bad=false;
+            return convertNumber(start,output);
+        }
+        bad=true;
+        return skipValue(depth);
+    }
+    bool scanStringRef(unsigned depth,const char*& where,bool& bad){
+        whitespace();
+        if(p_<end_ && *p_=='\"'){ where=p_; bad=false; }
+        else { where=nullptr; bad=true; }
+        return skipValue(depth);
+    }
+    // The string was validated and counted when the scan passed over it.
+    bool decodeAt(const char* where,std::string& output){
+        output.clear();
+        if(!where) return true;
+        const char* saved=p_;
+        const size_t counted=decodedStringBytes_;
+        p_=where;
+        decodedStringBytes_=0;
+        const bool decoded=string(output);
+        p_=saved;
+        decodedStringBytes_=counted;
+        return decoded;
+    }
+    bool scanEntry(unsigned depth,std::vector<EntryRef>& entries){
+        EntryRef entry;
+        whitespace();
+        if(p_>=end_ || *p_!='{'){
+            entries.push_back(entry);
+            return skipValue(depth);
+        }
+        if(!countValue(depth)) return false;
+        entry.object=true;
+        if(!members([&](const std::string& key){
+            if(key=="url") return scanStringRef(depth+1,entry.url,entry.urlBad);
+            if(key=="title") return scanStringRef(depth+1,entry.title,entry.titleBad);
+            return skipValue(depth+1);
+        })) return false;
+        entries.push_back(entry);
+        return true;
+    }
+    bool scanTab(unsigned depth,std::vector<EntryRef>& entries,
+                 std::vector<ScannedTab>& tabs,bool& bad){
+        whitespace();
+        if(p_>=end_ || *p_!='{'){
+            bad=true;
+            tabs.push_back(ScannedTab());
+            return skipValue(depth);
+        }
+        if(!countValue(depth)) return false;
+        bool entriesSeen=false,entriesBad=false,indexSeen=false,indexBad=false;
+        double indexValue=0;
+        entries.clear();
+        if(!members([&](const std::string& key){
+            if(key=="entries"){
+                entriesSeen=true;
+                entries.clear();
+                whitespace();
+                if(p_<end_ && *p_=='['){
+                    if(!countValue(depth+1)) return false;
+                    entriesBad=false;
+                    return elements([&](){ return scanEntry(depth+2,entries); });
+                }
+                entriesBad=true;
+                return skipValue(depth+1);
+            }
+            if(key=="index"){
+                indexSeen=true;
+                return scanNumberMember(depth+1,indexValue,indexBad);
+            }
+            return skipValue(depth+1);
+        })) return false;
+        tabs.push_back(ScannedTab());
+        if(!entriesSeen || entriesBad || indexBad){ bad=true; return true; }
+        if(entries.empty()) return true;
+        int index=(int)(std::min)(entries.size(),(size_t)INT_MAX);
+        if(indexSeen && indexValue>=(double)INT_MIN && indexValue<=(double)INT_MAX)
+            index=(int)indexValue;
+        if(index<1) index=1;
+        if((size_t)index>entries.size()) index=(int)entries.size();
+        const EntryRef& current=entries[(size_t)index-1];
+        if(!current.object || current.urlBad || current.titleBad){ bad=true; return true; }
+        ScannedTab& scanned=tabs.back();
+        scanned.hasEntry=true;
+        return decodeAt(current.url,scanned.url) && decodeAt(current.title,scanned.title);
+    }
+    bool scanWindow(unsigned depth,std::vector<WinFp>& parsed,bool& bad){
+        whitespace();
+        if(p_>=end_ || *p_!='{'){
+            bad=true;
+            return skipValue(depth);
+        }
+        if(!countValue(depth)) return false;
+        std::vector<ScannedTab> tabs;
+        std::vector<EntryRef> entries;
+        bool tabsSeen=false,tabsBad=false,selectedSeen=false,selectedBad=false;
+        double selectedValue=0;
+        if(!members([&](const std::string& key){
+            if(key=="tabs"){
+                tabsSeen=true;
+                tabsBad=false;
+                tabs.clear();
+                whitespace();
+                if(p_<end_ && *p_=='['){
+                    if(!countValue(depth+1)) return false;
+                    return elements([&](){ return scanTab(depth+2,entries,tabs,tabsBad); });
+                }
+                tabsBad=true;
+                return skipValue(depth+1);
+            }
+            if(key=="selected"){
+                selectedSeen=true;
+                return scanNumberMember(depth+1,selectedValue,selectedBad);
+            }
+            return skipValue(depth+1);
+        })) return false;
+        if(!tabsSeen || tabsBad || selectedBad){ bad=true; return true; }
+        int selected=1;
+        if(selectedSeen && selectedValue>=(double)INT_MIN && selectedValue<=(double)INT_MAX)
+            selected=(int)selectedValue;
+        WinFp fingerprint;
+        fingerprint.tabCount=(int)tabs.size();
+        fingerprint.tabs.reserve(tabs.size());
+        for(size_t ti=0;ti<tabs.size();++ti){
+            ScannedTab& tab=tabs[ti];
+            if(!tab.hasEntry) continue;
+            std::string domain=etld1(hostOf(tab.url));
+            if(!domain.empty()) ++fingerprint.counts[domain];
+            fingerprint.tabsBlob+=tab.title;
+            fingerprint.tabsBlob.push_back(' ');
+            fingerprint.tabsBlob+=tab.url;
+            fingerprint.tabsBlob.push_back(' ');
+            const bool isSelected=selected>0 && ti==(size_t)(selected-1);
+            if(isSelected){
+                fingerprint.activeTab=(int)fingerprint.tabs.size();
+                fingerprint.activeTitle=tab.title;
+                fingerprint.activeDomain=domain;
+            }
+            SessionTab decoded;
+            decoded.url=std::move(tab.url);
+            decoded.title=std::move(tab.title);
+            fingerprint.tabs.push_back(std::move(decoded));
+        }
+        parsed.push_back(std::move(fingerprint));
+        return true;
+    }
+    bool scanWindows(unsigned depth,std::vector<WinFp>& parsed,bool& bad){
+        whitespace();
+        bad=false;
+        if(p_>=end_ || *p_!='['){
+            bad=true;
+            return skipValue(depth);
+        }
+        if(!countValue(depth)) return false;
+        return elements([&](){ return scanWindow(depth+1,parsed,bad); });
     }
 };
 
@@ -399,11 +728,16 @@ inline bool ExtractFirefoxWindows(const JValue& root,std::vector<WinFp>& output)
       catch(const std::length_error&) { output.clear(); return false; }
 }
 
-inline bool ParseFirefoxSessionJson(const std::string& json,std::vector<WinFp>& output){
+// The tree walk above defines what a session means; tests compare the scan to it.
+inline bool ParseFirefoxSessionJsonTree(const std::string& json,std::vector<WinFp>& output){
     output.clear();
     JValue root;
     if(!JParser(json).parse(root)) return false;
     return ExtractFirefoxWindows(root,output);
+}
+
+inline bool ParseFirefoxSessionJson(const std::string& json,std::vector<WinFp>& output){
+    return JParser(json).scanFirefoxWindows(output);
 }
 
 static const size_t MAX_CHROMIUM_WINDOWS=10000;

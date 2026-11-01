@@ -14837,6 +14837,156 @@ static void test_picker_enum_publishes_display_only_rows_safely(){
           cachedIcon<fallbackIcon);
 }
 
+static bool SameScannedWindows(const std::vector<WinFp>& left,const std::vector<WinFp>& right){
+    if(left.size()!=right.size()) return false;
+    for(size_t w=0;w<left.size();++w){
+        const WinFp& a=left[w];
+        const WinFp& b=right[w];
+        if(a.activeTitle!=b.activeTitle || a.activeDomain!=b.activeDomain ||
+           a.counts!=b.counts || a.tabCount!=b.tabCount ||
+           a.tabsBlob!=b.tabsBlob || a.activeTab!=b.activeTab ||
+           a.tabs.size()!=b.tabs.size()) return false;
+        for(size_t t=0;t<a.tabs.size();++t)
+            if(a.tabs[t].url!=b.tabs[t].url || a.tabs[t].title!=b.tabs[t].title)
+                return false;
+    }
+    return true;
+}
+
+// The scan must mean exactly what the tree walk means, on any input.
+static void test_firefox_scan_matches_the_tree_walk(){
+    const std::string tab=
+        "{\"entries\":[{\"url\":\"https://a.example/1\",\"title\":\"One\"},"
+        "{\"url\":\"https://b.example/2\",\"title\":\"Two\",\"formdata\":{\"x\":[1,2,{\"y\":null}]}}],"
+        "\"index\":2,\"lastAccessed\":1788337602000,\"hidden\":false,\"attributes\":{}}";
+    const std::vector<std::string> documents={
+        "{\"windows\":[]}",
+        "{\"windows\":[{\"tabs\":["+tab+"],\"selected\":1,\"z\":3}],\"session\":{\"lastUpdate\":1}}",
+        "{\"version\":[\"sessionrestore\",1],\"windows\":[{\"selected\":2,\"tabs\":["+tab+","+tab+"]},{\"tabs\":["+tab+"]}]}",
+        " \r\n\t{ \"windows\" : [ { \"tabs\" : [ { \"index\" : 1 , \"entries\" : [ { \"title\" : \"T\" , \"url\" : \"u\" } ] } ] } ] } \n",
+        // index: before the entries, out of range, fractional, huge, and a repeat
+        "{\"windows\":[{\"tabs\":[{\"index\":1,\"entries\":[{\"url\":\"a\"},{\"url\":\"b\"}]}]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":[{\"url\":\"a\"},{\"url\":\"b\"}],\"index\":0}]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":[{\"url\":\"a\"},{\"url\":\"b\"}],\"index\":-4}]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":[{\"url\":\"a\"},{\"url\":\"b\"}],\"index\":99}]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":[{\"url\":\"a\"},{\"url\":\"b\"}],\"index\":1.7}]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":[{\"url\":\"a\"},{\"url\":\"b\"}],\"index\":1e300}]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":[{\"url\":\"a\"},{\"url\":\"b\"}],\"index\":\"1\"}]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":[{\"url\":\"a\"},{\"url\":\"b\"}],\"index\":\"1\",\"index\":1}]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":[{\"url\":\"a\"},{\"url\":\"b\"}],\"index\":1,\"index\":null}]}]}",
+        // selected: every position, and a tab with no entries still counts
+        "{\"windows\":[{\"selected\":0,\"tabs\":["+tab+"]}]}",
+        "{\"windows\":[{\"selected\":-1,\"tabs\":["+tab+"]}]}",
+        "{\"windows\":[{\"selected\":9,\"tabs\":["+tab+"]}]}",
+        "{\"windows\":[{\"selected\":1e300,\"tabs\":["+tab+"]}]}",
+        "{\"windows\":[{\"tabs\":["+tab+"],\"selected\":true}]}",
+        "{\"windows\":[{\"tabs\":["+tab+"],\"selected\":true,\"selected\":1}]}",
+        "{\"windows\":[{\"selected\":2,\"tabs\":[{\"entries\":[]},"+tab+"]}]}",
+        // shapes: only the chosen entry has to be well formed
+        "{\"windows\":[{\"tabs\":[{\"entries\":[7,{\"url\":\"b\"}],\"index\":2}]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":[7,{\"url\":\"b\"}],\"index\":1}]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":[{\"url\":1},{\"url\":\"b\"}],\"index\":2}]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":[{\"url\":1},{\"url\":\"b\"}],\"index\":1}]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":[{\"title\":null}]}]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":[{}]}]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":[{\"url\":1,\"url\":\"ok\"}]}]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":[{\"url\":\"ok\",\"url\":1}]}]}]}",
+        "{\"windows\":[{\"tabs\":[{}]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":3}]}]}",
+        "{\"windows\":[{\"tabs\":[3]}]}",
+        "{\"windows\":[{\"tabs\":3}]}",
+        "{\"windows\":[{}]}",
+        "{\"windows\":[3]}",
+        "{\"windows\":3}",
+        "{\"windows\":null}",
+        "{}",
+        "[]",
+        "3",
+        "\"windows\"",
+        "null",
+        // repeated keys: the last one wins at every level
+        "{\"windows\":3,\"windows\":[{\"tabs\":["+tab+"]}]}",
+        "{\"windows\":[{\"tabs\":["+tab+"]}],\"windows\":3}",
+        "{\"windows\":[3],\"windows\":[]}",
+        "{\"windows\":[{\"tabs\":[3],\"tabs\":["+tab+"]}]}",
+        "{\"windows\":[{\"tabs\":["+tab+"],\"tabs\":[3]}]}",
+        "{\"windows\":[{\"tabs\":["+tab+"],\"tabs\":[]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":3,\"entries\":[{\"url\":\"a\"}]}]}]}",
+        "{\"windows\":[{\"tabs\":[{\"entries\":[{\"url\":\"a\"}],\"entries\":[{\"url\":\"b\"},{\"url\":\"c\"}]}]}]}",
+        // text: escaped keys and values, surrogates, raw UTF-8
+        "{\"windows\":[{\"tabs\":[{\"entries\":[{\"ur\\u006c\":\"https://a.example/\\u00e9\",\"title\":\"\\ud83d\\ude00 \\ud800 \\\" \\\\ \\/ \\n \xd0\xbf\xd1\x80\xd0\xb8\"}]}]}]}",
+        // invalid JSON anywhere, including inside values the scan skips
+        "",
+        "{",
+        "{\"windows\":[",
+        "{\"windows\":[]} trailing",
+        "{\"windows\":[],}",
+        "{\"windows\":[{\"tabs\":[],}]}",
+        "{\"windows\":[],\"a\":}",
+        "{\"windows\":[],\"a\":tru}",
+        "{\"windows\":[],\"a\":01}",
+        "{\"windows\":[],\"a\":1.}",
+        "{\"windows\":[],\"a\":-}",
+        "{\"windows\":[],\"a\":1e}",
+        "{\"windows\":[],\"a\":1e999}",
+        "{\"windows\":[],\"a\":1e-9999}",
+        "{\"windows\":[],\"a\":[1,]}",
+        "{\"windows\":[],\"a\":{\"b\" 1}}",
+        "{\"windows\":[],\"a\":\"unterminated}",
+        "{\"windows\":[],\"a\":\"\\q\"}",
+        "{\"windows\":[],\"a\":\"\\u12\"}",
+        "{\"windows\":[],\"a\":\"\x01\"}",
+        "{\"windows\":[],\"a\":\"\xc0\xaf\"}",
+        "{\"windows\":[],\"a\":\"\xed\xa0\x80\"}",
+        "{\"windows\":[],\"\xff\":1}",
+        std::string("{\"windows\":[],\"a\":")+std::string(200,'[')+std::string(200,']')+"}",
+        std::string("{\"windows\":[],\"a\":")+std::string(125,'[')+std::string(125,']')+"}",
+        std::string("{\"windows\":[],\"a\":0.")+std::string(400,'1')+"}",
+    };
+    for(const std::string& document : documents){
+        std::vector<WinFp> scanned,walked;
+        WinFp leftover;
+        leftover.tabCount=9;
+        scanned.push_back(leftover);
+        const bool scanOk=ParseFirefoxSessionJson(document,scanned);
+        const bool walkOk=ParseFirefoxSessionJsonTree(document,walked);
+        CHECK(scanOk==walkOk);
+        CHECK(SameScannedWindows(scanned,walked));
+    }
+    // The limits bind at exactly the same point.
+    const std::string limited=documents[2];
+    for(unsigned depth=0;depth<12;++depth){
+        JValue tree;
+        std::vector<WinFp> scanned,walked;
+        const JsonLimits limits(depth,MAX_JSON_NODES,MAX_JSON_DECODED_STRING_BYTES);
+        const bool scanOk=JParser(limited,limits).scanFirefoxWindows(scanned);
+        const bool walkOk=JParser(limited,limits).parse(tree) && ExtractFirefoxWindows(tree,walked);
+        CHECK(scanOk==walkOk);
+    }
+    for(size_t nodes=0;nodes<80;++nodes){
+        JValue tree;
+        std::vector<WinFp> scanned,walked;
+        const JsonLimits limits(MAX_JSON_DEPTH,nodes,MAX_JSON_DECODED_STRING_BYTES);
+        const bool scanOk=JParser(limited,limits).scanFirefoxWindows(scanned);
+        const bool walkOk=JParser(limited,limits).parse(tree) && ExtractFirefoxWindows(tree,walked);
+        CHECK(scanOk==walkOk);
+    }
+    for(size_t text=0;text<400;text+=3){
+        JValue tree;
+        std::vector<WinFp> scanned,walked;
+        const JsonLimits limits(MAX_JSON_DEPTH,MAX_JSON_NODES,text);
+        const bool scanOk=JParser(limited,limits).scanFirefoxWindows(scanned);
+        const bool walkOk=JParser(limited,limits).parse(tree) && ExtractFirefoxWindows(tree,walked);
+        CHECK(scanOk==walkOk);
+    }
+}
+
+// Every session read runs through the parser, so an unoptimized build costs real CPU.
+static void test_release_builds_are_optimized(){
+    CHECK(ReadSourceFile(L"build.bat").find(" /O2 ")!=std::string::npos);
+    CHECK(ReadSourceFile(L"build-dev.bat").find(" /O2 ")!=std::string::npos);
+}
+
 static void test_picker_ctrl_move_uses_shared_foreground_handoff(){
     const std::string source=ReadSourceFile(L"src\\vde.cpp");
     const std::string helper=SourceSection(
@@ -31236,6 +31386,8 @@ int main(){
     test_settings_writes_run_key_only_when_autostart_toggled();
     test_manual_save_carries_over_skipped_app_records();
     test_tab_overlay_scroll_hit_and_selection();
+    test_firefox_scan_matches_the_tree_walk();
+    test_release_builds_are_optimized();
     test_program_key_and_display_name();
     test_program_chips_need_two_windows_or_a_hidden_program();
     test_program_chip_layout_wraps_and_respects_the_row_limit();
