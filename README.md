@@ -21,7 +21,7 @@ it does three things:
 
 <p align="center"><img src="docs/demo.gif" alt="win-vde at work: Ctrl+Alt+D opens the panel, typing finds a window by a background tab, unticking a program hides its windows, a window is dragged to another desktop, and after a reboot every browser window goes back while the screen stays put" width="840"></p>
 
-<p align="center"><a href="https://vde.conus.vision/#film">Watch the full tour with voice-over, in English or Russian</a></p>
+<p align="center"><a href="https://vde.conus.vision/#film">Watch the full tour with voice-over</a></p>
 
 - Author: Volodymyr Moskvin, <info@conus.vision>
 - Website: https://vde.conus.vision/
